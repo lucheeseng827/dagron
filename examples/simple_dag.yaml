@@ -1,0 +1,23 @@
+# A minimal diamond DAG you can run with:
+#   dagron run examples/simple_dag.yaml
+#
+#   a
+#  / \
+# b   c
+#  \ /
+#   d
+name: simple_dag
+tasks:
+  - name: a
+    command: ["echo", "task a"]
+  - name: b
+    command: ["echo", "task b"]
+    depends_on: ["a"]
+  - name: c
+    command: ["echo", "task c"]
+    depends_on: ["a"]
+  - name: d
+    command: ["echo", "task d"]
+    depends_on: ["b", "c"]
+    max_attempts: 3
+    retry_delay_secs: 1

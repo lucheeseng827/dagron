@@ -1,0 +1,31 @@
+[package]
+name = "dagron"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "A small, durable DAG workflow runner with pluggable Executor and WorkflowSource traits and zero-infra local reference implementations."
+license = "Apache-2.0"
+repository = "https://github.com/lucheeseng827/dagron"
+homepage = "https://github.com/lucheeseng827/dagron"
+keywords = ["dag", "workflow", "scheduler", "orchestration", "pipeline"]
+categories = ["concurrency", "command-line-utilities"]
+readme = "README.md"
+
+[lib]
+name = "dagron"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dagron"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "sync", "time", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+petgraph = "0.6"
+anyhow = "1"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
