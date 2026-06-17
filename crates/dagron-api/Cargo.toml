@@ -1,0 +1,33 @@
+[package]
+name = "dagron-api"
+version = "0.1.0"
+edition = "2021"
+description = "dagron management API — read-mostly axum service over the dagron Postgres, with LISTEN/NOTIFY → SSE live updates."
+
+[[bin]]
+name = "dagron-api"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jsonwebtoken = "9"
+argon2 = { version = "0.5", features = ["std"] }
+# GitOps "sync to Git" — open a PR via the GitHub REST API.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+base64 = "0.22"
+anyhow = "1"
+tracing = "0.1"
+# Shared, env-tunable logging bootstrap (single source of truth).
+dagron-logging = { path = "../dagron-logging" }
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
+serde_yaml = "0.9"
+petgraph = "0.6"
+cron = "0.16"

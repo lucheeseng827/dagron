@@ -1,0 +1,126 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "dagron.fullname" . }}-engine
+  labels:
+    {{- include "dagron.labels" . | nindent 4 }}
+    app.kubernetes.io/component: engine
+{{- if eq .Values.engine.executor "k8s" }}
+---
+# EXECUTOR=k8s: the engine creates one-shot task Pods in this namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "dagron.fullname" . }}-engine
+  labels:
+    {{- include "dagron.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "dagron.fullname" . }}-engine
+  labels:
+    {{- include "dagron.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "dagron.fullname" . }}-engine
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "dagron.fullname" . }}-engine
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dagron.fullname" . }}-engine
+  labels:
+    {{- include "dagron.labels" . | nindent 4 }}
+    app.kubernetes.io/component: engine
+spec:
+  replicas: {{ .Values.engine.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: engine
+  template:
+    metadata:
+      labels:
+        {{- include "dagron.labels" . | nindent 8 }}
+        app.kubernetes.io/component: engine
+    spec:
+      serviceAccountName: {{ include "dagron.fullname" . }}-engine
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: engine
+          image: {{ .Values.engine.image | quote }}
+          imagePullPolicy: {{ .Values.engine.imagePullPolicy }}
+          # No readOnlyRootFilesystem: the entrypoint seeds /workflows on the
+          # image's root fs. Everything else is locked down.
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "dagron.dbSecretName" . }}
+                  key: {{ include "dagron.dbSecretKey" . }}
+            - name: API_ADDR
+              value: "0.0.0.0:{{ .Values.engine.port }}"
+            - name: EXECUTOR
+              value: {{ .Values.engine.executor | quote }}
+            - name: K8S_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: K8S_IMAGE
+              value: {{ .Values.engine.taskImage | quote }}
+            - name: WORKER_COUNT
+              value: {{ .Values.engine.workerCount | quote }}
+            - name: DB_SCHEDULES
+              value: {{ ternary "1" "0" .Values.engine.dbSchedules | quote }}
+            # Admission cap for POST /runs: the engine returns 429 + Retry-After
+            # once this many runs are active, instead of growing an unbounded
+            # backlog (the LOADTEST.md finding). 0 disables the cap.
+            - name: MAX_INFLIGHT_RUNS
+              value: {{ .Values.engine.maxInflightRuns | quote }}
+            - name: RUST_LOG
+              value: {{ .Values.engine.rustLog | quote }}
+            {{- with .Values.engine.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - containerPort: {{ .Values.engine.port }}
+          resources:
+            {{- toYaml .Values.engine.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "dagron.fullname" . }}-engine
+  labels:
+    {{- include "dagron.labels" . | nindent 4 }}
+    app.kubernetes.io/component: engine
+spec:
+  type: {{ .Values.engine.service.type }}
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: engine
+  ports:
+    - port: {{ .Values.engine.port }}
+      targetPort: {{ .Values.engine.port }}
+      name: http

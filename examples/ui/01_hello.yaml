@@ -1,0 +1,8 @@
+# The smallest runnable workflow: one task that prints a message.
+# Build it in the UI (Workflows → New → "Hello world"), or submit it directly:
+#   curl -X POST localhost:8080/api/runs -H 'content-type: application/json' \
+#     --data "{\"yaml\": $(jq -Rs . < examples/ui/01_hello.yaml)}" -b cookies.txt
+name: hello-world
+tasks:
+  - name: greet
+    command: ["sh", "-c", "echo hello from dagron"]

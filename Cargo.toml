@@ -1,31 +1,44 @@
+# Workspace root. The `dagron` engine binary is the root package; the OSS library
+# crates are members so the whole module shares one Cargo.lock + target dir.
+[workspace]
+members = ["crates/dagron-core", "crates/dagron-executor", "crates/dagron-source", "crates/dagron-engine", "crates/dagron-api", "crates/dagron-logging"]
+# `ee/` (the closed Enterprise/Cloud superset — its own workspace at ee/Cargo.toml)
+# is excluded; the OSS workspace must build without ee/ present (OSS-builds-alone).
+exclude = ["ee"]
+resolver = "2"
+
 [package]
 name = "dagron"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.74"
-description = "A small, durable DAG workflow runner with pluggable Executor and WorkflowSource traits and zero-infra local reference implementations."
-license = "Apache-2.0"
-repository = "https://github.com/lucheeseng827/dagron"
-homepage = "https://github.com/lucheeseng827/dagron"
-keywords = ["dag", "workflow", "scheduler", "orchestration", "pipeline"]
-categories = ["concurrency", "command-line-utilities"]
-readme = "README.md"
-
-[lib]
-name = "dagron"
-path = "src/lib.rs"
+description = "dagron — durable DAG workflow runner on ractor: reconcile loop, pluggable executors (local + Docker), SQLite/Postgres backends."
 
 [[bin]]
 name = "dagron"
 path = "src/main.rs"
 
+[features]
+# The OSS engine is now a thin shell over the dagron-engine library; feature names
+# are unchanged but forward to it. default = full scheduler with the ops surface;
+# drop `ops` (and pick a backend) for a lean reconcile-only daemon, e.g.
+#   cargo build --no-default-features --features sqlite
+default = ["sqlite", "ops"]
+sqlite = ["dagron-engine/sqlite"]
+postgres = ["dagron-engine/postgres"]
+ops = ["dagron-engine/ops"]
+kubernetes = ["dagron-engine/kubernetes"]
+
 [dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "sync", "time", "fs"] }
-serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
-serde_json = "1"
-petgraph = "0.6"
+# All engine logic lives in dagron-engine; this binary just calls run() with the
+# OSS default seams. default-features = false so a `--features postgres` build does
+# not also drag in the engine's default `sqlite` backend (they collide).
+dagron-engine = { path = "crates/dagron-engine", default-features = false }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 anyhow = "1"
-async-trait = "0.1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# The crash-recovery integration test runs the built `dagron` binary and inspects
+# its SQLite datastore directly (sqlx) with unique temp paths (uuid).
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

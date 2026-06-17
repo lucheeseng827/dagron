@@ -1,0 +1,26 @@
+# Pattern 11 — Diamond of sub-DAGs
+#
+# A diamond (split → A, B → join) where each branch is itself a sub-workflow. Each
+# branch template expands to a multi-task sub-DAG; `join` fans in over both
+# branches' exits. Shows boundary rewiring with multiple exit nodes per branch.
+#
+#            ┌─ branch-a (fetch→clean) ─┐
+#   split ──>│                          ├── join
+#            └─ branch-b (fetch→score) ─┘
+name: diamond-subdags
+
+templates:
+  - name: clean-branch
+    tasks:
+      - { name: fetch, command: ["sh", "-c", "echo fetch-a"] }
+      - { name: clean, command: ["sh", "-c", "echo clean"], depends_on: [fetch] }
+  - name: score-branch
+    tasks:
+      - { name: fetch, command: ["sh", "-c", "echo fetch-b"] }
+      - { name: score, command: ["sh", "-c", "echo score"], depends_on: [fetch] }
+
+tasks:
+  - { name: split, command: ["sh", "-c", "echo split"] }
+  - { name: branch-a, template: clean-branch, depends_on: [split] }
+  - { name: branch-b, template: score-branch, depends_on: [split] }
+  - { name: join, command: ["sh", "-c", "echo join"], depends_on: [branch-a, branch-b] }

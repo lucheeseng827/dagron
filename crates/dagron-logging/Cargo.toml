@@ -1,0 +1,13 @@
+[package]
+name = "dagron-logging"
+version = "0.1.0"
+edition = "2021"
+description = "Shared, environment-tunable tracing/observability bootstrap for the dagron stack (controller, worker, management API, operator)."
+
+[lib]
+name = "dagron_logging"
+path = "src/lib.rs"
+
+[dependencies]
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

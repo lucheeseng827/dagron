@@ -1,0 +1,73 @@
+name: controller-stress
+tasks:
+  - name: init
+    command: ["sh", "-c", "echo init"]
+    depends_on: []
+    max_attempts: 1
+    timeout_secs: 10
+
+  - name: work-01
+    command: ["sh", "-c", "echo work-01"]
+    depends_on: [init]
+    max_attempts: 1
+    timeout_secs: 10
+
+  - name: work-02
+    command: ["sh", "-c", "echo work-02"]
+    depends_on: [init]
+    max_attempts: 1
+    timeout_secs: 10
+
+  - name: work-03
+    command: ["sh", "-c", "echo work-03"]
+    depends_on: [init]
+    max_attempts: 1
+    timeout_secs: 10
+
+  - name: work-04
+    command: ["sh", "-c", "echo work-04"]
+    depends_on: [init]
+    max_attempts: 1
+    timeout_secs: 10
+
+  - name: work-05
+    command: ["sh", "-c", "echo work-05"]
+    depends_on: [init]
+    max_attempts: 1
+    timeout_secs: 10
+
+  - name: work-06
+    command: ["sh", "-c", "echo work-06"]
+    depends_on: [init]
+    max_attempts: 1
+    timeout_secs: 10
+
+  - name: work-07
+    command: ["sh", "-c", "echo work-07"]
+    depends_on: [init]
+    max_attempts: 1
+    timeout_secs: 10
+
+  - name: work-08
+    command: ["sh", "-c", "echo work-08"]
+    depends_on: [init]
+    max_attempts: 1
+    timeout_secs: 10
+
+  - name: work-09
+    command: ["sh", "-c", "echo work-09"]
+    depends_on: [init]
+    max_attempts: 1
+    timeout_secs: 10
+
+  - name: work-10
+    command: ["sh", "-c", "echo work-10"]
+    depends_on: [init]
+    max_attempts: 1
+    timeout_secs: 10
+
+  - name: finalize
+    command: ["sh", "-c", "echo all done"]
+    depends_on: [work-01, work-02, work-03, work-04, work-05, work-06, work-07, work-08, work-09, work-10]
+    max_attempts: 1
+    timeout_secs: 10

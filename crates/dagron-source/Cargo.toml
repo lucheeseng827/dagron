@@ -1,0 +1,39 @@
+[package]
+name = "dagron-source"
+version = "0.1.0"
+edition = "2021"
+description = "dagron workflow ingestion: the WorkflowSource trait + File/Channel built-in sources, a SourceFactory extension seam, and the ractor IngestActor that turns submissions into runs. Queue backends (Redis/SQS/Kafka/NATS) are an Enterprise add-on (ee/dagron-source-queues)."
+
+[lib]
+name = "dagron_source"
+path = "src/lib.rs"
+
+[features]
+# Backend passthrough to dagron-core. The OSS engine activates the backend on
+# dagron-core directly (so it never needs these), but a standalone build of this
+# lib — or a downstream lib like ee/dagron-source-queues — must be able to resolve
+# core's required backend, since core has no default here (default-features=false).
+sqlite = ["dagron-core/sqlite"]
+postgres = ["dagron-core/postgres"]
+
+[dependencies]
+# The ingest actor turns submissions into runs via the core datastore facade and
+# validates payloads against the core DAG model. No backend feature needed here:
+# the actor only calls db::create_run, which both backends expose identically.
+dagron-core = { path = "../dagron-core", default-features = false }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
+async-trait = "0.1"
+anyhow = "1"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+uuid = { version = "1", features = ["v4"] }
+ractor = "0.10"
+
+[dev-dependencies]
+# The ingest test creates a real SQLite datastore + reads back row counts, so it
+# needs a core backend (default-features=false on the normal dep keeps a postgres
+# build of the engine from also dragging in sqlite) and sqlx for the assertions.
+dagron-core = { path = "../dagron-core", features = ["sqlite"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }

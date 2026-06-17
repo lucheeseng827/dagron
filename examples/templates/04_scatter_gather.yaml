@@ -1,0 +1,23 @@
+# Pattern 04 — Scatter / gather (map-reduce, fan-out then fan-in)
+#
+# Fan a template out over items, then a downstream task that `depends_on` the
+# fan-out node fans IN over every expanded copy's exit — so `reduce` waits for all
+# shards. This is the canonical map-reduce / scatter-gather shape.
+#
+# split → {work.0, work.1, work.2, work.3} → reduce (depends on all four)
+name: scatter-gather
+
+templates:
+  - name: mapper
+    parameters: { n: "0" }
+    tasks:
+      - { name: compute, command: ["sh", "-c", "echo partial result for {{ n }}"] }
+
+tasks:
+  - { name: split, command: ["sh", "-c", "echo split input into 4"] }
+  - name: work
+    template: mapper
+    with_items: [0, 1, 2, 3]
+    arguments: { n: "{{ item }}" }
+    depends_on: [split]
+  - { name: reduce, command: ["sh", "-c", "echo combine partials"], depends_on: [work] }

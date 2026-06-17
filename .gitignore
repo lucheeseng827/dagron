@@ -1,7 +1,0 @@
-/target
-**/*.rs.bk
-*.pdb
-
-# The monorepo root ignores Cargo.lock globally; re-include it here so the public
-# mirror (a binary crate) ships a committed lockfile for reproducible builds.
-!Cargo.lock

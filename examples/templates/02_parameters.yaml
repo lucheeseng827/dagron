@@ -1,0 +1,28 @@
+# Pattern 02 — Parameterized template (dynamic arguments)
+#
+# A template declares `parameters` (defaults). A caller overrides them with
+# `arguments`, whose values are resolved in the CALLER's scope first ({{env}}
+# below) and then fill the template's isolated scope ({{region}}, {{bucket}}).
+#
+# Template scope is isolated: inside `deploy` only its own parameters are visible.
+name: parameters
+
+parameters:
+  env: prod
+
+templates:
+  - name: deploy
+    parameters:
+      region: us-east-1
+      bucket: default-bucket
+    tasks:
+      - { name: push, command: ["sh", "-c", "echo deploy to {{ region }}/{{ bucket }}"] }
+
+tasks:
+  - name: deploy-east
+    template: deploy
+    arguments: { region: us-east-1, bucket: "{{ env }}-east" }
+  - name: deploy-west
+    template: deploy
+    arguments: { region: us-west-2, bucket: "{{ env }}-west" }
+    depends_on: [deploy-east]

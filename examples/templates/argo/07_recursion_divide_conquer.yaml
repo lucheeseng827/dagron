@@ -1,0 +1,69 @@
+# Pattern 07 — Divide & conquer (binary recursion / tree)
+#
+# dagron: a template calls itself TWICE (left + right halves) until a size
+# threshold, then does leaf work; both branches guarded by `when: {{size}} > 1`.
+# Argo: the `solve` dag template has two tasks that reference `template: solve`
+# (itself) — `left` and `right` — each guarded by
+# `when: "{{inputs.parameters.size}} > 1"` (the base case). Halving uses the Argo
+# expression "{{=asInt(inputs.parameters.size) / 2}}". The when-guards stop the
+# recursion once size collapses to 1.
+#
+# size=4 -> splits into 2+2 -> each into 1+1 (leaves).
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: divide-conquer-
+spec:
+  entrypoint: main
+  arguments:
+    parameters:
+      - { name: size, value: "4" }
+  templates:
+    - name: main
+      dag:
+        tasks:
+          - name: start
+            template: solve
+            arguments:
+              parameters:
+                - { name: size, value: "{{workflow.parameters.size}}" }
+                - { name: label, value: "n" }
+
+    - name: solve
+      inputs:
+        parameters:
+          - { name: size, value: "1" }
+          - { name: label, value: "root" }
+      dag:
+        tasks:
+          - name: work
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: "solve {{inputs.parameters.label}} size {{inputs.parameters.size}}" }
+          - name: left
+            template: solve
+            # Base case: stop recursing once size collapses to 1.
+            when: "{{inputs.parameters.size}} > 1"
+            arguments:
+              parameters:
+                - { name: size, value: "{{=asInt(inputs.parameters.size) / 2}}" }
+                - { name: label, value: "{{inputs.parameters.label}}L" }
+            dependencies: [work]
+          - name: right
+            template: solve
+            when: "{{inputs.parameters.size}} > 1"
+            arguments:
+              parameters:
+                - { name: size, value: "{{=asInt(inputs.parameters.size) / 2}}" }
+                - { name: label, value: "{{inputs.parameters.label}}R" }
+            dependencies: [work]
+
+    - name: echo
+      inputs:
+        parameters:
+          - { name: msg }
+      container:
+        image: alpine:3.20
+        command: [sh, -c]
+        args: ["echo {{inputs.parameters.msg}}"]

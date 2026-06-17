@@ -1,0 +1,38 @@
+[package]
+name = "dagron-core"
+version = "0.1.0"
+edition = "2021"
+description = "dagron core: DAG model + validation, matrix/call expansion, the datastore facade (SQLite/Postgres) and the process metrics registry. The foundation the engine, API and operator share."
+
+[lib]
+name = "dagron_core"
+path = "src/lib.rs"
+
+[features]
+# Exactly one datastore backend must be active (enforced by compile_error! in
+# db.rs). `default = sqlite` so `cargo build --workspace` and standalone checks
+# resolve a backend; dependents that pick a different backend depend on this
+# crate with `default-features = false` and forward the one they want.
+default = ["sqlite"]
+# Zero-infra single-node backend (optimistic CAS claim).
+sqlite = ["sqlx/sqlite"]
+# Horizontal scale: FOR UPDATE SKIP LOCKED + LISTEN/NOTIFY.
+postgres = ["sqlx/postgres"]
+# Management/UI surface: the extra datastore queries (run listings, dead-letter
+# inspection, DB-backed schedules, status counts) + metrics fields that back the
+# `ops` HTTP API in the binary. Pure gating, no deps — a lean reconcile-only build
+# leaves it off. Mirrors (and is enabled by) the binary's `ops` feature.
+ops = []
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "macros", "migrate"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+petgraph = "0.6"
+chrono = "0.4"
+thiserror = "1"
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"

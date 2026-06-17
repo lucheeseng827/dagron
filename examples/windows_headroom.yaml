@@ -1,0 +1,33 @@
+name: windows-headroom-check
+tasks:
+  - name: check-memory
+    command: ["powershell", "-NoProfile", "-Command",
+      "Write-Host '=== memory ==='; $os = Get-CimInstance Win32_OperatingSystem; Write-Host \"Total: $([math]::Round($os.TotalVisibleMemorySize/1024))MB  Free: $([math]::Round($os.FreePhysicalMemory/1024))MB  Used: $([math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory)/1024))MB\""]
+    depends_on: []
+    max_attempts: 2
+    retry_delay_secs: 2
+    timeout_secs: 30
+
+  - name: check-cpu
+    command: ["powershell", "-NoProfile", "-Command",
+      "Write-Host '=== cpu ==='; $cpu = Get-CimInstance Win32_Processor; Write-Host \"Cores: $($cpu.NumberOfCores)  Logical: $($cpu.NumberOfLogicalProcessors)  Load: $($cpu.LoadPercentage)%  Model: $($cpu.Name.Trim())\""]
+    depends_on: []
+    max_attempts: 2
+    retry_delay_secs: 2
+    timeout_secs: 30
+
+  - name: check-disk
+    command: ["powershell", "-NoProfile", "-Command",
+      "Write-Host '=== disk ==='; Get-PSDrive C | ForEach-Object { $used=[math]::Round($_.Used/1GB,1); $free=[math]::Round($_.Free/1GB,1); Write-Host \"C: Used: ${used}GB  Free: ${free}GB\" }"]
+    depends_on: []
+    max_attempts: 2
+    retry_delay_secs: 2
+    timeout_secs: 30
+
+  - name: summarize-headroom
+    command: ["powershell", "-NoProfile", "-Command",
+      "Write-Host '=== headroom summary ==='; $os = Get-CimInstance Win32_OperatingSystem; $cpu = Get-CimInstance Win32_Processor; $disk = Get-PSDrive C; Write-Host \"mem_free_mb=$([math]::Round($os.FreePhysicalMemory/1024)) cpu_load_pct=$($cpu.LoadPercentage) disk_free_gb=$([math]::Round($disk.Free/1GB,1))\""]
+    depends_on: [check-memory, check-cpu, check-disk]
+    max_attempts: 2
+    retry_delay_secs: 2
+    timeout_secs: 30

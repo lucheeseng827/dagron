@@ -1,0 +1,21 @@
+# Pattern 01 — DAG of DAGs (a workflow that calls another workflow)
+#
+# The simplest sub-workflow: a `template` is a reusable sub-DAG, and a task
+# `call`s it via `template:` instead of running a container. At run-creation the
+# engine expands `run-etl` into the template's three tasks (build → process →
+# publish), wiring `prepare` before them and `notify` after.
+#
+# Expands to: prepare → run-etl.build → run-etl.process → run-etl.publish → notify
+name: dag-of-dags
+
+templates:
+  - name: etl
+    tasks:
+      - { name: build,   command: ["sh", "-c", "echo build"] }
+      - { name: process, command: ["sh", "-c", "echo process"], depends_on: [build] }
+      - { name: publish, command: ["sh", "-c", "echo publish"], depends_on: [process] }
+
+tasks:
+  - { name: prepare, command: ["sh", "-c", "echo prepare"] }
+  - { name: run-etl, template: etl, depends_on: [prepare] }
+  - { name: notify,  command: ["sh", "-c", "echo done"], depends_on: [run-etl] }

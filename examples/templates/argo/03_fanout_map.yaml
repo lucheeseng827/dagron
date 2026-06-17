@@ -1,0 +1,34 @@
+# Pattern 03 — Fan-out / map (withItems)
+#
+# dagron: `with_items` expands the call once per list element; `{{item}}` binds
+# the element inside each expansion.
+# Argo: `withItems:` on a dag task does the same — one parallel copy per element,
+# with `{{item}}` referencing the current element. Here each copy runs the
+# `handler` template with `shard = {{item}}`.
+#
+# Expands to: process(alpha), process(beta), process(gamma) — independent/parallel.
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: fanout-map-
+spec:
+  entrypoint: main
+  templates:
+    - name: main
+      dag:
+        tasks:
+          - name: process
+            template: handler
+            withItems: ["alpha", "beta", "gamma"]
+            arguments:
+              parameters:
+                - { name: shard, value: "{{item}}" }
+
+    - name: handler
+      inputs:
+        parameters:
+          - { name: shard, value: "0" }
+      container:
+        image: alpine:3.20
+        command: [sh, -c]
+        args: ["echo handling shard {{inputs.parameters.shard}}"]

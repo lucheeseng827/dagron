@@ -1,0 +1,33 @@
+[package]
+name = "dagron-executor"
+version = "0.1.0"
+edition = "2021"
+description = "dagron task executors: the Executor trait + Local / Docker / Kubernetes backends, and the ractor worker pool that runs claimed tasks."
+
+[lib]
+name = "dagron_executor"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Kubernetes pod executor (EXECUTOR=kubernetes). Pure-Rust client; compiles
+# without a cluster, runs only against a live apiserver.
+kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:rustls"]
+
+[dependencies]
+# Core types: ExecContext borrows dag::{EnvVar, ResourceRequirements}; the worker
+# pool records per-task durations into the core metrics registry.
+dagron-core = { path = "../dagron-core", default-features = false }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "sync", "time"] }
+async-trait = "0.1"
+anyhow = "1"
+tracing = "0.1"
+serde_json = "1"
+ractor = "0.10"
+uuid = { version = "1", features = ["v4"] }
+bollard = "0.16"
+futures-util = "0.3"
+# Kubernetes pod executor (feature-gated, off by default).
+kube = { version = "3", default-features = false, features = ["client", "rustls-tls"], optional = true }
+k8s-openapi = { version = "0.27", features = ["v1_31"], optional = true }
+rustls = { version = "0.23", features = ["ring"], optional = true }

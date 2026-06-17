@@ -1,0 +1,45 @@
+{{- if .Values.ingress.enabled }}
+{{- if not .Values.ingress.host }}{{ fail "ingress.enabled=true requires ingress.host" }}{{- end }}
+{{- if not .Values.dagronApi.enabled }}{{ fail "ingress.enabled=true requires dagronApi.enabled=true (the /api backend)" }}{{- end }}
+{{- if not .Values.frontend.enabled }}{{ fail "ingress.enabled=true requires frontend.enabled=true (the / backend)" }}{{- end }}
+# Single host, same-origin: /api/* → dagron-api, everything else → frontend.
+# Same origin means the HttpOnly session cookie set on /api/login is sent on
+# every request. `/api` is listed first (more specific prefix).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "dagron.fullname" . }}
+  labels:
+    {{- include "dagron.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts: [{{ .Values.ingress.host | quote }}]
+      secretName: {{ .Values.ingress.tls.secretName | quote }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "dagron.fullname" . }}-api
+                port:
+                  number: {{ .Values.dagronApi.port }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "dagron.fullname" . }}-frontend
+                port:
+                  number: {{ .Values.frontend.port }}
+{{- end }}

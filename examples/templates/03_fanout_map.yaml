@@ -1,0 +1,20 @@
+# Pattern 03 — Fan-out / map (withItems)
+#
+# `with_items` expands the call once per list element. `{{ item }}` binds the
+# element inside the expansion (and `{{ index }}` the position). This is the
+# classic "run the same step over a list" map.
+#
+# Expands to: process.0.run, process.1.run, process.2.run (independent, parallel)
+name: fanout-map
+
+templates:
+  - name: handler
+    parameters: { shard: "0" }
+    tasks:
+      - { name: run, command: ["sh", "-c", "echo handling shard {{ shard }}"] }
+
+tasks:
+  - name: process
+    template: handler
+    with_items: ["alpha", "beta", "gamma"]
+    arguments: { shard: "{{ item }}" }

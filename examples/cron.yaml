@@ -1,0 +1,18 @@
+# Cron-triggered run starts (v5).
+#
+# Point the scheduler at this file with CRON_CONFIG=examples/cron.yaml. The
+# leadership holder fires each schedule by calling create_run on its DAG — so a
+# cron-started run is identical to a queued one downstream.
+#
+# Cron expressions use the `cron` crate's 6-or-7 field form:
+#   sec  min  hour  day-of-month  month  day-of-week  [year]
+schedules:
+  # Every 30 seconds — handy for watching cron fire during a demo.
+  - name: heartbeat
+    cron: "*/30 * * * * *"
+    dag: examples/simple_dag.yaml
+
+  # 02:00:00 every day.
+  - name: nightly-pipeline
+    cron: "0 0 2 * * *"
+    dag: examples/simple_dag.yaml

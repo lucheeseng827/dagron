@@ -1,0 +1,69 @@
+# Pattern 13 — Fan-out where each item runs a multi-step sub-DAG
+#
+# dagron: combines map + DAG-of-DAGs — fan out over a list where EACH item runs a
+# full sub-pipeline (not a single step); the aggregate fans in over every item's
+# sub-DAG exit.
+# Argo: a `withParam` task (`ingest`) references the `ingest-one` DAG template, so
+# each item expands into a multi-task sub-DAG (download -> validate -> load);
+# `aggregate` depends on the whole fan-out, fanning in over all sub-DAGs.
+#
+# datasets=[orders,users,events] -> 3 x (download -> validate -> load) -> aggregate
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: fanout-subdag-
+spec:
+  entrypoint: main
+  arguments:
+    parameters:
+      - { name: datasets, value: '["orders", "users", "events"]' }
+  templates:
+    - name: main
+      dag:
+        tasks:
+          - name: ingest
+            template: ingest-one
+            withParam: "{{workflow.parameters.datasets}}"
+            arguments:
+              parameters:
+                - { name: ds, value: "{{item}}" }
+          - name: aggregate
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: "aggregate all datasets" }
+            dependencies: [ingest]
+
+    # Each fan-out item runs this full multi-step sub-DAG.
+    - name: ingest-one
+      inputs:
+        parameters:
+          - { name: ds, value: "?" }
+      dag:
+        tasks:
+          - name: download
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: "download {{inputs.parameters.ds}}" }
+          - name: validate
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: "validate {{inputs.parameters.ds}}" }
+            dependencies: [download]
+          - name: load
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: "load {{inputs.parameters.ds}}" }
+            dependencies: [validate]
+
+    - name: echo
+      inputs:
+        parameters:
+          - { name: msg }
+      container:
+        image: alpine:3.20
+        command: [sh, -c]
+        args: ["echo {{inputs.parameters.msg}}"]

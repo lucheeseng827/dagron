@@ -1,0 +1,70 @@
+# Pattern 09 — Nested templates (composition / multi-level)
+#
+# dagron: templates call other templates; `pipeline` composes the reusable
+# `stage` template three times, threading a `phase` parameter.
+# Argo: a `dag` template (`pipeline`) has tasks that reference another `dag`
+# template (`stage`), which itself calls leaf containers — templates calling
+# templates, multi-level composition.
+#
+# main -> pipeline -> stage(extract) -> stage(transform) -> stage(load),
+# each stage = prep -> exec.
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: nested-templates-
+spec:
+  entrypoint: main
+  templates:
+    - name: main
+      dag:
+        tasks:
+          - name: go
+            template: pipeline
+
+    - name: pipeline
+      dag:
+        tasks:
+          - name: extract
+            template: stage
+            arguments:
+              parameters:
+                - { name: phase, value: extract }
+          - name: transform
+            template: stage
+            arguments:
+              parameters:
+                - { name: phase, value: transform }
+            dependencies: [extract]
+          - name: load
+            template: stage
+            arguments:
+              parameters:
+                - { name: phase, value: load }
+            dependencies: [transform]
+
+    - name: stage
+      inputs:
+        parameters:
+          - { name: phase, value: noop }
+      dag:
+        tasks:
+          - name: prep
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: "prep {{inputs.parameters.phase}}" }
+          - name: exec
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: "run {{inputs.parameters.phase}}" }
+            dependencies: [prep]
+
+    - name: echo
+      inputs:
+        parameters:
+          - { name: msg }
+      container:
+        image: alpine:3.20
+        command: [sh, -c]
+        args: ["echo {{inputs.parameters.msg}}"]

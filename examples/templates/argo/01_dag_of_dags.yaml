@@ -1,0 +1,64 @@
+# Pattern 01 — DAG of DAGs (a workflow that calls another workflow)
+#
+# dagron: a `template` is a reusable sub-DAG; a task `call`s it via `template:`.
+# Argo: the same — a `dag` template (`etl`) holds the sub-DAG, and a task in the
+# entrypoint dag references it with `template: etl`. The `prepare` task runs
+# before and `notify` after, via `dependencies`.
+#
+# Flow: prepare -> run-etl (build -> process -> publish) -> notify
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: dag-of-dags-
+spec:
+  entrypoint: main
+  templates:
+    - name: main
+      dag:
+        tasks:
+          - name: prepare
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: prepare }
+          - name: run-etl
+            template: etl
+            dependencies: [prepare]
+          - name: notify
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: done }
+            dependencies: [run-etl]
+
+    # Reusable sub-DAG (the dagron `etl` template).
+    - name: etl
+      dag:
+        tasks:
+          - name: build
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: build }
+          - name: process
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: process }
+            dependencies: [build]
+          - name: publish
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: publish }
+            dependencies: [process]
+
+    # Leaf container template (mirrors a dagron `sh -c echo` task).
+    - name: echo
+      inputs:
+        parameters:
+          - { name: msg }
+      container:
+        image: alpine:3.20
+        command: [sh, -c]
+        args: ["echo {{inputs.parameters.msg}}"]

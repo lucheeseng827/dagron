@@ -1,0 +1,53 @@
+# Pattern 05 — Dynamic width (withParam from a JSON-array parameter)
+#
+# dagron: `with_param` reads the fan-out list from a PARAMETER holding a JSON
+# array string, so overriding `shards` at submit time changes the graph width.
+# Argo: `withParam:` does exactly this — it expands over a JSON array, here taken
+# from the workflow-level parameter `shards`. Override it at submit
+# (`argo submit -p shards='[1,2,3,4,5]'`) for data-driven parallelism.
+#
+# shards="[1,2,3]" -> three parallel ingest copies, then a single rollup.
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: dynamic-shards-
+spec:
+  entrypoint: main
+  arguments:
+    parameters:
+      # JSON array string; override at submit to change fan-out width.
+      - { name: shards, value: "[1, 2, 3]" }
+  templates:
+    - name: main
+      dag:
+        tasks:
+          - name: ingest-all
+            template: ingest
+            withParam: "{{workflow.parameters.shards}}"
+            arguments:
+              parameters:
+                - { name: id, value: "{{item}}" }
+          - name: rollup
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: rollup }
+            dependencies: [ingest-all]
+
+    - name: ingest
+      inputs:
+        parameters:
+          - { name: id, value: "0" }
+      container:
+        image: alpine:3.20
+        command: [sh, -c]
+        args: ["echo ingest shard {{inputs.parameters.id}}"]
+
+    - name: echo
+      inputs:
+        parameters:
+          - { name: msg }
+      container:
+        image: alpine:3.20
+        command: [sh, -c]
+        args: ["echo {{inputs.parameters.msg}}"]

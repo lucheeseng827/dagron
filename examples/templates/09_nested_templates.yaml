@@ -1,0 +1,24 @@
+# Pattern 09 — Nested templates (composition / multi-level)
+#
+# Templates call other templates: `pipeline` composes the reusable `stage`
+# template three times. Composition + parameter threading lets you build a big
+# graph from small, independently-meaningful pieces.
+#
+# pipeline → stage(extract) → stage(transform) → stage(load), each stage = prep→exec
+name: nested-templates
+
+templates:
+  - name: stage
+    parameters: { phase: "noop" }
+    tasks:
+      - { name: prep, command: ["sh", "-c", "echo prep {{ phase }}"] }
+      - { name: exec, command: ["sh", "-c", "echo run {{ phase }}"], depends_on: [prep] }
+
+  - name: pipeline
+    tasks:
+      - { name: extract,   template: stage, arguments: { phase: extract } }
+      - { name: transform, template: stage, arguments: { phase: transform }, depends_on: [extract] }
+      - { name: load,      template: stage, arguments: { phase: load },      depends_on: [transform] }
+
+tasks:
+  - { name: go, template: pipeline }

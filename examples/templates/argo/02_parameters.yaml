@@ -1,0 +1,45 @@
+# Pattern 02 — Parameterized template (dynamic arguments)
+#
+# dagron: a template declares `parameters` (defaults); a caller overrides via
+# `arguments`, resolved in the caller's scope first ({{env}}), then filling the
+# template's isolated scope ({{region}}, {{bucket}}).
+# Argo: the template declares `inputs.parameters` with `default:` values, and
+# each caller passes `arguments.parameters`. Caller-scope values come from the
+# workflow `spec.arguments.parameters` (referenced as {{workflow.parameters.env}}).
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: parameters-
+spec:
+  entrypoint: main
+  arguments:
+    parameters:
+      - { name: env, value: prod }
+  templates:
+    - name: main
+      dag:
+        tasks:
+          - name: deploy-east
+            template: deploy
+            arguments:
+              parameters:
+                - { name: region, value: us-east-1 }
+                - { name: bucket, value: "{{workflow.parameters.env}}-east" }
+          - name: deploy-west
+            template: deploy
+            arguments:
+              parameters:
+                - { name: region, value: us-west-2 }
+                - { name: bucket, value: "{{workflow.parameters.env}}-west" }
+            dependencies: [deploy-east]
+
+    # Parameterized template with isolated scope + defaults.
+    - name: deploy
+      inputs:
+        parameters:
+          - { name: region, value: us-east-1 }
+          - { name: bucket, value: default-bucket }
+      container:
+        image: alpine:3.20
+        command: [sh, -c]
+        args: ["echo deploy to {{inputs.parameters.region}}/{{inputs.parameters.bucket}}"]

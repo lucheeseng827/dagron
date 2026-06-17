@@ -1,0 +1,30 @@
+# Pattern 12 — Reusable retry/resilience wrapper
+#
+# A template that bundles a resilience policy (max_attempts + retry_delay_secs +
+# timeout) so every caller inherits the same hardened behaviour without repeating
+# it. Wrap flaky external calls in one place.
+#
+# `retry_delay_secs` is the BASE delay: the engine applies exponential backoff
+# from it (delay = retry_delay_secs * 2^(attempt-1)), so 2s → 2s, 4s, 8s, …
+# Both `payment` and `notify` get 5 attempts / 2s-base backoff / 30s timeout from
+# the wrapper — change the policy once, every caller updates.
+name: retry-wrapper
+
+templates:
+  - name: resilient-step
+    parameters: { label: "step", cmd: "true" }
+    tasks:
+      - name: attempt
+        command: ["sh", "-c", "echo {{ label }}: {{ cmd }}"]
+        max_attempts: 5
+        retry_delay_secs: 2
+        timeout_secs: 30
+
+tasks:
+  - name: payment
+    template: resilient-step
+    arguments: { label: payment, cmd: "call payment API" }
+  - name: notify
+    template: resilient-step
+    arguments: { label: email, cmd: "send receipt" }
+    depends_on: [payment]

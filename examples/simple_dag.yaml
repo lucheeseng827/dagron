@@ -1,23 +1,26 @@
-# A minimal diamond DAG you can run with:
-#   dagron run examples/simple_dag.yaml
-#
-#   a
-#  / \
-# b   c
-#  \ /
-#   d
-name: simple_dag
+name: simple-pipeline
 tasks:
-  - name: a
-    command: ["echo", "task a"]
-  - name: b
-    command: ["echo", "task b"]
-    depends_on: ["a"]
-  - name: c
-    command: ["echo", "task c"]
-    depends_on: ["a"]
-  - name: d
-    command: ["echo", "task d"]
-    depends_on: ["b", "c"]
+  - name: prepare
+    command: ["echo", "step 1 – prepare"]
+    depends_on: []
+    # v1: up to 3 attempts with 2 s base backoff (2 s, 4 s, …)
     max_attempts: 3
-    retry_delay_secs: 1
+    retry_delay_secs: 2
+    # v1: per-task timeout (falls back to 25 s when absent)
+    timeout_secs: 10
+
+  - name: process-a
+    command: ["echo", "step 2a – process branch A"]
+    depends_on: [prepare]
+    max_attempts: 2
+    retry_delay_secs: 5
+
+  - name: process-b
+    command: ["echo", "step 2b – process branch B"]
+    depends_on: [prepare]
+    max_attempts: 2
+    retry_delay_secs: 5
+
+  - name: summarize
+    command: ["echo", "step 3 – summarize"]
+    depends_on: [process-a, process-b]

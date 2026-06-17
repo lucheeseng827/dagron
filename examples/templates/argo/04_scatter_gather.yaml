@@ -1,0 +1,54 @@
+# Pattern 04 — Scatter / gather (map-reduce, fan-out then fan-in)
+#
+# dagron: fan a template out over items, then a downstream task `depends_on` the
+# fan-out node so it fans IN over every expanded copy's exit.
+# Argo: identical — a `withItems` task (`work`) is listed as a `dependencies` of
+# `reduce`, so Argo waits for ALL fan-out copies before running `reduce`.
+#
+# split -> {work(0), work(1), work(2), work(3)} -> reduce (depends on all four)
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: scatter-gather-
+spec:
+  entrypoint: main
+  templates:
+    - name: main
+      dag:
+        tasks:
+          - name: split
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: "split input into 4" }
+          - name: work
+            template: mapper
+            withItems: [0, 1, 2, 3]
+            arguments:
+              parameters:
+                - { name: n, value: "{{item}}" }
+            dependencies: [split]
+          - name: reduce
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: "combine partials" }
+            dependencies: [work]
+
+    - name: mapper
+      inputs:
+        parameters:
+          - { name: n, value: "0" }
+      container:
+        image: alpine:3.20
+        command: [sh, -c]
+        args: ["echo partial result for {{inputs.parameters.n}}"]
+
+    - name: echo
+      inputs:
+        parameters:
+          - { name: msg }
+      container:
+        image: alpine:3.20
+        command: [sh, -c]
+        args: ["echo {{inputs.parameters.msg}}"]

@@ -1,0 +1,33 @@
+name: docker-headroom-check
+tasks:
+  - name: check-memory
+    docker_image: alpine:latest
+    command: ["sh", "-c", "echo '=== memory ===' && free -m"]
+    depends_on: []
+    max_attempts: 2
+    retry_delay_secs: 2
+    timeout_secs: 30
+
+  - name: check-cpu
+    docker_image: alpine:latest
+    command: ["sh", "-c", "echo '=== cpu ===' && nproc && cat /proc/cpuinfo | grep 'model name' | head -1"]
+    depends_on: []
+    max_attempts: 2
+    retry_delay_secs: 2
+    timeout_secs: 30
+
+  - name: check-disk
+    docker_image: alpine:latest
+    command: ["sh", "-c", "echo '=== disk ===' && df -h /"]
+    depends_on: []
+    max_attempts: 2
+    retry_delay_secs: 2
+    timeout_secs: 30
+
+  - name: summarize-headroom
+    docker_image: alpine:latest
+    command: ["sh", "-c", "echo '=== headroom summary ===' && echo 'mem:' $(awk '/MemAvailable/{print $2}' /proc/meminfo) 'kB avail' && echo 'cpu:' $(nproc) 'cores' && echo 'disk:' $(df / | awk 'NR==2{print $4}') 'kB avail'"]
+    depends_on: [check-memory, check-cpu, check-disk]
+    max_attempts: 2
+    retry_delay_secs: 2
+    timeout_secs: 30

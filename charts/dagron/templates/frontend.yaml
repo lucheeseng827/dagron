@@ -1,0 +1,73 @@
+{{- if .Values.frontend.enabled }}
+# Next.js frontend (standalone server). The browser reaches it at the ingress
+# root; /api/* is routed by the Ingress straight to dagron-api (same host →
+# same-origin session cookie), so no API URL needs baking into the image here.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dagron.fullname" . }}-frontend
+  labels:
+    {{- include "dagron.labels" . | nindent 4 }}
+    app.kubernetes.io/component: frontend
+spec:
+  replicas: {{ .Values.frontend.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: frontend
+  template:
+    metadata:
+      labels:
+        {{- include "dagron.labels" . | nindent 8 }}
+        app.kubernetes.io/component: frontend
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000           # node user in node:22-slim
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: frontend
+          image: {{ .Values.frontend.image | quote }}
+          imagePullPolicy: {{ .Values.frontend.imagePullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: PORT
+              value: {{ .Values.frontend.port | quote }}
+            - name: HOSTNAME
+              value: "0.0.0.0"
+            {{- with .Values.frontend.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - containerPort: {{ .Values.frontend.port }}
+          readinessProbe:
+            tcpSocket: { port: {{ .Values.frontend.port }} }
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.frontend.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "dagron.fullname" . }}-frontend
+  labels:
+    {{- include "dagron.labels" . | nindent 4 }}
+    app.kubernetes.io/component: frontend
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: frontend
+  ports:
+    - port: {{ .Values.frontend.port }}
+      targetPort: {{ .Values.frontend.port }}
+      name: http
+{{- end }}

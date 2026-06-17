@@ -1,0 +1,33 @@
+# Pattern 07 — Divide & conquer (binary recursion / tree)
+#
+# A template calls itself TWICE (left + right halves) until a size threshold, then
+# does leaf work — a recursive tree, like parallel merge-sort or range splitting.
+# Both recursive branches are guarded by `when: {{ size }} > 1`; the leaf work
+# runs at every level and the halves run in parallel.
+#
+# size=4 → splits into 2+2 → each into 1+1 (leaves).
+name: divide-conquer
+
+parameters:
+  size: "4"
+
+templates:
+  - name: solve
+    parameters: { size: "1", label: "root" }
+    tasks:
+      - { name: work, command: ["sh", "-c", "echo solve {{ label }} size {{ size }}"] }
+      - name: left
+        template: solve
+        when: "{{ size }} > 1"
+        arguments: { size: "{{ size / 2 }}", label: "{{ label }}L" }
+        depends_on: [work]
+      - name: right
+        template: solve
+        when: "{{ size }} > 1"
+        arguments: { size: "{{ size / 2 }}", label: "{{ label }}R" }
+        depends_on: [work]
+
+tasks:
+  - name: start
+    template: solve
+    arguments: { size: "{{ size }}", label: "n" }

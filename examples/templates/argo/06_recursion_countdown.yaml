@@ -1,0 +1,59 @@
+# Pattern 06 — Recursion with a base case (countdown)
+#
+# dagron: a template calls ITSELF with a decremented argument ({{n - 1}}) under a
+# `when:` guard as the base case; at n=0 the guard is false so the recursive call
+# is skipped and recursion terminates.
+# Argo: a `dag` template (`countdown`) has a task that references `template:
+# countdown` (itself), guarded by `when: "{{inputs.parameters.n}} > 0"`. The
+# decrement uses Argo expression syntax: "{{=asInt(inputs.parameters.n) - 1}}".
+# The when-guard IS the base case: when n reaches 0 the self-call is skipped.
+#
+# n=3 -> tick(3) -> tick(2) -> tick(1) -> tick(0), each gated on the previous.
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: recursion-countdown-
+spec:
+  entrypoint: main
+  arguments:
+    parameters:
+      - { name: start, value: "3" }
+  templates:
+    - name: main
+      dag:
+        tasks:
+          - name: launch
+            template: countdown
+            arguments:
+              parameters:
+                - { name: n, value: "{{workflow.parameters.start}}" }
+
+    - name: countdown
+      inputs:
+        parameters:
+          - { name: n, value: "0" }
+      dag:
+        tasks:
+          - name: tick
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: "T-minus {{inputs.parameters.n}}" }
+          - name: recurse
+            template: countdown
+            # Base case: when n reaches 0 this self-call is skipped -> recursion stops.
+            when: "{{inputs.parameters.n}} > 0"
+            arguments:
+              parameters:
+                # Decrement each level via an Argo expression.
+                - { name: n, value: "{{=asInt(inputs.parameters.n) - 1}}" }
+            dependencies: [tick]
+
+    - name: echo
+      inputs:
+        parameters:
+          - { name: msg }
+      container:
+        image: alpine:3.20
+        command: [sh, -c]
+        args: ["echo {{inputs.parameters.msg}}"]

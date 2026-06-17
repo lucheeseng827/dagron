@@ -1,0 +1,13 @@
+# A reusable three-step pipeline (build → process → publish). On its own it is an
+# ordinary workflow; it also serves as the CHILD chained by 04_chained_parent.yaml.
+# Save it under the name `etl` so the parent can reference it.
+name: etl
+tasks:
+  - name: build
+    command: ["sh", "-c", "echo build"]
+  - name: process
+    command: ["sh", "-c", "echo process"]
+    depends_on: [build]
+  - name: publish
+    command: ["sh", "-c", "echo publish"]
+    depends_on: [process]

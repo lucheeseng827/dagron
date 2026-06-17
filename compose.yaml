@@ -1,0 +1,83 @@
+# Local full-stack bring-up for the dagron UI, validated with podman:
+#   podman compose up --build
+#
+# Stack: Postgres ← engine (scheduler, runs migrations, ops API + resident) ←
+# dagron-api (authed edge) ← Next.js frontend (proxies /api → dagron-api).
+#
+# Auth: dagron-api owns login. Sign in from the UI with the seeded admin
+# (DAGRON_ADMIN_EMAIL / DAGRON_ADMIN_PASSWORD below); dagron-api mints an HS256
+# session JWT signed with DAGRON_JWT_SECRET. scripts/mint-dev-token.mjs can still
+# mint a token by hand for API-only testing.
+name: dagron-ui
+
+# Dev-only secret (≥32 chars, as dagron-api now requires). Change for any real deploy.
+x-jwt-secret: &jwt_secret dev-insecure-jwt-secret-change-me-please
+
+services:
+  postgres:
+    image: docker.io/library/postgres:16-alpine
+    environment:
+      POSTGRES_USER: dagron
+      POSTGRES_PASSWORD: dagron
+      POSTGRES_DB: workflow
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dagron -d workflow"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: localdev   # debian-slim runtime so example `echo` tasks resolve (distroless has none)
+      args:
+        FEATURES: postgres,ops
+    environment:
+      DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
+      API_ADDR: 0.0.0.0:8787   # keeps the process resident + serves the internal ops API
+      EXECUTOR: local
+      RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  dagron-api:
+    build:
+      context: .
+      dockerfile: crates/dagron-api/Dockerfile
+    environment:
+      DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
+      DAGRON_JWT_SECRET: *jwt_secret
+      # Local stack is plain HTTP, so don't mark the session cookie Secure
+      # (a Secure cookie wouldn't be stored over http://). Leave default (true) in prod.
+      DAGRON_COOKIE_SECURE: "false"
+      # First-login admin, seeded idempotently on startup (self-contained auth).
+      DAGRON_ADMIN_EMAIL: admin@local
+      DAGRON_ADMIN_PASSWORD: dagron-admin
+      DAGRON_ADMIN_NAME: Administrator
+      PORT: "8080"
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      engine:
+        condition: service_started
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Baked into the Next /api rewrite at build time; the standalone server
+        # can't change it at runtime, so it is intentionally only a build arg.
+        DAGRON_API_URL: http://dagron-api:8080
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      dagron-api:
+        condition: service_started

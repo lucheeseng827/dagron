@@ -1,0 +1,28 @@
+# Pattern 06 — Recursion with a base case (countdown)
+#
+# A template calls ITSELF with a decremented argument (`{{ n - 1 }}` — minimal
+# integer arithmetic) and a `when:` guard as the base case. At n=0 the guard is
+# false and the recursive call is skipped, so the recursion terminates. A depth
+# cap (64) is the safety net if a guard is ever wrong.
+#
+# n=3 → tick(3) → tick(2) → tick(1) → tick(0), each gated on the previous.
+name: recursion-countdown
+
+parameters:
+  start: "3"
+
+templates:
+  - name: countdown
+    parameters: { n: "0" }
+    tasks:
+      - { name: tick, command: ["sh", "-c", "echo T-minus {{ n }}"] }
+      - name: recurse
+        template: countdown
+        when: "{{ n }} > 0"               # base case: stop at 0
+        arguments: { n: "{{ n - 1 }}" }   # decrement each level
+        depends_on: [tick]
+
+tasks:
+  - name: launch
+    template: countdown
+    arguments: { n: "{{ start }}" }

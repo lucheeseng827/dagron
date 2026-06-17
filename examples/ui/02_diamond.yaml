@@ -1,0 +1,23 @@
+# Fan-out / fan-in: `a` runs first, then `b` and `c` run in parallel, and `d`
+# waits for both. `d` also shows per-task retries (3 attempts, 1s backoff).
+#
+#   a
+#  / \
+# b   c
+#  \ /
+#   d
+name: diamond
+tasks:
+  - name: a
+    command: ["sh", "-c", "echo a"]
+  - name: b
+    command: ["sh", "-c", "echo b"]
+    depends_on: [a]
+  - name: c
+    command: ["sh", "-c", "echo c"]
+    depends_on: [a]
+  - name: d
+    command: ["sh", "-c", "echo d"]
+    depends_on: [b, c]
+    max_attempts: 3
+    retry_delay_secs: 1

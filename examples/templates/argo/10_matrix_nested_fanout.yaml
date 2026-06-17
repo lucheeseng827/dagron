@@ -1,0 +1,55 @@
+# Pattern 10 — Matrix / nested fan-out (2-D map)
+#
+# dagron: an outer fan-out over `regions` calls a template that ITSELF fans out
+# over `services` — the cross-product (matrix).
+# Argo: an outer `withItems` task (`regions`) calls `per-region`, whose own task
+# uses `withParam` over a `services` JSON array — nesting fan-outs = a 2-D matrix.
+# Each cell is region x service.
+#
+# regions=[us,eu] x services=[api,web] -> 4 deploy cells.
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: matrix-fanout-
+spec:
+  entrypoint: main
+  arguments:
+    parameters:
+      - { name: services, value: '["api", "web"]' }
+  templates:
+    - name: main
+      dag:
+        tasks:
+          - name: regions
+            template: per-region
+            withItems: ["us", "eu"]
+            arguments:
+              parameters:
+                - { name: region, value: "{{item}}" }
+                - { name: services, value: "{{workflow.parameters.services}}" }
+
+    # Inner fan-out: one copy per service (withParam over the JSON array).
+    - name: per-region
+      inputs:
+        parameters:
+          - { name: region, value: "?" }
+          - { name: services, value: "[]" }
+      dag:
+        tasks:
+          - name: deploy
+            template: one-service
+            withParam: "{{inputs.parameters.services}}"
+            arguments:
+              parameters:
+                - { name: region, value: "{{inputs.parameters.region}}" }
+                - { name: svc, value: "{{item}}" }
+
+    - name: one-service
+      inputs:
+        parameters:
+          - { name: region, value: "?" }
+          - { name: svc, value: "?" }
+      container:
+        image: alpine:3.20
+        command: [sh, -c]
+        args: ["echo deploy {{inputs.parameters.svc}} in {{inputs.parameters.region}}"]

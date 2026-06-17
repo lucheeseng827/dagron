@@ -1,0 +1,24 @@
+# Pattern 05 — Dynamic width (withParam from a JSON-array parameter)
+#
+# Unlike with_items (a literal list), `with_param` reads the fan-out list from a
+# PARAMETER holding a JSON array string. Override `shards` at submit time and the
+# graph width changes — data-driven parallelism without editing the workflow.
+#
+# shards="[1,2,3,4,5]" → five parallel ingest copies, then a single rollup.
+name: dynamic-shards
+
+parameters:
+  shards: "[1, 2, 3]"          # override at submit to change fan-out width
+
+templates:
+  - name: ingest
+    parameters: { id: "0" }
+    tasks:
+      - { name: pull, command: ["sh", "-c", "echo ingest shard {{ id }}"] }
+
+tasks:
+  - name: ingest-all
+    template: ingest
+    with_param: "{{ shards }}"
+    arguments: { id: "{{ item }}" }
+  - { name: rollup, command: ["sh", "-c", "echo rollup"], depends_on: [ingest-all] }

@@ -1,0 +1,49 @@
+# Pattern 12 — Reusable retry/resilience wrapper
+#
+# dagron: a template bundles a resilience policy (max_attempts + retry_delay_secs
+# + timeout) so every caller inherits the same hardened behaviour; backoff is
+# exponential from the base delay.
+# Argo: the `resilient-step` template carries a `retryStrategy:` (limit + backoff
+# with duration/factor) and `activeDeadlineSeconds:` (timeout). Every caller that
+# references it inherits the policy — change it once, all callers update.
+# limit: 5 -> up to 5 retries; backoff 2s base, factor 2 -> 2s, 4s, 8s, ...
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: retry-wrapper-
+spec:
+  entrypoint: main
+  templates:
+    - name: main
+      dag:
+        tasks:
+          - name: payment
+            template: resilient-step
+            arguments:
+              parameters:
+                - { name: label, value: payment }
+                - { name: cmd, value: "call payment API" }
+          - name: notify
+            template: resilient-step
+            arguments:
+              parameters:
+                - { name: label, value: email }
+                - { name: cmd, value: "send receipt" }
+            dependencies: [payment]
+
+    # Reusable resilience wrapper: same retry/backoff/timeout for every caller.
+    - name: resilient-step
+      inputs:
+        parameters:
+          - { name: label, value: step }
+          - { name: cmd, value: "true" }
+      retryStrategy:
+        limit: 5
+        backoff:
+          duration: "2"   # base delay (seconds)
+          factor: 2        # exponential: 2s, 4s, 8s, ...
+      activeDeadlineSeconds: 30
+      container:
+        image: alpine:3.20
+        command: [sh, -c]
+        args: ["echo {{inputs.parameters.label}}: {{inputs.parameters.cmd}}"]

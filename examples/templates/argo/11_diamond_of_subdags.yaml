@@ -1,0 +1,77 @@
+# Pattern 11 — Diamond of sub-DAGs
+#
+# dagron: a diamond (split -> A, B -> join) where each branch is itself a
+# sub-workflow that expands to a multi-task sub-DAG; `join` fans in over both.
+# Argo: `branch-a` and `branch-b` are dag tasks referencing the `clean-branch` /
+# `score-branch` dag templates; both depend on `split`, and `join` lists both as
+# `dependencies` — the classic diamond, with each arm a multi-task sub-DAG.
+#
+#            +- branch-a (fetch -> clean) -+
+#   split -->|                             |-- join
+#            +- branch-b (fetch -> score) -+
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: diamond-subdags-
+spec:
+  entrypoint: main
+  templates:
+    - name: main
+      dag:
+        tasks:
+          - name: split
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: split }
+          - name: branch-a
+            template: clean-branch
+            dependencies: [split]
+          - name: branch-b
+            template: score-branch
+            dependencies: [split]
+          - name: join
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: join }
+            dependencies: [branch-a, branch-b]
+
+    - name: clean-branch
+      dag:
+        tasks:
+          - name: fetch
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: fetch-a }
+          - name: clean
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: clean }
+            dependencies: [fetch]
+
+    - name: score-branch
+      dag:
+        tasks:
+          - name: fetch
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: fetch-b }
+          - name: score
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: score }
+            dependencies: [fetch]
+
+    - name: echo
+      inputs:
+        parameters:
+          - { name: msg }
+      container:
+        image: alpine:3.20
+        command: [sh, -c]
+        args: ["echo {{inputs.parameters.msg}}"]

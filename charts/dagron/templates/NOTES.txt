@@ -1,0 +1,49 @@
+dagron {{ .Chart.AppVersion }} installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Components:
+  engine      {{ .Values.engine.image }}   (executor={{ .Values.engine.executor }}, {{ .Values.engine.replicas }} replica/s)
+{{- if .Values.dagronApi.enabled }}
+  dagron-api  {{ .Values.dagronApi.image }}
+{{- end }}
+{{- if .Values.frontend.enabled }}
+  frontend    {{ .Values.frontend.image }}
+{{- end }}
+{{- if .Values.operator.image }}
+  operator    {{ .Values.operator.image }}
+{{- end }}
+{{- if .Values.postgres.enabled }}
+  postgres    in-cluster (throwaway — do NOT use for real data)
+{{- end }}
+
+Reach the UI:
+{{- if .Values.ingress.enabled }}
+  http{{ if .Values.ingress.tls.enabled }}s{{ end }}://{{ .Values.ingress.host }}/
+  ( /api/* is routed to dagron-api on the same host so the session cookie works )
+{{- else if .Values.frontend.enabled }}
+  Ingress is disabled. Port-forward to try it locally:
+    kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "dagron.fullname" . }}-frontend 3000:{{ .Values.frontend.port }}
+    kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "dagron.fullname" . }}-api 8080:{{ .Values.dagronApi.port }}
+  then open http://localhost:3000. Note: /api calls only work if the frontend is
+  configured to reach dagron-api (port-forwarded above on :8080) — the clean
+  same-origin setup is ingress.enabled with a host.
+{{- end }}
+
+{{- if .Values.dagronApi.admin.email }}
+
+Sign in:  {{ .Values.dagronApi.admin.email }}  /  (the password in the UI Secret)
+{{- end }}
+
+{{- if eq (include "dagron.manageUiSecret" .) "true" }}
+
+⚠  Using chart-managed secrets. Before any real deploy, override:
+     dagronApi.jwtSecret        (>= 32 chars, the HS256 signing key)
+     dagronApi.admin.password
+   or point dagronApi.existingSecret.name at a pre-created Secret.
+{{- end }}
+{{- if and .Values.dagronApi.cookieSecure (not (and .Values.ingress.enabled .Values.ingress.tls.enabled)) }}
+
+⚠  dagronApi.cookieSecure=true but no HTTPS path is configured. Over plain HTTP
+   (a port-forward, or an ingress without TLS) the browser won't store the Secure
+   session cookie and login will appear to fail. Use HTTPS (ingress.tls.enabled=true),
+   or set dagronApi.cookieSecure=false for an HTTP-only test.
+{{- end }}

@@ -1,0 +1,488 @@
+@import "https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap";
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── dagron design system (from the phase-2 prototype) ─────────────────────── */
+:root {
+  --bg: #0d1014;
+  --panel: #15191f;
+  --panel-2: #1b2027;
+  --side: #11151b;
+  --card: #15191f;
+  --border: rgba(255, 255, 255, 0.07);
+  --border-strong: rgba(255, 255, 255, 0.12);
+
+  --fg: #e6edf3;
+  --muted: #8b949e;
+  --dim: #6e7681;
+
+  --accent: #e8833a; /* rust ember */
+  --accent-hover: #f0a35e;
+  --blue: #2f81f7;
+  --green: #2ea043;
+  --amber: #d29922;
+  --red: #f85149;
+  --muted-status: #484f58;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+code,
+pre,
+.mono {
+  font-family: "IBM Plex Mono", monospace;
+}
+
+/* ── app shell: left sidebar + main ───────────────────────────────────────── */
+.dy-shell {
+  display: flex;
+  min-height: 100vh;
+}
+
+.dy-side {
+  width: 232px;
+  flex-shrink: 0;
+  background: var(--side);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding: 16px 12px;
+  gap: 4px;
+}
+
+.dy-brand {
+  padding: 6px 8px 14px;
+}
+.dy-brand-name {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+.dy-brand-sub {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 10px;
+  color: var(--dim);
+  margin-top: 3px;
+  letter-spacing: 0.12em;
+}
+
+.dy-navitem {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  border-radius: 8px;
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--muted);
+  cursor: pointer;
+  text-decoration: none;
+  transition: background 0.12s, color 0.12s;
+}
+.dy-navitem:hover {
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--fg);
+}
+.dy-navitem-active {
+  color: var(--fg);
+  background: rgba(232, 131, 58, 0.12);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.dy-main {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* ── sidebar: brand logo, nav sections, status pill, user chip ─────────────── */
+.dy-brand-row {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 2px 6px 14px;
+}
+.dy-logo {
+  position: relative;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  background: linear-gradient(150deg, #f0a35e, #e8833a 55%, #c25a1e);
+  box-shadow: 0 2px 10px rgba(232, 131, 58, 0.35);
+  flex-shrink: 0;
+  overflow: hidden;
+}
+.dy-logo i {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 10px;
+  height: 10px;
+  border-right: 2.5px solid #1a1207;
+  border-bottom: 2.5px solid #1a1207;
+}
+.dy-logo i:nth-child(1) {
+  transform: translate(-58%, -50%) rotate(-45deg);
+}
+.dy-logo i:nth-child(2) {
+  transform: translate(-12%, -50%) rotate(-45deg);
+  border-color: rgba(26, 18, 7, 0.5);
+}
+
+.dy-navsection {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 9.5px;
+  color: #56606b;
+  letter-spacing: 0.08em;
+  padding: 16px 11px 6px;
+}
+
+.dy-icon {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+.dy-navcount {
+  margin-left: auto;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+  color: var(--dim);
+}
+.dy-navcount-danger {
+  color: var(--red);
+}
+.dy-navdot {
+  margin-left: auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--amber);
+}
+
+.dy-side-foot {
+  margin-top: auto;
+  padding-top: 14px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+}
+.dy-status {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 11px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+}
+.dy-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 8px var(--green);
+  flex-shrink: 0;
+}
+.dy-user {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 4px 3px;
+  width: 100%;
+  background: none;
+  border: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  border-radius: 8px;
+  transition: background 0.12s;
+}
+.dy-user:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+.dy-avatar {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #2f81f7, #1f5fc0);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: #fff;
+  flex-shrink: 0;
+}
+
+/* ── primitives ───────────────────────────────────────────────────────────── */
+.dy-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+}
+
+.dy-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border);
+}
+.dy-pill-active {
+  color: var(--fg);
+  background: rgba(232, 131, 58, 0.14);
+  border-color: rgba(232, 131, 58, 0.4);
+}
+
+.dy-btn {
+  padding: 7px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border-strong);
+  background: var(--panel-2);
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+.dy-btn:hover {
+  border-color: var(--accent);
+}
+.dy-btn-primary {
+  /* Primary CTAs are blue in the design comp; rust is reserved for brand + nav. */
+  background: var(--blue);
+  border-color: var(--blue);
+  color: #fff;
+  font-weight: 600;
+}
+.dy-btn-primary:hover {
+  background: #4a93ff;
+  border-color: #4a93ff;
+}
+.dy-btn-danger:hover {
+  border-color: var(--red);
+  color: var(--red);
+}
+.dy-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.dy-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.dy-table th {
+  text-align: left;
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 8px 12px;
+}
+.dy-table td {
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+  font-size: 13.5px;
+}
+
+.dy-page {
+  padding: 26px 32px 40px;
+  max-width: 1180px;
+}
+.dy-h1 {
+  font-size: 23px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin: 0 0 18px;
+}
+
+/* ── page header: title + subtitle + actions ──────────────────────────────── */
+.dy-pagehead {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 22px;
+}
+.dy-subtitle {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 13.5px;
+}
+
+/* ── KPI tiles ────────────────────────────────────────────────────────────── */
+.dy-kpis {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+  margin-bottom: 18px;
+}
+@media (max-width: 900px) {
+  .dy-kpis {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+.dy-kpi {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px 17px;
+}
+.dy-kpi-label {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 9px;
+}
+.dy-kpi-value {
+  font-size: 27px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+.dy-kpi-sub {
+  font-size: 11.5px;
+  color: var(--muted);
+  margin-top: 7px;
+}
+
+/* ── small primitives ─────────────────────────────────────────────────────── */
+.dy-bar {
+  height: 5px;
+  background: var(--bg);
+  border-radius: 3px;
+  margin-top: 11px;
+  overflow: hidden;
+}
+.dy-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #2ea043, #3fb950);
+}
+.dy-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+/* Smaller variant, e.g. the live-connection indicator on the run detail header. */
+.dy-dot-sm {
+  width: 7px;
+  height: 7px;
+}
+.dy-empty {
+  color: var(--muted);
+  margin-top: 12px;
+}
+.dy-cardhead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.dy-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 8px;
+  border-radius: 8px;
+  text-decoration: none;
+  color: var(--fg);
+}
+.dy-row:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+/* Grid table row (Runs page: ● | Workflow | Run | Started | Duration | Trigger). */
+.dy-runrow {
+  align-items: center;
+  padding: 13px 18px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  color: var(--fg);
+  text-decoration: none;
+  cursor: pointer;
+}
+.dy-runrow:hover {
+  background: rgba(255, 255, 255, 0.025);
+}
+
+/* Small square action button (workflow row pause/edit/delete). */
+.dy-iconbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  text-decoration: none;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.dy-iconbtn:hover {
+  background: #222a33;
+  color: var(--fg);
+}
+.dy-iconbtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ── React Flow (DagGraph / EditableDag): dark-theme the chrome ───────────────
+   @xyflow v12 themes via CSS custom properties on the .react-flow container;
+   element-level overrides lose to its own vars, so set the vars here. The
+   MiniMap mask + node colours are set via props on the component. */
+.react-flow {
+  --xy-controls-button-background-color: var(--panel-2);
+  --xy-controls-button-background-color-hover: #222a33;
+  --xy-controls-button-color: var(--fg);
+  --xy-controls-button-color-hover: #fff;
+  --xy-controls-button-border-color: var(--border);
+  --xy-minimap-background-color: #11151b;
+}
+.react-flow__controls {
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.react-flow__minimap {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.react-flow__attribution {
+  display: none;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}

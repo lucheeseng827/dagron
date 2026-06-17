@@ -1,0 +1,388 @@
+//! Workflow schedules — the UI "schedule drawer" backend.
+//!
+//! Manages rows in the `schedules` table (workflow + cron expression). The engine
+//! (leadership-gated `schedule.rs`) is what actually fires due rows; dagron-api
+//! only validates the cron expression and computes `next_fire_at`. `enabled` is
+//! stored as INTEGER (0/1) for SQLite/Postgres portability and exposed as bool.
+
+use std::str::FromStr;
+
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::Json;
+use cron::Schedule as CronSchedule;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::auth::AuthUser;
+use crate::state::AppState;
+
+#[derive(Serialize, sqlx::FromRow)]
+struct ScheduleRow {
+    id: String,
+    workflow_id: String,
+    workflow_name: String,
+    cron_expr: String,
+    enabled: i64,
+    next_fire_at: Option<String>,
+    last_fired_at: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Serialize)]
+pub struct Schedule {
+    pub id: String,
+    pub workflow_id: String,
+    pub workflow_name: String,
+    pub cron_expr: String,
+    pub enabled: bool,
+    pub next_fire_at: Option<String>,
+    pub last_fired_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl From<ScheduleRow> for Schedule {
+    fn from(r: ScheduleRow) -> Self {
+        Schedule {
+            id: r.id,
+            workflow_id: r.workflow_id,
+            workflow_name: r.workflow_name,
+            cron_expr: r.cron_expr,
+            enabled: r.enabled != 0,
+            next_fire_at: r.next_fire_at,
+            last_fired_at: r.last_fired_at,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        }
+    }
+}
+
+const SELECT: &str = "SELECT s.id AS id, s.workflow_id AS workflow_id, w.name AS workflow_name,
+        s.cron_expr AS cron_expr, s.enabled AS enabled, s.next_fire_at AS next_fire_at,
+        s.last_fired_at AS last_fired_at, s.created_at AS created_at, s.updated_at AS updated_at
+ FROM schedules s JOIN workflows w ON w.id = s.workflow_id";
+
+#[derive(Deserialize)]
+pub struct ListParams {
+    pub workflow_id: Option<String>,
+}
+
+/// `GET /api/schedules?workflow_id=` — all schedules, or one workflow's.
+pub async fn list_schedules(
+    _auth: AuthUser,
+    State(state): State<AppState>,
+    Query(params): Query<ListParams>,
+) -> Result<Json<Vec<Schedule>>, StatusCode> {
+    let rows = if let Some(wid) = params.workflow_id {
+        sqlx::query_as::<_, ScheduleRow>(&format!("{SELECT} WHERE s.workflow_id = $1 ORDER BY s.created_at"))
+            .bind(wid)
+            .fetch_all(&state.read_pool)
+            .await
+    } else {
+        sqlx::query_as::<_, ScheduleRow>(&format!("{SELECT} ORDER BY s.created_at"))
+            .fetch_all(&state.read_pool)
+            .await
+    }
+    .map_err(internal)?;
+    Ok(Json(rows.into_iter().map(Schedule::from).collect()))
+}
+
+#[derive(Deserialize)]
+pub struct CreateBody {
+    pub workflow_id: String,
+    pub cron_expr: String,
+    pub enabled: Option<bool>,
+}
+
+/// `POST /api/schedules` — validate the cron expr, compute the first fire, insert.
+pub async fn create_schedule(
+    _auth: AuthUser,
+    State(state): State<AppState>,
+    Json(body): Json<CreateBody>,
+) -> Result<(StatusCode, Json<Schedule>), (StatusCode, String)> {
+    let next = next_fire(&body.cron_expr)?;
+
+    // 404 if the workflow doesn't exist (clearer than an FK violation).
+    let exists: Option<String> = sqlx::query_scalar("SELECT id FROM workflows WHERE id = $1")
+        .bind(&body.workflow_id)
+        .fetch_optional(&state.read_pool)
+        .await
+        .map_err(internal_msg)?;
+    if exists.is_none() {
+        return Err((StatusCode::NOT_FOUND, format!("workflow '{}' not found", body.workflow_id)));
+    }
+
+    let id = Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let enabled: i64 = if body.enabled.unwrap_or(true) { 1 } else { 0 };
+
+    sqlx::query(
+        "INSERT INTO schedules (id, workflow_id, cron_expr, enabled, next_fire_at, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$6)",
+    )
+    .bind(&id)
+    .bind(&body.workflow_id)
+    .bind(&body.cron_expr)
+    .bind(enabled)
+    .bind(&next)
+    .bind(&now)
+    .execute(&state.write_pool)
+    .await
+    .map_err(internal_msg)?;
+
+    let row = fetch_one(&state, &id).await?;
+    Ok((StatusCode::CREATED, Json(row)))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateBody {
+    pub cron_expr: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+/// `PUT /api/schedules/:id` — change cron and/or enabled; recompute next fire
+/// when the expression changes or the schedule is (re)enabled.
+pub async fn update_schedule(
+    _auth: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateBody>,
+) -> Result<Json<Schedule>, (StatusCode, String)> {
+    let current = sqlx::query_as::<_, ScheduleRow>(&format!("{SELECT} WHERE s.id = $1"))
+        .bind(&id)
+        .fetch_optional(&state.read_pool)
+        .await
+        .map_err(internal_msg)?
+        .ok_or((StatusCode::NOT_FOUND, format!("schedule '{id}' not found")))?;
+
+    let cron_expr = body.cron_expr.unwrap_or(current.cron_expr.clone());
+    let enabled = body.enabled.unwrap_or(current.enabled != 0);
+    // Recompute next fire from now whenever the cron changed or we (re)enabled.
+    let next = if enabled { Some(next_fire(&cron_expr)?) } else { None };
+    let now = chrono::Utc::now().to_rfc3339();
+
+    sqlx::query(
+        "UPDATE schedules SET cron_expr=$2, enabled=$3, next_fire_at=$4, updated_at=$5 WHERE id=$1",
+    )
+    .bind(&id)
+    .bind(&cron_expr)
+    .bind(if enabled { 1i64 } else { 0 })
+    .bind(&next)
+    .bind(&now)
+    .execute(&state.write_pool)
+    .await
+    .map_err(internal_msg)?;
+
+    Ok(Json(fetch_one(&state, &id).await?))
+}
+
+/// `DELETE /api/schedules/:id`.
+pub async fn delete_schedule(
+    _auth: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let n = sqlx::query("DELETE FROM schedules WHERE id = $1")
+        .bind(&id)
+        .execute(&state.write_pool)
+        .await
+        .map_err(internal)?
+        .rows_affected();
+    if n == 0 { Err(StatusCode::NOT_FOUND) } else { Ok(StatusCode::NO_CONTENT) }
+}
+
+// ── Backfill (QW3) ─────────────────────────────────────────────────────────────
+
+/// Hard ceiling on runs materialized by a single backfill call — the bound that
+/// keeps a wide range from stampeding the cluster. `max_runs` may lower it but
+/// never raise it past this.
+const BACKFILL_HARD_CAP: usize = 1000;
+
+#[derive(Deserialize)]
+pub struct BackfillBody {
+    /// Inclusive lower bound (RFC3339); fire-times strictly after this are used.
+    pub from: String,
+    /// Inclusive upper bound (RFC3339).
+    pub to: String,
+    /// Cap on runs created this call (clamped to `[1, BACKFILL_HARD_CAP]`).
+    pub max_runs: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub struct BackfillResponse {
+    /// Runs newly created this call.
+    pub scheduled: usize,
+    /// Fire-times already materialized by a prior backfill (deduped, not re-run).
+    pub skipped: usize,
+    pub from: String,
+    pub to: String,
+    pub run_ids: Vec<String>,
+}
+
+/// `POST /api/schedules/:id/backfill` — materialize the schedule's missed runs
+/// across `[from, to]` (QW3). Enumerates the cron fire-times in range, **caps the
+/// count** (`max_runs`, hard ceiling [`BACKFILL_HARD_CAP`]) so a wide window can't
+/// stampede, then submits one run per fire-time through the same create_run path
+/// as a normal submit.
+///
+/// Re-issuing the same window is safe: each fire-time is a slot in the
+/// `schedule_backfills` ledger, claimed with `INSERT ... ON CONFLICT DO NOTHING`,
+/// so a slot already materialized by a prior call is skipped (reported in
+/// `skipped`) rather than double-run.
+///
+/// NOTE (MVP scope): runs are created directly rather than enqueued through the
+/// engine's `MAX_INFLIGHT_RUNS` admission valve, so actual concurrency is bounded
+/// by the engine's `WORKER_COUNT` and this per-call cap, not the valve. A durable
+/// queue-backed backfill (survives a restart mid-call) is the remaining beta
+/// follow-up documented in the roadmap.
+pub async fn backfill(
+    _auth: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<BackfillBody>,
+) -> Result<Json<BackfillResponse>, (StatusCode, String)> {
+    use chrono::{DateTime, Utc};
+
+    let from = DateTime::parse_from_rfc3339(&body.from)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid 'from' (RFC3339): {e}")))?
+        .with_timezone(&Utc);
+    let to = DateTime::parse_from_rfc3339(&body.to)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid 'to' (RFC3339): {e}")))?
+        .with_timezone(&Utc);
+    if from >= to {
+        return Err((StatusCode::BAD_REQUEST, "'from' must be before 'to'".to_string()));
+    }
+    let cap = body.max_runs.unwrap_or(BACKFILL_HARD_CAP).clamp(1, BACKFILL_HARD_CAP);
+
+    // Load the schedule's cron + its workflow spec (404 if the schedule is gone).
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT s.cron_expr, w.spec
+         FROM schedules s JOIN workflows w ON w.id = s.workflow_id
+         WHERE s.id = $1",
+    )
+    .bind(&id)
+    .fetch_optional(&state.read_pool)
+    .await
+    .map_err(internal_msg)?;
+    let Some((cron_expr, spec_yaml)) = row else {
+        return Err((StatusCode::NOT_FOUND, format!("schedule '{id}' not found")));
+    };
+
+    let sched = CronSchedule::from_str(&cron_expr)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid cron '{cron_expr}': {e}")))?;
+
+    // Enumerate fire-times in (from, to]. Bound the (infinite) cron iterator at
+    // cap+1 so we can detect — and reject — an over-wide range without looping.
+    let fires: Vec<DateTime<Utc>> = sched
+        .after(&from)
+        .take_while(|d| *d <= to)
+        .take(cap + 1)
+        .collect();
+    if fires.len() > cap {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "backfill range yields more than {cap} runs; narrow the range or raise \
+                 max_runs (hard cap {BACKFILL_HARD_CAP})"
+            ),
+        ));
+    }
+
+    // Validate the spec once, then create one run per *newly-claimed* fire-time.
+    let spec = crate::routes::control::parse_and_validate(&spec_yaml)?;
+    let now = Utc::now().to_rfc3339();
+    let mut run_ids = Vec::new();
+    let mut skipped = 0usize;
+    for fire in &fires {
+        let logical_date = fire.to_rfc3339();
+        // Claim the slot; ON CONFLICT means a prior backfill already ran it.
+        let claimed = sqlx::query(
+            "INSERT INTO schedule_backfills (schedule_id, logical_date, created_at)
+             VALUES ($1, $2, $3) ON CONFLICT (schedule_id, logical_date) DO NOTHING",
+        )
+        .bind(&id)
+        .bind(&logical_date)
+        .bind(&now)
+        .execute(&state.write_pool)
+        .await
+        .map_err(internal_msg)?
+        .rows_affected();
+        if claimed == 0 {
+            skipped += 1;
+            continue;
+        }
+
+        // create_run is its own transaction, so the claim and the run can't share
+        // one. If it fails, release the claim (DELETE) so the slot stays reclaimable
+        // instead of being permanently counted as `skipped` on a later retry.
+        let run_id = match crate::routes::control::create_run(&state, &spec, &spec_yaml).await {
+            Ok(run_id) => run_id,
+            Err(e) => {
+                let _ = sqlx::query(
+                    "DELETE FROM schedule_backfills WHERE schedule_id = $1 AND logical_date = $2",
+                )
+                .bind(&id)
+                .bind(&logical_date)
+                .execute(&state.write_pool)
+                .await;
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")));
+            }
+        };
+        // Record which run filled the slot (best-effort; the slot is already claimed).
+        sqlx::query(
+            "UPDATE schedule_backfills SET run_id = $1 WHERE schedule_id = $2 AND logical_date = $3",
+        )
+        .bind(&run_id)
+        .bind(&id)
+        .bind(&logical_date)
+        .execute(&state.write_pool)
+        .await
+        .map_err(internal_msg)?;
+        run_ids.push(run_id);
+    }
+
+    tracing::info!(schedule_id = %id, scheduled = run_ids.len(), skipped, from = %body.from, to = %body.to, "backfill submitted");
+    Ok(Json(BackfillResponse {
+        scheduled: run_ids.len(),
+        skipped,
+        from: body.from,
+        to: body.to,
+        run_ids,
+    }))
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+/// Validate a cron expression and return its next fire time (RFC3339).
+/// 400 on a bad expression or one with no upcoming fire.
+fn next_fire(expr: &str) -> Result<String, (StatusCode, String)> {
+    let sched = CronSchedule::from_str(expr)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid cron '{expr}': {e}")))?;
+    let now = chrono::Utc::now();
+    sched
+        .after(&now)
+        .next()
+        .map(|d| d.to_rfc3339())
+        .ok_or((StatusCode::BAD_REQUEST, format!("cron '{expr}' has no upcoming fire time")))
+}
+
+async fn fetch_one(state: &AppState, id: &str) -> Result<Schedule, (StatusCode, String)> {
+    sqlx::query_as::<_, ScheduleRow>(&format!("{SELECT} WHERE s.id = $1"))
+        .bind(id)
+        .fetch_one(&state.read_pool)
+        .await
+        .map(Schedule::from)
+        .map_err(internal_msg)
+}
+
+fn internal(err: sqlx::Error) -> StatusCode {
+    tracing::error!(error = ?err, "db query failed");
+    StatusCode::INTERNAL_SERVER_ERROR
+}
+
+fn internal_msg(err: sqlx::Error) -> (StatusCode, String) {
+    tracing::error!(error = ?err, "db query failed");
+    (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+}

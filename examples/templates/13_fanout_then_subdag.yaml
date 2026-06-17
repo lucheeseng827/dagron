@@ -1,0 +1,27 @@
+# Pattern 13 — Fan-out where each item runs a multi-step sub-DAG
+#
+# Combines map + DAG-of-DAGs: fan out over a list, and EACH item runs a full
+# sub-pipeline (not a single step). The aggregate then fans in over every item's
+# sub-DAG exit. This is the realistic "process N datasets, each via the same
+# multi-stage pipeline, then merge" shape.
+#
+# datasets=[orders,users,events] → 3 × (download→validate→load) → aggregate
+name: fanout-subdag
+
+parameters:
+  datasets: '["orders", "users", "events"]'
+
+templates:
+  - name: ingest-one
+    parameters: { ds: "?" }
+    tasks:
+      - { name: download, command: ["sh", "-c", "echo download {{ ds }}"] }
+      - { name: validate, command: ["sh", "-c", "echo validate {{ ds }}"], depends_on: [download] }
+      - { name: load,     command: ["sh", "-c", "echo load {{ ds }}"],     depends_on: [validate] }
+
+tasks:
+  - name: ingest
+    template: ingest-one
+    with_param: "{{ datasets }}"
+    arguments: { ds: "{{ item }}" }
+  - { name: aggregate, command: ["sh", "-c", "echo aggregate all datasets"], depends_on: [ingest] }

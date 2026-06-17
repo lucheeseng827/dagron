@@ -1,0 +1,28 @@
+# Pattern 08 — Conditional execution (when)
+#
+# `when:` on a task (leaf or call) skips it — and any sub-DAG it would expand to —
+# when the expression is false. Drive it from a parameter to switch optional
+# stages on/off at submit time. A skipped task contributes no nodes; downstream
+# tasks that depended only on it become roots (don't block) — Argo-like skip.
+#
+# run_tests=true, deploy_prod=false → build, test, stage run; prod-deploy skipped.
+name: conditional-branch
+
+parameters:
+  run_tests: "true"
+  deploy_prod: "false"
+
+templates:
+  - name: prod-deploy
+    tasks:
+      - { name: approve, command: ["sh", "-c", "echo approve"] }
+      - { name: ship,    command: ["sh", "-c", "echo ship to prod"], depends_on: [approve] }
+
+tasks:
+  - { name: build, command: ["sh", "-c", "echo build"] }
+  - { name: test,  command: ["sh", "-c", "echo test"], when: "{{ run_tests }}", depends_on: [build] }
+  - { name: stage, command: ["sh", "-c", "echo deploy staging"], depends_on: [build] }
+  - name: prod
+    template: prod-deploy
+    when: "{{ deploy_prod }}"
+    depends_on: [stage]

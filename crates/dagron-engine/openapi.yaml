@@ -1,0 +1,592 @@
+openapi: 3.0.3
+info:
+  title: module-54 workflow scheduler — management API
+  description: >
+    Read/write control surface over the workflow scheduler's datastore: list and
+    inspect runs, submit a DAG, cancel a run, and scrape metrics. Every operation
+    is a thin shell over the same `db` facade the reconcile loop uses, so the API
+    holds no scheduler state of its own and works whether it runs in-process next
+    to the loop or as a standalone read sidecar against the shared Postgres
+    backend.
+
+
+    Served only when the binary is built with the (default) `ops` Cargo feature
+    and `API_ADDR` is set. This document is also served live by the running
+    scheduler at `/openapi.yaml` and `/openapi.json`, with a Swagger UI at `/docs`.
+
+
+    Security: this embedded API performs **no authentication** of its own — bind
+    `API_ADDR` to localhost / a trusted network and place authentication (e.g. the
+    `dagron-api` service, an auth proxy, or network policy) in front of it before
+    exposing it. It is intended for in-process ops and trusted-network sidecar use.
+  version: 0.1.0
+  license:
+    name: lab crate
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local management API (set API_ADDR to choose host:port)
+
+tags:
+  - name: runs
+    description: Workflow run lifecycle
+  - name: dead-letters
+    description: Poison submissions parked after repeated ingestion failure
+  - name: ops
+    description: Health, metrics, and API self-description
+
+paths:
+  /healthz:
+    get:
+      tags: [ops]
+      summary: Liveness probe
+      description: Returns `ok` while the API is serving. Never touches the datastore.
+      operationId: healthz
+      responses:
+        "200":
+          description: Service is live
+          content:
+            text/plain:
+              schema: { type: string, example: ok }
+
+  /metrics:
+    get:
+      tags: [ops]
+      summary: Prometheus metrics
+      description: >
+        Prometheus text exposition (version 0.0.4): process-lifetime counters
+        (`scheduler_runs_created_total`, `scheduler_tasks_*_total`) plus live
+        datastore gauges (`scheduler_runs`/`scheduler_tasks` by status) and
+        `scheduler_uptime_seconds`. Gauges are read fresh from the DB per scrape.
+      operationId: metrics
+      responses:
+        "200":
+          description: Metrics in Prometheus text format
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: |
+                  # HELP scheduler_runs_created_total Runs created by this scheduler since boot.
+                  # TYPE scheduler_runs_created_total counter
+                  scheduler_runs_created_total 2
+                  # TYPE scheduler_runs gauge
+                  scheduler_runs{status="running"} 1
+        "500":
+          $ref: "#/components/responses/Error"
+
+  /openapi.yaml:
+    get:
+      tags: [ops]
+      summary: This OpenAPI document (YAML)
+      operationId: openapiYaml
+      responses:
+        "200":
+          description: OpenAPI 3.0 spec
+          content:
+            application/yaml:
+              schema: { type: string }
+
+  /openapi.json:
+    get:
+      tags: [ops]
+      summary: This OpenAPI document (JSON)
+      operationId: openapiJson
+      responses:
+        "200":
+          description: OpenAPI 3.0 spec
+          content:
+            application/json:
+              schema: { type: object }
+
+  /docs:
+    get:
+      tags: [ops]
+      summary: Swagger UI
+      description: >
+        Self-hosted HTML page that renders this spec with Swagger UI. The UI
+        assets load from a CDN, so the page needs outbound internet; the raw spec
+        at `/openapi.yaml` does not.
+      operationId: docs
+      responses:
+        "200":
+          description: Swagger UI HTML
+          content:
+            text/html:
+              schema: { type: string }
+
+  /runs:
+    get:
+      tags: [runs]
+      summary: List runs
+      description: Runs newest-first, joined to the definition for the DAG name.
+      operationId: listRuns
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: Filter by run status.
+          schema: { $ref: "#/components/schemas/RunStatus" }
+        - name: limit
+          in: query
+          required: false
+          description: Max rows to return (clamped to 1..=1000).
+          schema: { type: integer, format: int64, default: 50, minimum: 1, maximum: 1000 }
+      responses:
+        "200":
+          description: Matching runs
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runs]
+                properties:
+                  runs:
+                    type: array
+                    maxItems: 1000
+                    items: { $ref: "#/components/schemas/RunSummary" }
+        "500":
+          $ref: "#/components/responses/Error"
+    post:
+      tags: [runs]
+      summary: Submit a DAG
+      description: >
+        Parse and cycle-check a DAG (YAML — a superset of JSON, so JSON bodies
+        parse too) and create a run for it. The raw body is stored verbatim as the
+        workflow definition.
+
+
+        Admission control: when `MAX_INFLIGHT_RUNS` is set and that many runs are
+        already active, the submit is shed with `429 Too Many Requests` and a
+        `Retry-After` header instead of growing an unbounded backlog. Clients
+        should back off and retry.
+      operationId: submitRun
+      requestBody:
+        required: true
+        description: The DAG spec.
+        content:
+          application/yaml:
+            schema: { $ref: "#/components/schemas/DagSpec" }
+          application/json:
+            schema: { $ref: "#/components/schemas/DagSpec" }
+          text/plain:
+            schema: { type: string }
+      responses:
+        "201":
+          description: Run created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id]
+                properties:
+                  run_id: { type: string, format: uuid }
+        "400":
+          description: Invalid DAG (parse error, unknown dependency, or cycle)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          description: >
+            At the in-flight admission cap (`MAX_INFLIGHT_RUNS`). Back off and
+            retry after the `Retry-After` header.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              description: Seconds to wait before retrying.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          $ref: "#/components/responses/Error"
+
+  /runs/{id}:
+    get:
+      tags: [runs]
+      summary: Get a run and its tasks
+      operationId: getRun
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "200":
+          description: Run detail
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run, tasks]
+                properties:
+                  run: { $ref: "#/components/schemas/WorkflowRun" }
+                  tasks:
+                    type: array
+                    items: { $ref: "#/components/schemas/TaskRun" }
+        "404":
+          description: No such run
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          $ref: "#/components/responses/Error"
+
+  /runs/{id}/cancel:
+    post:
+      tags: [runs]
+      summary: Cancel a run
+      description: >
+        Flip a `running` run and all its non-terminal tasks to `cancelled` in one
+        transaction. Idempotent: a missing or already-terminal run yields `409`.
+      operationId: cancelRun
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "200":
+          description: Run cancelled
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, cancelled]
+                properties:
+                  run_id: { type: string, format: uuid }
+                  cancelled: { type: boolean, example: true }
+        "409":
+          description: Run is missing or already terminal (nothing to cancel)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          $ref: "#/components/responses/Error"
+
+  /runs/{id}/rerun:
+    post:
+      tags: [runs]
+      summary: Rerun a run from its failure frontier
+      description: >
+        Cascade rerun a `failed`/`cancelled` run: every failed or cancelled task
+        is reset to `pending` and the run re-armed, while already-`succeeded`
+        tasks are left intact, so execution resumes from the point of failure
+        rather than re-running the whole DAG. `remaining_deps` is recomputed so
+        the frontier becomes ready immediately and tasks behind a reset
+        dependency wait for it to re-succeed.
+      operationId: rerunRun
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                from:
+                  type: string
+                  enum: [failed]
+                  default: failed
+                  description: >
+                    Rerun mode. Only `failed` (the default) is supported on this
+                    single-binary surface.
+      responses:
+        "200":
+          description: Run re-armed; number of tasks reset returned
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, rerun]
+                properties:
+                  run_id: { type: string, format: uuid }
+                  rerun: { type: integer, example: 3, description: tasks reset }
+        "400":
+          description: Unsupported rerun mode
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: Run not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: Run is not in a rerunnable (failed/cancelled) state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          $ref: "#/components/responses/Error"
+
+  /dead-letters:
+    get:
+      tags: [dead-letters]
+      summary: List dead letters
+      description: >
+        Poison submissions parked after they failed to parse, or after their
+        `create_run` failed `DEAD_LETTER_MAX_ATTEMPTS` times. Newest first.
+      operationId: listDeadLetters
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, format: int64, default: 50, minimum: 1, maximum: 1000 }
+      responses:
+        "200":
+          description: Parked dead letters
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [dead_letters]
+                properties:
+                  dead_letters:
+                    type: array
+                    maxItems: 1000
+                    items: { $ref: "#/components/schemas/DeadLetter" }
+        "500":
+          $ref: "#/components/responses/Error"
+
+  /dead-letters/{id}/redrive:
+    post:
+      tags: [dead-letters]
+      summary: Redrive a dead letter
+      description: >
+        Re-attempt the parked payload as a fresh run. On success the dead letter
+        is deleted; a still-invalid payload returns `400` and the row is kept.
+      operationId: redriveDeadLetter
+      parameters:
+        - $ref: "#/components/parameters/DeadLetterId"
+      responses:
+        "200":
+          description: Redriven into a new run
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, redriven_from]
+                properties:
+                  run_id: { type: string, format: uuid }
+                  redriven_from: { type: string, format: uuid }
+        "400":
+          description: The parked payload is still an invalid DAG
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: No such dead letter
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          $ref: "#/components/responses/Error"
+
+  /dead-letters/{id}:
+    delete:
+      tags: [dead-letters]
+      summary: Discard a dead letter
+      operationId: deleteDeadLetter
+      parameters:
+        - $ref: "#/components/parameters/DeadLetterId"
+      responses:
+        "200":
+          description: Discarded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, deleted]
+                properties:
+                  id: { type: string, format: uuid }
+                  deleted: { type: boolean, example: true }
+        "404":
+          description: No such dead letter
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          $ref: "#/components/responses/Error"
+
+components:
+  parameters:
+    RunId:
+      name: id
+      in: path
+      required: true
+      description: Run UUID.
+      schema: { type: string, format: uuid }
+    DeadLetterId:
+      name: id
+      in: path
+      required: true
+      description: Dead-letter UUID.
+      schema: { type: string, format: uuid }
+
+  responses:
+    Error:
+      description: Unexpected server/datastore error
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string, description: Human-readable failure message }
+
+    DeadLetter:
+      type: object
+      description: A poison submission parked after repeated ingestion failure.
+      required: [id, payload, error, source, failures, first_seen_at, last_error_at]
+      properties:
+        id: { type: string, format: uuid }
+        payload: { type: string, description: The raw submission, verbatim }
+        error: { type: string, description: Last failure reason }
+        source: { type: string, description: WorkflowSource that produced it (file/redis/sqs/kafka) }
+        failures: { type: integer, format: int64, description: Times tried before giving up }
+        first_seen_at: { type: string, format: date-time }
+        last_error_at: { type: string, format: date-time }
+
+    RunStatus:
+      type: string
+      description: Workflow run lifecycle state.
+      enum: [pending, running, succeeded, failed, cancelled]
+
+    TaskStatus:
+      type: string
+      description: Task state-machine node.
+      enum: [pending, ready, running, succeeded, failed, skipped, cancelled]
+
+    RunSummary:
+      type: object
+      description: List-view projection of a run, with the DAG name joined in.
+      required: [id, name, status, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, description: DAG name from the definition }
+        status: { $ref: "#/components/schemas/RunStatus" }
+        created_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time, nullable: true }
+
+    WorkflowRun:
+      type: object
+      description: One execution instance of a workflow definition.
+      required: [id, definition_id, status, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        definition_id: { type: string, format: uuid }
+        status: { $ref: "#/components/schemas/RunStatus" }
+        input: { type: string, nullable: true }
+        output: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time, nullable: true }
+
+    TaskRun:
+      type: object
+      description: One node within a run — the row that drives the state machine.
+      required: [id, run_id, name, status, attempt, remaining_deps, version]
+      properties:
+        id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        name: { type: string }
+        status: { $ref: "#/components/schemas/TaskStatus" }
+        attempt: { type: integer, format: int64, description: Attempts run so far }
+        remaining_deps:
+          type: integer
+          format: int64
+          description: Dependency counter; task becomes ready at 0
+        input:
+          type: string
+          nullable: true
+          description: Serialised TaskSpec JSON
+        output: { type: string, nullable: true, description: stdout or error message }
+        claimed_by: { type: string, nullable: true, description: Worker holding the lease }
+        lease_expires_at: { type: string, format: date-time, nullable: true }
+        version:
+          type: integer
+          format: int64
+          description: Monotonic CAS/fencing token guarding against double-claim
+        scheduled_at: { type: string, format: date-time, nullable: true }
+        finished_at: { type: string, format: date-time, nullable: true }
+
+    TaskSpec:
+      type: object
+      description: One task in a submitted DAG.
+      required: [name, command]
+      properties:
+        name: { type: string }
+        command:
+          type: array
+          items: { type: string }
+          description: argv; command[0] is the binary
+          example: ["echo", "hello"]
+        depends_on:
+          type: array
+          items: { type: string }
+          default: []
+          description: Names of tasks that must succeed first
+        input:
+          nullable: true
+          description: Arbitrary JSON payload carried with the task
+        max_attempts:
+          type: integer
+          format: int32
+          default: 1
+          minimum: 1
+          description: Attempt cap before the task is marked failed (1 = no retries)
+        retry_delay_secs:
+          type: integer
+          format: int64
+          default: 0
+          description: Base backoff; actual delay = retry_delay_secs * 2^(attempt-1)
+        timeout_secs:
+          type: integer
+          format: int64
+          nullable: true
+          description: Per-task timeout (falls back to 25 s when absent)
+        docker_image:
+          type: string
+          nullable: true
+          description: Image for the Docker/Kubernetes executor; ignored by LocalExecutor
+        env:
+          type: array
+          default: []
+          description: Environment variables injected into the task container
+          items:
+            type: object
+            required: [name, value]
+            properties:
+              name: { type: string }
+              value: { type: string }
+        resources:
+          nullable: true
+          description: >
+            Per-task pod CPU/memory requests & limits (Kubernetes executor only).
+          type: object
+          properties:
+            requests:
+              type: object
+              additionalProperties: { type: string }
+              example: { cpu: "250m", memory: "256Mi" }
+            limits:
+              type: object
+              additionalProperties: { type: string }
+              example: { memory: "512Mi" }
+        service_account:
+          type: string
+          nullable: true
+          description: >
+            ServiceAccount for the task pod — the IRSA seam for S3 access
+            (Kubernetes executor only).
+
+    DagSpec:
+      type: object
+      description: A submitted workflow DAG.
+      required: [name, tasks]
+      properties:
+        name: { type: string }
+        tasks:
+          type: array
+          items: { $ref: "#/components/schemas/TaskSpec" }
+      example:
+        name: simple-pipeline
+        tasks:
+          - { name: prepare, command: ["echo", "step 1"], depends_on: [] }
+          - { name: summarize, command: ["echo", "done"], depends_on: [prepare] }

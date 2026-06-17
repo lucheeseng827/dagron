@@ -1,0 +1,156 @@
+# dagron Helm chart values.
+
+nameOverride: ""
+fullnameOverride: ""
+
+# imagePullSecrets applied to every pod (e.g. an ECR pull secret).
+# imagePullSecrets:
+#   - name: ecr-creds
+imagePullSecrets: []
+
+# ── Engine / API ───────────────────────────────────────────────────────────
+# The `dagron` binary running as a long-lived server: schedules fire, workers
+# run tasks, and the HTTP API is served on `port`.
+#
+# IMPORTANT: this image must be built with the `postgres`, `ops`, and
+# `kubernetes` cargo features. The module Dockerfile defaults to a sqlite-only
+# build — see terraform/README.md §"Building the images".
+engine:
+  image: mancube/dagron-engine:0.2.0
+  imagePullPolicy: IfNotPresent
+  replicas: 1
+  port: 8080
+  # Task executor: "k8s" runs each task as a one-shot Pod in this namespace.
+  # Use "local" to run tasks in-process (no pod-create RBAC needed).
+  executor: k8s
+  # Default image for task pods when a task doesn't specify its own.
+  taskImage: alpine:latest
+  workerCount: 4
+  # Admission cap for POST /runs: the engine sheds load with 429 + Retry-After
+  # once this many runs are active (pending/running), the API-path backpressure
+  # valve from the load-test work. 0 disables it.
+  maxInflightRuns: 64
+  # Enable DB-backed schedules so CronWorkflow CRs actually fire.
+  dbSchedules: true
+  rustLog: info
+  # Extra environment variables appended verbatim to the engine container — an
+  # escape hatch for knobs the chart doesn't model (e.g. queue-source creds).
+  extraEnv: []
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {memory: 512Mi}
+  service:
+    type: ClusterIP
+
+# ── Operator ─────────────────────────────────────────────────────────────────
+# kube-rs operator that watches Workflow/CronWorkflow CRs cluster-wide and
+# upserts them into the dagron datastore.
+operator:
+  image: mancube/dagron-operator:0.2.0
+  imagePullPolicy: IfNotPresent
+  replicas: 1
+  rustLog: info
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {memory: 256Mi}
+  # The operator watches CRs cluster-wide (Api::all), so it gets a ClusterRole.
+  # Set false and supply your own binding to scope it down.
+  rbac:
+    create: true
+
+# ── Datastore ──────────────────────────────────────────────────────────────
+# Throwaway single-replica Postgres for testing. For anything real, set
+# postgres.enabled=false and point externalDatabaseUrl at a managed DB.
+postgres:
+  enabled: true
+  image: postgres:16-alpine
+  user: dagron
+  database: dagron
+  # WARNING: INSECURE default for throwaway testing ONLY. Override for anything
+  # not immediately destroyed (the terraform stack passes a value via --set).
+  password: dagron-test-pw
+  storage: 1Gi
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {memory: 256Mi}
+
+# Used when postgres.enabled = false. Full connection string, e.g.
+# postgres://user:pass@host:5432/dagron
+#
+# NOTE: this inlines the password into the rendered Secret and therefore into
+# `helm history` / any committed values file. For production, leave this empty
+# and point externalDatabaseSecret at a Secret you create out-of-band instead.
+externalDatabaseUrl: ""
+
+# Reference a pre-existing Secret for DATABASE_URL instead of having the chart
+# create one from externalDatabaseUrl. Preferred for managed databases: the
+# connection string (and its password) never lands in values files, helm
+# history, or CI logs. Only used when postgres.enabled = false; when `name` is
+# set it takes precedence over externalDatabaseUrl and no chart Secret is made.
+#
+#   kubectl -n <ns> create secret generic dagron-db \
+#     --from-literal=DATABASE_URL='postgres://user:REAL_PW@host:5432/dagron?sslmode=require'
+externalDatabaseSecret:
+  name: ""              # name of the existing Secret (empty = chart-managed)
+  key: "DATABASE_URL"   # key within that Secret holding the connection string
+
+# ── dagron-api (authenticated UI gateway) ───────────────────────────────────
+# Stateless edge over the same Postgres the engine writes; owns login (its own
+# HS256 session JWT) and serves the UI's REST + SSE. Scales to N replicas.
+dagronApi:
+  enabled: true
+  image: mancube/dagron-api:0.2.0
+  imagePullPolicy: IfNotPresent
+  replicas: 1
+  port: 8080
+  # Session cookie Secure (HTTPS-only). Login WILL fail over plain HTTP while
+  # this is true (the browser won't store/send the cookie), so set false for any
+  # non-TLS access path — `kubectl port-forward` or a plain-HTTP test ingress:
+  #   --set dagronApi.cookieSecure=false
+  cookieSecure: true
+  rustLog: info
+  # HS256 signing key for session JWTs — MUST be >= 32 chars. Stored in a
+  # chart-managed Secret unless existingSecret.name is set. CHANGE for any real
+  # deploy (this default value will fail the >=32 check intentionally if shortened).
+  jwtSecret: "CHANGE-ME-dagron-jwt-signing-key-32+chars"
+  jwtSecretKey: DAGRON_JWT_SECRET
+  # First admin, seeded idempotently on startup. Set email "" to skip seeding
+  # (e.g. when users are created out-of-band via POST /api/users).
+  admin:
+    email: admin@local
+    name: Administrator
+    password: "CHANGE-ME-admin-password"
+  adminPasswordKey: DAGRON_ADMIN_PASSWORD
+  # Recommended for prod: point at a pre-created Secret whose keys match
+  # jwtSecretKey above (and adminPasswordKey, if seeding) — the defaults
+  # DAGRON_JWT_SECRET / DAGRON_ADMIN_PASSWORD unless you renamed them — so
+  # neither secret lands in values/helm history. When name is set, the chart
+  # makes no UI Secret.
+  existingSecret:
+    name: ""
+  extraEnv: []
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {memory: 256Mi}
+
+# ── Frontend (Next.js UI) ────────────────────────────────────────────────────
+frontend:
+  enabled: true
+  image: mancube/dagron-frontend:0.2.0
+  imagePullPolicy: IfNotPresent
+  replicas: 1
+  port: 3000
+  extraEnv: []
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {memory: 512Mi}
+
+# ── Ingress (single host, same-origin: /api → dagron-api, / → frontend) ──────
+ingress:
+  enabled: false
+  className: nginx
+  host: ""                 # e.g. dagron.example.com — REQUIRED when enabled
+  annotations: {}
+  tls:
+    enabled: false
+    secretName: dagron-tls

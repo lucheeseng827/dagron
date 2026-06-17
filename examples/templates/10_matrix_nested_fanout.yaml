@@ -1,0 +1,31 @@
+# Pattern 10 — Matrix / nested fan-out (2-D map)
+#
+# An outer fan-out over `regions` calls a template that ITSELF fans out over
+# `services` — the cross-product (matrix) build. Each cell is region × service.
+# Nesting fan-outs is how you express a parameter matrix.
+#
+# regions=[us,eu] × services=[api,web] → 4 deploy cells.
+name: matrix-fanout
+
+parameters:
+  services: '["api", "web"]'
+
+templates:
+  - name: per-region
+    parameters: { region: "?", services: "[]" }
+    tasks:
+      - name: deploy
+        template: one-service
+        with_param: "{{ services }}"
+        arguments: { region: "{{ region }}", svc: "{{ item }}" }
+
+  - name: one-service
+    parameters: { region: "?", svc: "?" }
+    tasks:
+      - { name: apply, command: ["sh", "-c", "echo deploy {{ svc }} in {{ region }}"] }
+
+tasks:
+  - name: regions
+    template: per-region
+    with_items: ["us", "eu"]
+    arguments: { region: "{{ item }}", services: "{{ services }}" }

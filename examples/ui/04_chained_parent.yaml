@@ -1,0 +1,25 @@
+# Chaining: a workflow that runs ANOTHER saved workflow as one of its steps.
+#
+# The `run-etl` task has no command — it has `workflow_ref: etl`. When this
+# workflow runs, dagron-api loads the saved `etl` workflow (03_etl.yaml) and
+# inlines its tasks here, namespaced as run-etl.build / run-etl.process /
+# run-etl.publish, wiring `prepare` before them and `notify` after:
+#
+#   prepare -> run-etl.build -> run-etl.process -> run-etl.publish -> notify
+#
+# Prerequisite: save the `etl` workflow first (03_etl.yaml), or the run is
+# rejected with "references unknown workflow 'etl'".
+#
+# NOTE: `workflow_ref` is resolved on the UI / management API path
+# (POST /api/workflows/:id/run and POST /api/runs). It is distinct from the
+# engine's inline `template:` mechanism in examples/templates/.
+name: nightly
+tasks:
+  - name: prepare
+    command: ["sh", "-c", "echo prepare"]
+  - name: run-etl
+    workflow_ref: etl
+    depends_on: [prepare]
+  - name: notify
+    command: ["sh", "-c", "echo done"]
+    depends_on: [run-etl]

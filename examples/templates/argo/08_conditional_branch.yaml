@@ -1,0 +1,70 @@
+# Pattern 08 — Conditional execution (when)
+#
+# dagron: `when:` on a task (leaf or call) skips it — and any sub-DAG it would
+# expand to — when the expression is false; driven from a parameter.
+# Argo: `when:` on a dag task does the same. A skipped task does not run, and
+# Argo's skip semantics let downstream tasks proceed. Here `test` is gated on
+# `run_tests` and the `prod` sub-DAG call is gated on `deploy_prod`.
+#
+# run_tests=true, deploy_prod=false -> build, test, stage run; prod skipped.
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: conditional-branch-
+spec:
+  entrypoint: main
+  arguments:
+    parameters:
+      - { name: run_tests, value: "true" }
+      - { name: deploy_prod, value: "false" }
+  templates:
+    - name: main
+      dag:
+        tasks:
+          - name: build
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: build }
+          - name: test
+            template: echo
+            when: "{{workflow.parameters.run_tests}} == true"
+            arguments:
+              parameters:
+                - { name: msg, value: test }
+            dependencies: [build]
+          - name: stage
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: "deploy staging" }
+            dependencies: [build]
+          - name: prod
+            template: prod-deploy
+            when: "{{workflow.parameters.deploy_prod}} == true"
+            dependencies: [stage]
+
+    # Sub-DAG that only expands/runs when the `prod` task's `when` is true.
+    - name: prod-deploy
+      dag:
+        tasks:
+          - name: approve
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: approve }
+          - name: ship
+            template: echo
+            arguments:
+              parameters:
+                - { name: msg, value: "ship to prod" }
+            dependencies: [approve]
+
+    - name: echo
+      inputs:
+        parameters:
+          - { name: msg }
+      container:
+        image: alpine:3.20
+        command: [sh, -c]
+        args: ["echo {{inputs.parameters.msg}}"]
