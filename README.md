@@ -7,6 +7,20 @@ binary, zero infrastructure to get started.
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
+## See it in action
+
+The optional web UI (the `dagron-api` gateway + Next.js frontend, brought up with
+`docker compose up`) gives you a live view over the same engine the CLI drives —
+submit workflows, watch runs stream, inspect the DAG, and read task logs.
+
+| Overview — scheduler health, runs today, success rate, GitOps sync | Run detail — the live DAG graph with per-task status + output |
+|---|---|
+| [![Overview dashboard](docs/images/overview.png)](docs/images/overview.png) | [![Run DAG graph](docs/images/run-graph.png)](docs/images/run-graph.png) |
+
+| Workflows — saved definitions, schedules, recent-run history | Runs — every execution across all workflows | Metrics — live run/task counts by status |
+|---|---|---|
+| [![Workflows list](docs/images/workflows.png)](docs/images/workflows.png) | [![Runs list](docs/images/runs.png)](docs/images/runs.png) | [![Metrics](docs/images/metrics.png)](docs/images/metrics.png) |
+
 ## Why dagron
 
 - **Lightweight** — a Rust binary, no Python/Celery/etc. to operate.
