@@ -23,6 +23,9 @@ postgres = ["sqlx/postgres"]
 # `ops` HTTP API in the binary. Pure gating, no deps — a lean reconcile-only build
 # leaves it off. Mirrors (and is enabled by) the binary's `ops` feature.
 ops = []
+# Enterprise Edition: auto-backfill sweep, run_reruns ledger, parameterized
+# rerun metrics, and outbox eventing. Implies `ops` (the management surface).
+enterprise = ["ops"]
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

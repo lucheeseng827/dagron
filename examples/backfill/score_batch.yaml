@@ -1,0 +1,22 @@
+# MLO-6 — "Bad model shipped; re-run inference over the affected window" → cancel
+# the bad run, then parameterized re-run with the rolled-back model version (M5).
+#
+# `MODEL_VERSION` is the execution knob the `score` task echoes; a rerun's `params`
+# are deep-merged into each reset task's stored input (verify with psql). The
+# `load-batch` sleep gives you a window to cancel the in-flight bad-model run:
+#
+#   run → cancel → rerun {"params":{"model_version":"v6"}}
+#
+# Walkthrough: examples/backfill/README.md
+name: score_batch
+tasks:
+  - name: load-batch
+    command: ["sh", "-c", "echo 'load inference batch'; sleep 20"]
+  - name: score
+    command: ["sh", "-c", "echo \"score with model=$MODEL_VERSION\""]
+    depends_on: [load-batch]
+    env:
+      - { name: MODEL_VERSION, value: "v7" }
+  - name: publish
+    command: ["sh", "-c", "echo 'publish predictions'"]
+    depends_on: [score]

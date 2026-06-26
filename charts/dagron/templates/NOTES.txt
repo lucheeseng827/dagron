@@ -8,7 +8,7 @@ Components:
 {{- if .Values.frontend.enabled }}
   frontend    {{ .Values.frontend.image }}
 {{- end }}
-{{- if .Values.operator.image }}
+{{- if .Values.operator }}
   operator    {{ .Values.operator.image }}
 {{- end }}
 {{- if .Values.postgres.enabled }}

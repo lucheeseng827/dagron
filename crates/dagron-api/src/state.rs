@@ -3,6 +3,9 @@
 //! `AppState` is cheap to clone (PgPool and broadcast::Sender are Arc-backed),
 //! so it is handed to every handler via axum's `State` extractor.
 
+use std::sync::Arc;
+
+use dagron_identity::IdentityProvider;
 use serde::Serialize;
 use sqlx::postgres::PgPool;
 use tokio::sync::broadcast;
@@ -33,4 +36,8 @@ pub struct AppState {
     /// Whether the session cookie is marked `Secure` (HTTPS-only). Defaults to
     /// true; set `DAGRON_COOKIE_SECURE=false` for plain-HTTP local dev.
     pub cookie_secure: bool,
+    /// Authentication backend behind the identity seam. OSS default =
+    /// `LocalIdentityProvider` (argon2 against the `users` table); the Enterprise
+    /// edition plugs an SSO provider here.
+    pub identity: Arc<dyn IdentityProvider>,
 }

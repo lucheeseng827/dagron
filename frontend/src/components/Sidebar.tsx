@@ -82,7 +82,7 @@ export default function Sidebar() {
           <div className="dy-brand-name" style={{ fontSize: 17 }}>
             dagron
           </div>
-          <div className="dy-brand-sub">WORKFLOWS · RUST</div>
+          <div className="dy-brand-sub">WORKFLOWS</div>
         </div>
       </Link>
 

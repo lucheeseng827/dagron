@@ -155,8 +155,9 @@ pub struct RerunBody {
     /// Rerun mode. Only `failed` (the default) is supported; `task:<id>` is reserved.
     #[serde(default)]
     from: Option<String>,
-    /// QW4 — deep-merged into each reset task's stored TaskSpec `input`, so a
-    /// fix-forward rerun can change task inputs without re-authoring the workflow.
+    /// Deep-merged into each reset task's stored TaskSpec `input` (EE). Accepted
+    /// by all builds so clients get an explicit 400 rather than a silent no-op
+    /// when `params` is supplied against a non-Enterprise build.
     #[serde(default)]
     params: Option<serde_json::Value>,
 }
@@ -189,6 +190,16 @@ pub async fn rerun_run(
             ));
         }
     }
+    // Non-enterprise builds accept the field (so serde doesn't silently discard
+    // it) but must reject it explicitly so callers know params had no effect.
+    #[cfg(not(feature = "enterprise"))]
+    if body.params.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "`params` rerun override requires the Enterprise feature".to_string(),
+        ));
+    }
+    #[cfg(feature = "enterprise")]
     if let Some(p) = &body.params {
         if !p.is_object() {
             return Err((StatusCode::BAD_REQUEST, "params must be a JSON object".to_string()));
@@ -218,9 +229,10 @@ pub async fn rerun_run(
 
     let now = chrono::Utc::now().to_rfc3339();
 
-    // QW4: capture the broken cone's specs before reset and merge params into each
-    // task's `input`. The reset UPDATE below never touches `input` (it carries the
-    // command), so these per-row overrides are applied alongside it.
+    // EE: capture the broken cone's specs before reset and deep-merge `params`
+    // into each task's `input`. The reset UPDATE below never touches `input`
+    // (it carries the command), so these per-row overrides are applied alongside it.
+    #[cfg(feature = "enterprise")]
     let overrides: Vec<(String, String)> = if let Some(params) = body.params.as_ref() {
         let rows: Vec<(String, Option<String>)> = sqlx::query_as(
             "SELECT id, input FROM task_runs WHERE run_id = $1 AND status IN ('failed','cancelled')",
@@ -246,6 +258,8 @@ pub async fn rerun_run(
     } else {
         Vec::new()
     };
+    #[cfg(not(feature = "enterprise"))]
+    let overrides: Vec<(String, String)> = Vec::new();
 
     let reset = sqlx::query(
         "UPDATE task_runs
@@ -292,6 +306,7 @@ pub async fn rerun_run(
 
 /// Recursively merge `overlay` into `base`: matching object keys merge; every
 /// other shape (scalars, arrays, type mismatches) is replaced by `overlay`.
+#[cfg(feature = "enterprise")]
 fn deep_merge(base: &mut serde_json::Value, overlay: serde_json::Value) {
     match (base, overlay) {
         (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {

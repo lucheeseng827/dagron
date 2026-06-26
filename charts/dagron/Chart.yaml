@@ -1,17 +1,14 @@
 apiVersion: v2
 name: dagron
 description: |
-  dagron DAG engine + GitOps operator for Kubernetes. Deploys the full stack — engine/API, the dagron-api UI gateway, the Next.js frontend,
-  the kube-rs operator that reconciles Workflow/CronWorkflow CRs into the
-  datastore, and a throwaway in-cluster Postgres for testing. Built to exercise
-  the operator end-to-end on kind/k3d/k3s/EKS.
+  dagron DAG engine for Kubernetes. Deploys the stack — engine/API, the dagron-api
+  UI gateway, the Next.js frontend, and a throwaway in-cluster Postgres for testing.
+  Runs on kind/k3d/k3s/EKS.
 type: application
 version: 0.2.0
 # appVersion tracks the dagron image; override images via values.yaml.
-appVersion: "0.1.0"
+appVersion: "0.2.0"
 keywords:
   - dagron
   - workflow
   - dag
-  - operator
-  - gitops

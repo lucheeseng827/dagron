@@ -16,11 +16,16 @@ postgres = ["dagron-core/postgres"]
 ops = ["dep:axum", "dep:cron", "dagron-core/ops"]
 # Kubernetes pod executor (EXECUTOR=kubernetes).
 kubernetes = ["dagron-executor/kubernetes"]
+# Enterprise Edition: auto-backfill sweep loop, run_reruns ledger,
+# parameterized rerun metrics, and outbox eventing. Implies `ops`.
+enterprise = ["dagron-core/enterprise", "ops"]
 
 [dependencies]
 dagron-core = { path = "../dagron-core", default-features = false }
 dagron-executor = { path = "../dagron-executor" }
 dagron-source = { path = "../dagron-source" }
+dagron-lineage = { path = "../dagron-lineage" }
+dagron-artifact = { path = "../dagron-artifact" }
 dagron-logging = { path = "../dagron-logging" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "sync", "time", "net"] }
 serde = { version = "1", features = ["derive"] }

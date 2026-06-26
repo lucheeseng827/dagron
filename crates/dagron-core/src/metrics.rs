@@ -109,11 +109,34 @@ pub struct Metrics {
     pub tasks_failed: AtomicU64,
     pub tasks_retried: AtomicU64,
     pub dead_letters: AtomicU64,
+    /// Runs created by the auto-backfill catch-up sweep (QW3 auto-catchup). A schedule that
+    /// missed fires while the scheduler was down has them materialized here.
+    #[cfg(feature = "enterprise")]
+    pub catchup_runs: AtomicU64,
+    /// Terminally-failed runs the self-healing loop re-armed from their failure
+    /// frontier (QW3-catchup auto-rerun of incomplete workflows).
+    #[cfg(feature = "enterprise")]
+    pub auto_reruns: AtomicU64,
     /// Task wall-time (claim→finish), the headroom-dominating signal real ETL
     /// tasks have but the no-op load test never exercised.
     pub task_duration: Histogram,
     /// Reconcile-loop tick duration — the CPU-pegging signal from LOADTEST.md.
     pub reconcile_tick: Histogram,
+    // ── QW3 auto-catchup self-healing state gauges (EE) ──────────────────────────────────
+    // Unlike the counters above (monotonic, bumped on the hot path) these are
+    // *current state* re-published by the auto-backfill loop on every sweep: the
+    // loop is the single writer, `render` reads the last value. They are the
+    // signals an alerting rule scrapes to *trigger* eventing (alert on lag →
+    // webhook / redrive) — the "register workflow + data state as metrics" goal.
+    /// Catch-up schedules whose oldest missed fire is still outstanding.
+    #[cfg(feature = "enterprise")]
+    pub overdue_schedules: AtomicU64,
+    /// Largest catch-up lag, in seconds, across all catch-up schedules.
+    #[cfg(feature = "enterprise")]
+    pub schedule_lag_seconds: AtomicU64,
+    /// Runs still `running` past the stall SLA (suspected-incomplete workflows).
+    #[cfg(feature = "enterprise")]
+    pub incomplete_runs: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -126,8 +149,18 @@ impl Default for Metrics {
             tasks_failed: AtomicU64::new(0),
             tasks_retried: AtomicU64::new(0),
             dead_letters: AtomicU64::new(0),
+            #[cfg(feature = "enterprise")]
+            catchup_runs: AtomicU64::new(0),
+            #[cfg(feature = "enterprise")]
+            auto_reruns: AtomicU64::new(0),
             task_duration: Histogram::new(DURATION_BUCKETS),
             reconcile_tick: Histogram::new(DURATION_BUCKETS),
+            #[cfg(feature = "enterprise")]
+            overdue_schedules: AtomicU64::new(0),
+            #[cfg(feature = "enterprise")]
+            schedule_lag_seconds: AtomicU64::new(0),
+            #[cfg(feature = "enterprise")]
+            incomplete_runs: AtomicU64::new(0),
         }
     }
 }
@@ -159,6 +192,27 @@ impl Metrics {
     }
     pub fn inc_dead_letters(&self) {
         Self::bump(&self.dead_letters);
+    }
+    /// One run materialized by the auto-backfill catch-up sweep (QW3 auto-catchup).
+    #[cfg(feature = "enterprise")]
+    pub fn inc_catchup_runs(&self) {
+        Self::bump(&self.catchup_runs);
+    }
+    /// One failed run re-armed by the self-healing auto-rerun loop (QW3 auto-catchup).
+    #[cfg(feature = "enterprise")]
+    pub fn inc_auto_reruns(&self) {
+        Self::bump(&self.auto_reruns);
+    }
+
+    /// Re-publish the QW3 auto-catchup self-healing state gauges. Called once per sweep by the
+    /// auto-backfill loop (the single writer); `render` reads these back. Storing
+    /// them as atomics — rather than re-querying the DB per `/metrics` scrape —
+    /// keeps the scrape cheap and decouples the alerting signal from scrape timing.
+    #[cfg(feature = "enterprise")]
+    pub fn set_backfill_state(&self, overdue_schedules: u64, max_lag_secs: u64, incomplete_runs: u64) {
+        self.overdue_schedules.store(overdue_schedules, Ordering::Relaxed);
+        self.schedule_lag_seconds.store(max_lag_secs, Ordering::Relaxed);
+        self.incomplete_runs.store(incomplete_runs, Ordering::Relaxed);
     }
 
     /// Record a completed task's wall time (claim→finish), in seconds.
@@ -199,6 +253,20 @@ impl Metrics {
             let _ = writeln!(out, "# TYPE {name} counter");
             let _ = writeln!(out, "{name} {value}");
         }
+        #[cfg(feature = "enterprise")]
+        {
+            let ee_counters: [(&str, &str, u64); 2] = [
+                ("scheduler_catchup_runs_total", "Runs materialized by the auto-backfill catch-up sweep.",
+                 self.catchup_runs.load(Ordering::Relaxed)),
+                ("scheduler_auto_reruns_total", "Failed runs re-armed by the self-healing auto-rerun loop.",
+                 self.auto_reruns.load(Ordering::Relaxed)),
+            ];
+            for (name, help, value) in ee_counters {
+                let _ = writeln!(out, "# HELP {name} {help}");
+                let _ = writeln!(out, "# TYPE {name} counter");
+                let _ = writeln!(out, "{name} {value}");
+            }
+        }
 
         // Datastore gauges (whole-cluster truth, read per scrape).
         let _ = writeln!(out, "# HELP scheduler_runs Workflow runs grouped by status.");
@@ -227,6 +295,23 @@ impl Metrics {
         let _ = writeln!(out, "# HELP scheduler_dead_letters Dead-letter rows currently parked.");
         let _ = writeln!(out, "# TYPE scheduler_dead_letters gauge");
         let _ = writeln!(out, "scheduler_dead_letters {}", snap.dead_letters);
+
+        // QW3 auto-catchup self-healing state gauges (EE) — republished by the
+        // auto-backfill loop each sweep. Alerting on `scheduler_schedule_lag_seconds`
+        // or `scheduler_incomplete_runs` is the intended trigger for downstream
+        // eventing (redrive, page, webhook).
+        #[cfg(feature = "enterprise")]
+        {
+            let _ = writeln!(out, "# HELP scheduler_overdue_schedules Catch-up schedules with an outstanding missed fire.");
+            let _ = writeln!(out, "# TYPE scheduler_overdue_schedules gauge");
+            let _ = writeln!(out, "scheduler_overdue_schedules {}", self.overdue_schedules.load(Ordering::Relaxed));
+            let _ = writeln!(out, "# HELP scheduler_schedule_lag_seconds Largest catch-up lag across schedules (oldest outstanding miss).");
+            let _ = writeln!(out, "# TYPE scheduler_schedule_lag_seconds gauge");
+            let _ = writeln!(out, "scheduler_schedule_lag_seconds {}", self.schedule_lag_seconds.load(Ordering::Relaxed));
+            let _ = writeln!(out, "# HELP scheduler_incomplete_runs Runs still running past the stall SLA (suspected incomplete).");
+            let _ = writeln!(out, "# TYPE scheduler_incomplete_runs gauge");
+            let _ = writeln!(out, "scheduler_incomplete_runs {}", self.incomplete_runs.load(Ordering::Relaxed));
+        }
 
         let _ = writeln!(out, "# HELP scheduler_uptime_seconds Seconds since this scheduler booted.");
         let _ = writeln!(out, "# TYPE scheduler_uptime_seconds gauge");

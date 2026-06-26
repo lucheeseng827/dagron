@@ -6,7 +6,7 @@
 //! users. On startup `bootstrap_admin` seeds a first admin from env so the very
 //! first login needs no manual DB step.
 
-use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
 use argon2::Argon2;
 use axum::extract::State;
 use axum::http::header::SET_COOKIE;
@@ -49,46 +49,22 @@ pub async fn login(
     State(state): State<AppState>,
     Json(body): Json<LoginBody>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let row: Option<(String, String, String, String)> = sqlx::query_as(
-        "SELECT id, name, pw_hash, groups FROM users WHERE email = $1",
-    )
-    .bind(&body.email)
-    // Auth is a primary-pool decision: read from write_pool so a just-created
-    // user (or a fresh group change) is visible immediately and not subject to
-    // replica lag if read_pool ever points at a read replica.
-    .fetch_optional(&state.write_pool)
-    .await
-    .map_err(|e| {
-        tracing::error!(error = ?e, "login query failed");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    // Verify the password. To avoid leaking which emails exist via response
-    // timing, the no-such-user path still performs an Argon2 verify against a
-    // fixed dummy hash before returning the same generic 401.
-    let (id, name, pw_hash, groups) = match row {
-        Some(r) => r,
-        None => {
-            if let Ok(dummy) = PasswordHash::new(dummy_pw_hash()) {
-                let _ = Argon2::default().verify_password(body.password.as_bytes(), &dummy);
-            }
-            return Err(StatusCode::UNAUTHORIZED);
-        }
+    // Authentication goes through the identity seam (OSS default = local argon2;
+    // EE = SSO). dagron-api still owns the session it mints below.
+    let user = state
+        .identity
+        .authenticate_password(&body.email, &body.password)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = ?e, "authentication backend failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    // None = bad credentials → the same generic 401 (no account-existence leak).
+    let Some(user) = user else {
+        return Err(StatusCode::UNAUTHORIZED);
     };
 
-    let parsed = PasswordHash::new(&pw_hash).map_err(|e| {
-        tracing::error!(error = ?e, "stored password hash is malformed");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    if Argon2::default()
-        .verify_password(body.password.as_bytes(), &parsed)
-        .is_err()
-    {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
-    let groups: Vec<String> = serde_json::from_str(&groups).unwrap_or_default();
-    let token = mint_token(&state.jwt_secret, &id, &body.email, &name, groups)
+    let token = mint_token(&state.jwt_secret, &user.id, &user.email, &user.name, user.groups)
         .map_err(|e| {
             tracing::error!(error = ?e, "minting token failed");
             StatusCode::INTERNAL_SERVER_ERROR
@@ -213,20 +189,6 @@ fn hash_password(password: &str) -> anyhow::Result<String> {
         .hash_password(password.as_bytes(), &salt)
         .map(|h| h.to_string())
         .map_err(|e| anyhow::anyhow!("argon2: {e}"))
-}
-
-/// A fixed, lazily-computed Argon2 hash used only to equalize timing on the
-/// no-such-user login path, so account existence can't be probed via response
-/// time. Never matches a real password.
-fn dummy_pw_hash() -> &'static str {
-    static H: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    H.get_or_init(|| {
-        let salt = SaltString::generate(&mut OsRng);
-        Argon2::default()
-            .hash_password(b"timing-equalizer-not-a-real-password", &salt)
-            .expect("hashing the dummy password should not fail")
-            .to_string()
-    })
 }
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────

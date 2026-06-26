@@ -4,11 +4,12 @@
 FROM rust:1.94-slim-bookworm AS builder
 WORKDIR /app
 # dagron-api builds standalone — its own crate, not via the module workspace. It
-# only needs the sibling dagron-logging path dep, so we deliberately do NOT copy
-# the workspace root Cargo.toml (which would pull in the unrelated engine libs).
-# Both crates live under crates/; the in-image layout mirrors that so the
-# `../dagron-logging` path dep resolves.
+# only needs sibling OSS path deps (dagron-logging, dagron-identity), so we
+# deliberately do NOT copy the workspace root Cargo.toml (which would pull in the
+# unrelated engine libs). The in-image layout mirrors crates/ so the path deps
+# resolve.
 COPY crates/dagron-logging/ ./crates/dagron-logging/
+COPY crates/dagron-identity/ ./crates/dagron-identity/
 COPY crates/dagron-api/Cargo.toml ./crates/dagron-api/Cargo.toml
 WORKDIR /app/crates/dagron-api
 # Compile dependencies against a stub main first so this layer is cached and a

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dagron-sdk"
+dynamic = ["version"]
+description = "Author dagron DAGs in Python and drive the dagron-api control plane (runs, workflows, schedules)."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+keywords = ["dagron", "workflow", "dag", "scheduler", "orchestration"]
+dependencies = []
+
+[project.urls]
+Roadmap = "https://github.com/lucheeseng827/nick-rust-project"
+
+[tool.setuptools]
+py-modules = ["dagron"]
+
+# Single source of truth for the version: `dagron.__version__`. Bump it there only
+# (see RELEASING.md); setuptools reads the literal statically at build time.
+[tool.setuptools.dynamic]
+version = { attr = "dagron.__version__" }

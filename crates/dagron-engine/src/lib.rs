@@ -14,6 +14,8 @@ pub use hooks::Seams;
 // belonging to any one, so they live in the engine alongside the run loop.
 #[cfg(feature = "ops")]
 mod api;
+#[cfg(feature = "enterprise")]
+mod backfill;
 #[cfg(feature = "ops")]
 mod cron;
 #[cfg(feature = "ops")]
@@ -305,6 +307,11 @@ pub async fn run(seams: Seams) -> Result<()> {
         let db_schedules_on = std::env::var("DB_SCHEDULES")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        // Automatic backfill & self-healing (QW3 auto-catchup / EE): opt-in via
+        // AUTO_BACKFILL=1. Like DB schedules it is a resident time-source, so a
+        // one-shot run does not exit while the loop is armed to heal future gaps.
+        #[cfg(feature = "enterprise")]
+        let auto_backfill_cfg = backfill::Config::from_env();
 
         // API_ADDR only makes this a server if it actually parses and the API
         // spawns. If it's set but invalid the API is disabled, so it must not
@@ -332,10 +339,19 @@ pub async fn run(seams: Seams) -> Result<()> {
             }
         }
         // Any of these makes the process a long-running server, not a one-shot run.
-        stay_resident =
-            api_on || cron_config.is_some() || gc_retention_secs.is_some() || db_schedules_on;
+        stay_resident = api_on
+            || cron_config.is_some()
+            || gc_retention_secs.is_some()
+            || db_schedules_on;
+        #[cfg(feature = "enterprise")]
+        { stay_resident = stay_resident || auto_backfill_cfg.is_some(); }
 
-        if cron_config.is_some() || gc_retention_secs.is_some() || db_schedules_on {
+        let needs_leadership = cron_config.is_some()
+            || gc_retention_secs.is_some()
+            || db_schedules_on;
+        #[cfg(feature = "enterprise")]
+        let needs_leadership = needs_leadership || auto_backfill_cfg.is_some();
+        if needs_leadership {
             let lease_secs: i64 = std::env::var("LEADER_LEASE_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -348,6 +364,15 @@ pub async fn run(seams: Seams) -> Result<()> {
             if db_schedules_on {
                 let (p, l, m) = (pool.clone(), Arc::clone(&is_leader), Arc::clone(&metrics));
                 tokio::spawn(async move { schedule::run(p, l, m).await });
+            }
+
+            // Automatic backfill & self-healing (QW3 auto-catchup / EE) — leadership-gated
+            // catch-up of missed fires + auto-rerun of failed runs, republishing schedule
+            // lag / incomplete-run state as metrics.
+            #[cfg(feature = "enterprise")]
+            if let Some(cfg) = auto_backfill_cfg {
+                let (p, l, m) = (pool.clone(), Arc::clone(&is_leader), Arc::clone(&metrics));
+                tokio::spawn(async move { backfill::run(p, cfg, l, m).await });
             }
 
             if let Some(path) = cron_config {
@@ -421,6 +446,21 @@ pub async fn run(seams: Seams) -> Result<()> {
     // Simple counter: how many tasks are currently in-flight inside the worker pool.
     let mut in_flight: usize = 0;
 
+    // Optional OpenLineage emitter (data lineage parity). Off unless
+    // OPENLINEAGE_URL is set; emits a terminal RunEvent per finalized run.
+    let lineage = dagron_lineage::OpenLineageClient::from_env();
+    if lineage.is_some() {
+        info!("OpenLineage emit enabled");
+    }
+
+    // Optional artifact store (XCom / Argo-artifact parity). When
+    // DAGRON_ARTIFACT_DIR is set, each dispatched task gets a per-run shared dir
+    // via `DAGRON_ARTIFACTS` so tasks in a run can pass files. Off otherwise.
+    let artifact_store = dagron_artifact::LocalFsStore::from_env();
+    if artifact_store.is_some() {
+        info!("artifact store enabled (DAGRON_ARTIFACTS injected per task)");
+    }
+
     info!("reconcile loop running (multi-run, queue-driven daemon)");
 
     loop {
@@ -443,20 +483,54 @@ pub async fn run(seams: Seams) -> Result<()> {
         if capacity > 0 {
             let claimed = db::claim_ready(&pool, &worker_id, capacity as i64).await?;
             for task in claimed {
-                let (ctx, max_attempts, retry_delay_secs) = match &task.input {
+                let (mut ctx, max_attempts, retry_delay_secs) = match &task.input {
                     Some(json) => match serde_json::from_str::<dag::TaskSpec>(json) {
-                        Ok(spec) => (
-                            ExecContext {
-                                command: spec.command,
-                                timeout_secs: spec.timeout_secs,
-                                docker_image: spec.docker_image,
-                                env: spec.env,
-                                resources: spec.resources,
-                                service_account: spec.service_account,
-                            },
-                            spec.max_attempts,
-                            spec.retry_delay_secs,
-                        ),
+                        Ok(spec) => {
+                            // Start with the declared env, then append any top-level
+                            // string keys from `input` so parameterized reruns
+                            // (deep-merged `params`) visibly change task behavior
+                            // without requiring the workflow author to thread each
+                            // param through an explicit `env:` entry.
+                            #[cfg(not(feature = "enterprise"))]
+                            let env = spec.env;
+                            #[cfg(feature = "enterprise")]
+                            let mut env = spec.env;
+                            // EE: merge top-level string keys from `input` as env vars
+                            // so parameterized reruns (params deep-merge) visibly change
+                            // task behavior without threading each param through an explicit
+                            // `env:` entry. `spec.env` is authoritative: skip any key whose
+                            // uppercased form already appears there, and reject names with
+                            // characters outside [A-Z0-9_] to prevent injection of reserved
+                            // names (PATH, HOME, etc.).
+                            #[cfg(feature = "enterprise")]
+                            if let Some(serde_json::Value::Object(map)) = &spec.input {
+                                let declared: std::collections::HashSet<String> =
+                                    env.iter().map(|e| e.name.clone()).collect();
+                                for (k, v) in map {
+                                    if let Some(s) = v.as_str() {
+                                        let name = k.to_uppercase();
+                                        if declared.contains(&name)
+                                            || !name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+                                        {
+                                            continue;
+                                        }
+                                        env.push(dag::EnvVar { name, value: s.to_string() });
+                                    }
+                                }
+                            }
+                            (
+                                ExecContext {
+                                    command: spec.command,
+                                    timeout_secs: spec.timeout_secs,
+                                    docker_image: spec.docker_image,
+                                    env,
+                                    resources: spec.resources,
+                                    service_account: spec.service_account,
+                                },
+                                spec.max_attempts,
+                                spec.retry_delay_secs,
+                            )
+                        }
                         Err(e) => {
                             // Poison row: a persisted spec this build can't parse.
                             // Failing the whole loop here would crash-loop the
@@ -479,6 +553,19 @@ pub async fn run(seams: Seams) -> Result<()> {
                     },
                     None => (ExecContext::new(vec!["true".to_string()], None, None), 1, 0),
                 };
+
+                // Artifact passing: give this task the run's shared artifact dir.
+                if let Some(store) = &artifact_store {
+                    match store.prepare_run_dir(&task.run_id).await {
+                        Ok(dir) => ctx.env.push(dag::EnvVar {
+                            name: "DAGRON_ARTIFACTS".to_string(),
+                            value: dir,
+                        }),
+                        Err(e) => {
+                            tracing::warn!(error = %e, run = %task.run_id, "could not prepare artifact dir")
+                        }
+                    }
+                }
 
                 info!(
                     task = %task.name,
@@ -578,6 +665,19 @@ pub async fn run(seams: Seams) -> Result<()> {
             info!(%run_id, %status, "run complete");
             // Edition seam: OSS no-op; downstream editions may emit the run event.
             seams.run_sink.on_run_completed(&run_id, &status.to_string()).await;
+            // OpenLineage: emit the terminal RunEvent (best-effort — a lineage
+            // backend being down never affects run execution).
+            if let Some(ol) = &lineage {
+                let job = db::workflow_name_for_run(&pool, &run_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| run_id.clone());
+                let failed = status.to_string() == "failed";
+                if let Err(e) = ol.emit_run_completed(&run_id, &job, failed).await {
+                    tracing::warn!(error = %e, %run_id, "OpenLineage emit failed");
+                }
+            }
         }
 
         // ── Step 6: drain-mode shutdown ─────────────────────────────────────

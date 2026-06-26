@@ -42,21 +42,9 @@ engine:
   service:
     type: ClusterIP
 
-# ── Operator ─────────────────────────────────────────────────────────────────
-# kube-rs operator that watches Workflow/CronWorkflow CRs cluster-wide and
-# upserts them into the dagron datastore.
-operator:
-  image: mancube/dagron-operator:0.2.0
-  imagePullPolicy: IfNotPresent
-  replicas: 1
-  rustLog: info
-  resources:
-    requests: {cpu: 50m, memory: 64Mi}
-    limits: {memory: 256Mi}
-  # The operator watches CRs cluster-wide (Api::all), so it gets a ClusterRole.
-  # Set false and supply your own binding to scope it down.
-  rbac:
-    create: true
+# The kube-rs operator (Workflow/CronWorkflow reconciler) is a separate, closed
+# component — its deployment, CRDs, and values are NOT part of this chart. Deploy
+# it from the operator's own private overlay if you use it.
 
 # ── Datastore ──────────────────────────────────────────────────────────────
 # Throwaway single-replica Postgres for testing. For anything real, set

@@ -1,5 +1,18 @@
 use serde::{Deserialize, Serialize};
 
+/// A claimed transactional-outbox event, handed to a delivery worker. Written in
+/// the same transaction as the run finalization (see `db::reap_completed_runs`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboxEvent {
+    pub id: String,
+    pub run_id: String,
+    pub event_type: String,
+    /// JSON event body (the delivery worker forwards this verbatim).
+    pub payload: String,
+    /// Delivery attempts so far (0 on first claim).
+    pub attempts: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")] // JSON matches the DB TEXT value (e.g. "running")
@@ -173,4 +186,26 @@ pub struct DueSchedule {
     pub id: String,
     pub cron_expr: String,
     pub spec: String,
+}
+
+/// A schedule opted into automatic catch-up (QW3 auto-catchup). Read by the engine's
+/// leadership-gated auto-backfill loop: it enumerates the cron fire-times missed
+/// between `last_fired_at` (bounded by `catchup_window_secs`) and now, then
+/// materializes each through the `schedule_backfills` dedup ledger.
+///
+/// `catchup_window_secs` / `catchup_max_runs` are per-schedule overrides of the
+/// engine's env defaults — `None` (NULL column) means "use the engine default".
+#[cfg(feature = "enterprise")]
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CatchupSchedule {
+    pub id: String,
+    pub cron_expr: String,
+    pub spec: String,
+    /// Last time the normal schedule loop fired this row (the catch-up lower
+    /// bound). `None` before the schedule has ever fired.
+    pub last_fired_at: Option<String>,
+    /// How far back to look for misses, overriding the engine default.
+    pub catchup_window_secs: Option<i64>,
+    /// Per-sweep run cap, overriding the engine default.
+    pub catchup_max_runs: Option<i64>,
 }

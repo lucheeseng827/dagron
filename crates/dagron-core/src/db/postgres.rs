@@ -47,6 +47,8 @@ pub async fn init_pool(conn: &str) -> Result<Pool> {
         .await?;
 
     sqlx::migrate!("./migrations_pg").run(&pool).await?;
+    #[cfg(feature = "enterprise")]
+    sqlx::migrate!("./migrations_pg_ee").run(&pool).await?;
     Ok(pool)
 }
 
@@ -533,6 +535,166 @@ pub async fn advance_schedule(pool: &Pool, id: &str, next_fire_at: &str, fired_a
     Ok(())
 }
 
+// ── QW3-catchup automatic backfill & self-healing ───────────────────────────────────
+//
+// Postgres mirror of the SQLite QW3-catchup family — identical contracts, `$n` binds. See
+// the SQLite copies for the full rationale. Powers the engine's leadership-gated
+// `backfill.rs`: catch a schedule up after a gap, and auto-rerun failed runs, both
+// bounded and emitted to the transactional outbox.
+
+/// Schedules opted into automatic catch-up, joined to their workflow spec.
+#[cfg(feature = "enterprise")]
+pub async fn list_catchup_schedules(pool: &Pool) -> Result<Vec<crate::models::CatchupSchedule>> {
+    use crate::models::CatchupSchedule;
+    let rows = sqlx::query_as::<_, CatchupSchedule>(
+        "SELECT s.id AS id, s.cron_expr AS cron_expr, w.spec AS spec,
+                s.last_fired_at AS last_fired_at,
+                s.catchup_window_secs AS catchup_window_secs,
+                s.catchup_max_runs AS catchup_max_runs
+         FROM schedules s JOIN workflows w ON w.id = s.workflow_id
+         WHERE s.enabled = 1 AND s.catchup = 1",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Claim one backfill slot in the dedup ledger (true iff newly inserted).
+#[cfg(feature = "ops")]
+pub async fn claim_backfill_slot(
+    pool: &Pool,
+    schedule_id: &str,
+    logical_date: &str,
+    now: &str,
+) -> Result<bool> {
+    let n = sqlx::query(
+        "INSERT INTO schedule_backfills (schedule_id, logical_date, created_at)
+         VALUES ($1, $2, $3) ON CONFLICT (schedule_id, logical_date) DO NOTHING",
+    )
+    .bind(schedule_id)
+    .bind(logical_date)
+    .bind(now)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(n > 0)
+}
+
+/// Record which run filled a claimed slot (best-effort).
+#[cfg(feature = "ops")]
+pub async fn record_backfill_run(
+    pool: &Pool,
+    schedule_id: &str,
+    logical_date: &str,
+    run_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE schedule_backfills SET run_id = $1 WHERE schedule_id = $2 AND logical_date = $3",
+    )
+    .bind(run_id)
+    .bind(schedule_id)
+    .bind(logical_date)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Release a claimed slot whose `create_run` failed so a later sweep can retry it.
+#[cfg(feature = "ops")]
+pub async fn release_backfill_slot(pool: &Pool, schedule_id: &str, logical_date: &str) -> Result<()> {
+    sqlx::query("DELETE FROM schedule_backfills WHERE schedule_id = $1 AND logical_date = $2")
+        .bind(schedule_id)
+        .bind(logical_date)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Terminally-`failed` runs eligible for an automatic rerun (under the attempt
+/// cap, past the cooldown). Newest failures first; bounded by `limit`.
+#[cfg(feature = "enterprise")]
+pub async fn list_failed_runs_for_rerun(
+    pool: &Pool,
+    max_attempts: i64,
+    cooldown_cutoff: &str,
+    limit: i64,
+) -> Result<Vec<String>> {
+    let ids: Vec<(String,)> = sqlx::query_as(
+        "SELECT wr.id
+         FROM workflow_runs wr
+         LEFT JOIN run_reruns rr ON rr.run_id = wr.id
+         WHERE wr.status = 'failed'
+           AND COALESCE(rr.attempts, 0) < $1
+           AND (rr.last_rerun_at IS NULL OR rr.last_rerun_at < $2)
+         ORDER BY wr.finished_at DESC
+         LIMIT $3",
+    )
+    .bind(max_attempts)
+    .bind(cooldown_cutoff)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(ids.into_iter().map(|(id,)| id).collect())
+}
+
+/// Record one auto-rerun attempt against a run (upsert).
+#[cfg(feature = "enterprise")]
+pub async fn bump_rerun_attempt(pool: &Pool, run_id: &str, now: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO run_reruns (run_id, attempts, last_rerun_at)
+         VALUES ($1, 1, $2)
+         ON CONFLICT(run_id) DO UPDATE SET
+             attempts = run_reruns.attempts + 1,
+             last_rerun_at = excluded.last_rerun_at",
+    )
+    .bind(run_id)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Count runs still `running` whose `created_at` predates `stall_cutoff`.
+#[cfg(feature = "enterprise")]
+pub async fn count_incomplete_runs(pool: &Pool, stall_cutoff: &str) -> Result<i64> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workflow_runs WHERE status = 'running' AND created_at < $1",
+    )
+    .bind(stall_cutoff)
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
+/// Append a `pending` event to the transactional outbox out-of-band, and NOTIFY
+/// so a listening drainer wakes promptly (parity with the run-finalization path).
+#[cfg(feature = "enterprise")]
+pub async fn enqueue_outbox_event(
+    pool: &Pool,
+    run_id: &str,
+    event_type: &str,
+    payload: &str,
+) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO event_outbox
+           (id, run_id, event_type, payload, status, attempts, next_attempt_at, created_at)
+         VALUES ($1, $2, $3, $4, 'pending', 0, $5, $6)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(run_id)
+    .bind(event_type)
+    .bind(payload)
+    .bind(&now)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+    notify(&mut *tx, run_id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Number of `workflow_runs` still in the `running` state.
 ///
 /// Used by the queue-ingestion path as an admission gate: the `IngestActor`
@@ -598,20 +760,135 @@ pub async fn reap_completed_runs(pool: &Pool) -> Result<Vec<(String, RunStatus)>
         } else {
             (RunStatus::Succeeded, "succeeded")
         };
+        // Finalize the run and append its outbox event in ONE transaction, so the
+        // event exists iff the finalization commits (transactional outbox).
+        let mut tx = pool.begin().await?;
         let affected = sqlx::query(
             "UPDATE workflow_runs SET status = $1, finished_at = $2 WHERE id = $3 AND status = 'running'",
         )
         .bind(status_str)
         .bind(&now)
         .bind(&run_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if affected > 0 {
+            let payload = serde_json::json!({ "run_id": run_id, "status": status_str }).to_string();
+            sqlx::query(
+                "INSERT INTO event_outbox
+                   (id, run_id, event_type, payload, status, attempts, next_attempt_at, created_at)
+                 VALUES ($1, $2, 'run.completed', $3, 'pending', 0, $4, $5)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&run_id)
+            .bind(&payload)
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
             finalized.push((run_id, status));
+        } else {
+            // Another reaper won the finalize; nothing to emit.
+            tx.rollback().await?;
         }
     }
     Ok(finalized)
+}
+
+/// The workflow definition's name for a run (for lineage / display), if found.
+pub async fn workflow_name_for_run(pool: &Pool, run_id: &str) -> Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT wd.name FROM workflow_runs wr
+         JOIN workflow_definitions wd ON wd.id = wr.definition_id
+         WHERE wr.id = $1",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.0))
+}
+
+// ── Transactional outbox: drain API (for the delivery worker) ──────────────────
+
+/// Claim up to `limit` due, pending outbox events for delivery with
+/// `FOR UPDATE SKIP LOCKED` (coordination-free, like task claiming), deferring
+/// each by `lease_secs` so a concurrent worker won't grab the same event
+/// mid-delivery. At-least-once: a crashed worker's lease lapses and the event is
+/// re-claimed.
+pub async fn claim_outbox_batch(
+    pool: &Pool,
+    limit: i64,
+    lease_secs: i64,
+) -> Result<Vec<crate::models::OutboxEvent>> {
+    let now = chrono::Utc::now();
+    let now_s = now.to_rfc3339();
+    let lease_until = (now + chrono::TimeDelta::seconds(lease_secs)).to_rfc3339();
+
+    let mut tx = pool.begin().await?;
+    let rows = sqlx::query(
+        "SELECT id, run_id, event_type, payload, attempts FROM event_outbox
+         WHERE status = 'pending' AND next_attempt_at <= $1
+         ORDER BY next_attempt_at LIMIT $2
+         FOR UPDATE SKIP LOCKED",
+    )
+    .bind(&now_s)
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let id: String = row.try_get("id")?;
+        sqlx::query("UPDATE event_outbox SET next_attempt_at = $1 WHERE id = $2")
+            .bind(&lease_until)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        out.push(crate::models::OutboxEvent {
+            id,
+            run_id: row.try_get("run_id")?,
+            event_type: row.try_get("event_type")?,
+            payload: row.try_get("payload")?,
+            attempts: row.try_get("attempts")?,
+        });
+    }
+    tx.commit().await?;
+    Ok(out)
+}
+
+/// Mark an outbox event delivered.
+pub async fn mark_outbox_delivered(pool: &Pool, id: &str) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query("UPDATE event_outbox SET status = 'delivered', delivered_at = $1 WHERE id = $2 AND status = 'pending'")
+        .bind(&now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Delivery failed but is retryable: bump attempts, record the error, and set the
+/// next eligible time (`retry_at`, caller computes the backoff).
+pub async fn mark_outbox_failed(pool: &Pool, id: &str, error: &str, retry_at: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE event_outbox SET attempts = attempts + 1, last_error = $1, next_attempt_at = $2 WHERE id = $3 AND status = 'pending'",
+    )
+    .bind(error)
+    .bind(retry_at)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Delivery exhausted its retries: park the event as `dead` (the broker-DLQ analog).
+pub async fn mark_outbox_dead(pool: &Pool, id: &str, error: &str) -> Result<()> {
+    sqlx::query("UPDATE event_outbox SET status = 'dead', attempts = attempts + 1, last_error = $1 WHERE id = $2 AND status = 'pending'")
+        .bind(error)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Returns the terminal RunStatus once every task_run is in a terminal state,

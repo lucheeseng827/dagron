@@ -48,6 +48,8 @@ pub async fn init_pool(db_path: &str) -> Result<Pool> {
         .await?;
 
     sqlx::migrate!("./migrations").run(&pool).await?;
+    #[cfg(feature = "enterprise")]
+    sqlx::migrate!("./migrations_ee").run(&pool).await?;
     Ok(pool)
 }
 
@@ -533,6 +535,178 @@ pub async fn advance_schedule(pool: &Pool, id: &str, next_fire_at: &str, fired_a
     Ok(())
 }
 
+// ── QW3-catchup automatic backfill & self-healing ───────────────────────────────────
+//
+// The QW3 backfill (dagron-api `POST /schedules/:id/backfill`) is operator-driven;
+// these power the engine's leadership-gated auto-backfill loop (`backfill.rs`),
+// which (1) catches a schedule up after a downtime/leadership gap and (2) reruns
+// terminally-failed runs from their failure frontier — both bounded, both emitting
+// to the existing transactional outbox so the action is observable downstream.
+
+/// Schedules opted into automatic catch-up. Joined to the workflow for its spec;
+/// carries `last_fired_at` (the catch-up lower bound) and the per-schedule
+/// window/cap overrides. Only the leadership holder calls this.
+#[cfg(feature = "enterprise")]
+pub async fn list_catchup_schedules(pool: &Pool) -> Result<Vec<crate::models::CatchupSchedule>> {
+    use crate::models::CatchupSchedule;
+    let rows = sqlx::query_as::<_, CatchupSchedule>(
+        "SELECT s.id AS id, s.cron_expr AS cron_expr, w.spec AS spec,
+                s.last_fired_at AS last_fired_at,
+                s.catchup_window_secs AS catchup_window_secs,
+                s.catchup_max_runs AS catchup_max_runs
+         FROM schedules s JOIN workflows w ON w.id = s.workflow_id
+         WHERE s.enabled = 1 AND s.catchup = 1",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Claim one backfill slot `(schedule_id, logical_date)` in the dedup ledger.
+/// Returns `true` only when this call newly inserted the row — a slot a prior
+/// (manual or automatic) backfill already materialized returns `false`, so a
+/// re-sweep of the same window never double-runs it. The composite PK is the gate.
+#[cfg(feature = "ops")]
+pub async fn claim_backfill_slot(
+    pool: &Pool,
+    schedule_id: &str,
+    logical_date: &str,
+    now: &str,
+) -> Result<bool> {
+    let n = sqlx::query(
+        "INSERT INTO schedule_backfills (schedule_id, logical_date, created_at)
+         VALUES (?, ?, ?) ON CONFLICT (schedule_id, logical_date) DO NOTHING",
+    )
+    .bind(schedule_id)
+    .bind(logical_date)
+    .bind(now)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(n > 0)
+}
+
+/// Record which run filled a claimed slot (best-effort; the slot is already held).
+#[cfg(feature = "ops")]
+pub async fn record_backfill_run(
+    pool: &Pool,
+    schedule_id: &str,
+    logical_date: &str,
+    run_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE schedule_backfills SET run_id = ? WHERE schedule_id = ? AND logical_date = ?",
+    )
+    .bind(run_id)
+    .bind(schedule_id)
+    .bind(logical_date)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Release a claimed slot whose `create_run` failed, so the next sweep can retry
+/// it instead of counting it permanently materialized.
+#[cfg(feature = "ops")]
+pub async fn release_backfill_slot(pool: &Pool, schedule_id: &str, logical_date: &str) -> Result<()> {
+    sqlx::query("DELETE FROM schedule_backfills WHERE schedule_id = ? AND logical_date = ?")
+        .bind(schedule_id)
+        .bind(logical_date)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Terminally-`failed` runs eligible for an automatic rerun: under the per-run
+/// attempt cap and past the cooldown since their last auto-rerun. The LEFT JOIN to
+/// `run_reruns` treats a run never auto-rerun (no ledger row) as `attempts = 0`
+/// with no cooldown. Newest failures first; bounded by `limit`.
+#[cfg(feature = "enterprise")]
+pub async fn list_failed_runs_for_rerun(
+    pool: &Pool,
+    max_attempts: i64,
+    cooldown_cutoff: &str,
+    limit: i64,
+) -> Result<Vec<String>> {
+    let ids: Vec<(String,)> = sqlx::query_as(
+        "SELECT wr.id
+         FROM workflow_runs wr
+         LEFT JOIN run_reruns rr ON rr.run_id = wr.id
+         WHERE wr.status = 'failed'
+           AND COALESCE(rr.attempts, 0) < ?
+           AND (rr.last_rerun_at IS NULL OR rr.last_rerun_at < ?)
+         ORDER BY wr.finished_at DESC
+         LIMIT ?",
+    )
+    .bind(max_attempts)
+    .bind(cooldown_cutoff)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(ids.into_iter().map(|(id,)| id).collect())
+}
+
+/// Record one auto-rerun attempt against a run (upsert: first attempt inserts,
+/// subsequent attempts increment). Bounds the self-healing loop so a
+/// deterministically-failing DAG cannot be re-armed forever.
+#[cfg(feature = "enterprise")]
+pub async fn bump_rerun_attempt(pool: &Pool, run_id: &str, now: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO run_reruns (run_id, attempts, last_rerun_at)
+         VALUES (?, 1, ?)
+         ON CONFLICT(run_id) DO UPDATE SET
+             attempts = attempts + 1,
+             last_rerun_at = excluded.last_rerun_at",
+    )
+    .bind(run_id)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Count runs still `running` whose `created_at` predates `stall_cutoff` — the
+/// suspected-incomplete population surfaced as the `scheduler_incomplete_runs`
+/// gauge (a stall-SLA alerting signal, not an auto-action).
+#[cfg(feature = "enterprise")]
+pub async fn count_incomplete_runs(pool: &Pool, stall_cutoff: &str) -> Result<i64> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workflow_runs WHERE status = 'running' AND created_at < ?",
+    )
+    .bind(stall_cutoff)
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
+/// Append a `pending` event to the transactional outbox out-of-band (i.e. not
+/// inside a run-finalization transaction). The auto-backfill loop uses this to
+/// make each catch-up / auto-rerun action deliverable to the same drain worker
+/// that ships `run.completed` — so self-healing is observable downstream.
+#[cfg(feature = "enterprise")]
+pub async fn enqueue_outbox_event(
+    pool: &Pool,
+    run_id: &str,
+    event_type: &str,
+    payload: &str,
+) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO event_outbox
+           (id, run_id, event_type, payload, status, attempts, next_attempt_at, created_at)
+         VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(run_id)
+    .bind(event_type)
+    .bind(payload)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Number of `workflow_runs` still in the `running` state.
 ///
 /// Used by the queue-ingestion path as an admission gate: the `IngestActor`
@@ -602,20 +776,142 @@ pub async fn reap_completed_runs(pool: &Pool) -> Result<Vec<(String, RunStatus)>
         } else {
             (RunStatus::Succeeded, "succeeded")
         };
+        // Finalize the run and append its outbox event in ONE transaction, so the
+        // event exists iff the finalization commits (transactional outbox).
+        let mut tx = pool.begin().await?;
         let affected = sqlx::query(
             "UPDATE workflow_runs SET status = ?, finished_at = ? WHERE id = ? AND status = 'running'",
         )
         .bind(status_str)
         .bind(&now)
         .bind(&run_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if affected > 0 {
+            let payload = serde_json::json!({ "run_id": run_id, "status": status_str }).to_string();
+            sqlx::query(
+                "INSERT INTO event_outbox
+                   (id, run_id, event_type, payload, status, attempts, next_attempt_at, created_at)
+                 VALUES (?, ?, 'run.completed', ?, 'pending', 0, ?, ?)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&run_id)
+            .bind(&payload)
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
             finalized.push((run_id, status));
+        } else {
+            // Another reaper won the finalize; nothing to emit.
+            tx.rollback().await?;
         }
     }
     Ok(finalized)
+}
+
+/// The workflow definition's name for a run (for lineage / display), if found.
+pub async fn workflow_name_for_run(pool: &Pool, run_id: &str) -> Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT wd.name FROM workflow_runs wr
+         JOIN workflow_definitions wd ON wd.id = wr.definition_id
+         WHERE wr.id = ?",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.0))
+}
+
+// ── Transactional outbox: drain API (for the delivery worker) ──────────────────
+
+/// Claim up to `limit` due, pending outbox events for delivery, deferring each by
+/// `lease_secs` (bump `next_attempt_at`) so a concurrent worker won't grab the
+/// same event mid-delivery. At-least-once: a worker that dies after claiming but
+/// before marking simply lets the lease lapse and the event is re-claimed.
+pub async fn claim_outbox_batch(
+    pool: &Pool,
+    limit: i64,
+    lease_secs: i64,
+) -> Result<Vec<crate::models::OutboxEvent>> {
+    let now = chrono::Utc::now();
+    let now_s = now.to_rfc3339();
+    let lease_until = (now + chrono::TimeDelta::seconds(lease_secs)).to_rfc3339();
+
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        id: String,
+        run_id: String,
+        event_type: String,
+        payload: String,
+        attempts: i64,
+    }
+
+    let mut tx = pool.begin().await?;
+    let rows: Vec<Row> = sqlx::query_as::<_, Row>(
+        "SELECT id, run_id, event_type, payload, attempts FROM event_outbox
+         WHERE status = 'pending' AND next_attempt_at <= ?
+         ORDER BY next_attempt_at LIMIT ?",
+    )
+    .bind(&now_s)
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+    for r in &rows {
+        sqlx::query("UPDATE event_outbox SET next_attempt_at = ? WHERE id = ?")
+            .bind(&lease_until)
+            .bind(&r.id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| crate::models::OutboxEvent {
+            id: r.id,
+            run_id: r.run_id,
+            event_type: r.event_type,
+            payload: r.payload,
+            attempts: r.attempts,
+        })
+        .collect())
+}
+
+/// Mark an outbox event delivered.
+pub async fn mark_outbox_delivered(pool: &Pool, id: &str) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query("UPDATE event_outbox SET status = 'delivered', delivered_at = ? WHERE id = ? AND status = 'pending'")
+        .bind(&now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Delivery failed but is retryable: bump attempts, record the error, and set the
+/// next eligible time (`retry_at`, caller computes the backoff).
+pub async fn mark_outbox_failed(pool: &Pool, id: &str, error: &str, retry_at: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE event_outbox SET attempts = attempts + 1, last_error = ?, next_attempt_at = ? WHERE id = ? AND status = 'pending'",
+    )
+    .bind(error)
+    .bind(retry_at)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Delivery exhausted its retries: park the event as `dead` (the broker-DLQ analog).
+pub async fn mark_outbox_dead(pool: &Pool, id: &str, error: &str) -> Result<()> {
+    sqlx::query("UPDATE event_outbox SET status = 'dead', attempts = attempts + 1, last_error = ? WHERE id = ? AND status = 'pending'")
+        .bind(error)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Returns the terminal RunStatus once every task_run is in a terminal state,
@@ -1048,6 +1344,58 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Transactional outbox: finalizing a run emits exactly one pending
+    /// `run.completed` event (atomic with the finalize), and the drain API can
+    /// claim → deliver it, after which it is not re-claimed.
+    #[tokio::test]
+    async fn reap_emits_outbox_event_then_drains() {
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: ob\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let run_id = create_run(&pool, &dag, yaml).await.unwrap();
+
+        advance_ready_tasks(&pool).await.unwrap();
+        let claimed = claim_ready(&pool, "w", 10).await.unwrap();
+        let task = &claimed[0];
+        assert!(mark_task_succeeded(&pool, &task.id, "w", task.version + 1, None)
+            .await
+            .unwrap());
+
+        let finalized = reap_completed_runs(&pool).await.unwrap();
+        assert_eq!(finalized.len(), 1, "the run finalizes");
+
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM event_outbox WHERE run_id = ? AND status = 'pending'",
+        )
+        .bind(&run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, 1, "finalization emitted exactly one pending event");
+
+        let batch = claim_outbox_batch(&pool, 10, 30).await.unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].event_type, "run.completed");
+        assert_eq!(batch[0].run_id, run_id);
+
+        // Leased rows aren't re-claimed within the lease window.
+        assert!(
+            claim_outbox_batch(&pool, 10, 30).await.unwrap().is_empty(),
+            "a leased event is not re-claimed"
+        );
+
+        mark_outbox_delivered(&pool, &batch[0].id).await.unwrap();
+        let delivered: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM event_outbox WHERE status = 'delivered'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(delivered, 1, "delivered event is marked");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A two-task DAG used by the v5/v6 read/cancel/GC tests.
     #[cfg(feature = "ops")]
     async fn seed_run(pool: &Pool) -> String {
@@ -1324,6 +1672,193 @@ mod tests {
         assert_eq!(first.len(), 1, "first claim wins the task");
         let second = claim_ready(&pool, "w2", 10).await.unwrap();
         assert!(second.is_empty(), "a running task cannot be claimed a second time");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── QW3-catchup automatic backfill & self-healing ────────────────────────────────
+
+    /// Insert a workflow + a catch-up-enabled schedule, returning the schedule id.
+    /// `last_fired_at` seeds the catch-up lower bound (None → never fired).
+    #[cfg(all(test, feature = "enterprise"))]
+    async fn seed_catchup_schedule(
+        pool: &Pool,
+        cron: &str,
+        spec_yaml: &str,
+        last_fired_at: Option<&str>,
+    ) -> String {
+        let wf_id = Uuid::new_v4().to_string();
+        let sched_id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query("INSERT INTO workflows (id, name, spec, created_at, updated_at) VALUES (?,?,?,?,?)")
+            .bind(&wf_id)
+            .bind(format!("wf-{wf_id}"))
+            .bind(spec_yaml)
+            .bind(&now)
+            .bind(&now)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO schedules
+               (id, workflow_id, cron_expr, enabled, catchup, next_fire_at, last_fired_at, created_at, updated_at)
+             VALUES (?,?,?,1,1,NULL,?,?,?)",
+        )
+        .bind(&sched_id)
+        .bind(&wf_id)
+        .bind(cron)
+        .bind(last_fired_at)
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sched_id
+    }
+
+    /// A catch-up schedule round-trips through `list_catchup_schedules`, and the
+    /// `schedule_backfills` slot claim dedups: the first claim of a logical date
+    /// wins, a second is a no-op (so a re-sweep can't double-run a missed fire),
+    /// and releasing a slot makes it reclaimable again.
+    #[tokio::test]
+    #[cfg(all(test, feature = "enterprise"))]
+    async fn catchup_listing_and_slot_dedup() {
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: nightly\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let sched_id = seed_catchup_schedule(&pool, "0 0 * * * *", yaml, None).await;
+
+        let listed = list_catchup_schedules(&pool).await.unwrap();
+        assert_eq!(listed.len(), 1, "the catch-up schedule is listed");
+        assert_eq!(listed[0].id, sched_id);
+        assert_eq!(listed[0].spec, yaml, "the workflow spec travels with the row");
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let logical = "2026-01-01T00:00:00+00:00";
+        assert!(
+            claim_backfill_slot(&pool, &sched_id, logical, &now).await.unwrap(),
+            "first claim of a fresh slot wins"
+        );
+        assert!(
+            !claim_backfill_slot(&pool, &sched_id, logical, &now).await.unwrap(),
+            "re-claiming the same slot is a no-op (dedup)"
+        );
+
+        // A non-catch-up schedule is excluded: disabling catchup hides it.
+        sqlx::query("UPDATE schedules SET catchup = 0 WHERE id = ?")
+            .bind(&sched_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(list_catchup_schedules(&pool).await.unwrap().is_empty());
+
+        // Release makes the slot reclaimable again (the create_run-failed path).
+        release_backfill_slot(&pool, &sched_id, logical).await.unwrap();
+        assert!(
+            claim_backfill_slot(&pool, &sched_id, logical, &now).await.unwrap(),
+            "a released slot can be re-claimed"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Auto-rerun eligibility: a fresh `failed` run is a candidate; once its
+    /// attempt ledger reaches the cap it drops out; and a recent rerun is held off
+    /// by the cooldown until the cutoff passes.
+    #[tokio::test]
+    #[cfg(all(test, feature = "enterprise"))]
+    async fn failed_run_rerun_cap_and_cooldown() {
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: r\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let run_id = create_run(&pool, &dag, yaml).await.unwrap();
+        // Drive the run terminal-failed.
+        sqlx::query("UPDATE workflow_runs SET status = 'failed', finished_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(&run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // A fresh failed run (no ledger row → last_rerun_at IS NULL) is a
+        // candidate regardless of cutoff. The cap and cooldown are AND'd, so the
+        // two are exercised independently below.
+        let far_past = "2000-01-01T00:00:00+00:00";
+        let future = (chrono::Utc::now() + chrono::TimeDelta::days(1)).to_rfc3339();
+        let cands = list_failed_runs_for_rerun(&pool, 3, far_past, 100).await.unwrap();
+        assert_eq!(cands, vec![run_id.clone()], "fresh failed run is a candidate");
+
+        // Cap (with a future cutoff so the cooldown clause always passes): under
+        // the cap it stays a candidate; at the cap it drops out.
+        let now = chrono::Utc::now().to_rfc3339();
+        bump_rerun_attempt(&pool, &run_id, &now).await.unwrap();
+        bump_rerun_attempt(&pool, &run_id, &now).await.unwrap();
+        assert_eq!(
+            list_failed_runs_for_rerun(&pool, 3, &future, 100).await.unwrap().len(),
+            1,
+            "attempts=2 < cap=3 → still a candidate"
+        );
+        bump_rerun_attempt(&pool, &run_id, &now).await.unwrap();
+        assert!(
+            list_failed_runs_for_rerun(&pool, 3, &future, 100).await.unwrap().is_empty(),
+            "attempts=3 == cap → no longer auto-rerun"
+        );
+
+        // Cooldown (with a generous cap so only the cooldown clause can exclude):
+        // a far-past cutoff is before last_rerun_at, holding the run off; a future
+        // cutoff lets it through again.
+        assert!(
+            list_failed_runs_for_rerun(&pool, 99, far_past, 100).await.unwrap().is_empty(),
+            "last_rerun_at is newer than the far-past cutoff — cooldown blocks it"
+        );
+        assert_eq!(
+            list_failed_runs_for_rerun(&pool, 99, &future, 100).await.unwrap().len(),
+            1,
+            "once the cutoff passes last_rerun_at the cooldown clears"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The stall gauge counts only runs `running` past the cutoff, and
+    /// `enqueue_outbox_event` lands a deliverable pending row out-of-band.
+    #[tokio::test]
+    #[cfg(all(test, feature = "enterprise"))]
+    async fn incomplete_count_and_outbox_enqueue() {
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: r\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let run_id = create_run(&pool, &dag, yaml).await.unwrap();
+        // Backdate the (still running) run's creation so it is past any near cutoff.
+        let old = (chrono::Utc::now() - chrono::TimeDelta::hours(5)).to_rfc3339();
+        sqlx::query("UPDATE workflow_runs SET created_at = ? WHERE id = ?")
+            .bind(&old)
+            .bind(&run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let cutoff = (chrono::Utc::now() - chrono::TimeDelta::hours(1)).to_rfc3339();
+        assert_eq!(
+            count_incomplete_runs(&pool, &cutoff).await.unwrap(),
+            1,
+            "a 5h-old running run is past the 1h stall cutoff"
+        );
+        // A future-ish cutoff (creation after it) excludes the run.
+        let near = (chrono::Utc::now() - chrono::TimeDelta::hours(9)).to_rfc3339();
+        assert_eq!(
+            count_incomplete_runs(&pool, &near).await.unwrap(),
+            0,
+            "with a 9h cutoff the 5h-old run is not yet stalled"
+        );
+
+        enqueue_outbox_event(&pool, &run_id, "backfill.catchup", "{\"k\":1}").await.unwrap();
+        let batch = claim_outbox_batch(&pool, 10, 30).await.unwrap();
+        assert_eq!(batch.len(), 1, "the enqueued event is claimable");
+        assert_eq!(batch[0].event_type, "backfill.catchup");
+        assert_eq!(batch[0].run_id, run_id);
 
         pool.close().await;
         let _ = std::fs::remove_file(&path);

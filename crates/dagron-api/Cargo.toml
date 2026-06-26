@@ -8,6 +8,11 @@ description = "dagron management API — read-mostly axum service over the dagro
 name = "dagron-api"
 path = "src/main.rs"
 
+[features]
+# Enterprise Edition: parameterized rerun (`params` deep-merge). No extra
+# crate dependencies — purely a code-gate on the rerun endpoint.
+enterprise = []
+
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
@@ -26,6 +31,9 @@ anyhow = "1"
 tracing = "0.1"
 # Shared, env-tunable logging bootstrap (single source of truth).
 dagron-logging = { path = "../dagron-logging" }
+# The identity seam: OSS ships LocalIdentityProvider behind this trait; EE swaps SSO.
+dagron-identity = { path = "../dagron-identity" }
+async-trait = "0.1"
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
 serde_yaml = "0.9"

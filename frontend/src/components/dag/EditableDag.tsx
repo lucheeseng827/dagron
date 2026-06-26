@@ -279,31 +279,31 @@ function TaskPanel({
       )}
 
       {!task.workflow_ref && (
-        <div style={{ display: "flex", gap: 8 }}>
-          <div style={{ flex: 1 }}>
+        <div style={{ display: "flex", gap: 8, alignItems: "stretch" }}>
+          <div style={fieldCol}>
             <Label>Max attempts</Label>
             <input
-              style={inputStyle}
+              style={fieldInput}
               type="number"
               min={1}
               value={task.max_attempts ?? ""}
               onChange={(e) => patch({ max_attempts: intField(e.target.value, 1) })}
             />
           </div>
-          <div style={{ flex: 1 }}>
+          <div style={fieldCol}>
             <Label>Retry delay s</Label>
             <input
-              style={inputStyle}
+              style={fieldInput}
               type="number"
               min={0}
               value={task.retry_delay_secs ?? ""}
               onChange={(e) => patch({ retry_delay_secs: intField(e.target.value, 0) })}
             />
           </div>
-          <div style={{ flex: 1 }}>
+          <div style={fieldCol}>
             <Label>Timeout s</Label>
             <input
-              style={inputStyle}
+              style={fieldInput}
               type="number"
               min={1}
               value={task.timeout_secs ?? ""}
@@ -370,6 +370,14 @@ const inputStyle: React.CSSProperties = {
   marginBottom: 12,
   fontSize: 13,
 };
+// A field column in a multi-column row: stretch to the tallest column (so a label that wraps to
+// two lines doesn't shift this input up), with the input pinned to the bottom so all inputs align.
+const fieldCol: React.CSSProperties = {
+  flex: 1,
+  display: "flex",
+  flexDirection: "column",
+};
+const fieldInput: React.CSSProperties = { ...inputStyle, marginTop: "auto" };
 function Label({ children }: { children: React.ReactNode }) {
   return (
     <div style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 5 }}>

@@ -1,7 +1,7 @@
 # Workspace root. The `dagron` engine binary is the root package; the OSS library
 # crates are members so the whole module shares one Cargo.lock + target dir.
 [workspace]
-members = ["crates/dagron-core", "crates/dagron-executor", "crates/dagron-source", "crates/dagron-engine", "crates/dagron-api", "crates/dagron-logging"]
+members = ["crates/dagron-core", "crates/dagron-executor", "crates/dagron-source", "crates/dagron-engine", "crates/dagron-api", "crates/dagron-identity", "crates/dagron-artifact", "crates/dagron-mcp", "crates/dagron-import", "crates/dagron-lineage", "crates/dagron-logging"]
 # `ee/` (the closed Enterprise/Cloud superset — its own workspace at ee/Cargo.toml)
 # is excluded; the OSS workspace must build without ee/ present (OSS-builds-alone).
 exclude = ["ee"]
@@ -27,6 +27,9 @@ sqlite = ["dagron-engine/sqlite"]
 postgres = ["dagron-engine/postgres"]
 ops = ["dagron-engine/ops"]
 kubernetes = ["dagron-engine/kubernetes"]
+# Enterprise Edition: auto-backfill, run_reruns, parameterized rerun, EE
+# metrics, and outbox eventing. Implies `ops`.
+enterprise = ["dagron-engine/enterprise"]
 
 [dependencies]
 # All engine logic lives in dagron-engine; this binary just calls run() with the

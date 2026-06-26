@@ -12,10 +12,12 @@
 
 mod auth;
 mod expand;
+mod identity;
 mod routes;
 mod state;
 mod stream;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -67,12 +69,18 @@ async fn main() -> Result<()> {
     // Broadcast channel for live task events; the listener that feeds it is added in 01-04.
     let (tx, _rx) = broadcast::channel::<TaskEvent>(1024);
 
+    // OSS identity: verify credentials against the local users table. The
+    // Enterprise edition swaps an SSO provider in behind the same seam.
+    let identity: Arc<dyn dagron_identity::IdentityProvider> =
+        Arc::new(identity::LocalIdentityProvider::new(pool.clone()));
+
     let state = AppState {
         read_pool: pool.clone(),
         write_pool: pool.clone(),
         tx: tx.clone(),
         jwt_secret,
         cookie_secure,
+        identity,
     };
 
     // dagron-api owns the users table; ensure it exists before serving login.

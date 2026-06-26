@@ -1,0 +1,22 @@
+[package]
+name = "dagron-import"
+version = "0.1.0"
+edition = "2021"
+description = "dagron importers — convert other orchestrators' workflow specs to dagron DAG YAML. Argo Workflows today; more to come."
+
+[[bin]]
+name = "dagron-import"
+path = "src/main.rs"
+
+[lib]
+name = "dagron_import"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+anyhow = "1"
+
+[dev-dependencies]
+# Validate generated specs against the real dagron parser.
+dagron-core = { path = "../dagron-core", features = ["sqlite"] }

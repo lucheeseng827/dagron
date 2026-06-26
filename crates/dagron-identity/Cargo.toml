@@ -1,0 +1,13 @@
+[package]
+name = "dagron-identity"
+version = "0.1.0"
+edition = "2021"
+description = "dagron-api identity seam: the IdentityProvider trait + VerifiedUser. OSS ships a local (argon2) provider; the Enterprise edition plugs SSO behind the same trait."
+
+[lib]
+name = "dagron_identity"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"

@@ -1,0 +1,16 @@
+# DE-1 — "Pipeline missed runs during a deploy / outage" → automatic catch-up (M2).
+#
+# An ordinary hourly rollup. Save it as a workflow, attach an hourly schedule with
+# `catchup: true`, and the engine's auto-backfill loop (AUTO_BACKFILL=1) fills
+# every cron fire-time missed inside the catch-up window the first time it sweeps —
+# bounded by the window + per-sweep cap so a long gap heals across ticks, and
+# deduped via the schedule_backfills ledger so it never double-runs a slot.
+#
+# Walkthrough: examples/backfill/README.md  ·  Use cases: docs/BACKFILL_USECASES.md
+name: sales_rollup
+tasks:
+  - name: extract
+    command: ["sh", "-c", "echo 'extract sales for this hour'"]
+  - name: rollup
+    command: ["sh", "-c", "echo 'aggregate hourly rollup'"]
+    depends_on: [extract]

@@ -1,0 +1,27 @@
+# DS-2 — "Re-run an experiment pipeline with new hyperparameters" → parameterized
+# re-run (M5).
+#
+# The hyperparameters live in `env` so the bundled `sh` tasks can echo them; a
+# real training image would read them (or its task `input`, where a rerun's
+# `params` are deep-merged). `prepare-features` sleeps briefly so you have a window
+# to cancel the first (default-config) run before re-running it with new params:
+#
+#   run → cancel → rerun {"params":{"learning_rate":"0.05","epochs":"25"}}
+#
+# The rerun resets the cancelled cone to pending and merges the params into each
+# reset task's stored input (inspect with psql — see the README).
+#
+# Walkthrough: examples/backfill/README.md
+name: train_experiment
+tasks:
+  - name: prepare-features
+    command: ["sh", "-c", "echo 'materialize training features'; sleep 20"]
+  - name: train
+    command: ["sh", "-c", "echo \"train: lr=$LEARNING_RATE epochs=$EPOCHS\""]
+    depends_on: [prepare-features]
+    env:
+      - { name: LEARNING_RATE, value: "0.01" }
+      - { name: EPOCHS, value: "10" }
+  - name: evaluate
+    command: ["sh", "-c", "echo 'evaluate + register metrics'"]
+    depends_on: [train]

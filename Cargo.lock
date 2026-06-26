@@ -428,10 +428,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "argon2",
+ "async-trait",
  "axum",
  "base64",
  "chrono",
  "cron",
+ "dagron-identity",
  "dagron-logging",
  "futures",
  "jsonwebtoken",
@@ -446,6 +448,15 @@ dependencies = [
  "tower-http",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "dagron-artifact"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "tokio",
 ]
 
 [[package]]
@@ -474,8 +485,10 @@ dependencies = [
  "axum",
  "chrono",
  "cron",
+ "dagron-artifact",
  "dagron-core",
  "dagron-executor",
+ "dagron-lineage",
  "dagron-logging",
  "dagron-source",
  "ractor",
@@ -508,9 +521,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "dagron-identity"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+]
+
+[[package]]
+name = "dagron-import"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dagron-core",
+ "serde",
+ "serde_yaml",
+]
+
+[[package]]
+name = "dagron-lineage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "reqwest",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "dagron-logging"
 version = "0.1.0"
 dependencies = [
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "dagron-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

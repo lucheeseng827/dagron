@@ -96,6 +96,7 @@ pre,
 .dy-navitem:hover {
   background: rgba(255, 255, 255, 0.04);
   color: var(--fg);
+  text-decoration: none;
 }
 .dy-navitem-active {
   color: var(--fg);
@@ -116,6 +117,9 @@ pre,
   align-items: center;
   gap: 11px;
   padding: 2px 6px 14px;
+}
+.dy-brand-row:hover {
+  text-decoration: none;
 }
 .dy-logo {
   position: relative;
@@ -483,6 +487,8 @@ a {
   color: var(--accent);
   text-decoration: none;
 }
+/* App links are styled UI (nav, table rows, buttons), not prose — no underline on hover.
+   Components convey hover via color/background instead. */
 a:hover {
-  text-decoration: underline;
+  text-decoration: none;
 }

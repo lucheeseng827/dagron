@@ -1,0 +1,16 @@
+[package]
+name = "dagron-lineage"
+version = "0.1.0"
+edition = "2021"
+description = "dagron OpenLineage emitter — posts RunEvents (COMPLETE/FAIL) to an OpenLineage backend (Marquez, etc.) for data lineage parity with Airflow."
+
+[lib]
+name = "dagron_lineage"
+path = "src/lib.rs"
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1"
+chrono = "0.4"
+anyhow = "1"
+tracing = "0.1"

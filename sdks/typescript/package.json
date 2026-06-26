@@ -1,0 +1,20 @@
+{
+  "name": "@dagron/sdk",
+  "version": "0.1.1",
+  "description": "Define dagron DAGs in TypeScript/JavaScript and submit them to dagron-api.",
+  "type": "module",
+  "main": "index.mjs",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs"
+    }
+  },
+  "files": ["index.mjs", "index.d.ts", "README.md"],
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "Apache-2.0",
+  "engines": { "node": ">=18" }
+}
