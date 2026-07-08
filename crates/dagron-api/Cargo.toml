@@ -9,7 +9,7 @@ name = "dagron-api"
 path = "src/main.rs"
 
 [features]
-# Enterprise Edition: parameterized rerun (`params` deep-merge). No extra
+# Optional feature: parameterized rerun (`params` deep-merge). No extra
 # crate dependencies — purely a code-gate on the rerun endpoint.
 enterprise = []
 
@@ -17,7 +17,7 @@ enterprise = []
 axum = { version = "0.8", features = ["macros"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal", "time", "process"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -31,7 +31,7 @@ anyhow = "1"
 tracing = "0.1"
 # Shared, env-tunable logging bootstrap (single source of truth).
 dagron-logging = { path = "../dagron-logging" }
-# The identity seam: OSS ships LocalIdentityProvider behind this trait; EE swaps SSO.
+# The identity seam: ships LocalIdentityProvider behind this trait; an alternate provider can swap SSO in.
 dagron-identity = { path = "../dagron-identity" }
 async-trait = "0.1"
 chrono = "0.4"
@@ -39,3 +39,5 @@ uuid = { version = "1", features = ["v4"] }
 serde_yaml = "0.9"
 petgraph = "0.6"
 cron = "0.16"
+# IANA timezone database for DST-safe per-schedule cron (matches the engine).
+chrono-tz = "0.10"

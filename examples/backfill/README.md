@@ -104,7 +104,7 @@ makes re-sweeps idempotent (`skipped`, not re-run).
 
 > Real-world framing: a schedule **paused for a week then re-enabled** has its
 > `last_fired_at` frozen at the pause, so catch-up fills pause→now (clamped to the
-> window) instead of stampeding — the anti-Airflow-`catchup` guard. Toggle it live:
+> window) instead of stampeding — the bounded-catch-up guard. Toggle it live:
 > `PUT /api/schedules/$SID {"catchup":false}` … re-enable later with `{"catchup":true}`.
 
 ---

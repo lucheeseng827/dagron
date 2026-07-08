@@ -36,8 +36,8 @@ pub struct AppState {
     /// Whether the session cookie is marked `Secure` (HTTPS-only). Defaults to
     /// true; set `DAGRON_COOKIE_SECURE=false` for plain-HTTP local dev.
     pub cookie_secure: bool,
-    /// Authentication backend behind the identity seam. OSS default =
-    /// `LocalIdentityProvider` (argon2 against the `users` table); the Enterprise
-    /// edition plugs an SSO provider here.
+    /// Authentication backend behind the identity seam. Default =
+    /// `LocalIdentityProvider` (argon2 against the `users` table); an alternate
+    /// provider can plug an SSO backend in here behind the same trait.
     pub identity: Arc<dyn IdentityProvider>,
 }

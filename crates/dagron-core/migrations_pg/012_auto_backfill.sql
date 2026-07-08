@@ -5,9 +5,8 @@
 -- default). BIGINT to match the i64 binding code (the SQLite path stores
 -- them in dynamically-typed INTEGER).
 --
--- The run_reruns attempt ledger and sweep hot-path indexes are EE-only; they
--- live in migrations_pg_ee/001_ee_backfill.sql and are applied only when the
--- `enterprise` Cargo feature is active.
+-- The run_reruns attempt ledger and sweep hot-path indexes are applied only
+-- when the `enterprise` Cargo feature is active.
 
 ALTER TABLE schedules ADD COLUMN IF NOT EXISTS catchup BIGINT NOT NULL DEFAULT 0
     CHECK (catchup IN (0, 1));

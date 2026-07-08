@@ -234,9 +234,10 @@ mod tests {
             command: vec!["python".to_string(), "/app/etl.py".to_string()],
             timeout_secs: Some(120),
             docker_image: Some("etl-task:latest".to_string()),
-            env: vec![EnvVar { name: "S3_BUCKET".into(), value: "dagron-lt".into() }],
+            env: vec![EnvVar { name: "S3_BUCKET".into(), value: "dagron-lt".into(), value_from: None }],
             resources: Some(ResourceRequirements { requests, limits }),
             service_account: Some("dagron-etl".to_string()),
+            log_sink: None,
         };
         let pod = build_pod("sched-xyz", "etl-task:latest", &ctx.command, &ctx).unwrap();
 

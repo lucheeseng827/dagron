@@ -2,16 +2,16 @@
 name = "dagron-source"
 version = "0.1.0"
 edition = "2021"
-description = "dagron workflow ingestion: the WorkflowSource trait + File/Channel built-in sources, a SourceFactory extension seam, and the ractor IngestActor that turns submissions into runs. Queue backends (Redis/SQS/Kafka/NATS) are an Enterprise add-on (ee/dagron-source-queues)."
+description = "dagron workflow ingestion: the WorkflowSource trait + File/Channel built-in sources, a SourceFactory extension seam, and the ractor IngestActor that turns submissions into runs. Queue backends (Redis/SQS/Kafka/NATS) plug in behind the SourceFactory seam."
 
 [lib]
 name = "dagron_source"
 path = "src/lib.rs"
 
 [features]
-# Backend passthrough to dagron-core. The OSS engine activates the backend on
+# Backend passthrough to dagron-core. The default engine activates the backend on
 # dagron-core directly (so it never needs these), but a standalone build of this
-# lib — or a downstream lib like ee/dagron-source-queues — must be able to resolve
+# lib — or a downstream lib built on it — must be able to resolve
 # core's required backend, since core has no default here (default-features=false).
 sqlite = ["dagron-core/sqlite"]
 postgres = ["dagron-core/postgres"]

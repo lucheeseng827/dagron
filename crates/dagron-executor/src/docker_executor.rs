@@ -110,7 +110,16 @@ impl Executor for DockerExecutor {
         while let Some(item) = logs.next().await {
             match item {
                 Ok(LogOutput::StdOut { message }) => {
-                    log_output.push_str(&String::from_utf8_lossy(&message));
+                    let line = String::from_utf8_lossy(&message);
+                    // Forward to the live-log tail (#17) if wired. The container has
+                    // already stopped here, so for Docker this surfaces the captured
+                    // output through the same append path rather than mid-run — true
+                    // `follow: true` streaming is a documented follow-up; Local
+                    // streams live.
+                    if let Some(sink) = &ctx.log_sink {
+                        sink.append(&line);
+                    }
+                    log_output.push_str(&line);
                 }
                 Ok(LogOutput::StdErr { message }) => {
                     let stderr_line = String::from_utf8_lossy(&message);

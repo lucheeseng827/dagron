@@ -160,6 +160,20 @@ paths:
         `Retry-After` header instead of growing an unbounded backlog. Clients
         should back off and retry.
       operationId: submitRun
+      parameters:
+        - name: wait
+          in: query
+          required: false
+          description: >
+            Synchronous invocation: block until the run reaches a terminal state
+            (or `timeout_secs` elapses) and return its status + result instead of
+            just the id. Response is `200` (not `201`) in this mode.
+          schema: { type: boolean, default: false }
+        - name: timeout_secs
+          in: query
+          required: false
+          description: Max seconds to wait when `wait=true` (default 30, clamped 1–600).
+          schema: { type: integer, default: 30, minimum: 1, maximum: 600 }
       requestBody:
         required: true
         description: The DAG spec.
@@ -172,7 +186,7 @@ paths:
             schema: { type: string }
       responses:
         "201":
-          description: Run created
+          description: Run created (fire-and-forget; `wait` absent/false)
           content:
             application/json:
               schema:
@@ -180,6 +194,13 @@ paths:
                 required: [run_id]
                 properties:
                   run_id: { type: string, format: uuid }
+        "200":
+          description: >
+            Run created and awaited (`wait=true`). A timed-out wait still returns
+            `200` with `finished: false` and the live status.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RunResult" }
         "400":
           description: Invalid DAG (parse error, unknown dependency, or cycle)
           content:
@@ -221,6 +242,82 @@ paths:
                     items: { $ref: "#/components/schemas/TaskRun" }
         "404":
           description: No such run
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          $ref: "#/components/responses/Error"
+
+  /runs/{id}/wait:
+    get:
+      tags: [runs]
+      summary: Long-poll a run until it finishes and return its result
+      description: >
+        Block until the run reaches a terminal state (or `timeout_secs` elapses)
+        and return its status + result (the `result_from` task's output on
+        success). The "await an already-submitted run" half of synchronous
+        invocation — pairs with `POST /runs?wait=true`. A timed-out wait returns
+        `200` with `finished: false` and the live status so the caller re-polls.
+      operationId: waitRun
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+        - name: timeout_secs
+          in: query
+          required: false
+          description: Max seconds to wait (default 30, clamped 1–600).
+          schema: { type: integer, default: 30, minimum: 1, maximum: 600 }
+      responses:
+        "200":
+          description: The run's current (terminal or, on timeout, live) status + result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RunResult" }
+        "404":
+          description: No such run
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          $ref: "#/components/responses/Error"
+
+  /runs/{id}/tasks/{task_id}/logs:
+    get:
+      tags: [runs]
+      summary: Tail a task's output
+      description: >
+        One task's output for live tailing (fast-win #17). With `?offset=`
+        returns only the output past that character offset, plus `next_offset`
+        (resume point) and `eof` (the task is terminal); poll with
+        `?offset=next_offset` until `eof`. Offsets are Unicode-scalar counts, so
+        they never split a multibyte character.
+      operationId: taskLogs
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+        - $ref: "#/components/parameters/TaskId"
+        - name: offset
+          in: query
+          required: false
+          description: Resume tailing from this character offset. Omit for the full output.
+          schema: { type: integer, minimum: 0 }
+      responses:
+        "200":
+          description: The task's output (or the slice past `offset`) with tail metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [task_id, name, status, attempt, output, offset, next_offset, eof]
+                properties:
+                  task_id: { type: string, format: uuid }
+                  name: { type: string }
+                  status: { $ref: "#/components/schemas/TaskStatus" }
+                  attempt: { type: integer, format: int64 }
+                  output: { type: string }
+                  offset: { type: integer, description: char offset this slice starts at }
+                  next_offset: { type: integer, description: resume point for the next poll }
+                  eof: { type: boolean, description: true once the task is terminal }
+        "404":
+          description: Run or task not found
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -307,6 +404,108 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "409":
           description: Run is not in a rerunnable (failed/cancelled) state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          $ref: "#/components/responses/Error"
+
+  /runs/{id}/tasks/{task_id}/clear:
+    post:
+      tags: [runs]
+      summary: Clear a completed task and re-run its downstream cone
+      description: >
+        Clear + downstream: reset a single completed task and every
+        terminal task that transitively depends on it to `pending`, re-arm the
+        run, and let the reconcile loop re-run just that sub-DAG. Already-
+        `succeeded` tasks outside the cone are untouched. Unlike `rerun`, this
+        re-runs a still-`succeeded` node on demand (e.g. to pick up a fixed
+        input) rather than only recovering failures.
+      operationId: clearTask
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "200":
+          description: Task and downstream cone reset; number of tasks reset returned
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, task_id, cleared]
+                properties:
+                  run_id: { type: string, format: uuid }
+                  task_id: { type: string, format: uuid }
+                  cleared: { type: integer, example: 2, description: tasks reset }
+        "404":
+          description: Run or task not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: Task is not in a clearable (completed) state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          $ref: "#/components/responses/Error"
+
+  /runs/{id}/tasks/{task_id}/approve:
+    post:
+      tags: [runs]
+      summary: Approve a human approval gate
+      description: >
+        Approve a `type: approval` gate that is `awaiting_approval` (fast-win
+        #19): the task succeeds and its dependents advance, so the DAG proceeds
+        past the gate.
+      operationId: approveTask
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "200":
+          description: Gate approved
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApprovalResolution" }
+        "404":
+          description: Run or task not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: Task is not awaiting approval
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          $ref: "#/components/responses/Error"
+
+  /runs/{id}/tasks/{task_id}/reject:
+    post:
+      tags: [runs]
+      summary: Reject a human approval gate
+      description: >
+        Reject a `type: approval` gate that is `awaiting_approval`: the task fails
+        and its `all_success` dependents skip, so the DAG does not proceed past
+        the gate.
+      operationId: rejectTask
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "200":
+          description: Gate rejected
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApprovalResolution" }
+        "404":
+          description: Run or task not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: Task is not awaiting approval
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -410,6 +609,12 @@ components:
       required: true
       description: Run UUID.
       schema: { type: string, format: uuid }
+    TaskId:
+      name: task_id
+      in: path
+      required: true
+      description: Task UUID within the run.
+      schema: { type: string, format: uuid }
     DeadLetterId:
       name: id
       in: path
@@ -452,7 +657,7 @@ components:
     TaskStatus:
       type: string
       description: Task state-machine node.
-      enum: [pending, ready, running, succeeded, failed, skipped, cancelled]
+      enum: [pending, ready, running, awaiting_approval, succeeded, failed, skipped, cancelled]
 
     RunSummary:
       type: object
@@ -477,6 +682,33 @@ components:
         output: { type: string, nullable: true }
         created_at: { type: string, format: date-time }
         finished_at: { type: string, format: date-time, nullable: true }
+
+    RunResult:
+      type: object
+      description: >
+        The outcome of a synchronous invocation (`POST /runs?wait=true` /
+        `GET /runs/{id}/wait`). `result` is the `result_from` task's output on
+        success, otherwise null; `finished` is false only when the wait timed out.
+      required: [run_id, status, finished]
+      properties:
+        run_id: { type: string, format: uuid }
+        status: { $ref: "#/components/schemas/RunStatus" }
+        finished:
+          type: boolean
+          description: True once the run is terminal; false if the wait timed out.
+        result:
+          type: string
+          nullable: true
+          description: The `result_from` task's output on success, else null.
+
+    ApprovalResolution:
+      type: object
+      description: The outcome of resolving a human approval gate (#19).
+      required: [run_id, task_id, resolution]
+      properties:
+        run_id: { type: string, format: uuid }
+        task_id: { type: string, format: uuid }
+        resolution: { type: string, enum: [approved, rejected] }
 
     TaskRun:
       type: object
@@ -582,6 +814,12 @@ components:
       required: [name, tasks]
       properties:
         name: { type: string }
+        result_from:
+          type: string
+          nullable: true
+          description: >
+            Name of the task whose output becomes the run's result (returned by a
+            synchronous invocation). Must name a real, non-hook task.
         tasks:
           type: array
           items: { $ref: "#/components/schemas/TaskSpec" }

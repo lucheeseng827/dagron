@@ -1,0 +1,165 @@
+# Build + push the official multi-arch dagron OSS images to Docker Hub
+# (docker.io/mancube/dagron-engine, -api, -frontend). Active in the PUBLIC MIRROR
+# (lucheeseng827/dagron); inert in the monorepo (the Dockerfiles/Cargo.lock it
+# builds only exist in the mirrored cut, and the monorepo never carries the
+# stamped `v*.*.*` tag this fires on).
+#
+# This is the dagron twin of mergestro-gate's mirror-native publish
+# (module_55/.github/workflows/docker.yml): the OSS release path builds the images
+# IN the open repo, from the open source, instead of pushing them from the private
+# monorepo. Only the three OSS images are ever built here — the closed add-on
+# images (operator / cloud / mcp / step-llm) live in a separate private pipeline
+# and their sources never enter the mirror at all.
+#
+# Requires two secrets in the mirror's `cicd` environment:
+#   DOCKERHUB_USERNAME — a Docker Hub user with push access to the mancube org
+#   DOCKERHUB_TOKEN    — a Docker Hub access token (Read/Write on mancube/dagron-*)
+#
+# Fires automatically on the full-semver version tags the OSS sync stamps on the
+# mirror (`v0.3.0` → mancube/dagron-<img>:0.3.0 + :0.3 + :latest; a prerelease
+# like `v0.3.0-rc.1` publishes the version tags but not :latest). Manual dispatch
+# takes an explicit tag.
+#
+# Each architecture builds NATIVELY — amd64 on ubuntu-latest, arm64 on GitHub's
+# free-for-public-repos arm runners — then a per-image merge job stitches one
+# multi-arch manifest. No QEMU (the emulated arm64 Rust build is punishingly slow).
+
+name: Publish Docker images
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to publish (e.g. 0.3.0)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        # One entry per OSS image. `context`/`file`/`build_args` are relative to
+        # the mirror repo root (= the module_54 cut). Keep FEATURES in lockstep
+        # with the monorepo release: postgres,ops,kubernetes is the k8s-capable
+        # engine build.
+        image:
+          - name: dagron-engine
+            context: "."
+            file: "./Dockerfile"
+            build_args: "FEATURES=postgres,ops,kubernetes"
+          - name: dagron-api
+            context: "."
+            file: "./crates/dagron-api/Dockerfile"
+            build_args: ""
+          - name: dagron-frontend
+            context: "./frontend"
+            file: "./frontend/Dockerfile"
+            build_args: ""
+        arch: [amd64, arm64]
+        # `arch` is a real matrix axis, so these includes attach the platform +
+        # runner to each (image × arch) combination rather than adding new legs.
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    # DOCKERHUB_USERNAME / DOCKERHUB_TOKEN live in the 'cicd' environment.
+    environment: cicd
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Push by digest only — the merge job below owns the human-readable tags.
+      - name: Build + push ${{ matrix.image.name }} (${{ matrix.platform }}, native)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.image.context }}
+          file: ${{ matrix.image.file }}
+          build-args: ${{ matrix.image.build_args }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=docker.io/mancube/${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          cache-from: type=gha,scope=docker-${{ matrix.image.name }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=docker-${{ matrix.image.name }}-${{ matrix.arch }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.image.name }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: cicd
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [dagron-engine, dagron-api, dagron-frontend]
+    steps:
+      - name: Collect this image's per-arch digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-${{ matrix.image }}-*
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: mancube/${{ matrix.image }}
+          # latest=auto → stable semver tags also tag :latest; prereleases don't.
+          # Manual dispatch uses the supplied raw tag.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'docker.io/mancube/${{ matrix.image }}@sha256:%s ' *)
+
+      - name: Inspect published image
+        run: docker buildx imagetools inspect "docker.io/mancube/${{ matrix.image }}:${{ steps.meta.outputs.version }}"

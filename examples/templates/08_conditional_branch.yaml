@@ -3,7 +3,7 @@
 # `when:` on a task (leaf or call) skips it — and any sub-DAG it would expand to —
 # when the expression is false. Drive it from a parameter to switch optional
 # stages on/off at submit time. A skipped task contributes no nodes; downstream
-# tasks that depended only on it become roots (don't block) — Argo-like skip.
+# tasks that depended only on it become roots (don't block).
 #
 # run_tests=true, deploy_prod=false → build, test, stage run; prod-deploy skipped.
 name: conditional-branch

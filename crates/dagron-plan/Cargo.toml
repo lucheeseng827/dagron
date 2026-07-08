@@ -1,0 +1,21 @@
+[package]
+name = "dagron-plan"
+version = "0.1.0"
+edition = "2021"
+description = "dagron-plan — show what a workflow change does before you merge it: diff two DAG specs (resolved through the real parser + expander) into a PR-friendly markdown + Mermaid report with git-diff-style exit codes."
+
+[[bin]]
+name = "dagron-plan"
+path = "src/main.rs"
+
+[lib]
+name = "dagron_plan"
+path = "src/lib.rs"
+
+[dependencies]
+# The plan resolves both specs through the exact parse → expand → validate
+# pipeline the engine uses, so "plan" reflects what would actually run. sqlite is
+# dagron-core's default backend feature (a backend must be selected to compile);
+# nothing here touches a datastore.
+dagron-core = { path = "../dagron-core" }
+anyhow = "1"

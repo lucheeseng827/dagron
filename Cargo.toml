@@ -1,9 +1,9 @@
-# Workspace root. The `dagron` engine binary is the root package; the OSS library
+# Workspace root. The `dagron` engine binary is the root package; the library
 # crates are members so the whole module shares one Cargo.lock + target dir.
 [workspace]
-members = ["crates/dagron-core", "crates/dagron-executor", "crates/dagron-source", "crates/dagron-engine", "crates/dagron-api", "crates/dagron-identity", "crates/dagron-artifact", "crates/dagron-mcp", "crates/dagron-import", "crates/dagron-lineage", "crates/dagron-logging"]
-# `ee/` (the closed Enterprise/Cloud superset — its own workspace at ee/Cargo.toml)
-# is excluded; the OSS workspace must build without ee/ present (OSS-builds-alone).
+members = ["crates/dagron-core", "crates/dagron-executor", "crates/dagron-source", "crates/dagron-engine", "crates/dagron-api", "crates/dagron-identity", "crates/dagron-artifact", "crates/dagron-mcp", "crates/dagron-import", "crates/dagron-plan", "crates/dagron-lineage", "crates/dagron-forge", "crates/dagron-logging"]
+# A sibling `ee/` directory (its own separate workspace, not present here) is
+# excluded so this workspace always builds standalone.
 exclude = ["ee"]
 resolver = "2"
 
@@ -18,7 +18,7 @@ name = "dagron"
 path = "src/main.rs"
 
 [features]
-# The OSS engine is now a thin shell over the dagron-engine library; feature names
+# The engine is a thin shell over the dagron-engine library; feature names
 # are unchanged but forward to it. default = full scheduler with the ops surface;
 # drop `ops` (and pick a backend) for a lean reconcile-only daemon, e.g.
 #   cargo build --no-default-features --features sqlite
@@ -27,13 +27,13 @@ sqlite = ["dagron-engine/sqlite"]
 postgres = ["dagron-engine/postgres"]
 ops = ["dagron-engine/ops"]
 kubernetes = ["dagron-engine/kubernetes"]
-# Enterprise Edition: auto-backfill, run_reruns, parameterized rerun, EE
+# Optional feature: auto-backfill, run_reruns, parameterized rerun, extra
 # metrics, and outbox eventing. Implies `ops`.
 enterprise = ["dagron-engine/enterprise"]
 
 [dependencies]
 # All engine logic lives in dagron-engine; this binary just calls run() with the
-# OSS default seams. default-features = false so a `--features postgres` build does
+# default seams. default-features = false so a `--features postgres` build does
 # not also drag in the engine's default `sqlite` backend (they collide).
 dagron-engine = { path = "crates/dagron-engine", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

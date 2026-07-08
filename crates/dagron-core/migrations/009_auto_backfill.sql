@@ -5,9 +5,8 @@
 -- default). These are dynamically-typed INTEGER here (the Postgres mirror uses
 -- BIGINT to match the i64 binding code).
 --
--- The run_reruns attempt ledger and sweep hot-path indexes are EE-only; they
--- live in migrations_ee/001_ee_backfill.sql and are applied only when the
--- `enterprise` Cargo feature is active.
+-- The run_reruns attempt ledger and sweep hot-path indexes are applied only
+-- when the `enterprise` Cargo feature is active.
 
 ALTER TABLE schedules ADD COLUMN catchup INTEGER NOT NULL DEFAULT 0
     CHECK (catchup IN (0, 1));

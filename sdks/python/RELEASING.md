@@ -116,7 +116,7 @@ python3 -m twine upload dist/*          # uploads the wheel + sdist to PyPI
 ```
 
 Then tag the release so the published artifact is traceable to a commit. This repo
-uses prefixed monorepo tags (mirroring the `dagron-oss-vX.Y.Z` convention) — use a
+uses prefixed monorepo tags — use a
 distinct prefix for the SDK so it doesn't collide with engine releases:
 
 ```bash

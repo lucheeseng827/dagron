@@ -1,10 +1,10 @@
 //! dagron engine — the reconcile-loop daemon as a reusable library.
 //!
 //! [`run`] is the whole scheduler: config from env, executor + worker pool + db
-//! pool + ingest actor, the ops surface, and the multi-run reconcile loop. Both
-//! the OSS `dagron` binary and the downstream binary are thin shells over it,
-//! differing only in the [`Seams`] they pass (built-in vs. extra sources; no-op
-//! vs. active run-lifecycle hooks).
+//! pool + ingest actor, the ops surface, and the multi-run reconcile loop. The
+//! `dagron` binary is a thin shell over it; alternate builds differ only in the
+//! [`Seams`] they pass (built-in vs. extra sources; no-op vs. active
+//! run-lifecycle hooks).
 
 pub mod hooks;
 pub use hooks::Seams;
@@ -16,6 +16,9 @@ pub use hooks::Seams;
 mod api;
 #[cfg(feature = "enterprise")]
 mod backfill;
+// First-class paced backfill jobs (#18) — driven from the schedule loop.
+#[cfg(feature = "ops")]
+mod backfill_jobs;
 #[cfg(feature = "ops")]
 mod cron;
 #[cfg(feature = "ops")]
@@ -24,6 +27,11 @@ mod gc;
 mod leadership;
 #[cfg(feature = "ops")]
 mod schedule;
+// Timezone-aware cron fire-time helper shared by cron/schedule/backfill loops.
+#[cfg(feature = "ops")]
+mod schedule_time;
+// Offline spec validation (`dagron validate`) — pure dagron-core, no ops needed.
+mod validate;
 
 // The engine logic now lives in three library crates. Re-alias them to the module
 // paths the wiring below (and the ops modules) already use — `db::`, `dag::`,
@@ -135,20 +143,70 @@ fn seed_workflow_dir() {
     }
 }
 
+/// Post a terminal commit status for a finalized run, if its spec declares a
+/// `notify.git` target. Best-effort: any failure (spec missing, no notify block,
+/// forge error) is logged and swallowed so run execution is never affected. The
+/// target's `{{ param }}` fields are resolved against the spec's `parameters`
+/// (e.g. `sha: "{{ commit_sha }}"` from the CI caller's submitted parameters).
+async fn post_forge_status(
+    forge: &dagron_forge::ForgeClient,
+    pool: &db::Pool,
+    run_id: &str,
+    status: &str,
+) {
+    let Some(yaml) = db::spec_for_run(pool, run_id).await.ok().flatten() else {
+        return;
+    };
+    let spec: dag::DagSpec = match serde_yaml::from_str(&yaml) {
+        Ok(s) => s,
+        Err(_) => return, // a spec this build can't parse; nothing to notify
+    };
+    let Some(git) = spec.notify.and_then(|n| n.git) else {
+        return; // no notify.git block — the common case
+    };
+    // Resolve templated fields against the workflow parameters.
+    let sub = |s: &str| dagron_core::expand::substitute(s, &spec.parameters);
+    let target = dagron_forge::GitTarget {
+        provider: git.provider,
+        repo: sub(&git.repo),
+        sha: sub(&git.sha),
+        context: git.context.as_deref().map(sub).unwrap_or_else(|| "dagron".to_string()),
+        target_url: git.target_url.as_deref().map(sub),
+    };
+    if target.sha.is_empty() || target.sha.contains("{{") {
+        tracing::warn!(%run_id, "notify.git sha did not resolve (missing parameter?) — skipping forge status");
+        return;
+    }
+    let state = dagron_forge::CommitState::from_run_status(status);
+    if let Err(e) = forge.post_status(&target, state).await {
+        tracing::warn!(error = %e, %run_id, "forge commit status post failed");
+    }
+}
+
 /// Run the dagron scheduler daemon to completion (or until killed). `seams`
-/// selects the edition behaviour; pass `Seams::default()` for the OSS engine.
+/// selects the extension behaviour; pass `Seams::default()` for the built-in
+/// configuration.
 pub async fn run(seams: Seams) -> Result<()> {
-    // Tunable, SaaS-ready logging for the workflow controller (and the worker
+    // Tunable, structured logging for the workflow controller (and the worker
     // pool it spawns). Verbosity/format are env-driven — see the shared
     // `dagron_logging` crate for the full knob list (RUST_LOG / LOG_LEVEL /
     // LOG_FORMAT / …).
     dagron_logging::init("controller");
 
+    let args: Vec<String> = std::env::args().collect();
+
+    // `dagron validate <file|dir>... [--json]` — offline spec lint through the
+    // same parse → expand → graph-validate pipeline every submit path uses.
+    // Handled before any daemon setup — and before `seed_workflow_dir` — so the
+    // subcommand stays side-effect free (no datastore, no executor, no server,
+    // no file seeding).
+    if args.get(1).map(String::as_str) == Some("validate") {
+        return validate::run_cli(&args[2..]);
+    }
+
     // GitOps init: seed /workflows from the image's bundled examples if empty.
     // (Was docker-entrypoint.sh; in-binary now so the image needs no shell.)
     seed_workflow_dir();
-
-    let args: Vec<String> = std::env::args().collect();
 
     // `dagron dev` (QW2) — curated zero-infra local quickstart: SQLite + the
     // management API/Swagger on a fixed local port, resident so the API (and any
@@ -307,8 +365,9 @@ pub async fn run(seams: Seams) -> Result<()> {
         let db_schedules_on = std::env::var("DB_SCHEDULES")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        // Automatic backfill & self-healing (QW3 auto-catchup / EE): opt-in via
-        // AUTO_BACKFILL=1. Like DB schedules it is a resident time-source, so a
+        // Automatic backfill & self-healing (behind the `enterprise` feature):
+        // opt-in via AUTO_BACKFILL=1. Like DB schedules it is a resident
+        // time-source, so a
         // one-shot run does not exit while the loop is armed to heal future gaps.
         #[cfg(feature = "enterprise")]
         let auto_backfill_cfg = backfill::Config::from_env();
@@ -348,7 +407,10 @@ pub async fn run(seams: Seams) -> Result<()> {
 
         let needs_leadership = cron_config.is_some()
             || gc_retention_secs.is_some()
-            || db_schedules_on;
+            || db_schedules_on
+            // #18: pace backfill jobs in any resident daemon (they can be created
+            // via the API whenever the server is up, independent of DB_SCHEDULES).
+            || stay_resident;
         #[cfg(feature = "enterprise")]
         let needs_leadership = needs_leadership || auto_backfill_cfg.is_some();
         if needs_leadership {
@@ -366,9 +428,16 @@ pub async fn run(seams: Seams) -> Result<()> {
                 tokio::spawn(async move { schedule::run(p, l, m).await });
             }
 
-            // Automatic backfill & self-healing (QW3 auto-catchup / EE) — leadership-gated
-            // catch-up of missed fires + auto-rerun of failed runs, republishing schedule
-            // lag / incomplete-run state as metrics.
+            // First-class paced backfill jobs (#18) — leadership-gated, always on in
+            // a resident daemon so an API-created job is paced to completion.
+            {
+                let (p, l, m) = (pool.clone(), Arc::clone(&is_leader), Arc::clone(&metrics));
+                tokio::spawn(async move { backfill_jobs::run(p, l, m).await });
+            }
+
+            // Automatic backfill & self-healing (behind the `enterprise` feature) —
+            // leadership-gated catch-up of missed fires + auto-rerun of failed runs,
+            // republishing schedule lag / incomplete-run state as metrics.
             #[cfg(feature = "enterprise")]
             if let Some(cfg) = auto_backfill_cfg {
                 let (p, l, m) = (pool.clone(), Arc::clone(&is_leader), Arc::clone(&metrics));
@@ -441,6 +510,12 @@ pub async fn run(seams: Seams) -> Result<()> {
 
     let (tx, mut rx) = mpsc::unbounded_channel::<worker::TaskResult>();
 
+    // Live-log stream (#17): workers push incremental output chunks here as tasks
+    // run; the loop drains them each tick and appends to the task's stored output
+    // for tailing. Separate from the result channel so partial output is visible
+    // before the task's terminal result arrives.
+    let (log_tx, mut log_rx) = mpsc::unbounded_channel::<dagron_executor::executor::LogChunk>();
+
     let poll_interval = std::time::Duration::from_millis(500);
 
     // Simple counter: how many tasks are currently in-flight inside the worker pool.
@@ -453,7 +528,15 @@ pub async fn run(seams: Seams) -> Result<()> {
         info!("OpenLineage emit enabled");
     }
 
-    // Optional artifact store (XCom / Argo-artifact parity). When
+    // Optional forge feedback (GitHub/GitLab commit statuses). Active when a
+    // GITHUB_TOKEN / GITLAB_TOKEN is set; a run whose spec carries a `notify.git`
+    // block posts its terminal status on finalization. Best-effort, like lineage.
+    let forge = dagron_forge::ForgeClient::from_env();
+    if forge.is_some() {
+        info!("forge feedback enabled (notify.git commit statuses)");
+    }
+
+    // Optional artifact store for passing files between tasks. When
     // DAGRON_ARTIFACT_DIR is set, each dispatched task gets a per-run shared dir
     // via `DAGRON_ARTIFACTS` so tasks in a run can pass files. Off otherwise.
     let artifact_store = dagron_artifact::LocalFsStore::from_env();
@@ -475,6 +558,31 @@ pub async fn run(seams: Seams) -> Result<()> {
             info!(recovered, "reclaimed expired leases");
         }
 
+        // ── Step 1b: run-level deadlines ────────────────────────────────────
+        // Fail any run past its `run_timeout_secs` budget and cancel its
+        // remaining tasks. Idempotent, so every scheduler may sweep; an executor
+        // finishing after the sweep is rejected by the fence guard.
+        for run_id in db::cancel_overdue_runs(&pool).await? {
+            tracing::warn!(%run_id, "run deadline exceeded (run_timeout_secs) — run failed, tasks cancelled");
+            metrics.inc_runs_deadline_exceeded();
+        }
+
+        // ── Step 1c: soft SLA deadline alerts ───────────────────────────────
+        // Emit a `run.deadline_exceeded` outbox event (once) for a run past its
+        // `deadline` — the run keeps running. Fire-once + winner-take-all in SQL.
+        for run_id in db::fire_deadline_alerts(&pool).await? {
+            tracing::warn!(%run_id, "run exceeded its soft deadline — SLA alert emitted");
+            metrics.inc_deadline_alerts();
+        }
+
+        // ── Step 1d: expire human approval gates (#19) ──────────────────────
+        // Auto-resolve any `awaiting_approval` task past its `approval_timeout_secs`
+        // per its `approval_on_timeout` default. Idempotent (guarded resolve), so
+        // every scheduler may sweep.
+        for (task_id, approved) in db::resolve_expired_approvals(&pool).await? {
+            tracing::info!(%task_id, approved, "approval gate timed out — auto-resolved");
+        }
+
         // ── Step 2: unblock tasks whose deps just completed ─────────────────
         db::advance_ready_tasks(&pool).await?;
 
@@ -483,7 +591,7 @@ pub async fn run(seams: Seams) -> Result<()> {
         if capacity > 0 {
             let claimed = db::claim_ready(&pool, &worker_id, capacity as i64).await?;
             for task in claimed {
-                let (mut ctx, max_attempts, retry_delay_secs) = match &task.input {
+                let (mut ctx, max_attempts, retry_delay_secs, retry_max_delay_secs) = match &task.input {
                     Some(json) => match serde_json::from_str::<dag::TaskSpec>(json) {
                         Ok(spec) => {
                             // Start with the declared env, then append any top-level
@@ -495,8 +603,9 @@ pub async fn run(seams: Seams) -> Result<()> {
                             let env = spec.env;
                             #[cfg(feature = "enterprise")]
                             let mut env = spec.env;
-                            // EE: merge top-level string keys from `input` as env vars
-                            // so parameterized reruns (params deep-merge) visibly change
+                            // Behind the `enterprise` feature: merge top-level string keys
+                            // from `input` as env vars so parameterized reruns
+                            // (params deep-merge) visibly change
                             // task behavior without threading each param through an explicit
                             // `env:` entry. `spec.env` is authoritative: skip any key whose
                             // uppercased form already appears there, and reject names with
@@ -514,7 +623,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                                         {
                                             continue;
                                         }
-                                        env.push(dag::EnvVar { name, value: s.to_string() });
+                                        env.push(dag::EnvVar { name, value: s.to_string(), value_from: None });
                                     }
                                 }
                             }
@@ -526,9 +635,12 @@ pub async fn run(seams: Seams) -> Result<()> {
                                     env,
                                     resources: spec.resources,
                                     service_account: spec.service_account,
+                                    // Wired per-attempt by the worker from `log_tx`.
+                                    log_sink: None,
                                 },
                                 spec.max_attempts,
                                 spec.retry_delay_secs,
+                                spec.retry_max_delay_secs,
                             )
                         }
                         Err(e) => {
@@ -551,7 +663,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                             continue;
                         }
                     },
-                    None => (ExecContext::new(vec!["true".to_string()], None, None), 1, 0),
+                    None => (ExecContext::new(vec!["true".to_string()], None, None), 1, 0, None),
                 };
 
                 // Artifact passing: give this task the run's shared artifact dir.
@@ -560,10 +672,30 @@ pub async fn run(seams: Seams) -> Result<()> {
                         Ok(dir) => ctx.env.push(dag::EnvVar {
                             name: "DAGRON_ARTIFACTS".to_string(),
                             value: dir,
+                            value_from: None,
                         }),
                         Err(e) => {
                             tracing::warn!(error = %e, run = %task.run_id, "could not prepare artifact dir")
                         }
+                    }
+                }
+
+                // Resolve `value_from` secret refs into concrete env values just
+                // before dispatch (#9). A missing secret fails the task rather
+                // than running it with an empty credential.
+                match dagron_executor::secrets::resolve(&ctx.env) {
+                    Ok(resolved) => ctx.env = resolved,
+                    Err(e) => {
+                        tracing::error!(task = %task.name, task_id = %task.id, error = %e, "secret resolution failed — marking task failed");
+                        db::mark_task_failed(
+                            &pool,
+                            &task.id,
+                            &worker_id,
+                            task.version.saturating_add(1),
+                            Some(format!("secret resolution failed: {e}")),
+                        )
+                        .await?;
+                        continue;
                     }
                 }
 
@@ -583,14 +715,30 @@ pub async fn run(seams: Seams) -> Result<()> {
                     attempt: task.attempt,
                     max_attempts,
                     retry_delay_secs,
+                    retry_max_delay_secs,
                     // Post-claim version is the fencing token (claim_ready bumped
                     // version from task.version to task.version + 1). saturating_add
                     // guards the theoretical i64 overflow without a debug panic.
                     fence: task.version.saturating_add(1),
                     result_tx: tx.clone(),
+                    log_tx: Some(log_tx.clone()),
                 })?;
                 metrics.inc_dispatched();
                 in_flight += 1;
+            }
+        }
+
+        // ── Step 3b: drain live-log chunks (#17) ────────────────────────────
+        // Append incremental output from still-running tasks so the API/UI can
+        // tail it before the task exits. Fence-guarded, so a stale attempt's late
+        // chunk can't corrupt a re-run; the first chunk of an attempt resets any
+        // prior-attempt output. Best-effort: a failed append is logged, not fatal.
+        while let Ok(chunk) = log_rx.try_recv() {
+            if let Err(e) =
+                db::append_task_output(&pool, &chunk.task_id, chunk.fence, &chunk.chunk, chunk.first)
+                    .await
+            {
+                tracing::warn!(task_id = %chunk.task_id, error = %e, "live-log append failed");
             }
         }
 
@@ -601,7 +749,7 @@ pub async fn run(seams: Seams) -> Result<()> {
             if result.success {
                 info!(task_id = %result.task_id, "task succeeded");
                 metrics.inc_succeeded();
-                seams.meter.on_task_completed(true).await; // edition seam (usage accounting)
+                seams.meter.on_task_completed(true).await; // extension seam (usage accounting)
                 db::mark_task_succeeded(
                     &pool,
                     &result.task_id,
@@ -615,9 +763,13 @@ pub async fn run(seams: Seams) -> Result<()> {
                 // the counter in the DB, but the snapshot we received is pre-claim).
                 let actual_attempt = result.attempt + 1;
                 if actual_attempt < result.max_attempts as i64 {
-                    // Exponential backoff: base * 2^(attempt-1), capped at 2^10 doublings.
+                    // Exponential backoff: base * 2^(attempt-1), capped at 2^10 doublings
+                    // and clamped to the spec's optional retry_max_delay_secs ceiling.
                     let shift = (actual_attempt as u32).saturating_sub(1).min(10);
-                    let delay_secs = result.retry_delay_secs.saturating_mul(1u64 << shift);
+                    let mut delay_secs = result.retry_delay_secs.saturating_mul(1u64 << shift);
+                    if let Some(cap) = result.retry_max_delay_secs {
+                        delay_secs = delay_secs.min(cap);
+                    }
                     let delay_i64 = i64::try_from(delay_secs).unwrap_or(i64::MAX);
                     let retry_at = (chrono::Utc::now()
                         + chrono::TimeDelta::seconds(delay_i64))
@@ -647,7 +799,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                         "task failed — max attempts reached"
                     );
                     metrics.inc_failed();
-                    seams.meter.on_task_completed(false).await; // edition seam (usage accounting)
+                    seams.meter.on_task_completed(false).await; // extension seam (usage accounting)
                     db::mark_task_failed(
                         &pool,
                         &result.task_id,
@@ -663,7 +815,7 @@ pub async fn run(seams: Seams) -> Result<()> {
         // ── Step 5: finalize any runs whose tasks are all terminal ──────────
         for (run_id, status) in db::reap_completed_runs(&pool).await? {
             info!(%run_id, %status, "run complete");
-            // Edition seam: OSS no-op; downstream editions may emit the run event.
+            // Extension seam: no-op by default; an alternate build may emit the run event.
             seams.run_sink.on_run_completed(&run_id, &status.to_string()).await;
             // OpenLineage: emit the terminal RunEvent (best-effort — a lineage
             // backend being down never affects run execution).
@@ -677,6 +829,12 @@ pub async fn run(seams: Seams) -> Result<()> {
                 if let Err(e) = ol.emit_run_completed(&run_id, &job, failed).await {
                     tracing::warn!(error = %e, %run_id, "OpenLineage emit failed");
                 }
+            }
+            // Forge feedback: if the run's spec has a `notify.git` block, post the
+            // terminal commit status (best-effort — a forge being down never
+            // affects run execution).
+            if let Some(forge) = &forge {
+                post_forge_status(forge, &pool, &run_id, &status.to_string()).await;
             }
         }
 

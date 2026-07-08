@@ -1,5 +1,7 @@
 //! HTTP route handlers for the dagron management API.
 
+pub mod backfills;
+pub mod badge;
 pub mod control;
 pub mod gitrepos;
 pub mod gitsync;

@@ -21,8 +21,12 @@ with no coordinator — the row leases are the only coordination point.
 flowchart LR
     yaml([DAG YAML file])
     browser([Browser · dagron frontend])
+    agent([AI agent · MCP client])
     subgraph edge["UI gateway (1..N, stateless)"]
         gw["dagron-api<br/>axum · self-contained JWT auth · SSE"]
+    end
+    subgraph mcp["Agent gateway (stdio, per-agent)"]
+        mc["dagron-mcp<br/>JSON-RPC 2024-11-05 · stdio · stderr-only logs"]
     end
     subgraph schedulers["Scheduler processes (1..N, identical)"]
         s1["scheduler A<br/>reconcile loop + worker pool<br/>(api.rs ops — internal)"]
@@ -35,6 +39,8 @@ flowchart LR
 
     yaml -->|"DagGraph::from_yaml → create_run"| s1
     browser -->|"HTTP + Bearer JWT"| gw
+    agent <-->|"MCP JSON-RPC (stdio)"| mc
+    mc -->|"HTTP + Bearer JWT (same edge)"| gw
     gw <-->|"read / control · LISTEN→SSE"| db
     s1 <-->|"claim / mark / NOTIFY"| db
     s2 <-->|"claim / mark / LISTEN"| db
@@ -42,12 +48,18 @@ flowchart LR
     s2 -->|"Executor::execute"| targets
 ```
 
-> **Two HTTP surfaces.** The engine's `api.rs` (`--features ops`) is an
+> **Three surfaces, one edge.** The engine's `api.rs` (`--features ops`) is an
 > **internal, unauthenticated** ops API (Prometheus `/metrics`, OpenAPI, dead-letter
 > management) — bind it cluster-private. **`dagron-api`** is the **authenticated
-> public UI edge** (self-contained argon2 + HS256 session JWT — no external IdP) and
-> the only surface the browser talks to. See [§2a](#2a-two-http-surfaces--engine-ops-api-vs-ui-gateway)
-> and [`crates/dagron-api/README.md`](../crates/dagron-api/README.md).
+> public UI edge** (self-contained argon2 + HS256 session JWT — no external IdP).
+> **`dagron-mcp`** is a thin per-agent adapter that fronts the same `dagron-api`
+> over MCP/JSON-RPC on stdio, so an AI agent gets the engine's CRUD plus
+> cluster-internal signals (metrics, dead-letters, the per-run SSE event channel)
+> through one consistent JWT-gated edge — never directly against the engine.
+> See [§2a](#2a-two-http-surfaces--engine-ops-api-vs-ui-gateway),
+> [§5.8](#58-mcp-agent-event-call--submit--bounded-sse-event-poll),
+> [`crates/dagron-api/README.md`](../crates/dagron-api/README.md), and
+> [`docs/MCP.md`](MCP.md).
 
 **Two backends, one API** (selected at compile time; see [`crates/dagron-core/src/db.rs`](../crates/dagron-core/src/db.rs)):
 
@@ -60,32 +72,41 @@ flowchart LR
 
 ## 2. Workspace & component architecture
 
-The engine is a Cargo **workspace** under `module_54/`: a thin wiring binary (the root
-`dagron` package's `src/`) over three reusable library crates in `crates/`. The reconcile
-loop in `main.rs` never names a concrete database type — it talks only to the
-`dagron_core::db` facade, which compiles in exactly one backend. That single seam is where
-horizontal scale slots in.
+The engine is a Cargo **workspace** under `module_54/`. The root `dagron` package's
+`src/main.rs` is a one-call shell over the **`dagron-engine`** library crate, which owns
+config, the multi-run reconcile loop, the `Seams` extension seam, and the ops modules —
+and wires the reusable library crates in `crates/` together. Alternate builds can plug
+different seams into the same shell. The reconcile loop never
+names a concrete database type — it talks only to the `dagron_core::db` facade, which
+compiles in exactly one backend. That single seam is where horizontal scale slots in.
 
 | Crate | Path | Owns |
 |---|---|---|
-| `dagron` (bin) | `src/` | arg/env config, the reconcile loop, and the ops modules (`api`/`cron`/`gc`/`leadership`/`schedule`) that wire the libs together |
+| `dagron` (bin) | `src/` | thin entry point: `dagron_engine::run(Seams::default())` — default seams (built-in sources, no-op run-lifecycle hooks) |
+| `dagron-engine` | `crates/dagron-engine` | env config, the reconcile loop + `in_flight` accounting, the `Seams` seam (`hooks.rs`), and the ops modules (`api`/`cron`/`gc`/`leadership`/`schedule`, feature `ops`) that wire the libs together |
 | `dagron-core` | `crates/dagron-core` | DAG model + validation, matrix/call expansion, the datastore facade (SQLite/Postgres + migrations), the metrics registry |
 | `dagron-executor` | `crates/dagron-executor` | the `Executor` trait + Local/Docker/Kube backends + the ractor worker pool |
-| `dagron-source` | `crates/dagron-source` | the `WorkflowSource` backends (File/Channel/Redis/SQS/Kafka/NATS) + the ingest actor |
+| `dagron-source` | `crates/dagron-source` | the `WorkflowSource` trait, the built-in File/Channel backends, the `source::build` factory, and the ingest actor — Redis/SQS/Kafka/NATS backends plug in via a `SourceFactory` seam |
 | `dagron-api` | `crates/dagron-api` | the authenticated public UI gateway (separate crate, Postgres-only) — see [§2a](#2a-two-http-surfaces--engine-ops-api-vs-ui-gateway) |
-| `dagron-operator` | `crates/dagron-operator` | the kube-rs Workflow/CronWorkflow operator |
+| `dagron-mcp` | `crates/dagron-mcp` | the per-agent stdio MCP adapter fronting `dagron-api` — see [§5.8](#58-mcp-agent-event-call--submit--bounded-sse-event-poll) and [`docs/MCP.md`](MCP.md) |
+| seam crates | `crates/dagron-{identity,artifact,import,lineage,logging}` | `dagron-api`'s auth seam (argon2 local login, IdP-swappable) · artifact-store seam (local FS today) · Argo→dagron YAML importer · OpenLineage emitter (best-effort, on run finalization) · shared `tracing` bootstrap |
 
-Feature flags keep their original names on the bin but **forward** to the crate that owns
-the gated code: `sqlite`/`postgres` → `dagron-core`, `kubernetes` → `dagron-executor`,
-`redis`/`sqs`/`kafka`/`nats` → `dagron-source`, `ops` → `dagron-core` + the bin.
+Feature flags keep their original names on the bin but **forward** through `dagron-engine`
+to the crate that owns the gated code: `sqlite`/`postgres` → `dagron-core`, `kubernetes` →
+`dagron-executor`, `ops` → the engine's ops modules + `dagron-core`.
 `dagron-core` defaults to `sqlite`; dependents pin `default-features = false` so a
 `--features postgres` build never also drags in sqlite (the two collide via `compile_error!`).
 
 ```mermaid
 flowchart TB
     subgraph bin["dagron (bin) · src/"]
+        main["main.rs — thin shell<br/>dagron_engine::run(Seams::default())"]
+    end
+
+    subgraph eng["dagron-engine · crates/dagron-engine"]
         direction TB
-        main["main.rs<br/>arg/env config · reconcile loop · in_flight accounting"]
+        run["lib.rs — run(Seams)<br/>env config · reconcile loop · in_flight accounting"]
+        hooks["hooks.rs — Seams<br/>extra sources · run-lifecycle hooks (default: no-op)"]
         api["api.rs<br/>axum ops API · list/inspect/submit/cancel (feature: ops)"]
         cronm["cron.rs<br/>cron-triggered create_run (leadership-gated)"]
         lead["leadership.rs<br/>leader_election lease · cluster singleton"]
@@ -118,13 +139,16 @@ flowchart TB
         direction TB
         ig["ingest.rs<br/>IngestActor (ractor) · create_run + backpressure"]
         src["source.rs<br/>WorkflowSource trait · File/Channel · source::build"]
-        q["source/*<br/>Redis · SQS · Kafka · NATS (feature-gated)"]
     end
 
-    main --> dag & dbfacade & wp & ig & api & cronm & gcm & lead & sched
+    q["queue sources (SourceFactory backends)<br/>Redis · SQS · Kafka · NATS"]
+
+    main --> run
+    run --> hooks
+    run --> dag & dbfacade & wp & ig & api & cronm & gcm & lead & sched
     dag --> expand
     ig --> src
-    src -.->|"#cfg(feature)"| q
+    src -.->|"SourceFactory seam"| q
     ig --> dbfacade
     api --> dbfacade & met
     cronm --> dbfacade
@@ -144,7 +168,9 @@ flowchart TB
 
 | Module (crate) | Responsibility |
 |---|---|
-| `src/main.rs` (bin) | binary entry; builds executor + worker pool + db pool + ingest actor, runs the multi-run daemon loop, tracks `in_flight`. Re-aliases the lib modules (`use dagron_core::{dag, db, metrics}`, …) so the wiring reads against the original short paths |
+| `src/main.rs` (bin) | thin entry point — calls `dagron_engine::run(Seams::default())`; alternate builds plug different seams into the same shell |
+| `lib.rs` (engine) | `run(Seams)` — builds executor + worker pool + db pool + ingest actor, runs the multi-run daemon loop, tracks `in_flight`. Re-aliases the lib crates (`use dagron_core::{dag, db, metrics}`, …) so the wiring reads against the original short paths |
+| `hooks.rs` (engine) | the `Seams` extension seam — extra ingestion sources + run-lifecycle hooks; the default seams are no-ops |
 | `dag.rs` (core) | `DagSpec`/`TaskSpec` deserialization, `DiGraph` build, `is_cyclic_directed`, `dep_count` (in-degree); `DagGraph::from_yaml` runs parse → expand → build → validate |
 | `expand.rs` (core) | matrix / call-task expansion into leaf tasks before the graph is built; `when` evaluation |
 | `db.rs` (core) | facade: feature-gates one backend, re-exports `Pool`, `Waker`, and the CRUD/claim/mark API |
@@ -157,13 +183,13 @@ flowchart TB
 | `docker_executor.rs` (executor) | `DockerExecutor` — per-task container, hard timeout, log capture, force-remove |
 | `kube_executor.rs` (executor, v3) | `KubeExecutor` — per-task one-shot Pod, phase poll under timeout, log capture, pod delete; `--features kubernetes` |
 | `source.rs` (source, v4) | `WorkflowSource` trait; `FileSource`/`ChannelSource`; `source::build` selects the backend |
-| `source/{redis,sqs,kafka,nats}_source.rs` (source, v4) | feature-gated queue backends with at-least-once ack semantics + native dead-letter routing |
+| queue sources (SourceFactory backends) | the Redis/SQS/Kafka/NATS queue backends (each behind its own feature) with at-least-once ack semantics + native dead-letter routing; registered via the `SourceFactory` seam |
 | `ingest.rs` (source, v4) | `IngestActor` (ractor) — pulls the source → `create_run`; `MAX_INFLIGHT_RUNS` admission backpressure; dead-letters poison submissions (parse failure → immediate; `create_run` failure → after `DEAD_LETTER_MAX_ATTEMPTS`) |
-| `api.rs` (bin, v5) | **internal, unauthenticated** `axum` ops API — list/inspect/submit/cancel runs + `/metrics`, `/healthz`, OpenAPI (`/openapi.{yaml,json}`, `/docs`), dead-letter list/redrive/discard; thin shell over the `dagron_core::db` facade. Bind cluster-private; user traffic goes through `dagron-api` instead |
-| `cron.rs` (bin, v5) | cron-triggered `create_run`; only the leadership holder fires, followers track `next` to avoid backlog |
-| `leadership.rs` (bin, v5) | `leader_election` lease renew loop → shared `is_leader` flag; cluster-wide singleton for cron/GC/schedules |
-| `gc.rs` (bin, v6) | retention sweep calling `db::gc_old_runs`; leadership-gated |
-| `schedule.rs` (bin) | DB-backed UI schedules (`DB_SCHEDULES=1`) — leadership-gated firing of first-class workflows |
+| `api.rs` (engine, v5) | **internal, unauthenticated** `axum` ops API — list/inspect/submit/cancel runs + `/metrics`, `/healthz`, OpenAPI (`/openapi.{yaml,json}`, `/docs`), dead-letter list/redrive/discard; thin shell over the `dagron_core::db` facade. Bind cluster-private; user traffic goes through `dagron-api` instead |
+| `cron.rs` (engine, v5) | cron-triggered `create_run`; only the leadership holder fires, followers track `next` to avoid backlog |
+| `leadership.rs` (engine, v5) | `leader_election` lease renew loop → shared `is_leader` flag; cluster-wide singleton for cron/GC/schedules |
+| `gc.rs` (engine, v6) | retention sweep calling `db::gc_old_runs`; leadership-gated |
+| `schedule.rs` (engine) | DB-backed UI schedules (`DB_SCHEDULES=1`) — leadership-gated firing of first-class workflows |
 
 ---
 
@@ -219,7 +245,7 @@ flowchart TB
 | Shared | runs list/detail, submit, cancel, dead-letters, metrics |
 
 > `dagron-api` is a **standalone** crate (it builds from its own dir, depending only
-> on `dagron-logging` — see its Dockerfile), so it **inlines** the Postgres SQL
+> on `dagron-logging` and `dagron-identity` — see its Dockerfile), so it **inlines** the Postgres SQL
 > rather than depending on `dagron-core`: that keeps its image a simple single-crate
 > build and sidesteps the backend `compile_error!` entirely. (Inside the engine
 > workspace the same collision is handled by pinning `dagron-core` with
@@ -236,19 +262,26 @@ write; the lease (`claimed_by` + `lease_expires_at`) + `version` are the correct
 ```mermaid
 stateDiagram-v2
     [*] --> pending: create_run (remaining_deps = in-degree)
-    pending --> ready: advance_ready_tasks<br/>(remaining_deps == 0)
-    pending --> cancelled: parent failed<br/>(recursive CTE)
-    ready --> cancelled: parent failed<br/>(recursive CTE)
+    pending --> ready: advance_ready_tasks<br/>(deps terminal, trigger_rule satisfied)
+    pending --> skipped: advance_ready_tasks<br/>(deps terminal, trigger_rule unsatisfied)
     ready --> running: claim_ready<br/>(CAS / SKIP LOCKED, lease +30s)
     running --> ready: recover_expired_leases<br/>(lease_expires_at < now)
     running --> ready: retry_task<br/>(failed and attempt < max, future scheduled_at)
     running --> succeeded: mark_task_succeeded<br/>(decrement dependents)
-    running --> failed: mark_task_failed<br/>(cancel downstream)
+    running --> failed: mark_task_failed<br/>(decrement dependents)
     succeeded --> [*]
     failed --> [*]
     cancelled --> [*]
     skipped --> [*]
 ```
+
+Every terminal transition (`succeeded`/`failed`/`skipped`/`cancelled`) decrements
+its dependents' `remaining_deps`. When a task's counter reaches 0 (all deps
+terminal), `advance_ready_tasks` evaluates its **`trigger_rule`** against the
+deps' outcomes: satisfied → `ready`, unsatisfied → `skipped` (which is itself
+terminal and cascades). The default `all_success` rule skips a task when any
+dependency failed — so a failed task's downstream is skipped, not cancelled;
+`cancelled` now means only an operator cancel or a run-deadline sweep.
 
 Terminal states: `succeeded`, `failed`, `cancelled`, `skipped`. `is_run_complete` flips the
 `workflow_runs` row to `succeeded`/`failed` once every task is terminal.
@@ -358,7 +391,7 @@ sequenceDiagram
     Note over A,B: disjoint batches, zero coordination, no task claimed twice
 ```
 
-### 5.4 Failure path — downstream cancellation (recursive CTE)
+### 5.4 Failure path — decrement dependents, then trigger-rule evaluation
 
 ```mermaid
 sequenceDiagram
@@ -370,9 +403,11 @@ sequenceDiagram
     WP-->>Lp: TaskResult success=false, attempt equals max_attempts
     Lp->>DB: mark_task_failed task, worker, fence, error
     DB->>DB: status running to failed, guard claimed_by equals worker AND version equals fence
-    DB->>DB: WITH RECURSIVE downstream UPDATE to cancelled, transitive dependents in pending/ready
+    DB->>DB: decrement remaining_deps of direct dependents (a failure is terminal, like success)
+    Lp->>DB: advance_ready_tasks (next tick)
+    DB->>DB: deps terminal → evaluate trigger_rule → ready or skipped (skips cascade)
     Lp->>DB: is_run_complete run_id
-    DB-->>Lp: Some failed, failed plus cancelled equals total
+    DB-->>Lp: Some failed once every task is terminal
     Lp-->>Lp: break
 ```
 
@@ -484,6 +519,48 @@ sequenceDiagram
     Cl->>DB: GET runs, runs by id, POST runs, cancel, metrics
 ```
 
+### 5.8 MCP agent event-call — submit + bounded SSE event poll
+
+`dagron-mcp` is request/response (one MCP `tools/call` → one HTTP call), but the
+agent needs to *observe* the engine, not just drive it. The `dagron_get_run_events`
+tool opens the same SSE channel the browser uses and reads it for a bounded
+window (`wait_ms`, capped at 10 s / 256 KiB), parses the SSE frames into JSON
+events, and returns them as a single tool response. The same edge enforces JWT;
+ids are validated locally so a crafted argument can't reshape the request path.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Ag as AI agent (MCP client)
+    participant Mc as dagron-mcp (stdio, per-agent)
+    participant Gw as dagron-api (UI edge · JWT)
+    participant DB as Postgres (LISTEN/NOTIFY)
+    participant Lp as scheduler reconcile loop
+
+    Note over Ag,Mc: JSON-RPC over stdio (2024-11-05); logs to stderr only
+    Ag->>Mc: tools/call dagron_submit_run, yaml
+    Mc->>Mc: validate args, no path-segment escapes
+    Mc->>Gw: POST api/runs Authorization Bearer JWT
+    Gw->>DB: insert workflow_run + task_runs + deps
+    Gw-->>Mc: 200 run_id
+    Mc-->>Ag: tools/result run_id
+
+    Ag->>Mc: tools/call dagron_get_run_events, run_id, wait_ms=2000
+    Mc->>Mc: safe_id(run_id), wait_ms in 100..=10000
+    Mc->>Gw: GET api/runs/{id}/stream accept text/event-stream
+    Gw->>DB: subscribe to task_events broadcast
+    par engine progress
+        Lp->>DB: mark_task_succeeded NOTIFY task_events
+        DB-->>Gw: NOTIFY commit-ordered
+        Gw-->>Mc: SSE event chunk(s)
+    and bounded window
+        Note over Mc: tokio time::timeout(wait_ms) around reqwest chunk()
+    end
+    Mc->>Mc: parse SSE frames, cap 256 KiB total
+    Mc-->>Ag: tools/result events[], event_count
+    Note over Ag: agent re-polls for the next window — the bounded read keeps the JSON-RPC call short
+```
+
 ---
 
 ## 6. Process lifecycle
@@ -524,9 +601,11 @@ stateDiagram-v2
   reclaimed (by any process, including itself) fails the version check and cannot double-apply
   dependency decrements or downstream cancellation.
 - **Dependency counter, not graph re-walk.** `remaining_deps` is seeded to in-degree and decremented
-  per completed dependency — O(edges) per completion, not O(nodes+edges) per tick.
-- **Termination guarantee.** A failure cancels its entire transitive downstream subgraph in one
-  recursive CTE, so `is_run_complete` always reaches a terminal state.
+  per *terminal* dependency (success, failure, or skip) — O(edges) per completion, not
+  O(nodes+edges) per tick.
+- **Termination guarantee.** Every terminal transition decrements its dependents, and a task whose
+  `trigger_rule` cannot be satisfied is `skipped` (itself terminal, cascading further). So the
+  dependency frontier always drains to a terminal state and `is_run_complete` terminates.
 - **At-least-once execution.** The lease bounds *concurrent* execution to one holder, but a worker
   that completes side effects then crashes before recording may have its task re-run after lease
   expiry — task commands should be idempotent. The bundled tasks (`echo`) are.

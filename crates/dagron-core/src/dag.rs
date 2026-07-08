@@ -17,7 +17,7 @@ pub struct TaskSpec {
     pub depends_on: Vec<String>,
     pub input: Option<serde_json::Value>,
 
-    // ── Sub-workflow / templating (Argo-style) ──────────────────────────────
+    // ── Sub-workflow / templating ────────────────────────────────────────────
     // These fields are consumed by the template expander and never persist on a
     // leaf task (skip_serializing_if keeps the stored TaskSpec JSON clean).
     /// Name of the `template` (a reusable sub-DAG declared in `DagSpec.templates`)
@@ -42,6 +42,52 @@ pub struct TaskSpec {
     /// recursive template terminate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<String>,
+    /// Human-readable label template for fan-out instances, e.g.
+    /// `instance_key: "{{ item.region }}"`. When set on a `with_items` /
+    /// `with_param` task, each expanded instance is named
+    /// `<task>.<rendered-label>` instead of `<task>.<index>` — a readable
+    /// display name for fan-out instances. Consumed at
+    /// expansion; never persists on a leaf. Labels are sanitized to
+    /// `[A-Za-z0-9_-]` and must be unique within the fan-out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_key: Option<String>,
+    /// When this task runs relative to its dependencies' outcomes.
+    /// One of `all_success` (default),
+    /// `all_done`, `one_failed`, `all_failed`, `none_failed`. `None` = the
+    /// default `all_success`. Lets a task be a cleanup join (`all_done`) or a
+    /// failure handler (`one_failed`) instead of being skipped when a
+    /// dependency fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_rule: Option<String>,
+    /// Lifecycle hook: `on_exit` runs this task once
+    /// every non-hook task is terminal (a finalizer/notifier); `on_failure` runs
+    /// it only when the run is failing. Sugar over trigger rules — the task is
+    /// auto-wired to depend on every non-hook task with the matching rule
+    /// (`all_done` / `one_failed`), so it needs no explicit `depends_on`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook: Option<String>,
+    /// When true, this task failing does **not** fail the run (an optional /
+    /// best-effort step). The task still shows as
+    /// `failed` and still skips its `all_success` dependents; use a downstream
+    /// `trigger_rule` if they should proceed regardless.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_failure: bool,
+    /// Task kind. `type: approval` makes this a **human approval gate**
+    /// (fast-win #19): when its dependencies are
+    /// satisfied it parks in `awaiting_approval` instead of running a command, and
+    /// waits for an operator to approve (→ succeeds) or reject (→ fails, skipping
+    /// `all_success` downstream) via the API, or for `approval_timeout_secs` to
+    /// auto-resolve it. `None`/`"task"` = an ordinary command task.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub task_type: Option<String>,
+    /// For a `type: approval` task: seconds to wait before the timeout default is
+    /// applied. `None` = wait indefinitely for a human.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_timeout_secs: Option<u64>,
+    /// What an expired approval defaults to — `"approve"` or `"reject"` (default
+    /// `"reject"`: absent a human decision, a gate fails safe).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_on_timeout: Option<String>,
     /// How many times this task may be attempted before it is marked failed.
     /// 1 = no retries (default). Must be ≥ 1.
     #[serde(default = "default_max_attempts")]
@@ -50,6 +96,12 @@ pub struct TaskSpec {
     /// 0 = immediate retry.
     #[serde(default)]
     pub retry_delay_secs: u64,
+    /// Upper bound in seconds on the exponential retry backoff. Without it the
+    /// delay doubles unbounded (up to 2^10 doublings); with it the computed
+    /// delay is clamped to `min(delay, retry_max_delay_secs)` — the
+    /// retry-backoff ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_max_delay_secs: Option<u64>,
     /// Per-task subprocess timeout in seconds. Falls back to the 25 s hard limit when absent.
     pub timeout_secs: Option<u64>,
     /// Docker image for this task. Used by DockerExecutor; ignored by LocalExecutor.
@@ -71,11 +123,28 @@ pub struct TaskSpec {
     pub service_account: Option<String>,
 }
 
-/// A single `name=value` environment variable for a task container.
+/// A single environment variable for a task container. Either a literal `value`
+/// or a `value_from` secret reference resolved at dispatch (never persisted
+/// resolved). Omitting `value` defaults it to empty (used with `value_from`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EnvVar {
     pub name: String,
+    #[serde(default)]
     pub value: String,
+    /// Resolve this variable's value from a secret at dispatch instead of storing
+    /// it inline — so a credential never lands in the workflow spec or the
+    /// datastore. See [`SecretRef`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_from: Option<SecretRef>,
+}
+
+/// A reference to an external secret (`value_from: { secret: NAME }`). The
+/// resolver (in `dagron-executor`) reads `DAGRON_SECRET_<NAME>` from the engine
+/// process environment, or a file `<DAGRON_SECRETS_DIR>/<NAME>` (the SOPS /
+/// External-Secrets-Operator mount convention) — whichever is configured.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SecretRef {
+    pub secret: String,
 }
 
 /// Kubernetes-style resource requests/limits (e.g. `cpu: "250m"`, `memory:
@@ -93,9 +162,67 @@ fn default_max_attempts() -> u32 {
     1
 }
 
-/// A reusable sub-DAG that tasks can `template:`-call — the dagron analogue of an
-/// Argo `template`/`WorkflowTemplate`. Declared under `DagSpec.templates`; its own
-/// `parameters` provide defaults that a caller's `arguments` override.
+/// `skip_serializing_if` helper for a `bool` field defaulting to `false`.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Valid `hook:` values.
+pub const HOOK_KINDS: &[&str] = &["on_exit", "on_failure"];
+
+/// Valid `type:` values. `task` (the default) is an ordinary command task;
+/// `approval` is a human approval gate (#19).
+pub const TASK_KINDS: &[&str] = &["task", "approval"];
+
+/// Valid `approval_on_timeout:` values.
+pub const APPROVAL_TIMEOUT_ACTIONS: &[&str] = &["approve", "reject"];
+
+impl TaskSpec {
+    /// Whether this task is a `type: approval` human gate (#19).
+    pub fn is_approval(&self) -> bool {
+        self.task_type.as_deref() == Some("approval")
+    }
+}
+
+/// A soft SLA deadline (`deadline:` block). See [`DagSpec::deadline`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DeadlineSpec {
+    /// Duration after the run starts, e.g. `"45m"`, `"2h"`, `"90s"`, or a bare
+    /// number of seconds. Parsed by [`parse_duration_secs`].
+    #[serde(rename = "in")]
+    pub within: String,
+}
+
+/// Parse a duration like `"45m"` / `"2h"` / `"90s"` / `"1d"` (or a bare number of
+/// seconds) into seconds. Errors on a malformed or zero duration.
+pub fn parse_duration_secs(s: &str) -> Result<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        bail!("empty duration");
+    }
+    let (num, mult) = match s.chars().last().unwrap() {
+        's' => (&s[..s.len() - 1], 1u64),
+        'm' => (&s[..s.len() - 1], 60),
+        'h' => (&s[..s.len() - 1], 3600),
+        'd' => (&s[..s.len() - 1], 86_400),
+        _ => (s, 1),
+    };
+    let n: u64 = num
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid duration '{s}' (use e.g. 45m, 2h, 90s, or seconds)"))?;
+    if n == 0 {
+        bail!("duration '{s}' must be greater than zero");
+    }
+    // Reject overflow rather than saturating to u64::MAX, so a fat-fingered value
+    // fails validation instead of silently becoming "forever".
+    n.checked_mul(mult)
+        .ok_or_else(|| anyhow::anyhow!("duration '{s}' is too large"))
+}
+
+/// A reusable sub-DAG that tasks can `template:`-call. Declared under
+/// `DagSpec.templates`; its own `parameters` provide defaults that a caller's
+/// `arguments` override.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TemplateSpec {
     pub name: String,
@@ -117,7 +244,59 @@ pub struct DagSpec {
     /// into the main `tasks` graph at run-creation time (see [`crate::expand`]).
     #[serde(default)]
     pub templates: Vec<TemplateSpec>,
+    /// Run-level wall-clock budget in seconds. When the run has been `running` longer than
+    /// this, the engine's deadline sweep marks it `failed` and cancels its
+    /// remaining tasks. `None` = no run-level deadline (per-task `timeout_secs`
+    /// still applies). Must be ≥ 1 when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_timeout_secs: Option<u64>,
+    /// Soft SLA deadline. Unlike `run_timeout_secs`
+    /// (which cancels), exceeding this only **emits an alert** — a
+    /// `run.deadline_exceeded` outbox event + a metric — and leaves the run
+    /// running. `None` = no deadline alert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<DeadlineSpec>,
+    /// Post-run notifications. Today: a `git` commit-status target so a run's
+    /// result shows up as a check on the commit that triggered it (forge
+    /// feedback). String fields accept `{{ param }}` templates, resolved against
+    /// `parameters` when the notification fires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<NotifySpec>,
+    /// Name of the task whose output becomes the *run's* result.
+    /// When set, a succeeding run copies that task's output
+    /// into `workflow_runs.output`, so a caller waiting on the run
+    /// (`POST /runs?wait=true` / `GET /runs/{id}/wait`) gets a single return value
+    /// — dagron as a durable function. The named task must exist and not be a
+    /// hook. `None` = the run has no distinguished result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_from: Option<String>,
     pub tasks: Vec<TaskSpec>,
+}
+
+/// Post-run notification targets (`notify:` block).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NotifySpec {
+    /// Post a commit status / PR check to a Git forge on run finalization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitNotify>,
+}
+
+/// A `notify.git` commit-status target. String fields are `{{ param }}`-templated.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GitNotify {
+    /// `github` or `gitlab`.
+    pub provider: String,
+    /// GitHub `owner/repo`, or GitLab project path/id.
+    pub repo: String,
+    /// Commit SHA the status attaches to — usually `"{{ commit_sha }}"` from a
+    /// parameter the CI caller supplies.
+    pub sha: String,
+    /// Status context/name shown on the commit (default `dagron`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// Optional link back to the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_url: Option<String>,
 }
 
 pub struct DagGraph {
@@ -128,7 +307,7 @@ pub struct DagGraph {
 
 impl DagGraph {
     /// Parse a workflow YAML, expand any `template:` calls into a flat leaf-only
-    /// DAG (Argo-style sub-workflows: recursion, fan-out, parameters), then build
+    /// DAG (sub-workflows: recursion, fan-out, parameters), then build
     /// and validate the graph. This is the single entry point every submit path
     /// uses, so sub-workflow support is uniform across the API, cron, and ingest.
     pub fn from_yaml(yaml: &str) -> Result<Self> {
@@ -137,10 +316,37 @@ impl DagGraph {
         Self::from_spec(spec)
     }
 
+    /// [`from_yaml`](Self::from_yaml) with parameter overrides merged in before
+    /// expansion. This is how time-originated submits (cron, DB schedules,
+    /// backfill) inject the fire's nominal time as `{{ scheduled_time }}`
+    /// (RFC-3339) so tasks can reference their logical date — the
+    /// data-interval idiom. Overrides win over declared defaults; keys
+    /// the spec never references are harmless (unknown `{{ … }}` stays verbatim,
+    /// unreferenced parameters are simply unused).
+    pub fn from_yaml_with_params(
+        yaml: &str,
+        overrides: &BTreeMap<String, String>,
+    ) -> Result<Self> {
+        let mut spec: DagSpec = serde_yaml::from_str(yaml)?;
+        for (k, v) in overrides {
+            spec.parameters.insert(k.clone(), v.clone());
+        }
+        let spec = crate::expand::expand(spec)?;
+        Self::from_spec(spec)
+    }
+
     /// Build the graph from an already-expanded (leaf-only) [`DagSpec`].
     pub fn from_spec(spec: DagSpec) -> Result<Self> {
         let mut graph = DiGraph::new();
         let mut node_index = HashMap::new();
+
+        if spec.run_timeout_secs == Some(0) {
+            bail!("invalid run_timeout_secs=0 in DAG '{}'; expected >= 1 (or omit)", spec.name);
+        }
+        if let Some(d) = &spec.deadline {
+            parse_duration_secs(&d.within)
+                .map_err(|e| anyhow::anyhow!("invalid deadline in DAG '{}': {e}", spec.name))?;
+        }
 
         for task in &spec.tasks {
             if node_index.contains_key(&task.name) {
@@ -153,6 +359,48 @@ impl DagGraph {
                     spec.name
                 );
             }
+            if let Some(rule) = &task.trigger_rule {
+                if !crate::models::TRIGGER_RULES.contains(&rule.as_str()) {
+                    bail!(
+                        "invalid trigger_rule '{}' for task '{}' in DAG '{}'; expected one of {:?}",
+                        rule,
+                        task.name,
+                        spec.name,
+                        crate::models::TRIGGER_RULES
+                    );
+                }
+            }
+            if let Some(hook) = &task.hook {
+                if !HOOK_KINDS.contains(&hook.as_str()) {
+                    bail!(
+                        "invalid hook '{}' for task '{}' in DAG '{}'; expected one of {:?}",
+                        hook,
+                        task.name,
+                        spec.name,
+                        HOOK_KINDS
+                    );
+                }
+            }
+            // Approval-gate validation (#19).
+            if let Some(kind) = &task.task_type {
+                if !TASK_KINDS.contains(&kind.as_str()) {
+                    bail!(
+                        "invalid type '{}' for task '{}' in DAG '{}'; expected one of {:?}",
+                        kind, task.name, spec.name, TASK_KINDS
+                    );
+                }
+            }
+            if let Some(action) = &task.approval_on_timeout {
+                if !APPROVAL_TIMEOUT_ACTIONS.contains(&action.as_str()) {
+                    bail!(
+                        "invalid approval_on_timeout '{}' for task '{}' in DAG '{}'; expected one of {:?}",
+                        action, task.name, spec.name, APPROVAL_TIMEOUT_ACTIONS
+                    );
+                }
+            }
+            if task.is_approval() && task.hook.is_some() {
+                bail!("task '{}' cannot be both an approval gate and a hook in DAG '{}'", task.name, spec.name);
+            }
             // After expansion every task must be a runnable leaf. A surviving
             // `template` or an empty `command` means expansion missed something.
             if task.template.is_some() {
@@ -163,7 +411,9 @@ impl DagGraph {
                     spec.name
                 );
             }
-            if task.command.is_empty() {
+            // A command is required for an ordinary task; an approval gate has no
+            // command (it waits for a human), so it is exempt.
+            if task.command.is_empty() && !task.is_approval() {
                 bail!(
                     "task '{}' has no command in DAG '{}' (a leaf task needs a command)",
                     task.name,
@@ -174,11 +424,18 @@ impl DagGraph {
             node_index.insert(task.name.clone(), idx);
         }
 
+        // A hook task is a finalizer: nothing may depend on it (it is auto-wired
+        // to depend on everything else). Catch a hand-written `depends_on: [hook]`.
+        let hook_names: std::collections::HashSet<&str> =
+            spec.tasks.iter().filter(|t| t.hook.is_some()).map(|t| t.name.as_str()).collect();
         for task in &spec.tasks {
             for dep in &task.depends_on {
                 let &from = node_index
                     .get(dep)
                     .ok_or_else(|| anyhow::anyhow!("unknown dependency '{dep}' in task '{}'", task.name))?;
+                if hook_names.contains(dep.as_str()) {
+                    bail!("task '{}' cannot depend on hook task '{dep}'", task.name);
+                }
                 let &to = node_index.get(&task.name).unwrap();
                 graph.add_edge(from, to, ());
             }
@@ -186,6 +443,17 @@ impl DagGraph {
 
         if is_cyclic_directed(&graph) {
             bail!("DAG '{}' contains a cycle", spec.name);
+        }
+
+        // `result_from` must name a real, non-hook task (a hook is a finalizer, not
+        // a result-bearing leaf) so the run's result is always well-defined.
+        if let Some(rf) = &spec.result_from {
+            if !node_index.contains_key(rf) {
+                bail!("result_from names unknown task '{rf}' in DAG '{}'", spec.name);
+            }
+            if hook_names.contains(rf.as_str()) {
+                bail!("result_from cannot name hook task '{rf}' in DAG '{}'", spec.name);
+            }
         }
 
         Ok(Self { spec, graph, node_index })
@@ -201,5 +469,150 @@ impl DagGraph {
 
     pub fn task_spec(&self, task_name: &str) -> Option<&TaskSpec> {
         self.spec.tasks.iter().find(|t| t.name == task_name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_timeout_zero_is_rejected() {
+        let err = DagGraph::from_yaml(
+            "name: w\nrun_timeout_secs: 0\ntasks:\n  - { name: a, command: [\"true\"] }\n",
+        )
+        .err()
+        .expect("run_timeout_secs=0 must be rejected")
+        .to_string();
+        assert!(err.contains("run_timeout_secs=0"), "got: {err}");
+    }
+
+    #[test]
+    fn run_timeout_survives_expansion() {
+        let g = DagGraph::from_yaml(
+            "name: w\nrun_timeout_secs: 90\ntasks:\n  - { name: a, command: [\"true\"] }\n",
+        )
+        .unwrap();
+        assert_eq!(g.spec.run_timeout_secs, Some(90));
+    }
+
+    #[test]
+    fn params_override_injects_scheduled_time() {
+        // A time-originated submit (cron/schedule/backfill) merges overrides in;
+        // declared defaults lose, and {{ scheduled_time }} resolves in any field.
+        let yaml = "name: w\nparameters: { scheduled_time: \"unset\", keep: \"k\" }\ntasks:\n  - { name: a, command: [\"echo\", \"{{ scheduled_time }}\", \"{{ keep }}\"] }\n";
+        let mut overrides = BTreeMap::new();
+        overrides.insert("scheduled_time".to_string(), "2026-07-07T00:00:00+00:00".to_string());
+        let g = DagGraph::from_yaml_with_params(yaml, &overrides).unwrap();
+        assert_eq!(
+            g.task_spec("a").unwrap().command,
+            vec!["echo", "2026-07-07T00:00:00+00:00", "k"]
+        );
+    }
+
+    #[test]
+    fn duration_parser_units_and_errors() {
+        assert_eq!(parse_duration_secs("90s").unwrap(), 90);
+        assert_eq!(parse_duration_secs("45m").unwrap(), 2700);
+        assert_eq!(parse_duration_secs("2h").unwrap(), 7200);
+        assert_eq!(parse_duration_secs("1d").unwrap(), 86_400);
+        assert_eq!(parse_duration_secs("120").unwrap(), 120); // bare = seconds
+        assert!(parse_duration_secs("0").is_err());
+        assert!(parse_duration_secs("").is_err());
+        assert!(parse_duration_secs("abc").is_err());
+    }
+
+    #[test]
+    fn retry_max_delay_survives_expansion() {
+        let yaml = "name: w\ntasks:\n  - { name: a, command: [\"true\"], max_attempts: 5, retry_delay_secs: 3, retry_max_delay_secs: 10 }\n";
+        let g = DagGraph::from_yaml(yaml).unwrap();
+        assert_eq!(g.task_spec("a").unwrap().retry_max_delay_secs, Some(10));
+    }
+
+    #[test]
+    fn notify_git_survives_expansion_and_resolves_from_params() {
+        let yaml = "name: ci\nparameters: { commit_sha: abc123 }\n\
+                    notify:\n  git:\n    provider: github\n    repo: acme/etl\n    sha: \"{{ commit_sha }}\"\n    context: dagron/ci\n\
+                    tasks:\n  - { name: a, command: [\"true\"] }\n";
+
+        // (1) The block survives parse + expand (the run's stored graph keeps it).
+        let expanded = DagGraph::from_yaml(yaml).unwrap();
+        assert!(expanded.spec.notify.and_then(|n| n.git).is_some());
+
+        // (2) The engine reads the *original* YAML (params intact) at finalize and
+        // resolves the templated sha against them — mirror that path here.
+        let raw: DagSpec = serde_yaml::from_str(yaml).unwrap();
+        let git = raw.notify.as_ref().and_then(|n| n.git.as_ref()).unwrap();
+        assert_eq!(git.provider, "github");
+        assert_eq!(crate::expand::substitute(&git.sha, &raw.parameters), "abc123");
+    }
+
+    #[test]
+    fn result_from_survives_expansion_and_is_validated() {
+        // (1) A valid result_from survives parse + expand.
+        let ok = DagGraph::from_yaml(
+            "name: w\nresult_from: b\ntasks:\n  - { name: a, command: [\"true\"] }\n  - { name: b, command: [\"true\"], depends_on: [\"a\"] }\n",
+        )
+        .unwrap();
+        assert_eq!(ok.spec.result_from.as_deref(), Some("b"));
+
+        // (2) result_from naming an unknown task is rejected.
+        let err = DagGraph::from_yaml(
+            "name: w\nresult_from: nope\ntasks:\n  - { name: a, command: [\"true\"] }\n",
+        )
+        .err()
+        .expect("unknown result_from must be rejected")
+        .to_string();
+        assert!(err.contains("result_from names unknown task 'nope'"), "got: {err}");
+
+        // (3) result_from naming a hook task is rejected (a hook isn't a result leaf).
+        let err = DagGraph::from_yaml(
+            "name: w\nresult_from: fin\ntasks:\n  - { name: a, command: [\"true\"] }\n  - { name: fin, command: [\"true\"], hook: on_exit }\n",
+        )
+        .err()
+        .expect("hook result_from must be rejected")
+        .to_string();
+        assert!(err.contains("result_from cannot name hook task 'fin'"), "got: {err}");
+    }
+
+    #[test]
+    fn approval_task_is_validated_and_needs_no_command() {
+        // An approval gate parses without a command and carries its timeout knobs.
+        let g = DagGraph::from_yaml(
+            "name: w\ntasks:\n  - { name: build, command: [\"make\"] }\n  - { name: gate, type: approval, depends_on: [build], approval_timeout_secs: 3600, approval_on_timeout: approve }\n  - { name: deploy, command: [\"ship\"], depends_on: [gate] }\n",
+        )
+        .unwrap();
+        let gate = g.task_spec("gate").unwrap();
+        assert!(gate.is_approval());
+        assert_eq!(gate.approval_timeout_secs, Some(3600));
+        assert_eq!(gate.approval_on_timeout.as_deref(), Some("approve"));
+
+        // An unknown type is rejected.
+        let err = DagGraph::from_yaml(
+            "name: w\ntasks:\n  - { name: a, type: wizardry, command: [\"true\"] }\n",
+        )
+        .err()
+        .expect("bad type rejected")
+        .to_string();
+        assert!(err.contains("invalid type 'wizardry'"), "got: {err}");
+
+        // An invalid approval_on_timeout is rejected.
+        let err = DagGraph::from_yaml(
+            "name: w\ntasks:\n  - { name: a, type: approval, approval_on_timeout: maybe }\n",
+        )
+        .err()
+        .expect("bad on_timeout rejected")
+        .to_string();
+        assert!(err.contains("invalid approval_on_timeout 'maybe'"), "got: {err}");
+
+        // A non-approval task still requires a command (rejected in expansion).
+        let err = DagGraph::from_yaml("name: w\ntasks:\n  - { name: a }\n")
+            .err()
+            .expect("command-less non-approval task rejected")
+            .to_string();
+        assert!(
+            err.contains("must set exactly one of `command`"),
+            "got: {err}"
+        );
     }
 }

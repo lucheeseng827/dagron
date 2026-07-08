@@ -1,12 +1,12 @@
 //! The dagron-api identity seam.
 //!
-//! [`IdentityProvider`] abstracts **authentication** — *who is this user* — so the
-//! OSS edition ships self-contained local login (argon2 against the `users` table)
-//! while a downstream edition can swap in an external IdP behind the same trait,
+//! [`IdentityProvider`] abstracts **authentication** — *who is this user* — so
+//! dagron ships a self-contained local login (argon2 against the `users` table)
+//! while an alternate provider can swap in an external IdP behind the same trait,
 //! without forking dagron-api. dagron-api always owns the **session** (its HS256
 //! cookie); a provider only resolves an identity from a credential.
 //!
-//! One-way dependency: this trait is OSS; downstream identity impls depend on it,
+//! One-way dependency: alternate identity impls depend on this trait,
 //! never the reverse.
 
 use anyhow::Result;
@@ -41,7 +41,7 @@ pub trait IdentityProvider: Send + Sync {
     ) -> Result<Option<VerifiedUser>>;
 
     /// Whether direct email+password login is offered (drives the login UI). The
-    /// OSS local provider returns `true`; a pure-SSO provider returns `false`.
+    /// local provider returns `true`; a pure-SSO provider returns `false`.
     fn supports_password_login(&self) -> bool {
         true
     }

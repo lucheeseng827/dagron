@@ -1,4 +1,4 @@
-//! Argo-style template expansion: turn a workflow that *calls other workflows*
+//! Template expansion: turn a workflow that *calls other workflows*
 //! into a flat, leaf-only DAG the engine can run unchanged.
 //!
 //! A [`DagSpec`] may declare reusable sub-DAGs under `templates:` and invoke them
@@ -66,14 +66,43 @@ pub fn expand(spec: DagSpec) -> Result<DagSpec> {
     }
 
     let mut budget = MAX_TASKS;
-    let e = expand_list(&spec.tasks, "", &spec.parameters, 0, &templates, &mut budget)?;
+    let mut e = expand_list(&spec.tasks, "", &spec.parameters, 0, &templates, &mut budget)?;
+
+    wire_hooks(&mut e.tasks)?;
 
     Ok(DagSpec {
         name: spec.name,
         parameters: BTreeMap::new(),
         templates: vec![],
+        run_timeout_secs: spec.run_timeout_secs,
+        deadline: spec.deadline,
+        notify: spec.notify,
+        result_from: spec.result_from,
         tasks: e.tasks,
     })
+}
+
+/// Wire lifecycle-hook tasks (fast-win #11): a `hook:` task is auto-wired to
+/// depend on every non-hook task and given the trigger rule its hook implies —
+/// `on_exit` → `all_done` (a finalizer that runs whatever happened),
+/// `on_failure` → `one_failed` (runs only if some task failed). This makes hooks
+/// pure sugar over the existing dependency + trigger-rule machinery.
+fn wire_hooks(tasks: &mut [TaskSpec]) -> Result<()> {
+    let non_hook: Vec<String> =
+        tasks.iter().filter(|t| t.hook.is_none()).map(|t| t.name.clone()).collect();
+    for t in tasks.iter_mut() {
+        let Some(hook) = t.hook.clone() else { continue };
+        let rule = match hook.as_str() {
+            "on_exit" => "all_done",
+            "on_failure" => "one_failed",
+            other => bail!("task '{}' has invalid hook '{other}' (expected on_exit or on_failure)", t.name),
+        };
+        // Depend on every non-hook task (not on other hooks, so hooks run in
+        // parallel at the end); its trigger_rule decides whether it fires.
+        t.depends_on = non_hook.iter().filter(|n| **n != t.name).cloned().collect();
+        t.trigger_rule = Some(rule.to_string());
+    }
+    Ok(())
 }
 
 /// Expand a list of sibling tasks, wiring their inter-dependencies.
@@ -151,7 +180,17 @@ fn expand_one(
     budget: &mut usize,
 ) -> Result<Expanded> {
     let is_call = task.template.is_some();
-    if is_call == !task.command.is_empty() {
+    // An approval gate (#19) is a leaf that carries no command — it waits for a
+    // human — so it is exempt from the "exactly one of command/template" rule
+    // (but it still may not be a template call).
+    if task.is_approval() {
+        if is_call {
+            bail!("approval task '{}' cannot also be a `template` call", task.name);
+        }
+        if !task.command.is_empty() {
+            bail!("approval task '{}' cannot set a `command` (it waits for a human)", task.name);
+        }
+    } else if is_call == !task.command.is_empty() {
         bail!(
             "task '{}' must set exactly one of `command` (leaf) or `template` (call)",
             task.name
@@ -159,6 +198,12 @@ fn expand_one(
     }
     if task.with_items.is_some() && task.with_param.is_some() {
         bail!("task '{}' sets both with_items and with_param", task.name);
+    }
+    if task.instance_key.is_some() && task.with_items.is_none() && task.with_param.is_none() {
+        bail!(
+            "task '{}' sets instance_key without with_items/with_param (nothing to label)",
+            task.name
+        );
     }
 
     // Resolve the fan-out items: None ⇒ a single (un-indexed) instance.
@@ -175,6 +220,7 @@ fn expand_one(
     }
 
     let mut acc = Expanded::empty();
+    let mut seen_labels: BTreeSet<String> = BTreeSet::new();
     for (i, item) in items.into_iter().enumerate() {
         // Per-instance scope: the caller ctx plus item/index bindings.
         let mut inst_ctx = ctx.clone();
@@ -191,7 +237,34 @@ fn expand_one(
         }
 
         let base = if fanned {
-            format!("{prefix}{}.{}", task.name, i)
+            // Human-readable instance label (`instance_key`) over the bare
+            // fan-out index when the author asked for one.
+            let label = match &task.instance_key {
+                Some(key) => {
+                    let label = sanitize_label(&substitute(key, &inst_ctx));
+                    if label.is_empty() {
+                        bail!(
+                            "task '{}' instance_key '{}' rendered empty for item {} \
+                             (after sanitizing to [A-Za-z0-9_.-])",
+                            task.name,
+                            key,
+                            i
+                        );
+                    }
+                    if !seen_labels.insert(label.clone()) {
+                        bail!(
+                            "task '{}' instance_key '{}' rendered duplicate label '{}' \
+                             — labels must be unique within the fan-out",
+                            task.name,
+                            key,
+                            label
+                        );
+                    }
+                    label
+                }
+                None => i.to_string(),
+            };
+            format!("{prefix}{}.{}", task.name, label)
         } else {
             format!("{prefix}{}", task.name)
         };
@@ -251,8 +324,15 @@ fn build_leaf(task: &TaskSpec, name: &str, ctx: &BTreeMap<String, String>) -> Ta
         command: task.command.iter().map(|a| substitute(a, ctx)).collect(),
         depends_on: vec![], // wired by the enclosing list
         input: task.input.clone(),
+        trigger_rule: task.trigger_rule.clone(),
+        hook: task.hook.clone(),
+        allow_failure: task.allow_failure,
+        task_type: task.task_type.clone(),
+        approval_timeout_secs: task.approval_timeout_secs,
+        approval_on_timeout: task.approval_on_timeout.clone(),
         max_attempts: task.max_attempts,
         retry_delay_secs: task.retry_delay_secs,
+        retry_max_delay_secs: task.retry_max_delay_secs,
         timeout_secs: task.timeout_secs,
         docker_image: task.docker_image.as_ref().map(|s| substitute(s, ctx)),
         env: task
@@ -261,6 +341,7 @@ fn build_leaf(task: &TaskSpec, name: &str, ctx: &BTreeMap<String, String>) -> Ta
             .map(|e| crate::dag::EnvVar {
                 name: e.name.clone(),
                 value: substitute(&e.value, ctx),
+                value_from: e.value_from.clone(),
             })
             .collect(),
         resources: task.resources.clone(),
@@ -271,7 +352,31 @@ fn build_leaf(task: &TaskSpec, name: &str, ctx: &BTreeMap<String, String>) -> Ta
         with_items: None,
         with_param: None,
         when: None,
+        instance_key: None,
     }
+}
+
+/// Sanitize a rendered `instance_key` label: keep `[A-Za-z0-9_-]` (`.` is the
+/// expansion hierarchy separator, so it is excluded), map runs of anything else
+/// to a single `-`, and cap the length so labels stay usable in task names,
+/// logs, and the UI.
+fn sanitize_label(raw: &str) -> String {
+    const MAX_LABEL: usize = 64;
+    let mut out = String::with_capacity(raw.len().min(MAX_LABEL));
+    let mut last_dash = false;
+    for ch in raw.chars() {
+        if out.len() >= MAX_LABEL {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-') {
+            out.push(ch);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
 }
 
 /// Resolve a task's fan-out items. `None` element list `[None]` means "one plain
@@ -315,7 +420,9 @@ fn plain(v: &Value) -> String {
 
 /// Replace every `{{ key }}` (optional surrounding whitespace) with `ctx[key]`.
 /// Unknown keys are left verbatim so partial templates round-trip harmlessly.
-fn substitute(s: &str, ctx: &BTreeMap<String, String>) -> String {
+/// Public so the engine's schedule gates (`when:`/`stop:`) evaluate expressions
+/// with the same substitution the template expander uses.
+pub fn substitute(s: &str, ctx: &BTreeMap<String, String>) -> String {
     if !s.contains("{{") {
         return s.to_string();
     }
@@ -382,7 +489,9 @@ fn eval_arith(expr: &str, ctx: &BTreeMap<String, String>) -> Option<String> {
 
 /// Evaluate a `when:` expression: `LHS OP RHS` (ops `==,!=,<=,>=,<,>`) or a bare
 /// truthy value. Numeric comparison when both sides parse as numbers, else string.
-fn eval_when(expr: &str) -> Result<bool> {
+/// Public so the engine's schedule gates reuse the identical comparison semantics
+/// as task-level `when:`.
+pub fn eval_when(expr: &str) -> Result<bool> {
     let expr = expr.trim();
     for op in ["<=", ">=", "==", "!=", "<", ">"] {
         if let Some(idx) = expr.find(op) {
@@ -672,6 +781,103 @@ tasks:
             checked += 1;
         }
         assert!(checked >= 13, "expected the example catalog, found {checked}");
+    }
+
+    #[test]
+    fn instance_key_labels_fan_out_instances() {
+        let (names, deps) = run(
+            r#"
+name: w
+tasks:
+  - name: sync
+    command: ["echo", "{{ item.region }}"]
+    with_items:
+      - { region: "us-east-1" }
+      - { region: "eu west 2" }
+    instance_key: "{{ item.region }}"
+  - { name: done, command: ["true"], depends_on: [sync] }
+"#,
+        );
+        // Readable labels replace bare indexes; the space sanitized to a dash.
+        assert!(names.contains(&"sync.us-east-1".to_string()), "names: {names:?}");
+        assert!(names.contains(&"sync.eu-west-2".to_string()), "names: {names:?}");
+        assert_eq!(deps["done"], vec!["sync.eu-west-2", "sync.us-east-1"]);
+    }
+
+    #[test]
+    fn instance_key_duplicate_labels_rejected() {
+        let spec: DagSpec = serde_yaml::from_str(
+            r#"
+name: w
+tasks:
+  - name: m
+    command: ["true"]
+    with_items: ["a!", "a?"]
+    instance_key: "{{ item }}"
+"#,
+        )
+        .unwrap();
+        // Both items sanitize to "a" — must fail loudly, not silently collide.
+        let err = expand(spec).unwrap_err().to_string();
+        assert!(err.contains("duplicate label"), "got: {err}");
+    }
+
+    #[test]
+    fn instance_key_without_fan_out_rejected() {
+        let spec: DagSpec = serde_yaml::from_str(
+            r#"
+name: w
+tasks:
+  - { name: solo, command: ["true"], instance_key: "x" }
+"#,
+        )
+        .unwrap();
+        let err = expand(spec).unwrap_err().to_string();
+        assert!(err.contains("without with_items/with_param"), "got: {err}");
+    }
+
+    #[test]
+    fn sanitize_label_rules() {
+        assert_eq!(sanitize_label("us-east-1"), "us-east-1");
+        assert_eq!(sanitize_label("a b//c"), "a-b-c"); // runs collapse to one dash
+        assert_eq!(sanitize_label("shard.7"), "shard-7"); // '.' is the hierarchy separator
+        assert_eq!(sanitize_label("!!!"), ""); // nothing usable survives
+        assert_eq!(sanitize_label(&"x".repeat(100)).len(), 64); // length cap
+    }
+
+    #[test]
+    fn hooks_wire_to_all_non_hook_tasks_with_a_trigger_rule() {
+        let spec = expanded(
+            r#"
+name: w
+tasks:
+  - { name: a, command: ["true"] }
+  - { name: b, command: ["true"], depends_on: [a] }
+  - { name: notify, command: ["echo"], hook: on_exit }
+  - { name: alert, command: ["echo"], hook: on_failure }
+"#,
+        );
+        let by = |n: &str| spec.tasks.iter().find(|t| t.name == n).unwrap().clone();
+        let mut nd = by("notify").depends_on;
+        nd.sort();
+        assert_eq!(nd, vec!["a", "b"], "on_exit hook depends on all non-hook tasks");
+        assert_eq!(by("notify").trigger_rule.as_deref(), Some("all_done"));
+        assert_eq!(by("alert").trigger_rule.as_deref(), Some("one_failed"));
+        // Hooks do not depend on each other.
+        assert!(!by("alert").depends_on.contains(&"notify".to_string()));
+        // The whole thing still builds (no cycle, valid graph).
+        crate::dag::DagGraph::from_spec(spec).unwrap();
+    }
+
+    #[test]
+    fn depending_on_a_hook_is_rejected() {
+        let err = crate::dag::DagGraph::from_yaml(
+            "name: w\ntasks:\n  - { name: fin, command: [\"echo\"], hook: on_exit }\n  - { name: x, command: [\"true\"], depends_on: [fin] }\n",
+        )
+        .err()
+        .expect("depending on a hook must be rejected")
+        .to_string();
+        assert!(err.contains("cannot depend on hook"), "got: {err}");
     }
 
     #[test]

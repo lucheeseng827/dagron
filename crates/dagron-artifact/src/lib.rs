@@ -1,10 +1,10 @@
-//! Artifact store seam — task data passing (XCom / Argo-artifact parity).
+//! Artifact store seam — passing data files between tasks in a run.
 //!
-//! [`ArtifactStore`] abstracts *where* task artifacts live so the OSS engine ships
+//! [`ArtifactStore`] abstracts *where* task artifacts live so the engine ships
 //! a zero-infra local-filesystem store while an S3/GCS backend plugs in behind the
 //! same trait. Tasks in a run share a per-run location (the engine injects
 //! `DAGRON_ARTIFACTS`) to pass files; the trait is the programmatic surface the API
-//! and downstream editions use to read/write artifacts by key.
+//! and alternate builds use to read/write artifacts by key.
 
 use std::path::PathBuf;
 
@@ -74,7 +74,7 @@ pub trait ArtifactStore: Send + Sync {
     }
 }
 
-/// Artifacts disabled — the OSS default when unconfigured. Every operation errors
+/// Artifacts disabled — the default when unconfigured. Every operation errors
 /// (so a workflow that genuinely needs artifacts fails loudly rather than silently
 /// losing data); `run_location` is `None` so the engine injects no dir.
 pub struct NoopStore;

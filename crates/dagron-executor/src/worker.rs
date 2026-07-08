@@ -11,7 +11,7 @@ use ractor::{Actor, ActorProcessingErr, ActorRef};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::Instrument;
 
-use crate::executor::{ExecContext, Executor};
+use crate::executor::{ExecContext, Executor, LogChunk, LogSink};
 use dagron_core::metrics::Metrics;
 
 // ── Result type (produced by workers, consumed by the reconcile loop) ─────────
@@ -25,6 +25,8 @@ pub struct TaskResult {
     pub attempt: i64,
     pub max_attempts: u32,
     pub retry_delay_secs: u64,
+    /// Optional clamp on the exponential backoff (spec `retry_max_delay_secs`).
+    pub retry_max_delay_secs: Option<u64>,
     /// Per-claim fencing token (the post-claim `version`). Mutations only apply
     /// if the row still carries this version, so a stale attempt whose lease was
     /// reclaimed — even by this same process — cannot overwrite a newer attempt.
@@ -40,10 +42,17 @@ pub struct DispatchPayload {
     pub attempt: i64,
     pub max_attempts: u32,
     pub retry_delay_secs: u64,
+    /// Optional clamp on the exponential backoff (spec `retry_max_delay_secs`);
+    /// echoed back in [`TaskResult`].
+    pub retry_max_delay_secs: Option<u64>,
     /// Per-claim fencing token (post-claim `version`); echoed back in TaskResult.
     pub fence: i64,
     /// Channel back to the reconcile loop — the worker sends its result here.
     pub result_tx: UnboundedSender<TaskResult>,
+    /// Optional live-log channel (#17). When set, the worker wires a per-task
+    /// [`LogSink`] into the executor context so incremental output streams back to
+    /// the loop for tailing. `None` disables streaming.
+    pub log_tx: Option<UnboundedSender<LogChunk>>,
 }
 
 // ── WorkerActor ───────────────────────────────────────────────────────────────
@@ -84,12 +93,12 @@ impl Actor for WorkerActor {
         message: WorkerMsg,
         state: &mut WorkerState,
     ) -> Result<(), ActorProcessingErr> {
-        let WorkerMsg::Execute(p) = message;
+        let WorkerMsg::Execute(mut p) = message;
 
         // Correlate every line emitted while this task runs (including events from
         // inside the executor backend) under one span, carrying the worker slot,
         // task, attempt and fence. With LOG_SPAN_EVENTS=close this span also yields
-        // an automatic per-task timing event for SaaS dashboards.
+        // an automatic per-task timing event for observability dashboards.
         let slot = myself.get_name().unwrap_or_else(|| "worker".to_string());
         let span = tracing::info_span!(
             "task",
@@ -108,6 +117,22 @@ impl Actor for WorkerActor {
                 "task starting",
             );
 
+            // Secret masking (#8): mask any sensitive task-env values out of the
+            // captured output *before* it is persisted or surfaced. Built from
+            // this task's env, so it covers every executor backend centrally.
+            let redactor = crate::redact::Redactor::from_task_env(&p.ctx.env);
+
+            // Live-log streaming (#17): wire a per-attempt sink so the executor can
+            // stream incremental (redacted) output back to the loop for tailing.
+            if let Some(log_tx) = p.log_tx.take() {
+                p.ctx.log_sink = Some(LogSink::new(
+                    log_tx,
+                    p.task_id.clone(),
+                    p.fence,
+                    redactor.clone(),
+                ));
+            }
+
             // Task wall time (claim→finish) — the workload signal the no-op load
             // test never exercised. Recorded whether the task succeeds or errors.
             let started = Instant::now();
@@ -123,11 +148,14 @@ impl Actor for WorkerActor {
                     } else {
                         tracing::error!(duration_ms, "non-zero exit");
                     }
-                    (o.success, Some(o.output))
+                    (o.success, Some(redactor.redact(&o.output).into_owned()))
                 }
                 Err(e) => {
-                    tracing::error!(duration_ms, err = %e, "executor error");
-                    (false, Some(e.to_string()))
+                    // The error string (e.g. a failed connection URL) can carry a
+                    // secret too — mask it before it is logged or stored.
+                    let msg = redactor.redact(&e.to_string()).into_owned();
+                    tracing::error!(duration_ms, err = %msg, "executor error");
+                    (false, Some(msg))
                 }
             };
 
@@ -140,6 +168,7 @@ impl Actor for WorkerActor {
                 attempt: p.attempt,
                 max_attempts: p.max_attempts,
                 retry_delay_secs: p.retry_delay_secs,
+                retry_max_delay_secs: p.retry_max_delay_secs,
                 fence: p.fence,
             }).is_err() {
                 tracing::warn!("result channel closed — reconcile loop may have exited");

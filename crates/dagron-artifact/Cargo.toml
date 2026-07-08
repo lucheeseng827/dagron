@@ -2,7 +2,7 @@
 name = "dagron-artifact"
 version = "0.1.0"
 edition = "2021"
-description = "dagron artifact store seam: the ArtifactStore trait + a local-filesystem default. Task data passing (XCom / Argo-artifact parity); an S3/GCS backend plugs in behind the same trait."
+description = "dagron artifact store seam: the ArtifactStore trait + a local-filesystem default. Passes data files between tasks in a run; an S3/GCS backend plugs in behind the same trait."
 
 [lib]
 name = "dagron_artifact"

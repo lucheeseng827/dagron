@@ -36,7 +36,7 @@ use state::{AppState, TaskEvent};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Tunable, SaaS-ready logging (RUST_LOG / LOG_LEVEL / LOG_FORMAT / …); see
+    // Tunable, structured logging (RUST_LOG / LOG_LEVEL / LOG_FORMAT / …); see
     // the shared `dagron_logging` crate for the full env knob list.
     dagron_logging::init("api");
 
@@ -69,8 +69,8 @@ async fn main() -> Result<()> {
     // Broadcast channel for live task events; the listener that feeds it is added in 01-04.
     let (tx, _rx) = broadcast::channel::<TaskEvent>(1024);
 
-    // OSS identity: verify credentials against the local users table. The
-    // Enterprise edition swaps an SSO provider in behind the same seam.
+    // Local identity: verify credentials against the local users table. An
+    // alternate provider can swap an SSO backend in behind the same seam.
     let identity: Arc<dyn dagron_identity::IdentityProvider> =
         Arc::new(identity::LocalIdentityProvider::new(pool.clone()));
 
@@ -116,6 +116,7 @@ async fn main() -> Result<()> {
         .route("/api/me", get(me))
         .route("/api/runs", get(routes::runs::list_runs))
         .route("/api/runs/{id}", get(routes::runs::get_run))
+        .route("/api/runs/{id}/wait", get(routes::runs::wait_run))
         .route("/api/runs/{id}/graph", get(routes::graph::get_graph))
         .route("/api/runs/{id}/tasks/{tid}/logs", get(routes::graph::get_task_logs))
         .route("/api/runs/{id}/stream", get(routes::stream::stream_run))
@@ -124,6 +125,9 @@ async fn main() -> Result<()> {
         .route("/api/runs/{id}/rerun", post(routes::control::rerun_run))
         .route("/api/runs/{id}/resubmit", post(routes::control::resubmit_run))
         .route("/api/runs/{id}/tasks/{tid}/retry", post(routes::control::retry_task))
+        .route("/api/runs/{id}/tasks/{tid}/clear", post(routes::control::clear_task))
+        .route("/api/runs/{id}/tasks/{tid}/approve", post(routes::control::approve_task))
+        .route("/api/runs/{id}/tasks/{tid}/reject", post(routes::control::reject_task))
         // Observability + dead-letter queue (authed UI edge over engine ops surface).
         .route("/api/metrics", get(routes::ops::metrics))
         .route("/api/dead-letters", get(routes::ops::list_dead_letters))
@@ -142,6 +146,8 @@ async fn main() -> Result<()> {
         )
         .route("/api/workflows/{id}/run", post(routes::workflows::run_workflow))
         .route("/api/workflows/{id}/sync-to-git", post(routes::gitsync::sync_to_git))
+        // Public run-status badge (embeds in READMEs; status label only, no auth).
+        .route("/api/badges/{name}", get(routes::badge::workflow_badge))
         // GitOps repository registry (connect / list / sync / disconnect).
         .route(
             "/api/git-repos",
@@ -160,6 +166,13 @@ async fn main() -> Result<()> {
                 .delete(routes::schedules::delete_schedule),
         )
         .route("/api/schedules/{id}/backfill", post(routes::schedules::backfill))
+        // First-class paced backfill jobs (#18): create/list/monitor/cancel.
+        .route(
+            "/api/backfills",
+            post(routes::backfills::create).get(routes::backfills::list),
+        )
+        .route("/api/backfills/{id}", get(routes::backfills::get))
+        .route("/api/backfills/{id}/cancel", post(routes::backfills::cancel))
         // Cap request bodies (submit YAML) to resist abuse.
         .layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024))
         .layer(TraceLayer::new_for_http())

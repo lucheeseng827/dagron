@@ -140,8 +140,21 @@ fn expand_pure(
     // Defense-in-depth: the rewired flat DAG must still be acyclic with unique
     // names (it always is for acyclic inputs, but cheap to assert).
     validate_graph(&root.name, &e.tasks).map_err(|(_, m)| m)?;
+    // `result_from` is copied from the authored spec, but a `workflow_ref` task it
+    // named may have been expanded into namespaced leaves — so re-check it against
+    // the *expanded* task names the run will actually carry.
+    if let Some(result_from) = &root.result_from {
+        if !e.tasks.iter().any(|t| &t.name == result_from) {
+            return Err(format!(
+                "result_from names unknown task '{result_from}' after expansion in workflow '{}'",
+                root.name
+            ));
+        }
+    }
     Ok(DagSpecInput {
         name: root.name,
+        run_timeout_secs: root.run_timeout_secs,
+        result_from: root.result_from,
         tasks: e.tasks,
     })
 }
@@ -294,11 +307,16 @@ fn leaf(task: &TaskSpecInput, name: String) -> TaskSpecInput {
         command: task.command.clone(),
         depends_on: vec![],
         input: task.input.clone(),
+        trigger_rule: task.trigger_rule.clone(),
         max_attempts: task.max_attempts,
         retry_delay_secs: task.retry_delay_secs,
+        retry_max_delay_secs: task.retry_max_delay_secs,
         timeout_secs: task.timeout_secs,
         docker_image: task.docker_image.clone(),
         workflow_ref: None,
+        task_type: task.task_type.clone(),
+        approval_timeout_secs: task.approval_timeout_secs,
+        approval_on_timeout: task.approval_on_timeout.clone(),
     }
 }
 

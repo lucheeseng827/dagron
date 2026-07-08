@@ -109,6 +109,14 @@ pub struct Metrics {
     pub tasks_failed: AtomicU64,
     pub tasks_retried: AtomicU64,
     pub dead_letters: AtomicU64,
+    /// Runs failed by the run-level deadline sweep (spec `run_timeout_secs`).
+    pub runs_deadline_exceeded: AtomicU64,
+    /// Soft SLA deadline alerts emitted (spec `deadline`) — run kept running.
+    pub deadline_alerts: AtomicU64,
+    /// Schedule fires skipped by a `when:` gate evaluating false.
+    pub schedule_gated: AtomicU64,
+    /// Schedules auto-stopped by a `stopStrategy` expression.
+    pub schedules_stopped: AtomicU64,
     /// Runs created by the auto-backfill catch-up sweep (QW3 auto-catchup). A schedule that
     /// missed fires while the scheduler was down has them materialized here.
     #[cfg(feature = "enterprise")]
@@ -122,7 +130,7 @@ pub struct Metrics {
     pub task_duration: Histogram,
     /// Reconcile-loop tick duration — the CPU-pegging signal from LOADTEST.md.
     pub reconcile_tick: Histogram,
-    // ── QW3 auto-catchup self-healing state gauges (EE) ──────────────────────────────────
+    // ── QW3 auto-catchup self-healing state gauges ──────────────────────────────────
     // Unlike the counters above (monotonic, bumped on the hot path) these are
     // *current state* re-published by the auto-backfill loop on every sweep: the
     // loop is the single writer, `render` reads the last value. They are the
@@ -149,6 +157,10 @@ impl Default for Metrics {
             tasks_failed: AtomicU64::new(0),
             tasks_retried: AtomicU64::new(0),
             dead_letters: AtomicU64::new(0),
+            runs_deadline_exceeded: AtomicU64::new(0),
+            deadline_alerts: AtomicU64::new(0),
+            schedule_gated: AtomicU64::new(0),
+            schedules_stopped: AtomicU64::new(0),
             #[cfg(feature = "enterprise")]
             catchup_runs: AtomicU64::new(0),
             #[cfg(feature = "enterprise")]
@@ -193,6 +205,22 @@ impl Metrics {
     pub fn inc_dead_letters(&self) {
         Self::bump(&self.dead_letters);
     }
+    /// One run failed by the run-level deadline sweep (spec `run_timeout_secs`).
+    pub fn inc_runs_deadline_exceeded(&self) {
+        Self::bump(&self.runs_deadline_exceeded);
+    }
+    /// One soft SLA deadline alert emitted (spec `deadline`).
+    pub fn inc_deadline_alerts(&self) {
+        Self::bump(&self.deadline_alerts);
+    }
+    /// One schedule fire skipped by a `when:` gate.
+    pub fn inc_schedule_gated(&self) {
+        Self::bump(&self.schedule_gated);
+    }
+    /// One schedule auto-stopped by a `stopStrategy` expression.
+    pub fn inc_schedules_stopped(&self) {
+        Self::bump(&self.schedules_stopped);
+    }
     /// One run materialized by the auto-backfill catch-up sweep (QW3 auto-catchup).
     #[cfg(feature = "enterprise")]
     pub fn inc_catchup_runs(&self) {
@@ -234,7 +262,7 @@ impl Metrics {
     pub fn render(&self, snap: &MetricsSnapshot, pool: Option<&DbPoolStats>) -> String {
         let mut out = String::with_capacity(2048);
 
-        let counters: [(&str, &str, u64); 6] = [
+        let counters: [(&str, &str, u64); 10] = [
             ("scheduler_runs_created_total", "Runs created by this scheduler since boot.",
              self.runs_created.load(Ordering::Relaxed)),
             ("scheduler_tasks_dispatched_total", "Tasks dispatched to the worker pool.",
@@ -247,6 +275,14 @@ impl Metrics {
              self.tasks_retried.load(Ordering::Relaxed)),
             ("scheduler_dead_letters_total", "Poison submissions parked in the dead-letter store.",
              self.dead_letters.load(Ordering::Relaxed)),
+            ("scheduler_runs_deadline_exceeded_total", "Runs failed by the run-level deadline sweep (run_timeout_secs).",
+             self.runs_deadline_exceeded.load(Ordering::Relaxed)),
+            ("scheduler_deadline_alerts_total", "Soft SLA deadline alerts emitted (deadline).",
+             self.deadline_alerts.load(Ordering::Relaxed)),
+            ("scheduler_schedule_gated_total", "Schedule fires skipped by a when: gate.",
+             self.schedule_gated.load(Ordering::Relaxed)),
+            ("scheduler_schedules_stopped_total", "Schedules auto-stopped by a stopStrategy expression.",
+             self.schedules_stopped.load(Ordering::Relaxed)),
         ];
         for (name, help, value) in counters {
             let _ = writeln!(out, "# HELP {name} {help}");
@@ -296,7 +332,7 @@ impl Metrics {
         let _ = writeln!(out, "# TYPE scheduler_dead_letters gauge");
         let _ = writeln!(out, "scheduler_dead_letters {}", snap.dead_letters);
 
-        // QW3 auto-catchup self-healing state gauges (EE) — republished by the
+        // QW3 auto-catchup self-healing state gauges — republished by the
         // auto-backfill loop each sweep. Alerting on `scheduler_schedule_lag_seconds`
         // or `scheduler_incomplete_runs` is the intended trigger for downstream
         // eventing (redrive, page, webhook).

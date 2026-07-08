@@ -1,0 +1,15 @@
+[package]
+name = "dagron-forge"
+version = "0.1.0"
+edition = "2021"
+description = "dagron forge feedback — post commit statuses / PR checks to GitHub or GitLab when a run finishes, so a workflow's result shows up as a green/red check on the commit that triggered it."
+
+[lib]
+name = "dagron_forge"
+path = "src/lib.rs"
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"

@@ -131,6 +131,56 @@ struct RunSummaryFull {
     finished_at: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct WaitParams {
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RunResult {
+    pub run_id: String,
+    pub status: String,
+    pub finished: bool,
+    /// The `result_from` task's output on success, else null (fast-win #15).
+    pub result: Option<String>,
+}
+
+/// `GET /api/runs/:id/wait?timeout_secs=` — synchronous invocation (fast-win
+/// #15): long-poll a run until it reaches a terminal state (or the timeout
+/// elapses) and return its status + result (the `result_from` task's output on
+/// success). 404 if the run is unknown; a timed-out wait returns `finished:false`
+/// with the live status so the caller re-polls. Backend-agnostic short poll — the
+/// engine (which may be a separate process) drives the run to completion.
+pub async fn wait_run(
+    _auth: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<WaitParams>,
+) -> Result<Json<RunResult>, StatusCode> {
+    let timeout =
+        std::time::Duration::from_secs(params.timeout_secs.unwrap_or(30).clamp(1, 600));
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let row: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT status, output FROM workflow_runs WHERE id = $1")
+                .bind(&id)
+                .fetch_optional(&state.read_pool)
+                .await
+                .map_err(internal)?;
+        let Some((status, output)) = row else {
+            return Err(StatusCode::NOT_FOUND);
+        };
+        let finished = matches!(status.as_str(), "succeeded" | "failed" | "cancelled");
+        if finished || tokio::time::Instant::now() >= deadline {
+            // Per the contract, `result` is the run output only on success; a
+            // failed/cancelled run's output is an error message, not a result.
+            let result = if status == "succeeded" { output } else { None };
+            return Ok(Json(RunResult { run_id: id, status, finished, result }));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 /// Map any DB error to 500 without leaking internals to the client.
 fn internal(err: sqlx::Error) -> StatusCode {
     tracing::error!(error = ?err, "db query failed");

@@ -1,0 +1,30 @@
+# Parity fast-wins demo: run-level deadline + labeled fan-out + capped retries.
+#
+#   dagron validate examples/deadline_fanout.yaml   # offline lint (CI-friendly)
+#   dagron examples/deadline_fanout.yaml            # one-shot run
+#
+# The run as a whole has a 10-minute wall-clock budget (`run_timeout_secs`) —
+# past it the engine fails the run and cancels whatever is still pending. Each
+# fan-out instance is named after its region (sync.us-east-1, …) instead of a
+# bare index, and retries back off exponentially but never wait longer than
+# 30 s between attempts. A schedule-fired run also receives
+# `{{ scheduled_time }}` (its nominal fire time, RFC-3339) as a parameter.
+name: deadline_fanout
+run_timeout_secs: 600
+parameters:
+  scheduled_time: ""            # filled by cron/schedule/backfill fires
+tasks:
+  - name: sync
+    command: ["sh", "-c", "echo syncing {{ item.region }} as-of '{{ scheduled_time }}'"]
+    with_items:
+      - { region: "us-east-1" }
+      - { region: "eu-west-2" }
+      - { region: "ap-south-1" }
+    instance_key: "{{ item.region }}"
+    max_attempts: 4
+    retry_delay_secs: 5
+    retry_max_delay_secs: 30
+    timeout_secs: 120
+  - name: report
+    command: ["echo", "all regions synced"]
+    depends_on: [sync]

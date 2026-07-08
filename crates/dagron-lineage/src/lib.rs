@@ -1,4 +1,4 @@
-//! OpenLineage emitter — data lineage parity (Airflow has OpenLineage built in).
+//! OpenLineage emitter — emits data-lineage events to an OpenLineage backend.
 //!
 //! On run finalization the engine calls [`OpenLineageClient::emit_run_completed`],
 //! which POSTs an OpenLineage `RunEvent` (`COMPLETE` / `FAIL`) to a lineage backend

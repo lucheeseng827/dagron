@@ -5,9 +5,9 @@ description: |
   UI gateway, the Next.js frontend, and a throwaway in-cluster Postgres for testing.
   Runs on kind/k3d/k3s/EKS.
 type: application
-version: 0.2.0
+version: 0.3.0
 # appVersion tracks the dagron image; override images via values.yaml.
-appVersion: "0.2.0"
+appVersion: "0.3.0"
 keywords:
   - dagron
   - workflow

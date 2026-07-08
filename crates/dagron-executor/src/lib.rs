@@ -12,6 +12,8 @@ pub mod docker_executor;
 pub mod executor;
 #[cfg(feature = "kubernetes")]
 pub mod kube_executor;
+pub mod redact;
+pub mod secrets;
 pub mod worker;
 
 /// Install the process-wide rustls `CryptoProvider` that the kube client needs

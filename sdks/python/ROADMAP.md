@@ -141,22 +141,22 @@ SSE streaming, and a `wait_for_run` poll helper. Real-socket test suite.
 - **Async client** (`AsyncClient`) — an `asyncio`/`aiohttp`-optional twin for
   high-fan-out submit/poll workloads. Kept as an extra so the core stays zero-dep.
 - **CLI** (`python -m dagron ...`) wrapping the most common verbs (submit, runs,
-  logs, cancel) for shell use, mirroring `ee/dagron-cli-ee`.
+  logs, cancel) for shell use.
 
 ### M5 — Deeper dagron internals *(v0.6+, gated on server exposure)*
 These reach beyond the current HTTP surface; each needs a server-side endpoint or a
 documented protocol before the SDK can wrap it. Tracked here so the SDK roadmap and
-the platform roadmap stay aligned (`docs/ROADMAP.md`, `ee/PRODUCT_ROADMAP.md`).
+the platform roadmap stay aligned (`docs/ROADMAP.md`).
 
 | Internal | Where it lives today | SDK plan |
 |---|---|---|
-| **MCP tools** (model-driven control) | `crates/dagron-mcp`, `ee/dagron-mcp-ee` | thin `mcp` helper once the tool schema stabilises |
+| **MCP tools** (model-driven control) | `crates/dagron-mcp` | thin `mcp` helper once the tool schema stabilises |
 | **Lineage / data catalog** | `crates/dagron-lineage` | `lineage` reads once an HTTP endpoint exists |
 | **Artifacts** (task inputs/outputs) | `crates/dagron-artifact` | `artifacts.get/put` against object storage |
-| **Event sources / queues** | `ee/dagron-source-queues` (kafka/sqs/nats/redis) | publish-a-trigger helper |
-| **Operator CRDs** (`Workflow`, schedules) | `ee/dagron-operator`, Helm `crds/` | optional Kubernetes-native authoring export |
+| **Event sources / queues** | queue sources (kafka/sqs/nats/redis) | publish-a-trigger helper |
+| **Operator CRDs** (`Workflow`, schedules) | Helm `crds/` | optional Kubernetes-native authoring export |
 | **Backfill (durable)** | `schedules/{id}/backfill` (MVP, in-process) | track the queue-backed beta follow-up |
-| **SSO / OIDC login** | `ee/dagron-sso` | pluggable auth provider on `Client` |
+| **SSO / OIDC login** | the identity seam | pluggable auth provider on `Client` |
 
 ### M6 — Stabilise to `v1.0`
 SemVer guarantees on the public surface, a published changelog, generated API

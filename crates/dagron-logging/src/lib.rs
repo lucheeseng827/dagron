@@ -2,16 +2,12 @@
 //!
 //! This is the **single source of truth** for how every internal dagron process
 //! turns `tracing` events into output: the workflow controller / reconcile loop
-//! and its worker pool (`dagron`), the management API (`dagron-api`), and the
-//! Kubernetes operator (`dagron-operator`) all call [`init`]. Configuring
+//! and its worker pool (`dagron`) and the management API (`dagron-api`) all call
+//! [`init`]. Configuring
 //! verbosity and format in one place keeps logs consistent — important down the
 //! line when shipping them to a central aggregator (Loki,
 //! CloudWatch, Datadog, …) that needs them machine-parseable and per-service
 //! attributable.
-//!
-//! NOTE: the public OSS mirror (`module_54/oss`) is a standalone crate excluded
-//! from the workspace, so it intentionally does *not* depend on this crate and
-//! keeps its own minimal init.
 //!
 //! Configuration is entirely environment-driven so it can be tuned per-deployment
 //! without a rebuild:
@@ -20,7 +16,7 @@
 //! |--------------------|-----------------------------------------------------|---------|---------|
 //! | `RUST_LOG`         | full [`EnvFilter`] directive                         | —       | Precise per-target verbosity, e.g. `info,dagron::worker=debug,sqlx=warn`. Wins over `LOG_LEVEL`. |
 //! | `LOG_LEVEL`        | `trace`/`debug`/`info`/`warn`/`error`               | `info`  | Simple global verbosity knob when you don't need per-target control. |
-//! | `LOG_FORMAT`       | `full`/`compact`/`pretty`/`json`                     | `full`  | `json` for SaaS log ingestion; `pretty` for local dev readability. |
+//! | `LOG_FORMAT`       | `full`/`compact`/`pretty`/`json`                     | `full`  | `json` for centralized log ingestion; `pretty` for local dev readability. |
 //! | `LOG_TARGET`       | `1`/`0`                                              | `1`     | Include the emitting module path on each line. |
 //! | `LOG_THREAD_IDS`   | `1`/`0`                                              | `0`     | Include the OS thread id (useful when debugging the worker pool). |
 //! | `LOG_THREAD_NAMES` | `1`/`0`                                              | `0`     | Include the thread name. |

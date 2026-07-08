@@ -14,9 +14,6 @@ The dagron workflow UI, over `dagron-api`:
 | Submit / cancel / retry / dead-letters / metrics | over `dagron-api` |
 | Workflows-as-first-class, editor, schedule, GitOps | the visual workflow surface |
 
-Enterprise-only screens (org/RBAC admin, audit log, usage dashboards) are not
-part of the OSS build — they live under `src/ee/` (see its README).
-
 ## Config
 
 Copy `.env.example` → `.env.local`:

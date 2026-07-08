@@ -12,12 +12,12 @@ A Helm chart published as an **OCI artifact**. It wires the three dagron images 
 
 | Version | Notes |
 |---|---|
-| `0.2.0` | pulls the `0.2.0` images |
+| `0.3.0` | pulls the `0.3.0` images |
 
 ## Install
 
 ```bash
-helm install dagron oci://registry-1.docker.io/mancube/dagron --version 0.2.0 \
+helm install dagron oci://registry-1.docker.io/mancube/dagron --version 0.3.0 \
   -n dagron --create-namespace \
   --set ingress.enabled=true --set-string ingress.host='dagron.your-host.example.com' \
   --set ingress.tls.enabled=true --set-string ingress.tls.secretName='dagron-tls' \
@@ -28,15 +28,15 @@ helm install dagron oci://registry-1.docker.io/mancube/dagron --version 0.2.0 \
 Inspect first:
 
 ```bash
-helm show values oci://registry-1.docker.io/mancube/dagron --version 0.2.0
-helm template dagron oci://registry-1.docker.io/mancube/dagron --version 0.2.0   # render without installing
+helm show values oci://registry-1.docker.io/mancube/dagron --version 0.3.0
+helm template dagron oci://registry-1.docker.io/mancube/dagron --version 0.3.0   # render without installing
 ```
 
 ## Common values
 
 | Value | Meaning |
 |---|---|
-| `engine.image` / `dagronApi.image` / `frontend.image` | image refs (default the matching `0.2.0` tags). |
+| `engine.image` / `dagronApi.image` / `frontend.image` | image refs (default the matching `0.3.0` tags). |
 | `dagronApi.jwtSecret` | **required** — session-cookie signing key (≥32 chars). |
 | `dagronApi.admin.{email,password,name}` | bootstrap admin user. |
 | `ingress.*` | host + TLS for the console. |
@@ -45,4 +45,4 @@ helm template dagron oci://registry-1.docker.io/mancube/dagron --version 0.2.0  
 
 > **Production:** disable the in-cluster Postgres and use a managed database; set a strong `jwtSecret` and admin password; enable ingress TLS.
 >
-> The GitOps **operator** is a separate, closed component and is **not** part of this chart.
+> The GitOps **operator** is a separate, optional component and is **not** part of this chart.

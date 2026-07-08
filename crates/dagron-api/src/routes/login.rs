@@ -49,8 +49,9 @@ pub async fn login(
     State(state): State<AppState>,
     Json(body): Json<LoginBody>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    // Authentication goes through the identity seam (OSS default = local argon2;
-    // EE = SSO). dagron-api still owns the session it mints below.
+    // Authentication goes through the identity seam (default = local argon2; an
+    // alternate provider can plug SSO in). dagron-api still owns the session it
+    // mints below.
     let user = state
         .identity
         .authenticate_password(&body.email, &body.password)

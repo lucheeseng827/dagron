@@ -143,9 +143,9 @@ impl WorkflowSource for ChannelSource {
 // ── Source selection ──────────────────────────────────────────────────────────
 
 /// Extension hook for ingestion sources beyond the built-in file/channel — e.g.
-/// the Enterprise queue backends (Redis/SQS/Kafka/NATS) in `dagron-source-queues`.
-/// An edition wires its factory into [`build_with`]; the OSS engine passes `None`
-/// and supports only the built-in sources.
+/// queue backends (Redis/SQS/Kafka/NATS). A build wires its factory into
+/// [`build_with`]; the default engine passes `None` and supports only the
+/// built-in sources.
 #[async_trait]
 pub trait SourceFactory: Send + Sync {
     /// Build the source for `kind`, or `Ok(None)` if this factory does not handle
@@ -171,13 +171,13 @@ pub async fn build_with(
         "file" => Box::new(FileSource::new(file_path)),
         other => bail!(
             "unknown SOURCE '{other}'. Built-in: 'file'. Queue backends \
-             (redis/sqs/kafka/nats) are an Enterprise feature — see dagron-source-queues."
+             (redis/sqs/kafka/nats) require a registered SourceFactory."
         ),
     })
 }
 
-/// Built-in-only source selection (the OSS engine). Use [`build_with`] to register
-/// additional (Enterprise) backends.
+/// Built-in-only source selection. Use [`build_with`] to register
+/// additional backends.
 pub async fn build(kind: &str, file_path: &str) -> Result<Box<dyn WorkflowSource>> {
     build_with(kind, file_path, None).await
 }

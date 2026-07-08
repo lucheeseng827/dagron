@@ -1,8 +1,8 @@
-//! OSS identity provider: verify credentials against the local `users` table.
+//! Local identity provider: verify credentials against the local `users` table.
 //!
-//! This is the default behind the [`IdentityProvider`] seam. The Enterprise
-//! edition swaps an SSO provider (`ee/dagron-sso`) in its place; dagron-api keeps
-//! owning the session cookie either way (see [`routes::login`](crate::routes::login)).
+//! This is the default behind the [`IdentityProvider`] seam. An alternate
+//! provider can swap an SSO backend in its place; dagron-api keeps owning the
+//! session cookie either way (see [`routes::login`](crate::routes::login)).
 
 use anyhow::Result;
 use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordVerifier, SaltString};

@@ -4,7 +4,7 @@
 task plus everything it blocked) — the fix for a *transient* failure where the
 same task succeeds on a later attempt.
 
-To make that observable deterministically on the OSS engine we simulate a
+To make that observable deterministically on the default engine we simulate a
 transient fault with a marker file on the engine host:
 
 * `reset`     removes the marker; it succeeds and is NOT re-run on the rerun,
@@ -15,8 +15,9 @@ transient fault with a marker file on the engine host:
     python 04_rerun_failed.py
 
 > Note: passing a `params=` override to `rerun_run` (a fix-forward rerun that
-> mutates task input) is an **Enterprise** feature; the OSS engine rejects it
-> with 400. This example uses a plain cascade rerun, which is OSS.
+> mutates task input) is gated behind the `enterprise` build feature; the
+> default engine rejects it with 400. This example uses a plain cascade rerun,
+> which every build supports.
 """
 from __future__ import annotations
 
@@ -56,7 +57,7 @@ def main() -> None:
         print("(expected a failure to demo rerun; nothing to recover)")
         return
 
-    # Cascade-rerun from the failure frontier (no params -> OSS-compatible).
+    # Cascade-rerun from the failure frontier (no params -> supported by every build).
     result = api.rerun_run(run_id)
     print("rerun reset tasks:", result.get("rerun"))
     recovered = api.wait_for_run(run_id, timeout=120)

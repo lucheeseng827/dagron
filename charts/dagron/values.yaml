@@ -16,7 +16,7 @@ imagePullSecrets: []
 # `kubernetes` cargo features. The module Dockerfile defaults to a sqlite-only
 # build — see terraform/README.md §"Building the images".
 engine:
-  image: mancube/dagron-engine:0.2.0
+  image: mancube/dagron-engine:0.3.0
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 8080
@@ -42,9 +42,9 @@ engine:
   service:
     type: ClusterIP
 
-# The kube-rs operator (Workflow/CronWorkflow reconciler) is a separate, closed
-# component — its deployment, CRDs, and values are NOT part of this chart. Deploy
-# it from the operator's own private overlay if you use it.
+# A Kubernetes operator (Workflow/CronWorkflow reconciler) is a separate,
+# optional component — its deployment, CRDs, and values are NOT part of this
+# chart. Deploy it from its own overlay if you use it.
 
 # ── Datastore ──────────────────────────────────────────────────────────────
 # Throwaway single-replica Postgres for testing. For anything real, set
@@ -87,7 +87,7 @@ externalDatabaseSecret:
 # HS256 session JWT) and serves the UI's REST + SSE. Scales to N replicas.
 dagronApi:
   enabled: true
-  image: mancube/dagron-api:0.2.0
+  image: mancube/dagron-api:0.3.0
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 8080
@@ -124,7 +124,7 @@ dagronApi:
 # ── Frontend (Next.js UI) ────────────────────────────────────────────────────
 frontend:
   enabled: true
-  image: mancube/dagron-frontend:0.2.0
+  image: mancube/dagron-frontend:0.3.0
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 3000

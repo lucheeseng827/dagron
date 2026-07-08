@@ -2,7 +2,7 @@
 name = "dagron-identity"
 version = "0.1.0"
 edition = "2021"
-description = "dagron-api identity seam: the IdentityProvider trait + VerifiedUser. OSS ships a local (argon2) provider; the Enterprise edition plugs SSO behind the same trait."
+description = "dagron-api identity seam: the IdentityProvider trait + VerifiedUser. Ships a local (argon2) provider; an alternate provider can plug SSO in behind the same trait."
 
 [lib]
 name = "dagron_identity"

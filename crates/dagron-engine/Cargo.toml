@@ -2,7 +2,7 @@
 name = "dagron-engine"
 version = "0.1.0"
 edition = "2021"
-description = "dagron engine: the reconcile-loop daemon as a reusable library — config, executor/worker/ingest wiring, the ops surface (API/cron/GC/leadership/schedule), and the run-lifecycle seams (RunSink/Meter) + the SourceFactory hook. Both the OSS `dagron` bin and the EE binary are thin shells over `run()`."
+description = "dagron engine: the reconcile-loop daemon as a reusable library — config, executor/worker/ingest wiring, the ops surface (API/cron/GC/leadership/schedule), and the run-lifecycle seams (RunSink/Meter) + the SourceFactory hook. The `dagron` bin is a thin shell over `run()`."
 
 [lib]
 name = "dagron_engine"
@@ -13,10 +13,10 @@ default = ["sqlite", "ops"]
 sqlite = ["dagron-core/sqlite"]
 postgres = ["dagron-core/postgres"]
 # Ops surface: axum management API + leadership-gated cron/GC/schedule loops.
-ops = ["dep:axum", "dep:cron", "dagron-core/ops"]
+ops = ["dep:axum", "dep:cron", "dep:chrono-tz", "dagron-core/ops"]
 # Kubernetes pod executor (EXECUTOR=kubernetes).
 kubernetes = ["dagron-executor/kubernetes"]
-# Enterprise Edition: auto-backfill sweep loop, run_reruns ledger,
+# Optional feature: auto-backfill sweep loop, run_reruns ledger,
 # parameterized rerun metrics, and outbox eventing. Implies `ops`.
 enterprise = ["dagron-core/enterprise", "ops"]
 
@@ -25,6 +25,7 @@ dagron-core = { path = "../dagron-core", default-features = false }
 dagron-executor = { path = "../dagron-executor" }
 dagron-source = { path = "../dagron-source" }
 dagron-lineage = { path = "../dagron-lineage" }
+dagron-forge = { path = "../dagron-forge" }
 dagron-artifact = { path = "../dagron-artifact" }
 dagron-logging = { path = "../dagron-logging" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "sync", "time", "net"] }
@@ -39,6 +40,8 @@ async-trait = "0.1"
 ractor = "0.10"
 axum = { version = "0.8", optional = true }
 cron = { version = "0.16", optional = true }
+# IANA timezone database for DST-safe per-schedule cron (ops-only, like `cron`).
+chrono-tz = { version = "0.10", optional = true }
 
 [dev-dependencies]
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }

@@ -10,6 +10,4 @@ into the repo's description, or sync it). Keep these in step with releases.
 | [`mancube/dagron-frontend`](https://hub.docker.com/r/mancube/dagron-frontend) | [`dagron-frontend.md`](./dagron-frontend.md) | Next.js operator console |
 | `oci://registry-1.docker.io/mancube/dagron` | [`dagron-chart.md`](./dagron-chart.md) | Helm chart (the full stack) |
 
-All three images are published **`linux/amd64` + `linux/arm64`** at `0.2.0` + `latest`. The closed GitOps
-**operator** (`mancube/dagron-operator`, private) is intentionally not documented here — it isn't part of
-the OSS deployment.
+All three images are published **`linux/amd64` + `linux/arm64`** at `0.3.0` + `latest`.

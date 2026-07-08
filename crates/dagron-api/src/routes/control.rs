@@ -148,6 +148,201 @@ pub async fn retry_task(
     Ok(Json(RetryResponse { retried: true }))
 }
 
+#[derive(Serialize)]
+pub struct ClearResponse {
+    pub run_id: String,
+    pub task_id: String,
+    pub cleared: u64,
+}
+
+/// `POST /api/runs/:id/tasks/:tid/clear` — clear + downstream: reset a
+/// completed task and every terminal task that transitively depends on it to
+/// `pending`, recompute `remaining_deps`, and re-arm the run so the reconcile
+/// loop re-runs just that sub-DAG. Unlike `retry_task` (a single failed task),
+/// this re-runs a still-`succeeded` node on demand and cascades to its
+/// downstream. Mirrors engine `db::clear_task_with_downstream` (keep in sync).
+/// 404 unknown run/task, 409 task not in a completed state.
+pub async fn clear_task(
+    _auth: AuthUser,
+    State(state): State<AppState>,
+    Path((id, tid)): Path<(String, String)>,
+) -> Result<Json<ClearResponse>, (StatusCode, String)> {
+    let mut tx = state.write_pool.begin().await.map_err(internal_msg)?;
+
+    // Lock the target row and re-check inside the tx so a concurrent clear/retry
+    // serializes rather than double-resetting.
+    let status: Option<String> = sqlx::query_scalar(
+        "SELECT status FROM task_runs WHERE id = $1 AND run_id = $2 FOR UPDATE",
+    )
+    .bind(&tid)
+    .bind(&id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(internal_msg)?;
+    let Some(status) = status else {
+        return Err((StatusCode::NOT_FOUND, format!("task '{tid}' not found in run '{id}'")));
+    };
+    if !matches!(status.as_str(), "succeeded" | "failed" | "skipped" | "cancelled") {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("task '{tid}' is not in a clearable (completed) state"),
+        ));
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // Reset the target + its transitive downstream cone (terminal tasks only).
+    let cleared = sqlx::query(
+        "WITH RECURSIVE cone(id) AS (
+             SELECT id FROM task_runs WHERE id = $1 AND run_id = $2
+             UNION
+             SELECT td.dependent_id FROM task_dependencies td
+             JOIN cone c ON td.dependency_id = c.id
+         )
+         UPDATE task_runs
+         SET status='pending', attempt=0, claimed_by=NULL, lease_expires_at=NULL,
+             output=NULL, finished_at=NULL, scheduled_at=$3, version=version+1
+         WHERE id IN (SELECT id FROM cone)
+           AND status IN ('succeeded','failed','skipped','cancelled')",
+    )
+    .bind(&tid)
+    .bind(&id)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal_msg)?
+    .rows_affected();
+
+    // Recompute remaining_deps for the reset frontier in a second statement so it
+    // sees the post-reset statuses (a just-reset dependency must count as
+    // outstanding — a single self-referential UPDATE can't guarantee that). Only
+    // *non-terminal* deps count: a terminal failed/cancelled upstream outside the
+    // reset cone never decrements again, so counting it would strand the task.
+    sqlx::query(
+        "UPDATE task_runs
+         SET remaining_deps = (
+                 SELECT COUNT(*) FROM task_dependencies d
+                 JOIN task_runs dep ON dep.id = d.dependency_id
+                 WHERE d.dependent_id = task_runs.id
+                   AND dep.status NOT IN ('succeeded','skipped','failed','cancelled')
+             )
+         WHERE run_id = $1 AND status = 'pending'",
+    )
+    .bind(&id)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal_msg)?;
+
+    // Re-arm a run that had finished so the reconcile loop resumes.
+    sqlx::query(
+        "UPDATE workflow_runs SET status='running', finished_at=NULL, output=NULL
+         WHERE id=$1 AND status IN ('succeeded','failed','cancelled')",
+    )
+    .bind(&id)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal_msg)?;
+
+    notify(&mut tx, &id).await.map_err(|s| (s, "internal server error".to_string()))?;
+    tx.commit().await.map_err(internal_msg)?;
+
+    tracing::info!(run_id = %id, task_id = %tid, cleared, "task cleared with downstream");
+    Ok(Json(ClearResponse { run_id: id, task_id: tid, cleared }))
+}
+
+#[derive(Serialize)]
+pub struct ApprovalResponse {
+    pub run_id: String,
+    pub task_id: String,
+    pub resolution: String,
+}
+
+/// `POST /api/runs/:id/tasks/:tid/approve` — approve a `type: approval` gate (#19):
+/// the task succeeds and its dependents advance. Mirrors engine
+/// `db::resolve_approval`. 404 unknown run/task, 409 not awaiting approval.
+pub async fn approve_task(
+    _auth: AuthUser,
+    State(state): State<AppState>,
+    Path((id, tid)): Path<(String, String)>,
+) -> Result<Json<ApprovalResponse>, (StatusCode, String)> {
+    resolve_approval(&state, &id, &tid, true).await
+}
+
+/// `POST /api/runs/:id/tasks/:tid/reject` — reject a gate: the task fails and its
+/// `all_success` dependents skip. Same status codes as approve.
+pub async fn reject_task(
+    _auth: AuthUser,
+    State(state): State<AppState>,
+    Path((id, tid)): Path<(String, String)>,
+) -> Result<Json<ApprovalResponse>, (StatusCode, String)> {
+    resolve_approval(&state, &id, &tid, false).await
+}
+
+async fn resolve_approval(
+    state: &AppState,
+    id: &str,
+    tid: &str,
+    approve: bool,
+) -> Result<Json<ApprovalResponse>, (StatusCode, String)> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let (status, output) =
+        if approve { ("succeeded", "approved") } else { ("failed", "rejected") };
+    let mut tx = state.write_pool.begin().await.map_err(internal_msg)?;
+    let rows = sqlx::query(
+        "UPDATE task_runs SET status = $1, finished_at = $2, output = $3
+         WHERE id = $4 AND run_id = $5 AND status = 'awaiting_approval'",
+    )
+    .bind(status)
+    .bind(&now)
+    .bind(output)
+    .bind(tid)
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal_msg)?
+    .rows_affected();
+
+    if rows == 0 {
+        tx.rollback().await.map_err(internal_msg)?;
+        // Disambiguate: unknown task → 404, existing-but-not-awaiting → 409.
+        let known: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM task_runs WHERE id = $1 AND run_id = $2")
+                .bind(tid)
+                .bind(id)
+                .fetch_optional(&state.read_pool)
+                .await
+                .map_err(internal_msg)?;
+        return if known.is_some() {
+            Err((StatusCode::CONFLICT, format!("task '{tid}' is not awaiting approval")))
+        } else {
+            Err((StatusCode::NOT_FOUND, format!("task '{tid}' not found in run '{id}'")))
+        };
+    }
+
+    // Terminal transition → decrement dependents so their trigger_rule evaluates.
+    sqlx::query(
+        "UPDATE task_runs SET remaining_deps = remaining_deps - 1
+         WHERE id IN (
+             SELECT dependent_id FROM task_dependencies WHERE dependency_id = $1
+         ) AND status = 'pending'",
+    )
+    .bind(tid)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal_msg)?;
+
+    notify(&mut tx, id).await.map_err(|s| (s, "internal server error".to_string()))?;
+    tx.commit().await.map_err(internal_msg)?;
+
+    let resolution = if approve { "approved" } else { "rejected" };
+    tracing::info!(run_id = %id, task_id = %tid, resolution, "approval gate resolved");
+    Ok(Json(ApprovalResponse {
+        run_id: id.to_string(),
+        task_id: tid.to_string(),
+        resolution: resolution.to_string(),
+    }))
+}
+
 // ── Rerun (cascade resume from failure) ────────────────────────────────────────
 
 #[derive(Debug, Default, Deserialize)]
@@ -155,9 +350,10 @@ pub struct RerunBody {
     /// Rerun mode. Only `failed` (the default) is supported; `task:<id>` is reserved.
     #[serde(default)]
     from: Option<String>,
-    /// Deep-merged into each reset task's stored TaskSpec `input` (EE). Accepted
-    /// by all builds so clients get an explicit 400 rather than a silent no-op
-    /// when `params` is supplied against a non-Enterprise build.
+    /// Deep-merged into each reset task's stored TaskSpec `input` (behind the
+    /// `enterprise` feature). Accepted by all builds so clients get an explicit
+    /// 400 rather than a silent no-op when `params` is supplied against a build
+    /// without the feature.
     #[serde(default)]
     params: Option<serde_json::Value>,
 }
@@ -196,7 +392,7 @@ pub async fn rerun_run(
     if body.params.is_some() {
         return Err((
             StatusCode::BAD_REQUEST,
-            "`params` rerun override requires the Enterprise feature".to_string(),
+            "`params` rerun override requires the `enterprise` feature".to_string(),
         ));
     }
     #[cfg(feature = "enterprise")]
@@ -229,8 +425,9 @@ pub async fn rerun_run(
 
     let now = chrono::Utc::now().to_rfc3339();
 
-    // EE: capture the broken cone's specs before reset and deep-merge `params`
-    // into each task's `input`. The reset UPDATE below never touches `input`
+    // Behind the `enterprise` feature: capture the broken cone's specs before
+    // reset and deep-merge `params` into each task's `input`. The reset UPDATE
+    // below never touches `input`
     // (it carries the command), so these per-row overrides are applied alongside it.
     #[cfg(feature = "enterprise")]
     let overrides: Vec<(String, String)> = if let Some(params) = body.params.as_ref() {
@@ -338,10 +535,18 @@ pub(crate) struct TaskSpecInput {
     pub(crate) depends_on: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) input: Option<serde_json::Value>,
+    /// Trigger rule (engine `trigger_rule`): when this task runs relative to its
+    /// deps' outcomes. Round-tripped into the stored task JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) trigger_rule: Option<String>,
     #[serde(default = "default_max_attempts")]
     pub(crate) max_attempts: u32,
     #[serde(default)]
     pub(crate) retry_delay_secs: u64,
+    /// Optional clamp on the exponential retry backoff (engine
+    /// `retry_max_delay_secs`); round-tripped into the stored task JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retry_max_delay_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -353,6 +558,23 @@ pub(crate) struct TaskSpecInput {
     /// it never reaches the engine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) workflow_ref: Option<String>,
+    /// Task kind (engine `type`). `type: approval` makes this a human approval
+    /// gate (#19) — a command-less leaf that parks in `awaiting_approval`.
+    /// Round-tripped into the stored task JSON so the engine sees it.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub(crate) task_type: Option<String>,
+    /// Approval timeout knobs (engine `approval_timeout_secs`/`approval_on_timeout`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) approval_timeout_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) approval_on_timeout: Option<String>,
+}
+
+impl TaskSpecInput {
+    /// Whether this task is a `type: approval` human gate (#19).
+    pub(crate) fn is_approval(&self) -> bool {
+        self.task_type.as_deref() == Some("approval")
+    }
 }
 
 fn default_max_attempts() -> u32 {
@@ -362,6 +584,17 @@ fn default_max_attempts() -> u32 {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct DagSpecInput {
     pub(crate) name: String,
+    /// Run-level wall-clock budget in seconds (engine `run_timeout_secs`);
+    /// stamped as `workflow_runs.deadline_at` at run creation so the engine's
+    /// deadline sweep enforces it.
+    #[serde(default)]
+    pub(crate) run_timeout_secs: Option<u64>,
+    /// Name of the task whose output becomes the run's result (engine
+    /// `result_from`, fast-win #15); stamped as `workflow_runs.result_from` so a
+    /// waiter (`GET /api/runs/:id/wait`) gets a single return value. Must name a
+    /// real task.
+    #[serde(default)]
+    pub(crate) result_from: Option<String>,
     pub(crate) tasks: Vec<TaskSpecInput>,
 }
 
@@ -372,6 +605,20 @@ pub(crate) struct DagSpecInput {
 pub(crate) fn parse_and_validate(yaml: &str) -> Result<DagSpecInput, (StatusCode, String)> {
     let spec: DagSpecInput = serde_yaml::from_str(yaml)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid YAML: {e}")))?;
+    if spec.run_timeout_secs == Some(0) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("invalid run_timeout_secs=0 in DAG '{}'; expected >= 1 (or omit)", spec.name),
+        ));
+    }
+    if let Some(rf) = &spec.result_from {
+        if !spec.tasks.iter().any(|t| &t.name == rf) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("result_from names unknown task '{rf}' in DAG '{}'", spec.name),
+            ));
+        }
+    }
     validate_graph(&spec.name, &spec.tasks)?;
     Ok(spec)
 }
@@ -387,27 +634,48 @@ pub(crate) fn validate_graph(
     let mut graph = DiGraph::<(), ()>::new();
     let mut idx = HashMap::new();
     let mut names = HashSet::new();
+    const TRIGGER_RULES: &[&str] =
+        &["all_success", "all_done", "one_failed", "all_failed", "none_failed"];
     for t in tasks {
         if !names.insert(t.name.clone()) {
             return Err((StatusCode::BAD_REQUEST, format!("duplicate task name '{}'", t.name)));
         }
-        // A task is exactly one of: a leaf (`command`) or a chain (`workflow_ref`).
-        // Catches a command-less task on the no-reference path too (where the
-        // expander, which also checks this, is skipped).
-        match (!t.command.is_empty(), t.workflow_ref.is_some()) {
-            (true, true) => {
+        if let Some(rule) = &t.trigger_rule {
+            if !TRIGGER_RULES.contains(&rule.as_str()) {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    format!("task '{}' sets both `command` and `workflow_ref` — use exactly one", t.name),
+                    format!("task '{}' has invalid trigger_rule '{rule}' (expected one of {TRIGGER_RULES:?})", t.name),
                 ));
             }
-            (false, false) => {
+        }
+        // An approval gate (#19) is a command-less leaf that waits for a human, so
+        // it is exempt from the leaf/chain rule (but must not carry either).
+        if t.is_approval() {
+            if !t.command.is_empty() || t.workflow_ref.is_some() {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    format!("task '{}' needs a `command` (leaf) or a `workflow_ref` (chain)", t.name),
+                    format!("approval task '{}' cannot set `command` or `workflow_ref`", t.name),
                 ));
             }
-            _ => {}
+        } else {
+            // A task is exactly one of: a leaf (`command`) or a chain (`workflow_ref`).
+            // Catches a command-less task on the no-reference path too (where the
+            // expander, which also checks this, is skipped).
+            match (!t.command.is_empty(), t.workflow_ref.is_some()) {
+                (true, true) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("task '{}' sets both `command` and `workflow_ref` — use exactly one", t.name),
+                    ));
+                }
+                (false, false) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("task '{}' needs a `command` (leaf) or a `workflow_ref` (chain)", t.name),
+                    ));
+                }
+                _ => {}
+            }
         }
         idx.insert(t.name.clone(), graph.add_node(()));
     }
@@ -498,7 +766,13 @@ pub(crate) async fn create_run(
 ) -> anyhow::Result<String> {
     let def_id = Uuid::new_v4().to_string();
     let run_id = Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
+    let created = chrono::Utc::now();
+    let now = created.to_rfc3339();
+    // Mirrors engine create_run: persist the absolute run deadline so the
+    // engine's sweep enforces `run_timeout_secs` on UI-submitted runs too.
+    let deadline_at = spec
+        .run_timeout_secs
+        .map(|secs| (created + chrono::TimeDelta::seconds(secs.min(i64::MAX as u64) as i64)).to_rfc3339());
 
     // in-degree per task = remaining_deps seed
     let mut indeg: HashMap<&str, i64> = spec.tasks.iter().map(|t| (t.name.as_str(), 0)).collect();
@@ -512,20 +786,21 @@ pub(crate) async fn create_run(
     sqlx::query("INSERT INTO workflow_definitions (id, name, spec, created_at) VALUES ($1,$2,$3,$4)")
         .bind(&def_id).bind(&spec.name).bind(yaml).bind(&now)
         .execute(&mut *tx).await?;
-    sqlx::query("INSERT INTO workflow_runs (id, definition_id, status, created_at) VALUES ($1,$2,'running',$3)")
-        .bind(&run_id).bind(&def_id).bind(&now)
+    sqlx::query("INSERT INTO workflow_runs (id, definition_id, status, created_at, deadline_at, result_from) VALUES ($1,$2,'running',$3,$4,$5)")
+        .bind(&run_id).bind(&def_id).bind(&now).bind(&deadline_at).bind(&spec.result_from)
         .execute(&mut *tx).await?;
 
     let mut ids: HashMap<String, String> = HashMap::new();
     for t in &spec.tasks {
         let task_id = Uuid::new_v4().to_string();
         let input_json = serde_json::to_string(t)?; // matches dag::TaskSpec shape
+        let trigger_rule = t.trigger_rule.as_deref().unwrap_or("all_success");
         sqlx::query(
-            "INSERT INTO task_runs (id, run_id, name, status, remaining_deps, input, scheduled_at)
-             VALUES ($1,$2,$3,'pending',$4,$5,$6)",
+            "INSERT INTO task_runs (id, run_id, name, status, remaining_deps, input, scheduled_at, trigger_rule)
+             VALUES ($1,$2,$3,'pending',$4,$5,$6,$7)",
         )
         .bind(&task_id).bind(&run_id).bind(&t.name)
-        .bind(indeg[t.name.as_str()]).bind(&input_json).bind(&now)
+        .bind(indeg[t.name.as_str()]).bind(&input_json).bind(&now).bind(trigger_rule)
         .execute(&mut *tx).await?;
         ids.insert(t.name.clone(), task_id);
     }

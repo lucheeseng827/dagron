@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use cron::Schedule;
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -30,6 +31,7 @@ use tracing::{info, warn};
 use crate::dag::DagGraph;
 use crate::db;
 use crate::metrics::Metrics;
+use crate::schedule_time::{gate_context, next_fire_in_tz, passes_when, validate_tz};
 
 /// How often the loop wakes to check whether any schedule is due.
 const TICK: Duration = Duration::from_secs(1);
@@ -45,13 +47,26 @@ struct RawEntry {
     cron: String,
     /// Path to the DAG YAML fired on this schedule.
     dag: String,
+    /// Optional IANA timezone (e.g. `America/New_York`) the `cron` expression is
+    /// interpreted in. Absent / `UTC` = UTC (the historical behavior).
+    #[serde(default)]
+    timezone: Option<String>,
+    /// Optional per-fire conditional gate evaluated against the scheduled time's
+    /// calendar fields (`hour`/`day`/`weekday`/`days_in_month`/…). When it is
+    /// false the fire is skipped and only the next fire time advances — e.g.
+    /// `when: "{{ weekday }} <= 5"` (weekdays only). Absent = always fire.
+    #[serde(default)]
+    when: Option<String>,
 }
 
-/// A loaded, validated cron schedule: its parsed expression, the DAG YAML to
-/// submit, and the next time it is due.
+/// A loaded, validated cron schedule: its parsed expression, the timezone it is
+/// evaluated in, an optional `when:` gate, the DAG YAML to submit, and the next
+/// time it is due.
 pub struct CronEntry {
     name: String,
     schedule: Schedule,
+    tz: Tz,
+    when: Option<String>,
     dag_yaml: String,
     next: DateTime<Utc>,
 }
@@ -71,18 +86,19 @@ pub async fn load(path: &str) -> Result<Vec<CronEntry>> {
     for e in raw.schedules {
         let schedule = Schedule::from_str(&e.cron)
             .with_context(|| format!("invalid cron expression '{}' for '{}'", e.cron, e.name))?;
+        let tz_name = e.timezone.as_deref().unwrap_or("UTC");
+        let tz = validate_tz(tz_name)
+            .with_context(|| format!("invalid timezone '{tz_name}' for schedule '{}'", e.name))?;
         let dag_yaml = tokio::fs::read_to_string(&e.dag)
             .await
             .with_context(|| format!("reading DAG '{}' for schedule '{}'", e.dag, e.name))?;
         // Validate the DAG now so a bad spec can't silently no-op every fire.
         DagGraph::from_yaml(&dag_yaml)
             .with_context(|| format!("invalid DAG '{}' for schedule '{}'", e.dag, e.name))?;
-        let next = schedule
-            .after(&now)
-            .next()
+        let next = next_fire_in_tz(&schedule, tz, now)
             .with_context(|| format!("cron '{}' for '{}' has no upcoming fire time", e.cron, e.name))?;
-        info!(name = %e.name, cron = %e.cron, %next, "cron schedule loaded");
-        entries.push(CronEntry { name: e.name, schedule, dag_yaml, next });
+        info!(name = %e.name, cron = %e.cron, tz = %tz, when = e.when.as_deref().unwrap_or(""), %next, "cron schedule loaded");
+        entries.push(CronEntry { name: e.name, schedule, tz, when: e.when, dag_yaml, next });
     }
     Ok(entries)
 }
@@ -105,13 +121,33 @@ pub async fn run(
         for entry in &mut entries {
             while entry.next <= now {
                 if leader {
-                    fire(&pool, entry, &metrics).await;
+                    // The nominal (scheduled) time is the fire's logical date,
+                    // regardless of how late the tick actually ran.
+                    let nominal = entry.next;
+                    // `when:` gate — skip this fire when the condition is false;
+                    // a malformed gate fires-on-error (logged) so a typo can't
+                    // silently stop the schedule.
+                    let gated = entry.when.as_ref().is_some_and(|expr| {
+                        let ctx = gate_context(nominal, entry.tz);
+                        match passes_when(expr, &ctx) {
+                            Ok(passes) => !passes,
+                            Err(e) => {
+                                warn!(schedule = %entry.name, error = %e, when = %expr, "when gate invalid — firing anyway");
+                                false
+                            }
+                        }
+                    });
+                    if gated {
+                        metrics.inc_schedule_gated();
+                        info!(schedule = %entry.name, when = entry.when.as_deref().unwrap_or(""), scheduled_time = %nominal, "cron fire gated (when: false) — skipping");
+                    } else {
+                        fire(&pool, entry, nominal, &metrics).await;
+                    }
                 }
                 // Advance regardless of leadership to avoid a backlog of misses.
-                entry.next = entry
-                    .schedule
-                    .after(&now)
-                    .next()
+                // Evaluated in the schedule's timezone so DST shifts the UTC
+                // instant but not the wall-clock fire time.
+                entry.next = next_fire_in_tz(&entry.schedule, entry.tz, now)
                     // A schedule with nothing left to fire is parked far out.
                     .unwrap_or_else(|| now + chrono::TimeDelta::days(36_500));
             }
@@ -121,13 +157,17 @@ pub async fn run(
 
 /// Create one run for a due schedule. The DAG was validated at load, but
 /// `create_run` can still fail transiently (DB blip) — log and move on; the next
-/// fire is independent.
-async fn fire(pool: &db::Pool, entry: &CronEntry, metrics: &Metrics) {
-    match DagGraph::from_yaml(&entry.dag_yaml) {
+/// fire is independent. The fire's nominal time is injected as the
+/// `{{ scheduled_time }}` parameter (RFC-3339) so tasks can reference their
+/// logical date — the data-interval idiom.
+async fn fire(pool: &db::Pool, entry: &CronEntry, nominal: DateTime<Utc>, metrics: &Metrics) {
+    let mut params = std::collections::BTreeMap::new();
+    params.insert("scheduled_time".to_string(), nominal.to_rfc3339());
+    match DagGraph::from_yaml_with_params(&entry.dag_yaml, &params) {
         Ok(dag) => match db::create_run(pool, &dag, &entry.dag_yaml).await {
             Ok(run_id) => {
                 metrics.inc_runs_created();
-                info!(schedule = %entry.name, %run_id, name = %dag.spec.name, "cron fired run");
+                info!(schedule = %entry.name, %run_id, name = %dag.spec.name, scheduled_time = %nominal, "cron fired run");
             }
             Err(e) => warn!(schedule = %entry.name, error = %e, "cron create_run failed"),
         },

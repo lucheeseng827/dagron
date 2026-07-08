@@ -2,7 +2,7 @@
 name = "dagron-lineage"
 version = "0.1.0"
 edition = "2021"
-description = "dagron OpenLineage emitter — posts RunEvents (COMPLETE/FAIL) to an OpenLineage backend (Marquez, etc.) for data lineage parity with Airflow."
+description = "dagron OpenLineage emitter — posts RunEvents (COMPLETE/FAIL) to an OpenLineage backend (Marquez, etc.) for data lineage."
 
 [lib]
 name = "dagron_lineage"

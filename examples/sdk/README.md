@@ -82,5 +82,6 @@ python 01_quickstart.py
 - The DAGs use plain `echo`/`sh` commands so they run on the engine's **local
   executor** with no container images. To exercise the Docker executor instead,
   bring the stack up with `compose.docker-executor.yaml` and give tasks an `image`.
-- A `params=` override on `rerun` (fix-forward rerun) is an **Enterprise** feature;
-  the OSS engine rejects it, so `04_rerun_failed.py` uses a plain cascade rerun.
+- A `params=` override on `rerun` (fix-forward rerun) is gated behind the
+  `enterprise` build feature; the default engine rejects it, so
+  `04_rerun_failed.py` uses a plain cascade rerun.

@@ -1,8 +1,8 @@
 -- Transactional outbox: run-lifecycle events written in the SAME transaction as
 -- the run's finalization (see db::reap_completed_runs), so a committed state
 -- change always has its event and a rolled-back one never emits a ghost. A
--- delivery worker (Enterprise: ee/dagron-events) drains pending rows to webhooks /
--- queues / downstream workflows; the OSS engine just records them durably.
+-- delivery worker drains pending rows to webhooks / queues / downstream
+-- workflows; without one the engine just records them durably.
 CREATE TABLE IF NOT EXISTS event_outbox (
     id              TEXT PRIMARY KEY NOT NULL,
     run_id          TEXT NOT NULL,

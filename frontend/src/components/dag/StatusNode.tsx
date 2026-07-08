@@ -14,7 +14,7 @@ export interface StatusNodeData {
   [key: string]: unknown;
 }
 
-/// Argo-style node: name + status badge, colored by task status. A task that
+/// DAG node: name + status badge, colored by task status. A task that
 /// chains another workflow renders with a sub-workflow badge instead.
 export default function StatusNode({ data }: NodeProps) {
   const d = data as StatusNodeData;

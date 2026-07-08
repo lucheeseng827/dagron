@@ -14,7 +14,7 @@
 //!    dedup ledger so a re-sweep (or the manual endpoint) never double-runs a slot.
 //!    This heals the gap since the last recorded fire: the canonical case is a
 //!    schedule **paused then re-enabled** (its `last_fired_at` is frozen at the
-//!    pause, exactly the Airflow `catchup` foot-gun), and a **catchup-only**
+//!    pause, a classic catch-up foot-gun), and a **catchup-only**
 //!    deployment (`DB_SCHEDULES` off) where this loop is the sole firing path.
 //!    (When the normal schedule loop co-runs it advances `last_fired_at` to the
 //!    present on resume — "resume from present", `schedule.rs` — so a pure process
@@ -49,6 +49,7 @@ use tracing::{debug, info, warn};
 use crate::dag::DagGraph;
 use crate::db;
 use crate::metrics::Metrics;
+use crate::schedule_time::parse_tz_or_utc;
 
 /// Absolute ceiling on runs one catch-up sweep materializes for a single
 /// schedule, regardless of the per-schedule or env cap — the backstop that stops
@@ -209,14 +210,22 @@ async fn sweep_catchup(
                 continue;
             }
         };
+        // Enumerate in the schedule's timezone (default UTC) so a missed fire
+        // lands on the correct wall-clock instant across DST. The row was
+        // tz-validated at write time; a bad value degrades to UTC.
+        let tz = parse_tz_or_utc(&s.timezone);
 
         // Enumerate missed fire-times in (lower, now]. CATCHUP_HARD_CAP bounds the
         // iterator so a wildly-misconfigured schedule cannot iterate millions of
         // past fires in one tick. The per-sweep cap is applied AFTER the dedup
         // check so successive sweeps advance past already-claimed slots instead of
         // repeatedly selecting the same capped page and stalling.
-        let all_fires: Vec<DateTime<Utc>> =
-            sched.after(&lower).take_while(|d| *d <= now).take(CATCHUP_HARD_CAP).collect();
+        let all_fires: Vec<DateTime<Utc>> = sched
+            .after(&lower.with_timezone(&tz))
+            .map(|d| d.with_timezone(&Utc))
+            .take_while(|d| *d <= now)
+            .take(CATCHUP_HARD_CAP)
+            .collect();
         if all_fires.is_empty() {
             continue;
         }
@@ -240,8 +249,12 @@ async fn sweep_catchup(
             }
             claimed_this_sweep += 1;
             // Re-validate the spec per fire (a bad edit since load must not panic
-            // the loop), then create the run on its own transaction.
-            let dag = match DagGraph::from_yaml(&s.spec) {
+            // the loop), then create the run on its own transaction. The missed
+            // fire's logical date is injected as `{{ scheduled_time }}` so a
+            // backfilled run processes *its* interval, not "now".
+            let mut params = std::collections::BTreeMap::new();
+            params.insert("scheduled_time".to_string(), logical.clone());
+            let dag = match DagGraph::from_yaml_with_params(&s.spec, &params) {
                 Ok(d) => d,
                 Err(e) => {
                     db::release_backfill_slot(pool, &s.id, &logical).await?;

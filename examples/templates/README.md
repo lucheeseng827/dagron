@@ -1,4 +1,4 @@
-# Sub-workflows & templating (Argo-style)
+# Sub-workflows & templating
 
 A dagron workflow can **call other workflows** inline. Declare reusable sub-DAGs
 under `templates:` and invoke them from a task with `template:`. At run-creation
@@ -46,7 +46,7 @@ A task is **either** a leaf (`command:`) **or** a call (`template:`) — exactly
 ### Scope
 Template scope is **isolated**: inside a template only its own `parameters`
 (filled by the caller's `arguments`) are visible. `arguments` values are resolved
-in the **caller's** scope first, then passed in — the standard Argo model.
+in the **caller's** scope first, then passed in.
 
 ### Safety
 - **Depth cap** (64) — a recursive template without a correct `when:` base case
@@ -91,5 +91,5 @@ curl -s localhost:8080/runs/<run_id> | jq '.tasks[].name'
 - Templates are **inline** (same file). Cross-file/stored-workflow `templateRef`
   is a planned follow-up (it needs a DB lookup during expansion).
 - A skipped task (`when` false) contributes no nodes; a dependent that depended
-  *only* on it becomes a root (doesn't block) — matching Argo's skip semantics.
+  *only* on it becomes a root (doesn't block).
 - Arithmetic is single-binary-op and whitespace-separated; no nested expressions.
