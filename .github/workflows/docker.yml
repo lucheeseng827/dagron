@@ -1,7 +1,8 @@
-# Build + push the official multi-arch dagron OSS images to Docker Hub
-# (docker.io/mancube/dagron-engine, -api, -frontend). Active in the PUBLIC MIRROR
-# (lucheeseng827/dagron); inert in the monorepo (the Dockerfiles/Cargo.lock it
-# builds only exist in the mirrored cut, and the monorepo never carries the
+# Build + push the official multi-arch dagron OSS images AND the OCI Helm chart to
+# Docker Hub (docker.io/mancube/dagron-engine, -api, -frontend, and the chart at
+# oci://registry-1.docker.io/mancube/dagron). Active in the PUBLIC MIRROR
+# (lucheeseng827/dagron); inert in the monorepo (the Dockerfiles/Cargo.lock/chart
+# it builds only exist in the mirrored cut, and the monorepo never carries the
 # stamped `v*.*.*` tag this fires on).
 #
 # This is the dagron twin of mergestro-gate's mirror-native publish
@@ -25,7 +26,7 @@
 # free-for-public-repos arm runners — then a per-image merge job stitches one
 # multi-arch manifest. No QEMU (the emulated arm64 Rust build is punishingly slow).
 
-name: Publish Docker images
+name: Publish Docker images + Helm chart
 
 on:
   push:
@@ -164,3 +165,52 @@ jobs:
 
       - name: Inspect published image
         run: docker buildx imagetools inspect "docker.io/mancube/${{ matrix.image }}:${{ steps.meta.outputs.version }}"
+
+  # Package + push the OSS Helm chart (OCI) after the images exist, so a single v*
+  # tag publishes the whole stack from the mirror. The mirror's charts/dagron is
+  # already the OSS cut — the .ossync sync strips the closed operator.yaml + crds —
+  # but the seatbelt below re-checks before pushing.
+  chart:
+    needs: merge
+    runs-on: ubuntu-latest
+    environment: cicd
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      - name: Resolve version
+        id: ver
+        env:
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            V="$DISPATCH_TAG"
+          else
+            V="${GITHUB_REF_NAME#v}"   # refs/tags/v0.3.0 -> 0.3.0
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "chart version $V"
+
+      - name: Package + push Helm chart (OCI)
+        env:
+          V: ${{ steps.ver.outputs.version }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "$DOCKER_PASSWORD" | \
+            helm registry login registry-1.docker.io -u "$DOCKER_USERNAME" --password-stdin
+          # Keep the packaged chart's default image tags in lockstep with $V so a
+          # vX.Y.Z chart pulls vX.Y.Z images (not a stale tag).
+          sed -i -E "s#^([[:space:]]*image: [^[:space:]]+/dagron-[a-z]+:).*#\1${V}#" \
+            charts/dagron/values.yaml
+          helm package charts/dagron --version "$V" --app-version "$V" -d dist
+          # Seatbelt: refuse to publish if a closed operator/CRD manifest is present.
+          if tar -tzf "dist/dagron-$V.tgz" | grep -E 'templates/operator\.yaml|/crds/'; then
+            echo "::error::closed operator/CRD manifest present in OSS chart package — refusing to push"
+            exit 1
+          fi
+          helm push "dist/dagron-$V.tgz" "oci://registry-1.docker.io/mancube"
+          echo "Pushed oci://registry-1.docker.io/mancube/dagron:$V"
