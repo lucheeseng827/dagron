@@ -11,7 +11,8 @@
 # images (operator / cloud / mcp / step-llm) live in a separate private pipeline
 # and their sources never enter the mirror at all.
 #
-# Requires two repo secrets on the mirror (same names as the monorepo release):
+# Requires two secrets in the mirror's `cicd` environment (same names as the
+# monorepo release):
 #   DOCKER_USERNAME — a Docker Hub user with push access to the mancube org
 #   DOCKER_PASSWORD — a Docker Hub access token (Read/Write on mancube/dagron-*)
 #
@@ -76,6 +77,8 @@ jobs:
             platform: linux/arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    # DOCKER_USERNAME / DOCKER_PASSWORD live in the 'cicd' environment.
+    environment: cicd
     steps:
       - uses: actions/checkout@v4
 
@@ -118,6 +121,7 @@ jobs:
   merge:
     needs: build
     runs-on: ubuntu-latest
+    environment: cicd
     strategy:
       fail-fast: false
       matrix:
