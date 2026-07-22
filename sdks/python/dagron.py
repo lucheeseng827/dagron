@@ -42,7 +42,7 @@ import urllib.request
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Union
 
 __all__ = ["Dag", "Client", "DagronError", "SpecLike", "__version__"]
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 #: Run statuses the engine treats as terminal (no further transitions).
 TERMINAL_RUN_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
@@ -63,11 +63,18 @@ class Dag:
     :meth:`Client.create_workflow`.
     """
 
-    def __init__(self, name: str) -> None:
-        """Create an empty DAG named ``name`` (raises if the name is empty)."""
+    def __init__(self, name: str, *, runner_class: Optional[str] = None) -> None:
+        """Create an empty DAG named ``name`` (raises if the name is empty).
+
+        ``runner_class`` is the workflow-level default runner class — every task
+        that doesn't set its own ``runner_class`` routes to that pool of engine
+        replicas (e.g. ``"etl"``, ``"pulse"``, ``"ml_training"``). Leave unset
+        for the shared default pool.
+        """
         if not name:
             raise ValueError("Dag requires a name")
         self.name = name
+        self.runner_class = runner_class
         self._tasks: List[Dict[str, Any]] = []
         self._names: set[str] = set()
 
@@ -86,6 +93,7 @@ class Dag:
         env: Optional[Union[Mapping[str, str], Sequence[Mapping[str, str]]]] = None,
         resources: Optional[Mapping[str, Any]] = None,
         service_account: Optional[str] = None,
+        runner_class: Optional[str] = None,
     ) -> str:
         """Add a task; returns its name (pass it to a later task's ``depends_on``).
 
@@ -132,6 +140,8 @@ class Dag:
             t["resources"] = dict(resources)
         if service_account:
             t["service_account"] = service_account
+        if runner_class:
+            t["runner_class"] = runner_class
 
         self._tasks.append(t)
         return name
@@ -163,7 +173,10 @@ class Dag:
         self._assert_acyclic()
         # Deep-copy so callers can't mutate our internal task state via the
         # returned spec (to_json/submit both go through here).
-        return copy.deepcopy({"name": self.name, "tasks": self._tasks})
+        spec: Dict[str, Any] = {"name": self.name, "tasks": self._tasks}
+        if self.runner_class:
+            spec["runner_class"] = self.runner_class
+        return copy.deepcopy(spec)
 
     def _assert_acyclic(self) -> None:
         """DFS colouring; raise on the first back-edge (a dependency cycle)."""
@@ -340,6 +353,23 @@ class Client:
         """Resurrect a single failed/cancelled task within a run."""
         return self._request("POST", f"/api/runs/{_seg(run_id)}/tasks/{_seg(task_id)}/retry")["retried"]
 
+    def approve_task(self, run_id: str, task_id: str) -> Dict[str, Any]:
+        """Approve a ``type: approval`` gate: the task succeeds and its dependents
+        advance. Returns ``{"run_id", "task_id", "resolution"}``. Raises
+        :class:`DagronError` with status 409 if the task is not awaiting approval.
+        """
+        return self._request(
+            "POST", f"/api/runs/{_seg(run_id)}/tasks/{_seg(task_id)}/approve"
+        )
+
+    def reject_task(self, run_id: str, task_id: str) -> Dict[str, Any]:
+        """Reject a ``type: approval`` gate: the task fails and its ``all_success``
+        dependents skip. Same return/errors as :meth:`approve_task`.
+        """
+        return self._request(
+            "POST", f"/api/runs/{_seg(run_id)}/tasks/{_seg(task_id)}/reject"
+        )
+
     def stream_run(self, run_id: str, *, timeout: Optional[float] = None) -> Iterator[Dict[str, Any]]:
         """Yield live task-state events for a run as Server-Sent Events.
 
@@ -472,6 +502,40 @@ class Client:
             body["max_runs"] = max_runs
         return self._request("POST", f"/api/schedules/{_seg(schedule_id)}/backfill", body=body)
 
+    # ── backfill jobs (durable, paced) ────────────────────────────────────────
+
+    def create_backfill(
+        self, schedule_id: str, frm: str, to: str, *, max_runs: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Create a durable, paced backfill *job* over ``[frm, to]`` (RFC3339).
+
+        Unlike :meth:`backfill_schedule` (which materialises the whole window in one
+        synchronous call, capped low), this snapshots the schedule and lets the
+        engine drip a bounded number of fire-times per tick — listable, monitorable,
+        and cancellable. Returns the created backfill job. Slots already materialised
+        by a manual/auto backfill are deduped, never double-run.
+        """
+        body: Dict[str, Any] = {"schedule_id": schedule_id, "from": frm, "to": to}
+        if max_runs is not None:
+            body["max_runs"] = max_runs
+        return self._request("POST", "/api/backfills", body=body)
+
+    def list_backfills(
+        self, *, schedule_id: Optional[str] = None, limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """List backfill jobs, newest first; filter by ``schedule_id``."""
+        return self._request(
+            "GET", "/api/backfills", params={"schedule_id": schedule_id, "limit": limit}
+        )
+
+    def get_backfill(self, backfill_id: str) -> Dict[str, Any]:
+        """Fetch one backfill job for monitoring (``fired``/``requested``/``status``)."""
+        return self._request("GET", f"/api/backfills/{_seg(backfill_id)}")
+
+    def cancel_backfill(self, backfill_id: str) -> Dict[str, Any]:
+        """Stop pacing a running backfill job. Returns the updated job."""
+        return self._request("POST", f"/api/backfills/{_seg(backfill_id)}/cancel")
+
     # ── dead letters ──────────────────────────────────────────────────────────
 
     def list_dead_letters(self, *, limit: int = 100) -> List[Dict[str, Any]]:
@@ -493,12 +557,19 @@ class Client:
         return self._request("GET", "/api/git-repos")
 
     def connect_git_repo(
-        self, url: str, *, branch: Optional[str] = None, auto_sync: bool = False
+        self,
+        url: str,
+        *,
+        branch: Optional[str] = None,
+        auto_sync: bool = False,
+        path: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Register (connect) a Git repository."""
-        return self._request(
-            "POST", "/api/git-repos", body={"url": url, "branch": branch, "auto_sync": auto_sync}
-        )
+        """Register (connect) a Git repository. ``path`` scopes discovery to a
+        subdirectory of the repo (server default ``dagron`` when omitted)."""
+        body: Dict[str, Any] = {"url": url, "branch": branch, "auto_sync": auto_sync}
+        if path is not None:
+            body["path"] = path
+        return self._request("POST", "/api/git-repos", body=body)
 
     def sync_git_repo(self, repo_id: str) -> Dict[str, Any]:
         """Mark a tracked repo synced now."""

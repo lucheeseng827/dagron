@@ -378,17 +378,74 @@ class ClientWorkflowTests(GatewayTestCase):
         body = json.loads(self.last_request()["body"])
         self.assertEqual(body, {"from": "2026-01-01T00:00:00Z", "to": "2026-01-02T00:00:00Z", "max_runs": 50})
 
+    def test_create_backfill_job(self):
+        self.respond("POST", "/api/backfills", 201, {"id": "bf-1", "status": "running"})
+        job = self.client.create_backfill(
+            "s-1", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", max_runs=100
+        )
+        self.assertEqual(job["id"], "bf-1")
+        self.assertEqual(
+            json.loads(self.last_request()["body"]),
+            {
+                "schedule_id": "s-1",
+                "from": "2026-01-01T00:00:00Z",
+                "to": "2026-01-02T00:00:00Z",
+                "max_runs": 100,
+            },
+        )
+
+    def test_create_backfill_omits_unset_max_runs(self):
+        self.respond("POST", "/api/backfills", 201, {"id": "bf-2"})
+        self.client.create_backfill("s-1", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z")
+        self.assertNotIn("max_runs", json.loads(self.last_request()["body"]))
+
+    def test_list_get_cancel_backfill(self):
+        self.respond("GET", "/api/backfills", 200, [{"id": "bf-1"}])
+        self.assertEqual(self.client.list_backfills(schedule_id="s-1")[0]["id"], "bf-1")
+        self.assertEqual(self.last_request()["query"], {"schedule_id": ["s-1"]})
+
+        self.respond("GET", "/api/backfills/bf-1", 200, {"id": "bf-1", "fired": 3})
+        self.assertEqual(self.client.get_backfill("bf-1")["fired"], 3)
+
+        self.respond("POST", "/api/backfills/bf-1/cancel", 200, {"id": "bf-1", "status": "cancelled"})
+        self.assertEqual(self.client.cancel_backfill("bf-1")["status"], "cancelled")
+
+    def test_approve_and_reject_task(self):
+        self.respond(
+            "POST", "/api/runs/r-1/tasks/t-1/approve", 200,
+            {"run_id": "r-1", "task_id": "t-1", "resolution": "approved"},
+        )
+        self.assertEqual(self.client.approve_task("r-1", "t-1")["resolution"], "approved")
+
+        self.respond(
+            "POST", "/api/runs/r-1/tasks/t-2/reject", 200,
+            {"run_id": "r-1", "task_id": "t-2", "resolution": "rejected"},
+        )
+        self.assertEqual(self.client.reject_task("r-1", "t-2")["resolution"], "rejected")
+
     def test_dead_letters_and_git_repos(self):
         self.respond("GET", "/api/dead-letters", 200, [{"id": "dl-1"}])
         self.assertEqual(self.client.list_dead_letters(limit=5)[0]["id"], "dl-1")
         self.assertEqual(self.last_request()["query"], {"limit": ["5"]})
 
         self.respond("POST", "/api/git-repos", 201, {"id": "g-1"})
-        self.client.connect_git_repo("https://github.com/o/r", branch="main", auto_sync=True)
+        self.client.connect_git_repo(
+            "https://github.com/o/r", branch="main", auto_sync=True, path="pipelines"
+        )
         self.assertEqual(
             json.loads(self.last_request()["body"]),
-            {"url": "https://github.com/o/r", "branch": "main", "auto_sync": True},
+            {
+                "url": "https://github.com/o/r",
+                "branch": "main",
+                "auto_sync": True,
+                "path": "pipelines",
+            },
         )
+
+    def test_connect_git_repo_omits_unset_path(self):
+        self.respond("POST", "/api/git-repos", 201, {"id": "g-2"})
+        self.client.connect_git_repo("https://github.com/o/r")
+        self.assertNotIn("path", json.loads(self.last_request()["body"]))
 
 
 # ── Client: error mapping + ops ───────────────────────────────────────────────

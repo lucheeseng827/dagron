@@ -47,6 +47,35 @@ pre,
   font-family: "IBM Plex Mono", monospace;
 }
 
+/* Minimal pill scrollbars — thin, transparent track, muted rounded thumb (no
+   default white/grey OS bar). Firefox uses scrollbar-width/color; WebKit/Blink
+   the ::-webkit-scrollbar pseudos. The thumb's transparent border + padding-box
+   clip leaves breathing room so it reads as a slim pill. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
+}
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.26);
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
 /* ── app shell: left sidebar + main ───────────────────────────────────────── */
 .dy-shell {
   display: flex;
@@ -78,6 +107,16 @@ pre,
   color: var(--dim);
   margin-top: 3px;
   letter-spacing: 0.12em;
+}
+
+/* Version tag trailing the WORKFLOWS brand subtitle. */
+.dy-brand-ver {
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--panel-2, rgba(255, 255, 255, 0.06));
+  color: var(--dim);
+  letter-spacing: 0.04em;
 }
 
 .dy-navitem {
@@ -131,21 +170,13 @@ pre,
   flex-shrink: 0;
   overflow: hidden;
 }
-.dy-logo i {
+/* Brand chevrons now render as an inline SVG in Sidebar.tsx (shared geometry
+   with app/icon.svg) so the logo matches the favicon; the old CSS-border
+   chevrons (.dy-logo i) were removed. */
+.dy-logo svg {
   position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 10px;
-  height: 10px;
-  border-right: 2.5px solid #1a1207;
-  border-bottom: 2.5px solid #1a1207;
-}
-.dy-logo i:nth-child(1) {
-  transform: translate(-58%, -50%) rotate(-45deg);
-}
-.dy-logo i:nth-child(2) {
-  transform: translate(-12%, -50%) rotate(-45deg);
-  border-color: rgba(26, 18, 7, 0.5);
+  top: 0;
+  left: 0;
 }
 
 .dy-navsection {
@@ -481,6 +512,132 @@ pre,
 }
 .react-flow__attribution {
   display: none;
+}
+/* Dependency edge under a dragged palette block: dropping here splices the
+   block into the edge (a -> b becomes a -> block -> b). Set as an edge
+   className by EditableDag while a drag hovers the edge's interaction stroke. */
+.react-flow__edge.dagron-edge-drop .react-flow__edge-path {
+  stroke: var(--blue);
+  stroke-width: 2.5;
+}
+
+/* ── ⌘K command palette ───────────────────────────────────────────────────── */
+.dy-cmdk-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 14vh;
+  z-index: 900;
+}
+.dy-cmdk {
+  width: min(620px, 92vw);
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.6);
+  overflow: hidden;
+}
+.dy-cmdk-input {
+  width: 100%;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--fg);
+  font: inherit;
+  font-size: 15px;
+  padding: 15px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.dy-cmdk-results {
+  max-height: 46vh;
+  overflow: auto;
+  padding: 6px;
+}
+.dy-cmdk-group {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 9.5px;
+  color: #56606b;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 10px 12px 4px;
+}
+.dy-cmdk-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 9px 12px;
+  border: none;
+  border-radius: 8px;
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  font-size: 13.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.dy-cmdk-item-active {
+  background: rgba(232, 131, 58, 0.14);
+}
+.dy-cmdk-empty {
+  padding: 18px 14px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.dy-kbd,
+.dy-cmdk-empty kbd {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 10px;
+  color: var(--dim);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.dy-search-btn {
+  width: 100%;
+  background: none;
+  border: 1px solid var(--border);
+  font: inherit;
+  margin-bottom: 6px;
+}
+.dy-search-btn .dy-kbd {
+  margin-left: auto;
+}
+
+/* ── toasts (bottom-right action feedback) ────────────────────────────────── */
+.dy-toasts {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 1000;
+  pointer-events: none;
+}
+.dy-toast {
+  background: var(--panel-2);
+  border: 1px solid var(--border-strong);
+  border-left: 3px solid var(--green);
+  color: var(--fg);
+  border-radius: 8px;
+  padding: 9px 14px;
+  font-size: 13px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+  max-width: 360px;
+}
+.dy-toast-error {
+  border-left-color: var(--red);
+}
+
+/* Clickable KPI tiles (overview) get a hover affordance. */
+a.dy-kpi:hover {
+  border-color: var(--border-strong);
+  background: var(--panel-2);
 }
 
 a {

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import CommandPalette from "@/components/CommandPalette";
 import Sidebar from "@/components/Sidebar";
 import { checkSession, login } from "@/lib/dagron-api";
 
@@ -34,6 +35,8 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
     <div className="dy-shell">
       <Sidebar />
       <main className="dy-main">{children}</main>
+      {/* Global ⌘K search — only mounted once the session is valid. */}
+      <CommandPalette />
     </div>
   );
 }

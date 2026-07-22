@@ -1,0 +1,39 @@
+# app-of-apps root. Apply THIS one manifest and Argo CD pulls in everything else
+# from Git: the AppProject, the platform Application, and the workflows
+# ApplicationSet. Those in turn deploy the chart and generate the per-team apps.
+#
+#   root-app ─► projects/dagron.yaml            (AppProject)
+#            ─► platform/dagron-platform.yaml   (Application → Helm chart, wave 0)
+#            ─► appsets/dagron-workflows.yaml    (ApplicationSet, wave 1)
+#                     └─► dagron-wf-team-data, dagron-wf-team-payments, …
+#
+# Uses the built-in `default` project to avoid a chicken-and-egg with the `dagron`
+# project it creates. Runs under `default` only these control-plane manifests.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: dagron-gitops-root
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/lucheeseng827/nick-rust-project.git
+    targetRevision: main
+    path: rust_modules/lab/module_54/examples/gitops
+    directory:
+      recurse: true
+      # Only the control-plane manifests — NOT workflows/ (the ApplicationSet owns
+      # those) and NOT the optional matrix AppSet. Swap in dagron-workflows-matrix.yaml
+      # here for the multi-cluster variant.
+      include: "{projects/*.yaml,platform/dagron-platform.yaml,appsets/dagron-workflows.yaml}"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

@@ -1,0 +1,11 @@
+-- Runner-class routing (runner segmentation): which pool of scheduler replicas
+-- may claim this task. Persisted per row so a retry / lease recovery stays in
+-- its class. 'default' matches every task created before this migration and
+-- every task that names no class, so an unsegmented deployment is unchanged.
+-- Mirrors migrations/019_runner_class.sql (SQLite).
+--
+-- The class-scoped ready index lives in 023 as CREATE INDEX CONCURRENTLY: a
+-- plain CREATE INDEX here would take a lock that blocks writers on a populated
+-- task_runs while migrations run at engine connect (live cells upgrade in
+-- place), and CONCURRENTLY needs its own no-transaction, single-statement file.
+ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS runner_class TEXT NOT NULL DEFAULT 'default';

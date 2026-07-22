@@ -1,0 +1,52 @@
+# A dagron Workflow CR — a one-shot DAG the operator reconciles into an engine run.
+#
+# Schema is the as-built CRD (dagron.io/v1, terraform/charts/dagron/crds/):
+#   spec.dag  = the SAME workflow YAML you'd POST to /api/workflows or run with
+#               the CLI — a string with top-level `name` + `tasks`.
+#
+# This is the "diamond" from loadtest/workflows/dagron/etl_diamond.yaml, trimmed
+# so it runs with the `local` executor (plain shell, no task image) — the demo in
+# examples/gitops/README.md sets engine.executor=local so this converges to
+# Succeeded on a throwaway kind cluster. For a real k8s-executor deploy, give each
+# task a `docker_image` and a `service_account` (see the loadtest workflows).
+#
+#              ┌─ transform ─┐
+#   extract ──>│             ├── load
+#              └─ db-probe ──┘
+apiVersion: dagron.io/v1
+kind: Workflow
+metadata:
+  name: etl-diamond
+  # namespace is set by the ApplicationSet's destination (team-data). The operator
+  # watches all namespaces, so a CR here still becomes a run in the one engine.
+  labels:
+    app.kubernetes.io/part-of: dagron-workflows
+    dagron.io/team: data
+spec:
+  dag: |
+    name: etl-diamond
+    tasks:
+      - name: extract
+        command: ["sh", "-c", "echo extract: pulling source rows; sleep 1"]
+        depends_on: []
+        max_attempts: 3
+        retry_delay_secs: 5
+        timeout_secs: 120
+      - name: transform
+        command: ["sh", "-c", "echo transform: cpu work; sleep 2"]
+        depends_on: [extract]
+        max_attempts: 2
+        retry_delay_secs: 5
+        timeout_secs: 180
+      - name: db-probe
+        command: ["sh", "-c", "echo db-probe: writing 500 rows; sleep 1"]
+        depends_on: [extract]
+        max_attempts: 3
+        retry_delay_secs: 5
+        timeout_secs: 120
+      - name: load
+        command: ["sh", "-c", "echo load: publishing result; sleep 1"]
+        depends_on: [transform, db-probe]
+        max_attempts: 3
+        retry_delay_secs: 5
+        timeout_secs: 120

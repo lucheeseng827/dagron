@@ -1,7 +1,7 @@
 # Workspace root. The `dagron` engine binary is the root package; the library
 # crates are members so the whole module shares one Cargo.lock + target dir.
 [workspace]
-members = ["crates/dagron-core", "crates/dagron-executor", "crates/dagron-source", "crates/dagron-engine", "crates/dagron-api", "crates/dagron-identity", "crates/dagron-artifact", "crates/dagron-mcp", "crates/dagron-import", "crates/dagron-plan", "crates/dagron-lineage", "crates/dagron-forge", "crates/dagron-logging"]
+members = ["crates/dagron-core", "crates/dagron-executor", "crates/dagron-source", "crates/dagron-engine", "crates/dagron-api", "crates/dagron-identity", "crates/dagron-artifact", "crates/dagron-crypto", "crates/dagron-mcp", "crates/dagron-import", "crates/dagron-plan", "crates/dagron-lineage", "crates/dagron-forge", "crates/dagron-logging"]
 # A sibling `ee/` directory (its own separate workspace, not present here) is
 # excluded so this workspace always builds standalone.
 exclude = ["ee"]

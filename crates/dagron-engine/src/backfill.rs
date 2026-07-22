@@ -254,7 +254,14 @@ async fn sweep_catchup(
             // backfilled run processes *its* interval, not "now".
             let mut params = std::collections::BTreeMap::new();
             params.insert("scheduled_time".to_string(), logical.clone());
-            let dag = match DagGraph::from_yaml_with_params(&s.spec, &params) {
+            let parsed = match crate::environments::template_params(pool, &s.spec).await {
+                Ok(extra) => {
+                    params.extend(extra);
+                    DagGraph::from_yaml_with_params(&s.spec, &params)
+                }
+                Err(e) => Err(e),
+            };
+            let dag = match parsed {
                 Ok(d) => d,
                 Err(e) => {
                     db::release_backfill_slot(pool, &s.id, &logical).await?;

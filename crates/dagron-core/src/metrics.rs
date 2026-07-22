@@ -29,6 +29,14 @@ const DURATION_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
 ];
 
+/// Max distinct `runner_class` label values exported per scrape. The class
+/// comes from workflow specs (only syntax-validated), so without a cap a
+/// submitter minting a class per run would mint a Prometheus series per run;
+/// classes beyond the cap fold into `runner_class="other"`. Generous next to
+/// any sane operator taxonomy (a handful of pools).
+#[cfg(feature = "ops")]
+const READY_CLASS_SERIES_CAP: usize = 20;
+
 /// A fixed-bucket Prometheus histogram backed by plain atomics — no registry
 /// crate, matching the hand-rolled exposition the rest of this module uses.
 ///
@@ -257,6 +265,9 @@ impl Metrics {
     /// process counters plus the datastore gauges in `snap`. Gated to the `ops`
     /// feature — the only caller is the management API's `/metrics` endpoint.
     ///
+    /// Per-class series are capped at [`READY_CLASS_SERIES_CAP`]; see the
+    /// ready-by-class block below.
+    ///
     /// `pool` is the live datastore connection-pool saturation, read per scrape.
     #[cfg(feature = "ops")]
     pub fn render(&self, snap: &MetricsSnapshot, pool: Option<&DbPoolStats>) -> String {
@@ -327,6 +338,42 @@ impl Metrics {
         let _ = writeln!(out, "# HELP scheduler_queue_depth Ready tasks awaiting dispatch (backlog).");
         let _ = writeln!(out, "# TYPE scheduler_queue_depth gauge");
         let _ = writeln!(out, "scheduler_queue_depth {queue_depth}");
+
+        // Per-runner-class backlog (runner segmentation). The age gauge is the
+        // unclaimable-class alarm signal: a class no live scheduler serves
+        // (every pool restricted away from it) only ever grows here.
+        //
+        // Cardinality is bounded even though `runner_class` comes from
+        // workflow specs (a submitter could mint a new class per run): only
+        // the READY_CLASS_SERIES_CAP busiest classes get their own series; the
+        // tail is folded into runner_class="other" (count summed, age = the
+        // tail's max, so an unserved class still raises the alarm from inside
+        // the bucket).
+        if !snap.ready_by_class.is_empty() {
+            let now = chrono::Utc::now();
+            let mut classes: Vec<_> = snap.ready_by_class.iter().collect();
+            classes.sort_by(|a, b| b.count.cmp(&a.count).then(a.runner_class.cmp(&b.runner_class)));
+            let (head, tail) = classes.split_at(classes.len().min(READY_CLASS_SERIES_CAP));
+            let tail_count: i64 = tail.iter().map(|b| b.count).sum();
+            let tail_age: i64 = tail.iter().map(|b| b.oldest_age_secs(now)).max().unwrap_or(0);
+
+            let _ = writeln!(out, "# HELP scheduler_ready_tasks_by_class Ready tasks awaiting dispatch, per runner class (top classes; tail bucketed as \"other\").");
+            let _ = writeln!(out, "# TYPE scheduler_ready_tasks_by_class gauge");
+            for b in head {
+                let _ = writeln!(out, "scheduler_ready_tasks_by_class{{runner_class=\"{}\"}} {}", b.runner_class, b.count);
+            }
+            if !tail.is_empty() {
+                let _ = writeln!(out, "scheduler_ready_tasks_by_class{{runner_class=\"other\"}} {tail_count}");
+            }
+            let _ = writeln!(out, "# HELP scheduler_ready_oldest_age_seconds Age of the oldest ready task, per runner class (top classes; tail bucketed as \"other\").");
+            let _ = writeln!(out, "# TYPE scheduler_ready_oldest_age_seconds gauge");
+            for b in head {
+                let _ = writeln!(out, "scheduler_ready_oldest_age_seconds{{runner_class=\"{}\"}} {}", b.runner_class, b.oldest_age_secs(now));
+            }
+            if !tail.is_empty() {
+                let _ = writeln!(out, "scheduler_ready_oldest_age_seconds{{runner_class=\"other\"}} {tail_age}");
+            }
+        }
 
         let _ = writeln!(out, "# HELP scheduler_dead_letters Dead-letter rows currently parked.");
         let _ = writeln!(out, "# TYPE scheduler_dead_letters gauge");
@@ -400,9 +447,24 @@ mod tests {
             runs_by_status: vec![("running".into(), 2), ("succeeded".into(), 5)],
             tasks_by_status: vec![("succeeded".into(), 10), ("ready".into(), 7)],
             dead_letters: 3,
+            ready_by_class: vec![crate::models::ReadyClassBacklog {
+                runner_class: "etl".into(),
+                count: 7,
+                oldest_scheduled_at: Some(
+                    (chrono::Utc::now() - chrono::TimeDelta::seconds(120)).to_rfc3339(),
+                ),
+            }],
         };
         let pool = DbPoolStats { connections: 5, idle: 2, max: 10 };
         let text = m.render(&snap, Some(&pool));
+        // Per-class backlog gauges (runner segmentation / unclaimable-class alarm).
+        assert!(text.contains("scheduler_ready_tasks_by_class{runner_class=\"etl\"} 7"));
+        let age_line = text
+            .lines()
+            .find(|l| l.starts_with("scheduler_ready_oldest_age_seconds{runner_class=\"etl\"}"))
+            .expect("per-class age gauge present");
+        let age: i64 = age_line.rsplit(' ').next().unwrap().parse().unwrap();
+        assert!((115..=130).contains(&age), "age ~120s, got {age}");
         assert!(text.contains("scheduler_runs_created_total 1"));
         assert!(text.contains("scheduler_tasks_succeeded_total 2"));
         assert!(text.contains("scheduler_dead_letters_total 1"));
@@ -420,6 +482,55 @@ mod tests {
         assert!(text.contains("scheduler_db_pool_connections 5"));
         assert!(text.contains("scheduler_db_pool_in_use 3"));
         assert!(text.contains("scheduler_db_pool_max 10"));
+    }
+
+    /// The per-class series cap: with more classes than READY_CLASS_SERIES_CAP,
+    /// only the busiest get their own series and the rest fold into
+    /// `runner_class="other"` (count summed, age = tail max). `other` cannot
+    /// collide with a real class — `dag::validate_runner_class` reserves it.
+    #[test]
+    fn ready_class_series_are_capped_with_other_tail() {
+        let m = Metrics::new();
+        let now = chrono::Utc::now();
+        // cap + 2 classes: class-00 (busiest, count 102) … class-21 (count 81).
+        // The two least-busy (class-20: 82, class-21: 81) fold into the tail;
+        // class-21 carries the tail's oldest task (~500 s).
+        let ready_by_class: Vec<crate::models::ReadyClassBacklog> = (0..READY_CLASS_SERIES_CAP + 2)
+            .map(|i| crate::models::ReadyClassBacklog {
+                runner_class: format!("class-{i:02}"),
+                count: (READY_CLASS_SERIES_CAP + 2 - i) as i64 + 80,
+                oldest_scheduled_at: Some(
+                    (now - chrono::TimeDelta::seconds(if i == READY_CLASS_SERIES_CAP + 1 { 500 } else { 60 }))
+                        .to_rfc3339(),
+                ),
+            })
+            .collect();
+        let snap = MetricsSnapshot {
+            runs_by_status: vec![],
+            tasks_by_status: vec![],
+            dead_letters: 0,
+            ready_by_class,
+        };
+        let text = m.render(&snap, None);
+
+        let class_lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("scheduler_ready_tasks_by_class{"))
+            .collect();
+        assert_eq!(class_lines.len(), READY_CLASS_SERIES_CAP + 1, "cap + one 'other' bucket");
+        assert!(text.contains("scheduler_ready_tasks_by_class{runner_class=\"class-00\"} 102"));
+        assert!(
+            !text.contains("runner_class=\"class-20\"") && !text.contains("runner_class=\"class-21\""),
+            "tail classes must not get their own series"
+        );
+        // Tail: 82 + 81 summed; age = the tail's max (~500 s).
+        assert!(text.contains("scheduler_ready_tasks_by_class{runner_class=\"other\"} 163"));
+        let age_line = text
+            .lines()
+            .find(|l| l.starts_with("scheduler_ready_oldest_age_seconds{runner_class=\"other\"}"))
+            .expect("tail age series present");
+        let age: i64 = age_line.rsplit(' ').next().unwrap().parse().unwrap();
+        assert!((495..=510).contains(&age), "tail age = max of folded classes, got {age}");
     }
 
     /// `observe` lands a value in the correct cumulative bucket and ignores

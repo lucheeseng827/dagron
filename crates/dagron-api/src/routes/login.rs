@@ -183,6 +183,48 @@ pub async fn create_user(
     Ok((StatusCode::CREATED, Json(CreateUserResponse { id })))
 }
 
+// ── List users (admin only) ───────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct UserView {
+    pub id: String,
+    pub email: String,
+    pub name: String,
+    pub groups: Vec<String>,
+    pub created_at: String,
+}
+
+/// `GET /api/users` — list users for the admin settings page. Password hashes
+/// never leave the table.
+pub async fn list_users(
+    AuthUser(claims): AuthUser,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<UserView>>, (StatusCode, String)> {
+    if !claims.groups.iter().any(|g| g == "admin") {
+        return Err((StatusCode::FORBIDDEN, "admin group required".to_string()));
+    }
+    let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT id, email, name, groups, created_at FROM users ORDER BY created_at",
+    )
+    .fetch_all(&state.read_pool)
+    .await
+    .map_err(|e| {
+        tracing::error!(error = ?e, "list users failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+    })?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|(id, email, name, groups, created_at)| UserView {
+                id,
+                email,
+                name,
+                groups: serde_json::from_str(&groups).unwrap_or_default(),
+                created_at,
+            })
+            .collect(),
+    ))
+}
+
 /// Argon2id hash of `password` with a random salt (PHC string form).
 fn hash_password(password: &str) -> anyhow::Result<String> {
     let salt = SaltString::generate(&mut OsRng);

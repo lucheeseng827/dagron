@@ -57,7 +57,17 @@ impl Expanded {
 }
 
 /// Expand all template calls in `spec` into a flat, leaf-only [`DagSpec`].
-pub fn expand(spec: DagSpec) -> Result<DagSpec> {
+pub fn expand(mut spec: DagSpec) -> Result<DagSpec> {
+    // task_defaults (the DRY block): fold into every task — top level and
+    // inside each template — before anything expands, so per-task overrides
+    // and template parameters behave identically with or without defaults.
+    if let Some(defaults) = spec.task_defaults.take() {
+        apply_task_defaults(&mut spec.tasks, &defaults);
+        for t in &mut spec.templates {
+            apply_task_defaults(&mut t.tasks, &defaults);
+        }
+    }
+
     let mut templates: BTreeMap<String, &TemplateSpec> = BTreeMap::new();
     for t in &spec.templates {
         if templates.insert(t.name.clone(), t).is_some() {
@@ -78,8 +88,47 @@ pub fn expand(spec: DagSpec) -> Result<DagSpec> {
         deadline: spec.deadline,
         notify: spec.notify,
         result_from: spec.result_from,
+        runner_class: spec.runner_class,
+        environment: spec.environment,
+        task_defaults: None,
         tasks: e.tasks,
     })
+}
+
+/// Merge [`TaskDefaults`] into each task. Optional fields fill only when the
+/// task left them unset; `max_attempts`/`retry_delay_secs` fill only when the
+/// task carries the built-in default (1 / 0); default `env` vars are prepended
+/// so a same-named task var shadows them (last write wins at the executor).
+fn apply_task_defaults(tasks: &mut [TaskSpec], d: &crate::dag::TaskDefaults) {
+    for t in tasks.iter_mut() {
+        if t.max_attempts == 1 {
+            if let Some(v) = d.max_attempts {
+                t.max_attempts = v;
+            }
+        }
+        if t.retry_delay_secs == 0 {
+            if let Some(v) = d.retry_delay_secs {
+                t.retry_delay_secs = v;
+            }
+        }
+        if t.retry_max_delay_secs.is_none() {
+            t.retry_max_delay_secs = d.retry_max_delay_secs;
+        }
+        if t.timeout_secs.is_none() {
+            t.timeout_secs = d.timeout_secs;
+        }
+        if t.docker_image.is_none() {
+            t.docker_image = d.docker_image.clone();
+        }
+        if t.runner_class.is_none() {
+            t.runner_class = d.runner_class.clone();
+        }
+        if !d.env.is_empty() {
+            let mut env = d.env.clone();
+            env.extend(t.env.drain(..));
+            t.env = env;
+        }
+    }
 }
 
 /// Wire lifecycle-hook tasks (fast-win #11): a `hook:` task is auto-wired to
@@ -229,9 +278,26 @@ fn expand_one(
             inst_ctx.insert("index".to_string(), i.to_string());
         }
 
-        // Conditional guard — the recursion base case.
+        // Conditional guard. Two flavors, told apart by what the condition
+        // references after parameter substitution:
+        //  * expansion-time (the recursion base case): fully resolvable from
+        //    parameters — evaluated here, false ⇒ the instance never exists;
+        //  * runtime: still references `{{ tasks.<name>.output }}` — carried
+        //    onto the leaf verbatim and evaluated by the engine when the task
+        //    becomes ready, so an upstream's *result* can branch the DAG.
+        let mut runtime_when: Option<String> = None;
         if let Some(cond) = &task.when {
-            if !eval_when(&substitute(cond, &inst_ctx))? {
+            let resolved = substitute(cond, &inst_ctx);
+            if when_refs_task_outputs(&resolved) {
+                if is_call {
+                    bail!(
+                        "task '{}': a runtime `when` (referencing tasks.*.output) is only \
+                         supported on leaf tasks, not template calls",
+                        task.name
+                    );
+                }
+                runtime_when = Some(resolved);
+            } else if !eval_when(&resolved)? {
                 continue; // skip this instance entirely
             }
         }
@@ -276,7 +342,7 @@ fn expand_one(
                 bail!("expansion exceeded {MAX_TASKS} tasks (fan-out × recursion blow-up?)");
             }
             *budget -= 1;
-            let leaf = build_leaf(task, &base, &inst_ctx);
+            let leaf = build_leaf(task, &base, &inst_ctx, runtime_when.clone());
             Expanded { roots: vec![base.clone()], exits: vec![base], tasks: vec![leaf] }
         };
         acc.roots.extend(inst.roots);
@@ -318,7 +384,14 @@ fn expand_call(
 }
 
 /// Materialize a leaf task with all string fields substituted in `ctx`.
-fn build_leaf(task: &TaskSpec, name: &str, ctx: &BTreeMap<String, String>) -> TaskSpec {
+/// `runtime_when` is a `when:` condition still referencing task outputs —
+/// persisted on the leaf for the engine's readiness-time evaluation.
+fn build_leaf(
+    task: &TaskSpec,
+    name: &str,
+    ctx: &BTreeMap<String, String>,
+    runtime_when: Option<String>,
+) -> TaskSpec {
     TaskSpec {
         name: name.to_string(),
         command: task.command.iter().map(|a| substitute(a, ctx)).collect(),
@@ -346,14 +419,51 @@ fn build_leaf(task: &TaskSpec, name: &str, ctx: &BTreeMap<String, String>) -> Ta
             .collect(),
         resources: task.resources.clone(),
         service_account: task.service_account.as_ref().map(|s| substitute(s, ctx)),
-        // call-only fields never survive on a leaf
+        // Substituted like docker_image so a template can parameterize its
+        // class; validated post-expansion in DagGraph::from_spec.
+        runner_class: task.runner_class.as_ref().map(|s| substitute(s, ctx)),
+        // `until` may reference workflow parameters ({{ threshold }} <= {{ output }});
+        // resolve them now — only {{ output }}/{{ attempt }} are runtime keys.
+        repeat: task.repeat.as_ref().map(|r| {
+            let mut r = r.clone();
+            r.until = substitute(&r.until, ctx);
+            r
+        }),
+        // call-only fields never survive on a leaf; a runtime `when` (task
+        // output refs) is the one gate that does — the engine consumes it.
         template: None,
         arguments: BTreeMap::new(),
         with_items: None,
         with_param: None,
-        when: None,
+        when: runtime_when,
         instance_key: None,
     }
+}
+
+/// True when a (substituted) `when:` condition still references an upstream
+/// task's output — the runtime-gate form.
+pub fn when_refs_task_outputs(cond: &str) -> bool {
+    !when_output_refs(cond).is_empty()
+}
+
+/// Extract the task names referenced as `{{ tasks.<name>.output }}` in a
+/// condition. Used for validation (each must be a dependency) and by the
+/// engine to build the evaluation context at readiness time.
+pub fn when_output_refs(cond: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    let mut rest = cond;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else { break };
+        let key = after[..end].trim();
+        if let Some(name) = key.strip_prefix("tasks.").and_then(|k| k.strip_suffix(".output")) {
+            if !name.is_empty() && !refs.iter().any(|r| r == name) {
+                refs.push(name.to_string());
+            }
+        }
+        rest = &after[end + 2..];
+    }
+    refs
 }
 
 /// Sanitize a rendered `instance_key` label: keep `[A-Za-z0-9_-]` (`.` is the
@@ -889,5 +999,136 @@ tasks:
         assert!(eval_when("true").unwrap());
         assert!(!eval_when("false").unwrap());
         assert!(!eval_when("0").unwrap());
+    }
+
+    #[test]
+    fn task_defaults_fill_unset_fields_and_tasks_win() {
+        let yaml = "name: w
+task_defaults:
+  max_attempts: 3
+  retry_delay_secs: 5
+  timeout_secs: 120
+  docker_image: base:1
+  env:
+    - { name: REGION, value: us-east-1 }
+tasks:
+  - { name: a, command: [\"true\"] }
+  - name: b
+    command: [\"true\"]
+    max_attempts: 7
+    docker_image: special:2
+    env:
+      - { name: REGION, value: eu-west-1 }
+";
+        let dag = crate::dag::DagGraph::from_yaml(yaml).unwrap();
+        let a = dag.spec.tasks.iter().find(|t| t.name == "a").unwrap();
+        assert_eq!(a.max_attempts, 3);
+        assert_eq!(a.retry_delay_secs, 5);
+        assert_eq!(a.timeout_secs, Some(120));
+        assert_eq!(a.docker_image.as_deref(), Some("base:1"));
+        assert_eq!(a.env.len(), 1);
+        let b = dag.spec.tasks.iter().find(|t| t.name == "b").unwrap();
+        assert_eq!(b.max_attempts, 7, "explicit task value must win");
+        assert_eq!(b.docker_image.as_deref(), Some("special:2"));
+        // Default env prepended, task's shadowing var last (last write wins).
+        assert_eq!(b.env.len(), 2);
+        assert_eq!(b.env[1].value, "eu-west-1");
+    }
+
+    #[test]
+    fn runtime_when_survives_expansion_and_param_when_still_drops() {
+        let yaml = "name: w
+parameters:
+  mode: fast
+tasks:
+  - { name: check, command: [\"decide\"] }
+  - name: deploy
+    command: [\"ship\"]
+    depends_on: [check]
+    when: \"{{ tasks.check.output }} == go\"
+  - name: slow-extra
+    command: [\"extra\"]
+    when: \"{{ mode }} == slow\"
+";
+        let dag = crate::dag::DagGraph::from_yaml(yaml).unwrap();
+        // Parameter-time when: false ⇒ dropped at expansion, as before.
+        assert!(dag.spec.tasks.iter().all(|t| t.name != "slow-extra"));
+        // Runtime when: survives onto the leaf for the engine.
+        let deploy = dag.spec.tasks.iter().find(|t| t.name == "deploy").unwrap();
+        assert_eq!(deploy.when.as_deref(), Some("{{ tasks.check.output }} == go"));
+    }
+
+    #[test]
+    fn runtime_when_must_reference_a_dependency() {
+        let err = crate::dag::DagGraph::from_yaml(
+            "name: w
+tasks:
+  - { name: check, command: [\"decide\"] }
+  - name: deploy
+    command: [\"ship\"]
+    when: \"{{ tasks.check.output }} == go\"
+",
+        )
+        .err()
+        .expect("runtime when without the dependency must be rejected")
+        .to_string();
+        assert!(err.contains("does not depend on 'check'"), "got: {err}");
+    }
+
+    #[test]
+    fn when_output_refs_are_extracted() {
+        assert_eq!(when_output_refs("{{ tasks.check.output }} == go"), vec!["check"]);
+        assert!(when_output_refs("{{ mode }} == slow").is_empty());
+        assert_eq!(
+            when_output_refs("{{ tasks.a.output }} == {{ tasks.b.output }}"),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn repeat_is_validated() {
+        let err = crate::dag::DagGraph::from_yaml(
+            "name: w
+tasks:
+  - name: poll
+    command: [\"check\"]
+    repeat: { until: \"{{ output }} == done\", max_iterations: 0 }
+",
+        )
+        .err()
+        .expect("max_iterations 0 must be rejected")
+        .to_string();
+        assert!(err.contains("max_iterations=0"), "got: {err}");
+
+        let ok = crate::dag::DagGraph::from_yaml(
+            "name: w
+tasks:
+  - name: poll
+    command: [\"check\"]
+    repeat: { until: \"{{ output }} == done\", max_iterations: 30, delay_secs: 10 }
+",
+        )
+        .unwrap();
+        let poll = ok.spec.tasks.iter().find(|t| t.name == "poll").unwrap();
+        assert_eq!(poll.repeat.as_ref().unwrap().max_iterations, 30);
+    }
+
+    #[test]
+    fn repeat_until_substitutes_parameters() {
+        // A workflow parameter in `until` resolves at expansion; the runtime
+        // keys ({{ output }}/{{ attempt }}) survive for readiness-time eval.
+        let ok = crate::dag::DagGraph::from_yaml_with_params(
+            "name: w
+parameters: { threshold: \"100\" }
+tasks:
+  - name: poll
+    command: [\"check\"]
+    repeat: { until: \"{{ threshold }} <= {{ output }}\", max_iterations: 5 }
+",
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        let poll = ok.spec.tasks.iter().find(|t| t.name == "poll").unwrap();
+        assert_eq!(poll.repeat.as_ref().unwrap().until, "100 <= {{ output }}");
     }
 }

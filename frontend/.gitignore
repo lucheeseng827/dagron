@@ -1,5 +1,7 @@
 node_modules/
 .next/
+# Monaco runtime staged from node_modules at build (scripts/copy-monaco.mjs)
+/public/monaco/
 next-env.d.ts
 *.tsbuildinfo
 .env

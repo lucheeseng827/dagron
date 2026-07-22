@@ -1,0 +1,39 @@
+# A second team's workflow. Because the ApplicationSet's git-directory generator
+# makes ONE Argo CD Application per folder under workflows/*, this folder becomes
+# its own Application (dagron-wf-team-payments) syncing into its own namespace —
+# team isolation falls out of the directory layout, no extra wiring.
+apiVersion: dagron.io/v1
+kind: Workflow
+metadata:
+  name: settlement-reconcile
+  labels:
+    app.kubernetes.io/part-of: dagron-workflows
+    dagron.io/team: payments
+spec:
+  dag: |
+    name: settlement-reconcile
+    tasks:
+      - name: fetch-ledger
+        command: ["sh", "-c", "echo fetch-ledger: pulling internal ledger; sleep 1"]
+        depends_on: []
+        max_attempts: 3
+        retry_delay_secs: 5
+        timeout_secs: 120
+      - name: fetch-processor
+        command: ["sh", "-c", "echo fetch-processor: pulling PSP report; sleep 1"]
+        depends_on: []
+        max_attempts: 3
+        retry_delay_secs: 5
+        timeout_secs: 120
+      - name: reconcile
+        command: ["sh", "-c", "echo reconcile: diffing ledger vs processor; sleep 2"]
+        depends_on: [fetch-ledger, fetch-processor]
+        max_attempts: 2
+        retry_delay_secs: 5
+        timeout_secs: 180
+      - name: report-breaks
+        command: ["sh", "-c", "echo report-breaks: emitting exceptions; sleep 1"]
+        depends_on: [reconcile]
+        max_attempts: 3
+        retry_delay_secs: 5
+        timeout_secs: 120

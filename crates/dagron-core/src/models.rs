@@ -211,6 +211,36 @@ pub struct MetricsSnapshot {
     pub tasks_by_status: Vec<(String, i64)>,
     /// Total rows in the dead-letter store (poison submissions parked for review).
     pub dead_letters: i64,
+    /// Ready backlog per runner class (count + oldest wait) — the signal that a
+    /// class no live scheduler serves is silently aging (runner segmentation).
+    pub ready_by_class: Vec<ReadyClassBacklog>,
+}
+
+/// Per-runner-class dispatch backlog: how many `ready` tasks are waiting and
+/// when the oldest became eligible. In a segmented fleet (`RUNNER_CLASSES`) a
+/// class every scheduler is restricted away from drains nowhere — its
+/// `oldest_scheduled_at` just ages. Surfaced as `/metrics` gauges and watched
+/// by the engine's stale-ready alert loop.
+#[cfg(feature = "ops")]
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadyClassBacklog {
+    pub runner_class: String,
+    pub count: i64,
+    /// `scheduled_at` of the oldest ready task in the class (RFC-3339).
+    pub oldest_scheduled_at: Option<String>,
+}
+
+#[cfg(feature = "ops")]
+impl ReadyClassBacklog {
+    /// Seconds the oldest ready task in this class has been eligible, clamped
+    /// at 0 (a future `scheduled_at` — a retry backoff — is not a wait).
+    pub fn oldest_age_secs(&self, now: chrono::DateTime<chrono::Utc>) -> i64 {
+        self.oldest_scheduled_at
+            .as_deref()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| (now - t.with_timezone(&chrono::Utc)).num_seconds().max(0))
+            .unwrap_or(0)
+    }
 }
 
 /// A parked poison submission (v4 dead-letter routing). Surfaced by the

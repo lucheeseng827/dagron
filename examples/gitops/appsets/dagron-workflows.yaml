@@ -1,0 +1,63 @@
+# LAYER 2 — the "workflows AppSet". ONE ApplicationSet that fans out into one
+# Argo CD Application per team folder, each syncing that team's dagron Workflow /
+# CronWorkflow CRs into its own namespace. Add a folder under workflows/ → a new
+# Application appears with no edits here. Commit a new CR into a folder → it syncs
+# into the cluster → the operator turns it into an engine run. `git push` is the
+# only mutation.
+#
+#   workflows/team-data/       ─┐  git-directory
+#   workflows/team-payments/   ─┼─ generator ─► Application dagron-wf-team-data
+#   workflows/<new-team>/      ─┘               Application dagron-wf-team-payments
+#                                               Application dagron-wf-<new-team>
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: dagron-workflows
+  namespace: argocd
+  annotations:
+    # After the platform (wave 0): its CRDs must exist before these CRs apply.
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  # Prune generated Applications when their source folder disappears (delete a
+  # team folder in Git → its Application, and the CRs it managed, are removed).
+  syncPolicy:
+    preserveResourcesOnDeletion: false
+  generators:
+    # Git directory generator: every immediate subfolder of workflows/ becomes a
+    # generator "row" exposing {{path}}, {{path.basename}}, etc.
+    - git:
+        repoURL: https://github.com/lucheeseng827/nick-rust-project.git
+        revision: main
+        directories:
+          - path: rust_modules/lab/module_54/examples/gitops/workflows/*
+  template:
+    metadata:
+      # e.g. dagron-wf-team-data
+      name: dagron-wf-{{path.basename}}
+      labels:
+        app.kubernetes.io/part-of: dagron-workflows
+        dagron.io/team: "{{path.basename}}"
+    spec:
+      project: dagron
+      source:
+        repoURL: https://github.com/lucheeseng827/nick-rust-project.git
+        revision: main
+        # The matched folder — Argo applies every manifest in it.
+        path: "{{path}}"
+      destination:
+        server: https://kubernetes.default.svc
+        # One namespace per team, named after the folder. The operator watches all
+        # namespaces, so runs still land in the single engine's Postgres.
+        namespace: "{{path.basename}}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m

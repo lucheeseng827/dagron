@@ -12,6 +12,14 @@ path = "src/main.rs"
 # Optional feature: parameterized rerun (`params` deep-merge). No extra
 # crate dependencies — purely a code-gate on the rerun endpoint.
 enterprise = []
+# Fetch archived run documents from cloud object storage (`GC_ARCHIVE_URL`) for
+# the /api/archive endpoints — same env contract and feature names as the
+# engine. One feature per backend; S3-compatible MinIO/Ceph rides `archive-s3`.
+archive-s3 = ["archive-cloud", "object_store/aws"]
+archive-gcs = ["archive-cloud", "object_store/gcp"]
+archive-azure = ["archive-cloud", "object_store/azure"]
+# Internal: shared object-store dep enabled by the cloud backends above.
+archive-cloud = ["dep:object_store"]
 
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
@@ -25,7 +33,7 @@ serde_json = "1"
 jsonwebtoken = "9"
 argon2 = { version = "0.5", features = ["std"] }
 # GitOps "sync to Git" — open a PR via the GitHub REST API.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 base64 = "0.22"
 anyhow = "1"
 tracing = "0.1"
@@ -33,6 +41,8 @@ tracing = "0.1"
 dagron-logging = { path = "../dagron-logging" }
 # The identity seam: ships LocalIdentityProvider behind this trait; an alternate provider can swap SSO in.
 dagron-identity = { path = "../dagron-identity" }
+# Encrypting environment secrets on write (the engine decrypts at dispatch).
+dagron-crypto = { path = "../dagron-crypto" }
 async-trait = "0.1"
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
@@ -41,3 +51,6 @@ petgraph = "0.6"
 cron = "0.16"
 # IANA timezone database for DST-safe per-schedule cron (matches the engine).
 chrono-tz = "0.10"
+# Cloud fetch for archived run documents (features `archive-s3`/`-gcs`/`-azure`).
+# Backend sub-features (aws/gcp/azure) are enabled by those features.
+object_store = { version = "0.11", optional = true }

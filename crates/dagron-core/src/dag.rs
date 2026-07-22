@@ -121,6 +121,40 @@ pub struct TaskSpec {
     /// `eks.amazonaws.com/role-arn` lets task pods assume an IAM role and reach S3
     /// (extract/load) without static credentials. Kubernetes executor only.
     pub service_account: Option<String>,
+    /// Which **runner class** (pool of scheduler replicas) may claim this task.
+    /// Schedulers started with `RUNNER_CLASSES=a,b` claim only tasks in those
+    /// classes; unset schedulers claim everything. Falls back to the DAG-level
+    /// [`DagSpec::runner_class`], then to `"default"`. Lowercase
+    /// `[a-z0-9_-]`, max 64 chars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_class: Option<String>,
+    /// Loop operator: re-run this task until `until` evaluates true (the
+    /// poll-until-done pattern). See [`RepeatSpec`]. Evaluated by the engine
+    /// each time the task *succeeds*; failures still follow the normal
+    /// retry/failure path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<RepeatSpec>,
+}
+
+/// `repeat:` — run a task repeatedly until a condition on its own output holds.
+///
+/// After each successful execution the engine evaluates `until` with
+/// `{{ output }}` (the task's stdout, trimmed) and `{{ attempt }}` (the
+/// 1-based iteration count) bound; the same expression grammar as `when:`
+/// (one binary comparison or a bare truthy value). True → the task succeeds
+/// and the DAG proceeds. False → the task is re-queued after `delay_secs`,
+/// up to `max_iterations` total executions, after which it **fails** (a
+/// condition that never came true is an error, not a success).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RepeatSpec {
+    /// Condition ending the loop, e.g. `"{{ output }} == done"`.
+    pub until: String,
+    /// Total execution budget (≥ 1). Bounded on purpose — an unbounded loop
+    /// wedges a run forever.
+    pub max_iterations: u32,
+    /// Seconds to wait between iterations (default 0 = immediate).
+    #[serde(default)]
+    pub delay_secs: u64,
 }
 
 /// A single environment variable for a task container. Either a literal `value`
@@ -182,6 +216,30 @@ impl TaskSpec {
     pub fn is_approval(&self) -> bool {
         self.task_type.as_deref() == Some("approval")
     }
+}
+
+/// The runner class tasks belong to when neither the task nor the DAG names one.
+/// Schedulers with no `RUNNER_CLASSES` restriction claim every class, so a
+/// deployment that never segments its runners behaves exactly as before.
+pub const DEFAULT_RUNNER_CLASS: &str = "default";
+
+/// Validate a `runner_class` name: lowercase `[a-z0-9_-]`, 1–64 chars, and not
+/// the reserved `"other"`. Strict on purpose — the name becomes a claim-path
+/// SQL filter value, a Helm pool name, and (k8s) part of label values, so one
+/// conservative charset serves all three; `"other"` is the metrics tail bucket
+/// (`scheduler_ready_*_by_class`), so a real class by that name would collide
+/// with the aggregated series.
+pub fn validate_runner_class(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 64 {
+        bail!("runner_class must be 1-64 characters, got {} ('{}')", name.len(), name);
+    }
+    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') {
+        bail!("runner_class '{name}' may only contain [a-z0-9_-]");
+    }
+    if name == "other" {
+        bail!("runner_class 'other' is reserved (it is the metrics tail bucket)");
+    }
+    Ok(())
 }
 
 /// A soft SLA deadline (`deadline:` block). See [`DagSpec::deadline`].
@@ -270,7 +328,55 @@ pub struct DagSpec {
     /// hook. `None` = the run has no distinguished result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_from: Option<String>,
+    /// Workflow-level default **runner class** applied to every task that does
+    /// not set its own [`TaskSpec::runner_class`] — so an ETL workflow routes
+    /// wholesale to the ETL runner pool with one line. `None` = `"default"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_class: Option<String>,
+    /// Named **environment** (variable set + secrets, managed via the UI/API)
+    /// this workflow runs against. Its variables become `{{ env.NAME }}`
+    /// template references (merged under the workflow's own `parameters` at run
+    /// creation), and its secrets are resolvable via
+    /// `value_from: {secret: NAME}` at dispatch — so one spec runs against
+    /// staging or prod by changing a single line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+    /// Workflow-wide task defaults (the DRY block): every field set here is
+    /// applied to each task that doesn't override it, so retries/timeouts/
+    /// images/env don't have to be repeated on every task. See [`TaskDefaults`]
+    /// for the exact merge rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_defaults: Option<TaskDefaults>,
     pub tasks: Vec<TaskSpec>,
+}
+
+/// `task_defaults:` — declared once, merged into every task (including tasks
+/// inside `templates`). Merge rules, per field:
+///
+/// * Optional task fields (`timeout_secs`, `docker_image`, `runner_class`,
+///   `retry_max_delay_secs`): the default applies only when the task leaves
+///   the field unset.
+/// * `max_attempts` / `retry_delay_secs`: the default applies when the task
+///   uses the field's built-in default (1 / 0) — i.e. a task wins by writing
+///   any explicit non-default value.
+/// * `env`: default vars are **prepended**; a task var with the same name
+///   shadows the default (last write wins at the executor).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct TaskDefaults {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_delay_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_max_delay_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker_image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<EnvVar>,
 }
 
 /// Post-run notification targets (`notify:` block).
@@ -279,6 +385,37 @@ pub struct NotifySpec {
     /// Post a commit status / PR check to a Git forge on run finalization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<GitNotify>,
+    /// POST a JSON event to an arbitrary HTTP endpoint on run finalization
+    /// and/or soft-deadline breach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook: Option<WebhookNotify>,
+    /// Post a message to a Slack incoming webhook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slack: Option<SlackNotify>,
+}
+
+/// A `notify.webhook` target. The engine POSTs
+/// `{ "event", "run_id", "workflow", "status", "at" }` as JSON. `url` is
+/// `{{ param }}`-templated like the git target's fields.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WebhookNotify {
+    pub url: String,
+    /// Events that fire it: any of `succeeded`, `failed`, `cancelled`,
+    /// `deadline_exceeded`. Empty (the default) = all of them.
+    #[serde(default)]
+    pub on: Vec<String>,
+}
+
+/// A `notify.slack` incoming-webhook target (the channel is fixed by the
+/// webhook itself). `webhook_url` is `{{ param }}`-templated.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SlackNotify {
+    pub webhook_url: String,
+    /// Events that fire it. Empty (the default) = `failed` +
+    /// `deadline_exceeded` only — chat channels want incidents, not every green
+    /// run; list events explicitly (e.g. `[succeeded, failed]`) to widen it.
+    #[serde(default)]
+    pub on: Vec<String>,
 }
 
 /// A `notify.git` commit-status target. String fields are `{{ param }}`-templated.
@@ -347,6 +484,10 @@ impl DagGraph {
             parse_duration_secs(&d.within)
                 .map_err(|e| anyhow::anyhow!("invalid deadline in DAG '{}': {e}", spec.name))?;
         }
+        if let Some(class) = &spec.runner_class {
+            validate_runner_class(class)
+                .map_err(|e| anyhow::anyhow!("invalid runner_class in DAG '{}': {e}", spec.name))?;
+        }
 
         for task in &spec.tasks {
             if node_index.contains_key(&task.name) {
@@ -401,6 +542,35 @@ impl DagGraph {
             if task.is_approval() && task.hook.is_some() {
                 bail!("task '{}' cannot be both an approval gate and a hook in DAG '{}'", task.name, spec.name);
             }
+            if let Some(class) = &task.runner_class {
+                validate_runner_class(class).map_err(|e| {
+                    anyhow::anyhow!(
+                        "invalid runner_class for task '{}' in DAG '{}': {e}",
+                        task.name,
+                        spec.name
+                    )
+                })?;
+            }
+            // `repeat:` loop-operator validation.
+            if let Some(rep) = &task.repeat {
+                if rep.until.trim().is_empty() {
+                    bail!("task '{}' repeat.until is empty in DAG '{}'", task.name, spec.name);
+                }
+                if rep.max_iterations == 0 {
+                    bail!(
+                        "invalid repeat.max_iterations=0 for task '{}' in DAG '{}'; expected >= 1",
+                        task.name,
+                        spec.name
+                    );
+                }
+                if task.is_approval() {
+                    bail!(
+                        "task '{}' cannot combine `repeat` with an approval gate in DAG '{}'",
+                        task.name,
+                        spec.name
+                    );
+                }
+            }
             // After expansion every task must be a runnable leaf. A surviving
             // `template` or an empty `command` means expansion missed something.
             if task.template.is_some() {
@@ -445,6 +615,24 @@ impl DagGraph {
             bail!("DAG '{}' contains a cycle", spec.name);
         }
 
+        // A runtime `when` (the only `when:` form surviving expansion) may only
+        // reference tasks it depends on — an output the gate is guaranteed to
+        // have when readiness is evaluated.
+        for task in &spec.tasks {
+            if let Some(cond) = &task.when {
+                for referenced in crate::expand::when_output_refs(cond) {
+                    if !task.depends_on.contains(&referenced) {
+                        bail!(
+                            "task '{}' when references '{{{{ tasks.{referenced}.output }}}}' but does \
+                             not depend on '{referenced}' in DAG '{}' — add it to depends_on",
+                            task.name,
+                            spec.name
+                        );
+                    }
+                }
+            }
+        }
+
         // `result_from` must name a real, non-hook task (a hook is a finalizer, not
         // a result-bearing leaf) so the run's result is always well-defined.
         if let Some(rf) = &spec.result_from {
@@ -475,6 +663,27 @@ impl DagGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runner-class validation: charset/length rules plus the reserved `other`
+    /// (the metrics tail bucket) — a spec-level `other` would collide with the
+    /// aggregated `runner_class="other"` series.
+    #[test]
+    fn runner_class_validation_rules() {
+        assert!(validate_runner_class("etl").is_ok());
+        assert!(validate_runner_class("ml_training-2").is_ok());
+        assert!(validate_runner_class("").is_err());
+        assert!(validate_runner_class(&"x".repeat(65)).is_err());
+        assert!(validate_runner_class("ETL").is_err());
+        assert!(validate_runner_class("a,b").is_err());
+        assert!(validate_runner_class("other").is_err(), "'other' is reserved");
+        let err = DagGraph::from_yaml(
+            "name: w\nrunner_class: other\ntasks:\n  - { name: a, command: [\"true\"] }\n",
+        )
+        .err()
+        .expect("spec-level 'other' must be rejected")
+        .to_string();
+        assert!(err.contains("reserved"), "spec-level 'other' rejected: {err}");
+    }
 
     #[test]
     fn run_timeout_zero_is_rejected() {

@@ -14,7 +14,15 @@
     "jsx": "preserve",
     "incremental": true,
     "plugins": [{ "name": "next" }],
-    "paths": { "@/*": ["./src/*"] }
+    "paths": {
+      "@/*": ["./src/*"],
+      // Open-core seam for proprietary screens (docs/OPEN_SOURCE.md §2):
+      // `@ee/X` resolves to src/ee (the closed implementation) when present,
+      // else to src/ee-stub (the OSS-shipped upsell fallback). The OSS mirror
+      // strips src/ee (.ossync exclude), so mirrored builds resolve the stubs
+      // and still compile.
+      "@ee/*": ["./src/ee/*", "./src/ee-stub/*"]
+    }
   },
   "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
   "exclude": ["node_modules"]

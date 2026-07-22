@@ -1,0 +1,62 @@
+# ADVANCED / OPTIONAL — multi-cluster fan-out. NOT applied by the default
+# bootstrap (bootstrap/root-app.yaml includes only dagron-workflows.yaml). Use
+# this instead of dagron-workflows.yaml when a dagron platform runs on several
+# clusters and every team's workflows should exist on each.
+#
+# A matrix generator is the CROSS PRODUCT of two generators:
+#   clusters  ── every cluster registered in Argo CD with label dagron=true
+#     ×
+#   git dirs  ── every team folder under workflows/*
+# ⇒ one Application per (cluster, team): dagron-wf-<cluster>-<team>.
+#
+# Register clusters first (`argocd cluster add <context>`), then label them:
+#   kubectl -n argocd label secret <cluster-secret> dagron=true
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: dagron-workflows-matrix
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  syncPolicy:
+    preserveResourcesOnDeletion: false
+  generators:
+    - matrix:
+        generators:
+          # Leg 1: clusters labelled dagron=true. Exposes {{.name}} + {{.server}}.
+          - clusters:
+              selector:
+                matchLabels:
+                  dagron: "true"
+          # Leg 2: the team folders. Exposes {{.path.basename}} + {{.path.path}}.
+          - git:
+              repoURL: https://github.com/lucheeseng827/nick-rust-project.git
+              revision: main
+              directories:
+                - path: rust_modules/lab/module_54/examples/gitops/workflows/*
+  template:
+    metadata:
+      name: "dagron-wf-{{.name}}-{{.path.basename}}"
+      labels:
+        app.kubernetes.io/part-of: dagron-workflows
+        dagron.io/team: "{{.path.basename}}"
+        dagron.io/cluster: "{{.name}}"
+    spec:
+      project: dagron
+      source:
+        repoURL: https://github.com/lucheeseng827/nick-rust-project.git
+        revision: main
+        path: "{{.path.path}}"
+      destination:
+        # The matched cluster from leg 1 — this is what makes it multi-cluster.
+        server: "{{.server}}"
+        namespace: "{{.path.basename}}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true

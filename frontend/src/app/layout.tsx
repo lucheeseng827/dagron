@@ -1,6 +1,7 @@
 import "./globals.css";
 import type { Metadata } from "next";
 import AuthGuard from "@/components/AuthGuard";
+import ToastProvider from "@/components/Toasts";
 
 export const metadata: Metadata = {
   title: "dagron",
@@ -12,7 +13,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en" data-theme="dark">
       <body>
         {/* AuthGuard gates + chooses shell (protected) vs bare (login). */}
-        <AuthGuard>{children}</AuthGuard>
+        <ToastProvider>
+          <AuthGuard>{children}</AuthGuard>
+        </ToastProvider>
       </body>
     </html>
   );

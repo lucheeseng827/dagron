@@ -1,0 +1,25 @@
+apiVersion: dagron.io/v1
+kind: CronWorkflow
+metadata:
+  name: hourly-settle
+  labels:
+    app.kubernetes.io/part-of: dagron-workflows
+    dagron.io/team: payments
+spec:
+  # Top of every hour (second=0 minute=0 hour=*).
+  schedule: "0 0 * * * *"
+  dag: |
+    name: hourly-settle
+    tasks:
+      - name: batch-authorizations
+        command: ["sh", "-c", "echo batch-authorizations: sweeping the last hour; sleep 1"]
+        depends_on: []
+        max_attempts: 3
+        retry_delay_secs: 10
+        timeout_secs: 180
+      - name: submit-settlement
+        command: ["sh", "-c", "echo submit-settlement: posting batch to processor; sleep 1"]
+        depends_on: [batch-authorizations]
+        max_attempts: 5
+        retry_delay_secs: 15
+        timeout_secs: 240

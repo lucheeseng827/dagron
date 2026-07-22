@@ -1,0 +1,11 @@
+[package]
+name = "dagron-crypto"
+version = "0.1.0"
+edition = "2021"
+description = "Shared secret-value encryption for dagron (AES-256-GCM, env-derived key). Dependency-free of sqlx/features so both dagron-api and dagron-engine can use it."
+
+[dependencies]
+aes-gcm = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+anyhow = "1"

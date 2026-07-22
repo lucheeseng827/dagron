@@ -25,7 +25,7 @@ spec:
       {{- end }}
       containers:
         - name: postgres
-          image: {{ .Values.postgres.image | quote }}
+          image: {{ include "dagron.image" (dict "image" $.Values.postgres.image "root" $) | quote }}
           env:
             - name: POSTGRES_USER
               value: {{ .Values.postgres.user | quote }}

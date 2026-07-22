@@ -155,6 +155,10 @@ fn expand_pure(
         name: root.name,
         run_timeout_secs: root.run_timeout_secs,
         result_from: root.result_from,
+        parameters: root.parameters,
+        environment: root.environment,
+        task_defaults: root.task_defaults,
+        runner_class: root.runner_class,
         tasks: e.tasks,
     })
 }
@@ -313,10 +317,18 @@ fn leaf(task: &TaskSpecInput, name: String) -> TaskSpecInput {
         retry_max_delay_secs: task.retry_max_delay_secs,
         timeout_secs: task.timeout_secs,
         docker_image: task.docker_image.clone(),
+        runner_class: task.runner_class.clone(),
         workflow_ref: None,
         task_type: task.task_type.clone(),
         approval_timeout_secs: task.approval_timeout_secs,
         approval_on_timeout: task.approval_on_timeout.clone(),
+        env: task.env.clone(),
+        // `when` inside an inlined workflow would need dependency-name
+        // namespacing to stay correct; runtime gates are validated against
+        // depends_on earlier, and inlined tasks' deps are rewired here — so a
+        // gate survives only with its (already-validated) dependency names.
+        when: task.when.clone(),
+        repeat: task.repeat.clone(),
     }
 }
 

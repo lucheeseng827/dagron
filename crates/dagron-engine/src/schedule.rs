@@ -107,7 +107,17 @@ pub async fn run(pool: db::Pool, is_leader: Arc<AtomicBool>, metrics: Arc<Metric
                 // parameter so tasks can reference their logical date.
                 let mut params = std::collections::BTreeMap::new();
                 params.insert("scheduled_time".to_string(), s.next_fire_at.clone());
-                match DagGraph::from_yaml_with_params(&s.spec, &params) {
+                // `{{ env.* }}` variables from the spec's declared environment;
+                // an unknown environment skips the fire (and logs) rather than
+                // running without its variables.
+                let parsed = match crate::environments::template_params(&pool, &s.spec).await {
+                    Ok(extra) => {
+                        params.extend(extra);
+                        DagGraph::from_yaml_with_params(&s.spec, &params)
+                    }
+                    Err(e) => Err(e),
+                };
+                match parsed {
                     Ok(dag) => match db::create_run(&pool, &dag, &s.spec).await {
                         Ok(run_id) => {
                             metrics.inc_runs_created();

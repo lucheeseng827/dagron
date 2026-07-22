@@ -18,6 +18,31 @@ helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
 {{- end -}}
 
 {{/*
+Resolve an image reference against an optional `global.imageRegistry` — the
+one lever that relocates every image to a private mirror for an air-gapped
+install (ee/DEPLOYMENT_BLUEPRINT.md). When set, it REPLACES the registry host
+of an image that already carries one (ghcr.io/…, host:port/…) and is PREPENDED
+to a bare image (mancube/…, alpine:3.21). Unset ⇒ the image is used verbatim,
+so existing installs are unchanged. Per-image values still win when overridden.
+Usage: {{ include "dagron.image" (dict "image" $.Values.engine.image "root" $) }}
+*/}}
+{{- define "dagron.image" -}}
+{{- $image := .image -}}
+{{- $registry := "" -}}
+{{- with .root.Values.global -}}{{- $registry = default "" .imageRegistry -}}{{- end -}}
+{{- if $registry -}}
+{{- $first := splitList "/" $image | first -}}
+{{- if and (contains "/" $image) (or (contains "." $first) (contains ":" $first) (eq $first "localhost")) -}}
+{{- printf "%s/%s" $registry (splitList "/" $image | rest | join "/") -}}
+{{- else -}}
+{{- printf "%s/%s" $registry $image -}}
+{{- end -}}
+{{- else -}}
+{{- $image -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 DATABASE_URL: the in-chart Postgres service when enabled, else the external URL.
 Fails the render if neither is configured, so a misconfigured install errors at
 `helm template` time rather than crash-looping in the cluster.
@@ -92,4 +117,36 @@ from: the external one when set, else the chart-managed `<fullname>-ui`.
 {{- else -}}
 {{ include "dagron.fullname" . }}-ui
 {{- end -}}
+{{- end -}}
+
+{{/*
+Environment-secrets key (DAGRON_ENV_SECRET_KEY): whether the feature is on —
+an inline key or an external Secret is configured. Off = the Environments UI
+still manages variables; storing secret values answers 503.
+*/}}
+{{- define "dagron.envSecretsEnabled" -}}
+{{- if or .Values.envSecrets.key .Values.envSecrets.existingSecret.name -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end -}}
+
+{{/*
+Name of the Secret holding the environment-secrets key: the external one when
+set, else the chart-managed `<fullname>-env-key`.
+*/}}
+{{- define "dagron.envSecretName" -}}
+{{- if .Values.envSecrets.existingSecret.name -}}
+{{ .Values.envSecrets.existingSecret.name }}
+{{- else -}}
+{{ include "dagron.fullname" . }}-env-key
+{{- end -}}
+{{- end -}}
+
+{{/*
+Env var / Secret key name for the environment-secrets key.
+*/}}
+{{- define "dagron.envSecretKeyName" -}}
+{{ .Values.envSecrets.keyName | default "DAGRON_ENV_SECRET_KEY" }}
 {{- end -}}

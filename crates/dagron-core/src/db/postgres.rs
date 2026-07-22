@@ -40,15 +40,43 @@ const EVENT_CHANNEL: &str = "task_events";
 /// feature is active.
 pub type Pool = PgPool;
 
+/// Opens the Postgres pool and runs migrations: the base set first, then — with
+/// the `enterprise` feature — the enterprise set. Both migrators run
+/// ignore-missing so the two migration dirs can share sqlx's single
+/// `_sqlx_migrations` table without colliding (see the inline comment below).
 pub async fn init_pool(conn: &str) -> Result<Pool> {
+    // DB_MAX_CONNECTIONS: per-process pool cap. On a shared state-store cell
+    // (ee/STATE_STORE.md) small-class engines run at 2-3 so hundreds of tenant
+    // engines fit one PgBouncer/cell budget; 8 stays the standalone default.
+    let max_connections: u32 = std::env::var("DB_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+        .max(2); // claim tx + listener headroom; 1 would deadlock the loop
     let pool = PgPoolOptions::new()
-        .max_connections(8)
+        .max_connections(max_connections)
         .connect(conn)
         .await?;
 
-    sqlx::migrate!("./migrations_pg").run(&pool).await?;
+    // The base and enterprise (900+) sets share sqlx's single `_sqlx_migrations`
+    // table. ignore_missing lets the base migrator tolerate the enterprise rows it
+    // does not own; without it an enterprise DB (900 already applied) fails the base
+    // migrator on every reboot with "migration 900 was previously applied but is
+    // missing in the resolved migrations" — before the enterprise migrator runs.
+    let mut base = sqlx::migrate!("./migrations_pg");
+    base.set_ignore_missing(true);
+    base.run(&pool).await?;
     #[cfg(feature = "enterprise")]
-    sqlx::migrate!("./migrations_pg_ee").run(&pool).await?;
+    {
+        // enterprise migrations live in a separate dir but share sqlx's single
+        // `_sqlx_migrations` table with the base set. Their versions are offset
+        // above the base range (900+) so they never collide, and ignore_missing
+        // lets this migrator tolerate the base migrations it doesn't own (else
+        // sqlx errors "previously applied but missing in resolved migrations").
+        let mut ee = sqlx::migrate!("./migrations_pg_ee");
+        ee.set_ignore_missing(true);
+        ee.run(&pool).await?;
+    }
     Ok(pool)
 }
 
@@ -87,8 +115,8 @@ pub async fn create_run(pool: &Pool, dag: &DagGraph, yaml_spec: &str) -> Result<
 
     sqlx::query(
         "INSERT INTO workflow_runs
-           (id, definition_id, status, created_at, deadline_at, alert_deadline_at, result_from)
-         VALUES ($1, $2, 'running', $3, $4, $5, $6)",
+           (id, definition_id, status, created_at, deadline_at, alert_deadline_at, result_from, environment)
+         VALUES ($1, $2, 'running', $3, $4, $5, $6, $7)",
     )
     .bind(&run_id)
     .bind(&def_id)
@@ -96,6 +124,7 @@ pub async fn create_run(pool: &Pool, dag: &DagGraph, yaml_spec: &str) -> Result<
     .bind(&deadline_at)
     .bind(&alert_deadline_at)
     .bind(&dag.spec.result_from)
+    .bind(&dag.spec.environment)
     .execute(&mut *tx)
     .await?;
 
@@ -118,11 +147,18 @@ pub async fn create_run(pool: &Pool, dag: &DagGraph, yaml_spec: &str) -> Result<
         let is_approval = i64::from(task_spec.is_approval());
         let approval_timeout = task_spec.approval_timeout_secs.map(|s| s as i64);
         let approval_on_timeout = task_spec.approval_on_timeout.as_deref();
+        // Resolved task → DAG default → 'default', so the claim-path filter can
+        // stay a plain column predicate with no spec re-parse.
+        let runner_class = task_spec
+            .runner_class
+            .as_deref()
+            .or(dag.spec.runner_class.as_deref())
+            .unwrap_or(crate::dag::DEFAULT_RUNNER_CLASS);
         sqlx::query(
             "INSERT INTO task_runs
              (id, run_id, name, status, remaining_deps, input, scheduled_at, trigger_rule,
-              allow_failure, is_approval, approval_timeout_secs, approval_on_timeout)
-             VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10, $11)",
+              allow_failure, is_approval, approval_timeout_secs, approval_on_timeout, runner_class)
+             VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(&task_id)
         .bind(&run_id)
@@ -135,6 +171,7 @@ pub async fn create_run(pool: &Pool, dag: &DagGraph, yaml_spec: &str) -> Result<
         .bind(is_approval)
         .bind(approval_timeout)
         .bind(approval_on_timeout)
+        .bind(runner_class)
         .execute(&mut *tx)
         .await?;
     }
@@ -207,8 +244,8 @@ pub async fn recover_expired_leases(pool: &Pool) -> Result<u64> {
 /// Each transition is guarded by `status = 'pending'`, so concurrent schedulers
 /// are winner-take-all and a skip's dependent-decrement runs exactly once.
 pub async fn advance_ready_tasks(pool: &Pool) -> Result<u64> {
-    let candidates: Vec<(String, String, i64)> = sqlx::query_as(
-        "SELECT id, trigger_rule, is_approval FROM task_runs
+    let candidates: Vec<(String, String, String, i64, Option<String>)> = sqlx::query_as(
+        "SELECT id, run_id, trigger_rule, is_approval, input FROM task_runs
          WHERE status = 'pending' AND remaining_deps = 0
          ORDER BY id",
     )
@@ -219,7 +256,7 @@ pub async fn advance_ready_tasks(pool: &Pool) -> Result<u64> {
     }
 
     let mut transitioned = 0u64;
-    for (task_id, rule, is_approval) in candidates {
+    for (task_id, run_id, rule, is_approval, input) in candidates {
         let dep_statuses: Vec<String> = sqlx::query_scalar(
             "SELECT dep.status FROM task_dependencies d
              JOIN task_runs dep ON dep.id = d.dependency_id
@@ -229,7 +266,65 @@ pub async fn advance_ready_tasks(pool: &Pool) -> Result<u64> {
         .fetch_all(pool)
         .await?;
 
-        if crate::models::trigger_rule_ready(&rule, &dep_statuses) {
+        // Runtime `when` gate: a leaf-surviving condition references upstream
+        // outputs (`{{ tasks.<name>.output }}`), evaluable only now that the
+        // deps are terminal. False ⇒ skipped, exactly like an unsatisfied
+        // trigger rule; an unevaluable expression fails the task loudly.
+        let mut when_pass = true;
+        if let Some(cond) = input
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<crate::dag::TaskSpec>(json).ok())
+            .and_then(|spec| spec.when)
+        {
+            let mut ctx: std::collections::BTreeMap<String, String> = Default::default();
+            for name in crate::expand::when_output_refs(&cond) {
+                let output: Option<Option<String>> = sqlx::query_scalar(
+                    "SELECT output FROM task_runs WHERE run_id = $1 AND name = $2",
+                )
+                .bind(&run_id)
+                .bind(&name)
+                .fetch_optional(pool)
+                .await?;
+                let value = output.flatten().unwrap_or_default();
+                ctx.insert(format!("tasks.{name}.output"), value.trim().to_string());
+            }
+            match crate::expand::eval_when(&crate::expand::substitute(&cond, &ctx)) {
+                Ok(pass) => when_pass = pass,
+                Err(e) => {
+                    // The gate itself is broken — fail the task so the author
+                    // sees it, and let the failure path advance dependents.
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let msg = format!("runtime when '{cond}' failed to evaluate: {e}");
+                    let mut tx = pool.begin().await?;
+                    let rows = sqlx::query(
+                        "UPDATE task_runs SET status = 'failed', output = $1, finished_at = $2
+                         WHERE id = $3 AND status = 'pending'",
+                    )
+                    .bind(&msg)
+                    .bind(&now)
+                    .bind(&task_id)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+                    if rows > 0 {
+                        sqlx::query(
+                            "UPDATE task_runs SET remaining_deps = remaining_deps - 1
+                             WHERE id IN (
+                                 SELECT dependent_id FROM task_dependencies WHERE dependency_id = $1
+                             ) AND status = 'pending'",
+                        )
+                        .bind(&task_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    tx.commit().await?;
+                    transitioned += rows;
+                    continue;
+                }
+            }
+        }
+
+        if when_pass && crate::models::trigger_rule_ready(&rule, &dep_statuses) {
             // An approval gate (#19) parks in `awaiting_approval` (never claimed by
             // a worker); `scheduled_at` marks when it began waiting for the sweep.
             let rows = if is_approval != 0 {
@@ -292,6 +387,18 @@ pub async fn advance_ready_tasks(pool: &Pool) -> Result<u64> {
 /// pre-claim snapshot the reconcile loop expects (the attempt that will run is
 /// `attempt + 1`), keeping the return contract identical to the SQLite path.
 pub async fn claim_ready(pool: &Pool, worker_id: &str, limit: i64) -> Result<Vec<TaskRun>> {
+    claim_ready_classes(pool, worker_id, limit, &[]).await
+}
+
+/// [`claim_ready`] restricted to a set of runner classes — the routing seam for
+/// segmented runner pools (`RUNNER_CLASSES`). An empty slice claims every class
+/// (the unsegmented scheduler), keeping the two call sites one query.
+pub async fn claim_ready_classes(
+    pool: &Pool,
+    worker_id: &str,
+    limit: i64,
+    classes: &[String],
+) -> Result<Vec<TaskRun>> {
     let now = chrono::Utc::now().to_rfc3339();
     let lease_exp = (chrono::Utc::now() + chrono::TimeDelta::seconds(30)).to_rfc3339();
 
@@ -306,6 +413,7 @@ pub async fn claim_ready(pool: &Pool, worker_id: &str, limit: i64) -> Result<Vec
              SELECT id FROM task_runs
              WHERE status = 'ready'
                AND (scheduled_at IS NULL OR scheduled_at <= $3)
+               AND (cardinality($5::text[]) = 0 OR runner_class = ANY($5::text[]))
              ORDER BY scheduled_at
              LIMIT $4
              FOR UPDATE SKIP LOCKED
@@ -319,6 +427,7 @@ pub async fn claim_ready(pool: &Pool, worker_id: &str, limit: i64) -> Result<Vec
     .bind(&lease_exp)
     .bind(&now)
     .bind(limit)
+    .bind(classes)
     .fetch_all(pool)
     .await?;
 
@@ -502,7 +611,11 @@ pub async fn append_task_output(
 /// Guarded on `status = 'awaiting_approval'` AND the run, so a double-approve or a
 /// wrong-run task id is a no-op. Returns whether it resolved (false → 404/409). A
 /// `pg_notify` wakes the reconcile loop so the freed dependents advance promptly.
-#[cfg(feature = "ops")]
+///
+/// Not `ops`-gated: the reconcile loop's timeout sweep
+/// ([`resolve_expired_approvals`]) needs it in every build — a lean engine
+/// with an approval gate must still fail-safe the gate when its timeout
+/// elapses, management API or not.
 pub async fn resolve_approval(
     pool: &Pool,
     run_id: &str,
@@ -546,8 +659,8 @@ pub async fn resolve_approval(
 /// Auto-resolve approval gates whose `approval_timeout_secs` elapsed since they
 /// began waiting (`scheduled_at`), applying `approval_on_timeout` (default
 /// `reject`). Returns the `(task_id, approved)` decisions. Idempotent via
-/// `resolve_approval`'s guard.
-#[cfg(feature = "ops")]
+/// `resolve_approval`'s guard. Not `ops`-gated — the reconcile loop calls this
+/// every tick in every build.
 pub async fn resolve_expired_approvals(pool: &Pool) -> Result<Vec<(String, bool)>> {
     let now = chrono::Utc::now();
     let candidates: Vec<(String, String, Option<String>, i64, Option<String>)> = sqlx::query_as(
@@ -1363,6 +1476,80 @@ pub async fn spec_for_run(pool: &Pool, run_id: &str) -> Result<Option<String>> {
     Ok(row.map(|r| r.0))
 }
 
+/// Read a dagron-api-owned `ui_settings` value (e.g. the instance-wide
+/// notification defaults). The table may not exist on engine-only deployments;
+/// callers should treat an `Err` as "no setting".
+pub async fn ui_setting(pool: &Pool, key: &str) -> Result<Option<String>> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT value FROM ui_settings WHERE key = $1")
+            .bind(key)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|r| r.0))
+}
+
+/// One task's stored TaskSpec JSON (the `input` column), for spec-driven
+/// post-success decisions (the `repeat:` loop operator).
+pub async fn task_input_json(pool: &Pool, task_id: &str) -> Result<Option<String>> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT input FROM task_runs WHERE id = $1")
+            .bind(task_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.and_then(|r| r.0))
+}
+
+// ── Environments (variable sets + encrypted secrets, spec `environment:`) ────
+
+/// The environment name a run was created with (None = none declared).
+pub async fn run_environment(pool: &Pool, run_id: &str) -> Result<Option<String>> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT environment FROM workflow_runs WHERE id = $1")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.and_then(|r| r.0))
+}
+
+/// A named environment's plain variables. `None` = no such environment (the
+/// caller decides whether that's an error); an unparseable `variables` blob is.
+pub async fn environment_vars(
+    pool: &Pool,
+    name: &str,
+) -> Result<Option<std::collections::BTreeMap<String, String>>> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT variables FROM environments WHERE name = $1")
+            .bind(name)
+            .fetch_optional(pool)
+            .await?;
+    match row {
+        None => Ok(None),
+        Some((json,)) => Ok(Some(
+            serde_json::from_str(&json)
+                .map_err(|e| anyhow::anyhow!("environment '{name}' variables unparseable: {e}"))?,
+        )),
+    }
+}
+
+/// The stored ciphertext of one environment secret (decrypted by the engine
+/// via dagron-crypto at dispatch). `None` = not defined in that environment.
+pub async fn environment_secret(
+    pool: &Pool,
+    env_name: &str,
+    secret_name: &str,
+) -> Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT s.ciphertext FROM environment_secrets s
+         JOIN environments e ON e.id = s.environment_id
+         WHERE e.name = $1 AND s.name = $2",
+    )
+    .bind(env_name)
+    .bind(secret_name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.0))
+}
+
 // ── Transactional outbox: drain API (for the delivery worker) ──────────────────
 
 /// Claim up to `limit` due, pending outbox events for delivery with
@@ -1822,10 +2009,218 @@ pub async fn status_counts(pool: &Pool) -> Result<crate::models::MetricsSnapshot
         runs_by_status: runs,
         tasks_by_status: tasks,
         dead_letters,
+        ready_by_class: ready_backlog_by_class(pool).await?,
     })
 }
 
+/// Ready backlog grouped by runner class: count + oldest `scheduled_at`. The
+/// per-class analog of the queue-depth gauge; in a segmented fleet a class no
+/// live scheduler serves shows up here as an ever-growing `oldest` age.
+#[cfg(feature = "ops")]
+pub async fn ready_backlog_by_class(
+    pool: &Pool,
+) -> Result<Vec<crate::models::ReadyClassBacklog>> {
+    let rows: Vec<(String, i64, Option<String>)> = sqlx::query_as(
+        "SELECT runner_class, COUNT(*), MIN(scheduled_at)
+         FROM task_runs WHERE status = 'ready'
+         GROUP BY runner_class ORDER BY runner_class",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(runner_class, count, oldest_scheduled_at)| crate::models::ReadyClassBacklog {
+            runner_class,
+            count,
+            oldest_scheduled_at,
+        })
+        .collect())
+}
+
 // ── v6 retention GC ─────────────────────────────────────────────────────────
+
+/// Convert any engine row to JSON generically. The whole schema is TEXT +
+/// BIGINT columns by design (see migrations_pg 001), so two decode attempts
+/// cover every column — and the archiver survives future migrations without a
+/// column-list edit.
+#[cfg(feature = "ops")]
+fn row_to_json(row: &sqlx::postgres::PgRow) -> serde_json::Value {
+    use sqlx::{Column, Row};
+    let mut obj = serde_json::Map::new();
+    for (i, col) in row.columns().iter().enumerate() {
+        let v = if let Ok(s) = row.try_get::<Option<String>, _>(i) {
+            s.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null)
+        } else if let Ok(n) = row.try_get::<Option<i64>, _>(i) {
+            n.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null)
+        } else if let Ok(f) = row.try_get::<Option<f64>, _>(i) {
+            f.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Null
+        };
+        obj.insert(col.name().to_string(), v);
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Terminal runs finished before `cutoff`, each as a self-contained archive
+/// document (`dagron.run-archive.v1`): the run row (+ its definition's
+/// name/spec), every task row, and the run's outbox events. The archive-
+/// before-purge GC writes these to the archive sink, then purges exactly the
+/// ids it archived via [`purge_runs_by_id`] — so history leaves the hot store
+/// only after it durably exists elsewhere (ee/STATE_STORE.md hot/cold split).
+#[cfg(feature = "ops")]
+pub async fn archivable_runs(
+    pool: &Pool,
+    cutoff: &str,
+    limit: i64,
+) -> Result<Vec<(String, serde_json::Value)>> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM workflow_runs
+         WHERE status IN ('succeeded','failed','cancelled')
+           AND finished_at IS NOT NULL AND finished_at < $1
+         ORDER BY finished_at LIMIT $2",
+    )
+    .bind(cutoff)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let run = sqlx::query(
+            "SELECT wr.*, wd.name AS definition_name, wd.spec AS definition_spec
+             FROM workflow_runs wr
+             JOIN workflow_definitions wd ON wd.id = wr.definition_id
+             WHERE wr.id = $1",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await?;
+        let tasks = sqlx::query("SELECT * FROM task_runs WHERE run_id = $1 ORDER BY name")
+            .bind(&id)
+            .fetch_all(pool)
+            .await?;
+        let outbox =
+            sqlx::query("SELECT * FROM event_outbox WHERE run_id = $1 ORDER BY created_at")
+                .bind(&id)
+                .fetch_all(pool)
+                .await?;
+        let doc = serde_json::json!({
+            "format": "dagron.run-archive.v1",
+            "run": row_to_json(&run),
+            "tasks": tasks.iter().map(row_to_json).collect::<Vec<_>>(),
+            "outbox_events": outbox.iter().map(row_to_json).collect::<Vec<_>>(),
+        });
+        out.push((id, doc));
+    }
+    Ok(out)
+}
+
+/// Upsert one row into the `archived_runs` index — the listable map of what
+/// left the hot store for the archive sink. Called by the GC sweep after the
+/// sink write verifies and before the purge; re-archiving (a crash between
+/// archive and purge) just refreshes `archived_at`.
+#[cfg(feature = "ops")]
+pub async fn index_archived_run(
+    pool: &Pool,
+    run_id: &str,
+    name: &str,
+    status: &str,
+    created_at: Option<&str>,
+    finished_at: Option<&str>,
+) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO archived_runs (run_id, name, status, created_at, finished_at, archived_at)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (run_id) DO UPDATE SET
+             name = excluded.name, status = excluded.status,
+             created_at = excluded.created_at, finished_at = excluded.finished_at,
+             archived_at = excluded.archived_at",
+    )
+    .bind(run_id)
+    .bind(name)
+    .bind(status)
+    .bind(created_at)
+    .bind(finished_at)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Stamp index rows as compacted into `parquet_path` — after this the runs'
+/// per-run JSON documents are gone and history reads answer "analytics only".
+/// Called by `dagron archive-compact` after the Parquet part file verifies.
+#[cfg(feature = "ops")]
+pub async fn mark_runs_compacted(
+    pool: &Pool,
+    run_ids: &[String],
+    parquet_path: &str,
+) -> Result<u64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let stamped = sqlx::query(
+        "UPDATE archived_runs SET compacted_at = $1, parquet_path = $2
+         WHERE run_id = ANY($3)",
+    )
+    .bind(&now)
+    .bind(parquet_path)
+    .bind(run_ids)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(stamped)
+}
+
+/// Purge exactly these runs (dependency edges → tasks → run, then orphaned
+/// definitions) in one transaction. Only still-terminal runs are touched, and a
+/// run's children go only when the run itself goes. Outbox rows are left for
+/// the delivery worker (they are archived, not owned, by the GC). Returns the
+/// number of `workflow_runs` removed.
+#[cfg(feature = "ops")]
+pub async fn purge_runs_by_id(pool: &Pool, run_ids: &[String]) -> Result<u64> {
+    if run_ids.is_empty() {
+        return Ok(0);
+    }
+    let mut tx = pool.begin().await?;
+    let mut purged = 0u64;
+    for id in run_ids {
+        let terminal: Option<i64> = sqlx::query_scalar(
+            "SELECT 1::bigint FROM workflow_runs
+             WHERE id = $1 AND status IN ('succeeded','failed','cancelled')",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if terminal.is_none() {
+            continue;
+        }
+        sqlx::query(
+            "DELETE FROM task_dependencies
+             WHERE dependent_id IN (SELECT id FROM task_runs WHERE run_id = $1)",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM task_runs WHERE run_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        purged += sqlx::query("DELETE FROM workflow_runs WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+    }
+    sqlx::query(
+        "DELETE FROM workflow_definitions
+         WHERE id NOT IN (SELECT DISTINCT definition_id FROM workflow_runs)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(purged)
+}
 
 /// Delete terminal runs finished before `cutoff` (an RFC-3339 timestamp), along
 /// with their task rows, dependency edges, and any now-unreferenced definitions.
@@ -1955,8 +2350,17 @@ pub struct Waker {
 }
 
 impl Waker {
+    /// Connect the LISTEN session. `DATABASE_LISTEN_URL`, when set, is used
+    /// instead of the query pool's target: on a shared state-store cell the
+    /// pool points at PgBouncer (transaction mode), which cannot serve a
+    /// session-scoped `LISTEN` — the listener must hit the **direct** Postgres
+    /// endpoint (ee/STATE_STORE.md split-DSN item). Unset, the listener shares
+    /// the pool's connection config exactly as before.
     pub async fn connect(pool: &Pool) -> Result<Self> {
-        let mut listener = PgListener::connect_with(pool).await?;
+        let mut listener = match std::env::var("DATABASE_LISTEN_URL") {
+            Ok(url) if !url.trim().is_empty() => PgListener::connect(url.trim()).await?,
+            _ => PgListener::connect_with(pool).await?,
+        };
         listener.listen(EVENT_CHANNEL).await?;
         Ok(Self { listener })
     }

@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import Editor from "@monaco-editor/react";
+import "@/lib/monaco"; // self-host the Monaco runtime (air-gap; no CDN)
 import ScheduleDrawer from "@/components/ScheduleDrawer";
 import EditableDag from "@/components/dag/EditableDag";
 import { modelToYaml, parseModel } from "@/lib/spec-model";

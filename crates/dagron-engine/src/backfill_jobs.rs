@@ -157,7 +157,26 @@ async fn pace_one(
         // panic the loop; on a parse error release the slot and complete the job.
         let mut params = std::collections::BTreeMap::new();
         params.insert("scheduled_time".to_string(), logical.clone());
-        let dag = match DagGraph::from_yaml_with_params(&job.spec, &params) {
+        // Environment resolution errors split two ways: a *deleted* environment
+        // is permanent (complete the job, like a spec that no longer parses),
+        // but a transient DB failure must NOT complete it — release the slot,
+        // rewind the cursor, and retry this fire next tick.
+        let parsed = match crate::environments::template_params(pool, &job.spec).await {
+            Ok(extra) => {
+                params.extend(extra);
+                DagGraph::from_yaml_with_params(&job.spec, &params)
+            }
+            Err(e) if e.downcast_ref::<crate::environments::UnknownEnvironment>().is_some() => {
+                Err(e)
+            }
+            Err(e) => {
+                db::release_backfill_slot(pool, &job.schedule_id, &logical).await?;
+                warn!(backfill = %job.id, logical_date = %logical, error = %e, "backfill-job environment resolution failed; retrying next tick");
+                new_cursor = previous_cursor;
+                break;
+            }
+        };
+        let dag = match parsed {
             Ok(d) => d,
             Err(e) => {
                 db::release_backfill_slot(pool, &job.schedule_id, &logical).await?;

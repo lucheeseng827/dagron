@@ -6,8 +6,10 @@ import {
   Controls,
   MiniMap,
   ReactFlow,
+  ReactFlowProvider,
   useEdgesState,
   useNodesState,
+  useReactFlow,
   type Connection,
   type Edge,
   type Node,
@@ -15,17 +17,31 @@ import {
 import "@xyflow/react/dist/style.css";
 
 import StatusNode from "./StatusNode";
-import { layout } from "./layout";
+import SentinelNode from "./SentinelNode";
+import SnippetPalette from "./SnippetPalette";
+import DirectionControl from "./DirectionControl";
+import { useDagDirection, type LayoutDirection } from "./direction";
+import { isSentinel, positionedSentinels } from "./sentinels";
+import { layout, NODE_H, NODE_W } from "./layout";
+import {
+  buildPaletteTask,
+  leafNames,
+  snippetById,
+  SNIPPET_MIME,
+  type Snippet,
+} from "@/lib/palette";
 import {
   formatCommand,
   nextTaskName,
   parseCommand,
+  spliceTask,
   wouldCycle,
+  TRIGGER_RULES,
   type Task,
   type WorkflowModel,
 } from "@/lib/spec-model";
 
-const nodeTypes = { status: StatusNode };
+const nodeTypes = { status: StatusNode, sentinel: SentinelNode };
 
 export interface EditableDagProps {
   model: WorkflowModel;
@@ -33,14 +49,30 @@ export interface EditableDagProps {
 }
 
 /// Editable DAG: drag to lay out, drag handles to connect (adds a dependency),
-/// select+Delete to remove, "+ Task" to add, and a side panel to edit the
+/// select+Delete to remove, a premade-block palette (click to append; drag a
+/// block onto the canvas to place it, or onto a dependency edge to splice it
+/// between the two tasks), "+ Task" to add, and a side panel to edit the
 /// selected task's fields. Structure is driven by `model`; positions are local.
-export default function EditableDag({ model, onChange }: EditableDagProps) {
+export default function EditableDag(props: EditableDagProps) {
+  // useReactFlow (drop-position mapping) needs a provider above the component.
+  return (
+    <ReactFlowProvider>
+      <EditableDagInner {...props} />
+    </ReactFlowProvider>
+  );
+}
+
+function EditableDagInner({ model, onChange }: EditableDagProps) {
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [selected, setSelected] = useState<string | null>(null);
+  // Layout direction (↓/→/↘), persisted + shared with the run viewer. Drives the
+  // auto-layout of unpositioned nodes and the "re-arrange" control on the canvas.
+  const [dir, setDir] = useDagDirection();
   // Remember positions across model rebuilds so edits don't reshuffle the graph.
   const positions = useRef<Record<string, { x: number; y: number }>>({});
+  // screenToFlowPosition maps drop coords; fitView re-frames after a re-layout.
+  const { screenToFlowPosition, fitView } = useReactFlow();
 
   // Rebuild RF nodes/edges whenever the model's structure changes.
   useEffect(() => {
@@ -50,7 +82,7 @@ export default function EditableDag({ model, onChange }: EditableDagProps) {
       position: positions.current[t.name] ?? { x: 0, y: 0 },
       width: 190,
       height: 52,
-      data: { name: t.name, status: "pending", attempt: 0, workflowRef: t.workflow_ref },
+      data: { name: t.name, status: "pending", attempt: 0, workflowRef: t.workflow_ref, dockerImage: t.docker_image },
       selected: t.name === selected,
     }));
     const rawEdges: Edge[] = model.tasks.flatMap((t) =>
@@ -58,10 +90,14 @@ export default function EditableDag({ model, onChange }: EditableDagProps) {
     );
     // Lay out only nodes without a remembered position.
     const needLayout = rawNodes.some((n) => !positions.current[n.id]);
-    const laid = needLayout ? layout(rawNodes, rawEdges) : rawNodes;
+    const laid = needLayout ? layout(rawNodes, rawEdges, dir) : rawNodes;
     for (const n of laid) positions.current[n.id] = n.position;
-    setNodes(laid);
-    setEdges(rawEdges);
+    // Frame the graph with read-only Start/End markers, placed relative to the
+    // laid-out tasks so they never disturb the user's manual positions. Markers
+    // go last (same order as the run viewer) to keep z-order consistent.
+    const s = positionedSentinels(laid, rawEdges);
+    setNodes([...laid, ...s.nodes]);
+    setEdges([...rawEdges, ...s.edges]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [model, selected]);
 
@@ -128,18 +164,143 @@ export default function EditableDag({ model, onChange }: EditableDagProps) {
     setSelected(name);
   };
 
+  // Re-arrange the whole canvas in a new layout direction (↓/→/↘). Unlike an
+  // edit, this discards manual positions and re-runs the auto-layout, so the
+  // user gets a clean vertical / horizontal / diagonal arrangement on demand —
+  // the same control the read-only run viewer has.
+  const applyDirection = useCallback(
+    (newDir: LayoutDirection) => {
+      setDir(newDir);
+      const rawNodes: Node[] = model.tasks.map((t) => ({
+        id: t.name,
+        type: "status",
+        position: { x: 0, y: 0 },
+        width: 190,
+        height: 52,
+        data: { name: t.name, status: "pending", attempt: 0, workflowRef: t.workflow_ref, dockerImage: t.docker_image },
+        selected: t.name === selected,
+      }));
+      const rawEdges: Edge[] = model.tasks.flatMap((t) =>
+        t.depends_on.map((dep) => ({ id: `${dep}->${t.name}`, source: dep, target: t.name })),
+      );
+      const laid = layout(rawNodes, rawEdges, newDir);
+      positions.current = {};
+      for (const n of laid) positions.current[n.id] = n.position;
+      const s = positionedSentinels(laid, rawEdges);
+      setNodes([...laid, ...s.nodes]);
+      setEdges([...rawEdges, ...s.edges]);
+      // Re-frame once React Flow has painted the new positions, so the whole
+      // re-arranged chain stays in view (esp. horizontal, which runs wide).
+      requestAnimationFrame(() => fitView({ duration: 300, padding: 0.2 }));
+    },
+    [model, selected, setDir, setNodes, setEdges, fitView],
+  );
+
+  // Palette insert failures ("result_from needs a task") are shown transiently
+  // in the palette rail, then cleared — same UX as the spec editor's rail.
+  const [paletteError, setPaletteError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!paletteError) return;
+    const t = setTimeout(() => setPaletteError(null), 4000);
+    return () => clearTimeout(t);
+  }, [paletteError]);
+
+  // Clicking a block appends it: a task chains onto the current leaf tasks
+  // (mirroring the spec editor's applySnippet), a run setting patches the model.
+  const insertSnippet = useCallback(
+    (s: Snippet) => {
+      if (s.kind === "task") {
+        const task = buildPaletteTask(s, model.tasks, leafNames(model.tasks));
+        onChange({ ...model, tasks: [...model.tasks, task] });
+        setSelected(task.name);
+      } else {
+        const next = { ...model };
+        const err = s.patchRun(next);
+        if (err) setPaletteError(err);
+        else onChange(next);
+      }
+    },
+    [model, onChange],
+  );
+
+  // Dropping a block places it exactly where it lands. Dropped on empty canvas
+  // it starts unchained — the user draws the dependency edges. Dropped on a
+  // dependency edge it is spliced into it: a -> b becomes a -> block -> b. The
+  // position is remembered before the model rebuild so the new node skips
+  // auto-layout and stays put.
+  // The task->task edge currently under the drag cursor (highlighted as the
+  // splice target). React Flow edges hit-test their own 20px interaction
+  // stroke, so the drag event's target tells us which edge we're over; sentinel
+  // Start/End edges are non-interactive and can't match, but validate both
+  // endpoints against the model anyway.
+  const [dropEdgeId, setDropEdgeId] = useState<string | null>(null);
+  const edgeUnderDrag = useCallback(
+    (e: React.DragEvent): { id: string; source: string; target: string } | null => {
+      const id = (e.target as Element | null)
+        ?.closest?.(".react-flow__edge")
+        ?.getAttribute("data-id");
+      if (!id) return null;
+      const edge = edges.find((x) => x.id === id);
+      const names = new Set(model.tasks.map((t) => t.name));
+      if (!edge || !names.has(edge.source) || !names.has(edge.target)) return null;
+      return { id, source: edge.source, target: edge.target };
+    },
+    [edges, model],
+  );
+  useEffect(() => {
+    setEdges((es) =>
+      es.map((ed) => {
+        const hot = ed.id === dropEdgeId;
+        if (hot === (ed.className === "dagron-edge-drop")) return ed;
+        return { ...ed, className: hot ? "dagron-edge-drop" : undefined };
+      }),
+    );
+  }, [dropEdgeId, setEdges]);
+  const onDragOver = useCallback(
+    (e: React.DragEvent) => {
+      if (!e.dataTransfer.types.includes(SNIPPET_MIME)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "copy";
+      setDropEdgeId(edgeUnderDrag(e)?.id ?? null);
+    },
+    [edgeUnderDrag],
+  );
+  const onDragLeave = useCallback(() => setDropEdgeId(null), []);
+  const onDrop = useCallback(
+    (e: React.DragEvent) => {
+      const s = snippetById(e.dataTransfer.getData(SNIPPET_MIME));
+      if (!s || s.kind !== "task") return;
+      e.preventDefault();
+      setDropEdgeId(null);
+      const p = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+      const task = buildPaletteTask(s, model.tasks, []);
+      positions.current[task.name] = { x: p.x - NODE_W / 2, y: p.y - NODE_H / 2 };
+      const hit = edgeUnderDrag(e);
+      onChange({
+        ...model,
+        tasks: hit
+          ? spliceTask(model.tasks, hit.source, hit.target, task)
+          : [...model.tasks, task],
+      });
+      setSelected(task.name);
+    },
+    [model, onChange, screenToFlowPosition, edgeUnderDrag],
+  );
+
   const sel = model.tasks.find((t) => t.name === selected) ?? null;
 
   return (
     <div style={{ display: "flex", height: "100%", width: "100%" }}>
+      <SnippetPalette draggable onInsert={insertSnippet} error={paletteError} />
       <div style={{ flex: 1, minWidth: 0, position: "relative" }}>
-        <button
-          onClick={addTask}
-          className="dy-btn dy-btn-primary"
-          style={{ position: "absolute", top: 10, left: 10, zIndex: 5 }}
+        <div
+          style={{ position: "absolute", top: 10, left: 10, zIndex: 5, display: "flex", gap: 8, alignItems: "center" }}
         >
-          + Task
-        </button>
+          <button onClick={addTask} className="dy-btn dy-btn-primary">
+            + Task
+          </button>
+          <DirectionControl dir={dir} onChange={applyDirection} />
+        </div>
         <ReactFlow
           nodes={nodes}
           edges={edges}
@@ -149,8 +310,11 @@ export default function EditableDag({ model, onChange }: EditableDagProps) {
           onConnect={onConnect}
           onEdgesDelete={onEdgesDelete}
           onNodesDelete={onNodesDelete}
-          onNodeClick={(_, n) => setSelected(n.id)}
+          onNodeClick={(_, n) => !isSentinel(n) && setSelected(n.id)}
           onPaneClick={() => setSelected(null)}
+          onDragOver={onDragOver}
+          onDragLeave={onDragLeave}
+          onDrop={onDrop}
           fitView
           proOptions={{ hideAttribution: true }}
         >
@@ -230,7 +394,9 @@ function TaskPanel({
     return (
       <aside style={panelStyle}>
         <p style={{ color: "var(--muted)", fontSize: 13 }}>
-          Select a task to edit, or drag from a node&apos;s handle to another to add a dependency.
+          Click a block to append it to the pipeline, drag one onto the canvas to place it, or drop
+          it on an edge to splice it between two steps. Select a task to edit it; drag from a
+          node&apos;s handle to another to add a dependency.
         </p>
       </aside>
     );
@@ -275,6 +441,14 @@ function TaskPanel({
             onChange={(e) => patch({ command: parseCommand(e.target.value) })}
             placeholder='echo "hello world"'
           />
+          <Label>Docker image</Label>
+          <input
+            style={inputStyle}
+            value={task.docker_image ?? ""}
+            onChange={(e) => patch({ docker_image: e.target.value || undefined })}
+            placeholder="(runs on host — e.g. alpine:3.20)"
+            title="Container image to pull and run the command in; empty runs on the host executor"
+          />
         </>
       )}
 
@@ -311,6 +485,25 @@ function TaskPanel({
             />
           </div>
         </div>
+      )}
+
+      {!task.workflow_ref && (
+        <>
+          <Label>Run when</Label>
+          <select
+            style={inputStyle}
+            value={task.trigger_rule ?? ""}
+            onChange={(e) => patch({ trigger_rule: e.target.value || undefined })}
+            title="When this task fires relative to its dependencies' outcomes (engine trigger_rule)"
+          >
+            <option value="">all_success (default)</option>
+            {TRIGGER_RULES.filter((r) => r !== "all_success").map((r) => (
+              <option key={r} value={r}>
+                {r}
+              </option>
+            ))}
+          </select>
+        </>
       )}
 
       <Label>Depends on</Label>

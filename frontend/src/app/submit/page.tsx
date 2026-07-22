@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import Editor from "@monaco-editor/react";
+import SpecEditorWithPreview from "@/components/dag/SpecEditorWithPreview";
 import { submitRun } from "@/lib/dagron-api";
 import { errMsg } from "@/lib/err";
 
@@ -42,21 +42,14 @@ export default function SubmitPage() {
           <h1 className="dy-h1" style={{ marginBottom: 0 }}>
             Submit workflow
           </h1>
-          <p className="dy-subtitle">Paste a DAG spec and run it once. Validated server-side.</p>
+          <p className="dy-subtitle">Paste a DAG spec and run it once — the graph previews live as you type. Validated server-side.</p>
         </div>
         <button onClick={onSubmit} disabled={busy} className="dy-btn dy-btn-primary" style={{ cursor: busy ? "wait" : "pointer" }}>
           {busy ? "Submitting…" : "▶ Run"}
         </button>
       </div>
       <div style={{ flex: 1, minHeight: 0, border: "1px solid var(--border)", borderRadius: 12, overflow: "hidden" }}>
-        <Editor
-          height="100%"
-          defaultLanguage="yaml"
-          theme="vs-dark"
-          value={yaml}
-          onChange={(v) => setYaml(v ?? "")}
-          options={{ minimap: { enabled: false }, fontSize: 13, tabSize: 2, scrollBeyondLastLine: false }}
-        />
+        <SpecEditorWithPreview value={yaml} onChange={setYaml} />
       </div>
       {error && <p style={{ color: "var(--red)", marginTop: 10 }}>{error}</p>}
     </div>

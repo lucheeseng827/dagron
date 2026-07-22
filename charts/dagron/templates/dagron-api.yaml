@@ -33,7 +33,7 @@ spec:
       {{- end }}
       containers:
         - name: dagron-api
-          image: {{ .Values.dagronApi.image | quote }}
+          image: {{ include "dagron.image" (dict "image" $.Values.dagronApi.image "root" $) | quote }}
           imagePullPolicy: {{ .Values.dagronApi.imagePullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false
@@ -59,6 +59,15 @@ spec:
               value: {{ .Values.dagronApi.cookieSecure | quote }}
             - name: RUST_LOG
               value: {{ .Values.dagronApi.rustLog | quote }}
+            {{- if eq (include "dagron.envSecretsEnabled" .) "true" }}
+            # Encrypts environment secret values on write (the engine holds the
+            # same key to decrypt them at dispatch).
+            - name: {{ include "dagron.envSecretKeyName" . }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "dagron.envSecretName" . }}
+                  key: {{ include "dagron.envSecretKeyName" . }}
+            {{- end }}
             {{- if .Values.dagronApi.admin.email }}
             # First admin, seeded idempotently on startup.
             - name: DAGRON_ADMIN_EMAIL

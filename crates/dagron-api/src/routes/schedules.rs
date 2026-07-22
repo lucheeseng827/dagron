@@ -452,8 +452,12 @@ pub async fn backfill(
         ));
     }
 
-    // Validate the spec once, then create one run per *newly-claimed* fire-time.
+    // Validate + prepare the spec once (workflow_ref chains inlined,
+    // task_defaults, environment variables, submit-time conditionals), then
+    // create one run per *newly-claimed* fire-time.
     let spec = crate::routes::control::parse_and_validate(&spec_yaml)?;
+    let spec = crate::expand::expand_workflow_refs(&state, spec).await?;
+    let spec = crate::routes::control::prepare_spec(&state, spec).await?;
     let now = Utc::now().to_rfc3339();
     let mut run_ids = Vec::new();
     let mut skipped = 0usize;

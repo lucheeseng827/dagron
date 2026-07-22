@@ -1,0 +1,31 @@
+# A dagron CronWorkflow CR — a schedule the engine fires (DB-backed schedules must
+# be on: engine.dbSchedules=true, which the demo values set).
+#
+#   spec.schedule = the engine's 6/7-field cron: sec min hour dom mon dow [year]
+#                   (CRD regex: ^(\S+\s+){5,6}\S+$ — 6 or 7 fields).
+#   spec.dag      = same workflow YAML as a Workflow CR.
+apiVersion: dagron.io/v1
+kind: CronWorkflow
+metadata:
+  name: nightly-rollup
+  labels:
+    app.kubernetes.io/part-of: dagron-workflows
+    dagron.io/team: data
+spec:
+  # 02:00:00 every day (second=0 minute=0 hour=2).
+  schedule: "0 0 2 * * *"
+  dag: |
+    name: nightly-rollup
+    tasks:
+      - name: aggregate
+        command: ["sh", "-c", "echo aggregate: rolling up yesterday; sleep 1"]
+        depends_on: []
+        max_attempts: 2
+        retry_delay_secs: 10
+        timeout_secs: 300
+      - name: publish
+        command: ["sh", "-c", "echo publish: writing daily rollup table; sleep 1"]
+        depends_on: [aggregate]
+        max_attempts: 3
+        retry_delay_secs: 10
+        timeout_secs: 120

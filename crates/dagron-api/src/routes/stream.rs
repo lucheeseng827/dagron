@@ -1,11 +1,13 @@
-//! Per-run live SSE stream.
+//! Live SSE streams (per-run and account-wide).
 //!
-//! Subscribes a receiver to the shared broadcast channel and emits only the
-//! events for the requested run. On broadcast lag (client too slow) it emits a
-//! `resync` event so the client refetches the full graph rather than silently
-//! missing a transition. Auth is the standard header bearer (`AuthUser`) — the
-//! frontend uses fetch-event-source so it can send the Authorization header
-//! (decision 01-02).
+//! Both endpoints subscribe a receiver to the shared broadcast channel; the
+//! per-run stream emits only the events for the requested run, while the
+//! account-wide stream forwards every event so list pages (Runs, Workflows,
+//! Overview) can refresh on activity instead of polling. On broadcast lag
+//! (client too slow) both emit a `resync` event so the client refetches rather
+//! than silently missing a transition. Auth is the standard header bearer
+//! (`AuthUser`) — the frontend uses fetch-event-source so it can send the
+//! Authorization header (decision 01-02).
 
 use std::convert::Infallible;
 
@@ -33,6 +35,25 @@ pub async fn stream_run(
         Ok(_) => None,
         // Client lagged behind the buffer → tell it to refetch (don't drop silently).
         Err(_lagged) => Some(Ok(Event::default().event("resync").data("lagged"))),
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// `GET /api/events/stream` — SSE of task-state changes across *all* runs.
+///
+/// Feeds the list pages' live mode: each event carries the affected run_id and
+/// the client coalesces bursts into a debounced list refetch, so idle sessions
+/// cost nothing (no polling) and busy ones are bounded by the client throttle.
+pub async fn stream_events(
+    _auth: AuthUser,
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let rx = state.tx.subscribe();
+
+    let stream = BroadcastStream::new(rx).map(|item| match item {
+        Ok(ev) => Ok(event_json(&ev)),
+        Err(_lagged) => Ok(Event::default().event("resync").data("lagged")),
     });
 
     Sse::new(stream).keep_alive(KeepAlive::default())

@@ -14,15 +14,31 @@ export interface Task {
   max_attempts?: number;
   retry_delay_secs?: number;
   timeout_secs?: number;
+  /// Container image to run the command in (engine `docker_image`); unset means
+  /// the host executor.
+  docker_image?: string;
+  /// When this task fires relative to its deps' outcomes (engine `trigger_rule`).
+  /// One of TRIGGER_RULES; unset means the default `all_success`.
+  trigger_rule?: string;
   /// Chain another *saved* workflow as this step. A task is either a leaf
   /// (`command`) or a call (`workflow_ref`) — the server inlines the referenced
   /// workflow at run time. Mutually exclusive with `command`.
   workflow_ref?: string;
-  /// Spec keys this editor doesn't model (e.g. `docker_image`, `env`, `input`,
-  /// inline `template`/`arguments`) preserved verbatim so the visual round-trip
-  /// is lossless — switching to the visual tab never silently drops a field.
+  /// Spec keys this editor doesn't model (e.g. `env`, `input`, `type: approval`
+  /// knobs) preserved verbatim so the visual round-trip is lossless — switching
+  /// to the visual tab never silently drops a field.
   _extra?: Record<string, unknown>;
 }
+
+/// Engine trigger-rule vocabulary (see dagron-core `trigger_rule_ready`), in the
+/// order shown by pickers. The first entry is the engine default.
+export const TRIGGER_RULES = [
+  "all_success",
+  "all_done",
+  "one_failed",
+  "all_failed",
+  "none_failed",
+] as const;
 
 export interface WorkflowModel {
   name: string;
@@ -40,6 +56,8 @@ const KNOWN_TASK_KEYS = new Set([
   "max_attempts",
   "retry_delay_secs",
   "timeout_secs",
+  "docker_image",
+  "trigger_rule",
   "workflow_ref",
 ]);
 
@@ -88,6 +106,8 @@ export function parseModel(specYaml: string): { model?: WorkflowModel; error?: s
       max_attempts: num(raw.max_attempts),
       retry_delay_secs: num(raw.retry_delay_secs),
       timeout_secs: num(raw.timeout_secs),
+      docker_image: typeof raw.docker_image === "string" ? raw.docker_image : undefined,
+      trigger_rule: typeof raw.trigger_rule === "string" ? raw.trigger_rule : undefined,
       workflow_ref: typeof raw.workflow_ref === "string" ? raw.workflow_ref : undefined,
       _extra: extraKeys(raw, (k) => KNOWN_TASK_KEYS.has(k)),
     });
@@ -113,13 +133,18 @@ export function modelToYaml(model: WorkflowModel): string {
   obj.tasks = model.tasks.map((t) => {
     const o: Record<string, unknown> = { name: t.name };
     // Preserve authored values losslessly: emit workflow_ref whenever present
-    // (even ""), and command unless an empty array is superseded by a ref.
+    // (even ""), and command unless an empty array is superseded by a ref or by
+    // an approval gate (a command-less leaf by definition — `command: []` would
+    // be a semantic no-op the engine tolerates but the docs say not to write).
+    const isApproval = t._extra?.type === "approval";
     if (t.workflow_ref !== undefined) o.workflow_ref = t.workflow_ref;
-    if (t.command.length > 0 || t.workflow_ref === undefined) o.command = t.command;
+    if (t.command.length > 0 || (t.workflow_ref === undefined && !isApproval)) o.command = t.command;
     if (t.depends_on.length) o.depends_on = t.depends_on;
     if (t.max_attempts != null) o.max_attempts = t.max_attempts;
     if (t.retry_delay_secs != null) o.retry_delay_secs = t.retry_delay_secs;
     if (t.timeout_secs != null) o.timeout_secs = t.timeout_secs;
+    if (t.docker_image) o.docker_image = t.docker_image;
+    if (t.trigger_rule) o.trigger_rule = t.trigger_rule;
     for (const [k, v] of Object.entries(t._extra ?? {})) {
       if (!KNOWN_TASK_KEYS.has(k)) o[k] = v;
     }
@@ -205,6 +230,23 @@ export function wouldCycle(tasks: Task[], from: string, to: string): boolean {
     if (t) stack.push(...t.depends_on);
   }
   return false;
+}
+
+/// Splice `task` (already uniquely named) into the dependency edge
+/// `source -> target`: the new task depends on `source`, and `target`'s
+/// dependency on `source` is rewired to the new task, so `source -> task ->
+/// target`. Other tasks that depend on `source` keep their direct edge. The
+/// result is acyclic whenever the input was: the new node's only edges replace
+/// an existing path.
+export function spliceTask(tasks: Task[], source: string, target: string, task: Task): Task[] {
+  return [
+    ...tasks.map((t) =>
+      t.name === target
+        ? { ...t, depends_on: t.depends_on.map((d) => (d === source ? task.name : d)) }
+        : t,
+    ),
+    { ...task, depends_on: [source] },
+  ];
 }
 
 /// Generate a fresh unique task name ("task-1", "task-2", …).

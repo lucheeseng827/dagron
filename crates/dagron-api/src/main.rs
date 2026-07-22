@@ -13,6 +13,11 @@
 mod auth;
 mod expand;
 mod identity;
+// `{{ }}` templating mirror for the submit path (core semantics, no core dep).
+mod tmpl;
+// Cloud archive URL → object_store dispatch (s3/gs/az) for /api/archive fetches.
+#[cfg(feature = "archive-cloud")]
+mod objstore;
 mod routes;
 mod state;
 mod stream;
@@ -91,6 +96,19 @@ async fn main() -> Result<()> {
     routes::gitrepos::ensure_schema(&pool)
         .await
         .context("ensuring git_repos schema")?;
+    // … and, on enterprise builds, the audit trail for control-plane mutations.
+    #[cfg(feature = "enterprise")]
+    routes::audit::ensure_schema(&pool)
+        .await
+        .context("ensuring audit_log schema")?;
+    // … and the UI-configurable instance settings (notification defaults).
+    routes::settings::ensure_schema(&pool)
+        .await
+        .context("ensuring ui_settings schema")?;
+    // … and environments (variable sets + encrypted secrets).
+    routes::environments::ensure_schema(&pool)
+        .await
+        .context("ensuring environments schema")?;
     // Additive `description` column on the engine-owned `workflows` table (the UI
     // owns this field). Idempotent + tolerant of the table not existing yet (the
     // engine creates it on first migrate); mirrors migrations_pg/010.
@@ -112,14 +130,49 @@ async fn main() -> Result<()> {
         // Self-contained auth: login + logout (public) + user management (admin-only).
         .route("/api/login", post(routes::login::login))
         .route("/api/logout", post(routes::login::logout))
-        .route("/api/users", post(routes::login::create_user))
+        .route(
+            "/api/users",
+            get(routes::login::list_users).post(routes::login::create_user),
+        )
         .route("/api/me", get(me))
+        // Rich health (DB + scheduler leadership + attention counters) for the
+        // sidebar widget; /healthz below stays the bare liveness probe.
+        .route("/api/health", get(routes::health::health))
+        // Global search behind the ⌘K palette (capped, parameterized).
+        .route("/api/search", get(routes::search::search))
+        // Instance-wide notification defaults (engine merges them per run).
+        .route(
+            "/api/settings/notifications",
+            get(routes::settings::get_notifications).put(routes::settings::put_notifications),
+        )
+        .route(
+            "/api/settings/notifications/test",
+            post(routes::settings::test_notifications),
+        )
+        // Environments: named variable sets + write-only encrypted secrets.
+        .route(
+            "/api/environments",
+            get(routes::environments::list).post(routes::environments::create),
+        )
+        .route(
+            "/api/environments/{id}",
+            axum::routing::put(routes::environments::update)
+                .delete(routes::environments::delete),
+        )
+        .route(
+            "/api/environments/{id}/secrets/{name}",
+            axum::routing::put(routes::environments::put_secret)
+                .delete(routes::environments::delete_secret),
+        )
         .route("/api/runs", get(routes::runs::list_runs))
         .route("/api/runs/{id}", get(routes::runs::get_run))
+        .route("/api/runs/{id}/spec", get(routes::runs::get_run_spec))
         .route("/api/runs/{id}/wait", get(routes::runs::wait_run))
         .route("/api/runs/{id}/graph", get(routes::graph::get_graph))
         .route("/api/runs/{id}/tasks/{tid}/logs", get(routes::graph::get_task_logs))
         .route("/api/runs/{id}/stream", get(routes::stream::stream_run))
+        // Account-wide activity stream: feeds the list pages' live-updates mode.
+        .route("/api/events/stream", get(routes::stream::stream_events))
         .route("/api/runs", post(routes::control::submit_run))
         .route("/api/runs/{id}/cancel", post(routes::control::cancel_run))
         .route("/api/runs/{id}/rerun", post(routes::control::rerun_run))
@@ -129,7 +182,12 @@ async fn main() -> Result<()> {
         .route("/api/runs/{id}/tasks/{tid}/approve", post(routes::control::approve_task))
         .route("/api/runs/{id}/tasks/{tid}/reject", post(routes::control::reject_task))
         // Observability + dead-letter queue (authed UI edge over engine ops surface).
+        .route("/api/archive/runs", get(routes::archive::list_archived_runs))
+        .route("/api/archive/runs/{id}", get(routes::archive::get_archived_run))
         .route("/api/metrics", get(routes::ops::metrics))
+        .route("/api/metrics/timeseries", get(routes::ops::metrics_timeseries))
+        // Human-in-the-loop worklist: every gate parked in awaiting_approval.
+        .route("/api/approvals", get(routes::ops::list_approvals))
         .route("/api/dead-letters", get(routes::ops::list_dead_letters))
         .route("/api/dead-letters/{id}/redrive", post(routes::ops::redrive_dead_letter))
         .route("/api/dead-letters/{id}", axum::routing::delete(routes::ops::delete_dead_letter))
@@ -145,6 +203,7 @@ async fn main() -> Result<()> {
                 .delete(routes::workflows::delete_workflow),
         )
         .route("/api/workflows/{id}/run", post(routes::workflows::run_workflow))
+        .route("/api/workflows/{id}/runs", get(routes::workflows::workflow_runs))
         .route("/api/workflows/{id}/sync-to-git", post(routes::gitsync::sync_to_git))
         // Public run-status badge (embeds in READMEs; status label only, no auth).
         .route("/api/badges/{name}", get(routes::badge::workflow_badge))
@@ -172,7 +231,20 @@ async fn main() -> Result<()> {
             post(routes::backfills::create).get(routes::backfills::list),
         )
         .route("/api/backfills/{id}", get(routes::backfills::get))
-        .route("/api/backfills/{id}/cancel", post(routes::backfills::cancel))
+        .route("/api/backfills/{id}/cancel", post(routes::backfills::cancel));
+
+    // Enterprise routes (docs/COMMERCIALIZATION.md §3): the audit trail read.
+    // OSS builds answer 404 here, matching the feature being absent.
+    #[cfg(feature = "enterprise")]
+    let app = app.route("/api/audit", get(routes::audit::list_audit));
+
+    let app = app
+        // Viewer read-only enforcement + audit trail for successful mutations
+        // (a passthrough on OSS builds — see routes/audit.rs).
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            routes::audit::audit_mutations,
+        ))
         // Cap request bodies (submit YAML) to resist abuse.
         .layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024))
         .layer(TraceLayer::new_for_http())

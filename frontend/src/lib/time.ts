@@ -29,6 +29,37 @@ export function fromNow(iso: string): string {
   return `in ${Math.floor(h / 24)}d`;
 }
 
+/// Absolute wall-clock form for tooltips/titles: the viewer's local time plus
+/// the raw UTC instant, so relative times are always one hover from precision.
+export function absTime(iso: string | null | undefined): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const local = d.toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  return `${local} (local) · ${d.toISOString().replace(".000Z", "Z")} UTC`;
+}
+
+/// Seconds → compact human duration ("45s", "3m 20s", "2h 5m"). Rounds the
+/// total first so boundary values (119.5) normalize to "2m", never "1m 60s".
+export function durationSecs(secs: number | null | undefined): string {
+  if (secs == null || !Number.isFinite(secs) || secs < 0) return "—";
+  const total = Math.round(secs);
+  if (total < 60) return `${total}s`;
+  const m = Math.floor(total / 60);
+  const rs = total % 60;
+  if (m < 60) return rs ? `${m}m ${rs}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return rm ? `${h}h ${rm}m` : `${h}h`;
+}
+
 /// Human duration between two ISO timestamps ("1m 23s", "2h 5m", "800ms").
 /// When `end` is null the run is still going → returns "running". Falls back to
 /// "—" on unparseable input.

@@ -60,6 +60,37 @@ impl FromRequestParts<AppState> for AuthUser {
     }
 }
 
+/// Decode the session claims straight from request headers (Authorization
+/// bearer or session cookie), without going through the extractor. Used by the
+/// audit middleware, which needs the identity *before* the handler consumes the
+/// request and must not itself reject unauthenticated requests (the handler's
+/// `AuthUser` extractor stays the authority on 401s).
+pub fn claims_from_request(
+    headers: &axum::http::HeaderMap,
+    jwt_secret: &str,
+) -> Option<SessionClaims> {
+    let from_bearer = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(extract_bearer);
+    let from_cookie = headers.get(COOKIE).and_then(|v| v.to_str().ok()).and_then(|header| {
+        header.split(';').find_map(|kv| {
+            kv.trim()
+                .strip_prefix(SESSION_COOKIE)
+                .and_then(|rest| rest.strip_prefix('='))
+                .filter(|v| !v.is_empty())
+        })
+    });
+    let token = from_bearer.or(from_cookie)?;
+    decode::<SessionClaims>(
+        token,
+        &DecodingKey::from_secret(jwt_secret.as_bytes()),
+        &Validation::new(Algorithm::HS256),
+    )
+    .ok()
+    .map(|d| d.claims)
+}
+
 /// Pull the session JWT out of the `dagron_session` cookie, if present.
 fn token_from_cookie(parts: &Parts) -> Option<&str> {
     let header = parts.headers.get(COOKIE)?.to_str().ok()?;

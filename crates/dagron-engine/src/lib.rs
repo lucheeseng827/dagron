@@ -24,12 +24,30 @@ mod cron;
 #[cfg(feature = "ops")]
 mod gc;
 #[cfg(feature = "ops")]
+// Environment integration: `{{ env.* }}` template params at run creation +
+// DB-backed secret resolution at dispatch.
+mod environments;
 mod leadership;
+// Outbound run notifications (`notify.webhook` / `notify.slack`), fired on run
+// finalization and soft-deadline breach. Best-effort, like forge feedback.
+mod notify;
 #[cfg(feature = "ops")]
 mod schedule;
 // Timezone-aware cron fire-time helper shared by cron/schedule/backfill loops.
 #[cfg(feature = "ops")]
 mod schedule_time;
+// Unclaimable-class alarm: warns when a runner class's ready backlog ages
+// because no live scheduler serves it (runner segmentation).
+#[cfg(feature = "ops")]
+mod stale_ready;
+// Cloud archive URL → object_store dispatch (s3/gs/az), shared by the GC sink
+// and the Parquet compactor.
+#[cfg(feature = "archive-cloud")]
+mod objstore;
+// `dagron archive-compact` — fold archived run documents into Parquet
+// (the analytics tier of the hot/cold split).
+#[cfg(feature = "archive-parquet")]
+mod archive_compact;
 // Offline spec validation (`dagron validate`) — pure dagron-core, no ops needed.
 mod validate;
 
@@ -204,6 +222,19 @@ pub async fn run(seams: Seams) -> Result<()> {
         return validate::run_cli(&args[2..]);
     }
 
+    // `dagron archive-compact [db_target]` — one bounded sweep folding archived
+    // run documents into the Parquet dataset (k8s CronJob shape). Like
+    // `validate`, handled before daemon setup; unlike it, it needs the sink env
+    // (GC_ARCHIVE_DIR / GC_ARCHIVE_URL) and optionally a datastore to stamp
+    // `archived_runs`. Feature-gated: without `archive-parquet` the subcommand
+    // is a clear startup error, never a silent no-op.
+    if args.get(1).map(String::as_str) == Some("archive-compact") {
+        #[cfg(feature = "archive-parquet")]
+        return archive_compact::run_cli(&args[2..]).await;
+        #[cfg(not(feature = "archive-parquet"))]
+        anyhow::bail!("`dagron archive-compact` requires building with `--features archive-parquet`");
+    }
+
     // GitOps init: seed /workflows from the image's bundled examples if empty.
     // (Was docker-entrypoint.sh; in-binary now so the image needs no shell.)
     seed_workflow_dir();
@@ -266,6 +297,24 @@ pub async fn run(seams: Seams) -> Result<()> {
         .unwrap_or(16)
         .max(1); // guard against WORKER_COUNT=0 stalling the scheduler
 
+    // Runner segmentation: RUNNER_CLASSES=etl,pulse restricts this scheduler to
+    // claiming tasks in those classes, so a pool of replicas becomes a dedicated
+    // runner for one workload shape (ee/RUNNER_SEGMENTATION.md). Unset/empty =
+    // claim every class — the unsegmented default. Names are validated with the
+    // same rule as the spec side so a typo fails at startup, not as an
+    // unclaimable-forever task class.
+    let runner_classes: Vec<String> = std::env::var("RUNNER_CLASSES")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    for class in &runner_classes {
+        dag::validate_runner_class(class)
+            .map_err(|e| anyhow::anyhow!("invalid RUNNER_CLASSES entry: {e}"))?;
+    }
+
     // Ingestion source: SOURCE=file|redis|sqs|kafka (default: file). Queue
     // backends require their Cargo feature. MAX_INFLIGHT_RUNS caps how many runs
     // may be active at once — the admission valve that lets the scheduler absorb
@@ -284,7 +333,7 @@ pub async fn run(seams: Seams) -> Result<()> {
         .unwrap_or(3)
         .max(1);
 
-    info!(%worker_id, %dag_path, db = %redact_conn(&db_target), %executor_kind, worker_count, %source_kind, max_inflight_runs, "scheduler starting");
+    info!(%worker_id, %dag_path, db = %redact_conn(&db_target), %executor_kind, worker_count, %source_kind, max_inflight_runs, runner_classes = ?runner_classes, "scheduler starting");
 
     // rustls 0.23 needs a process-level CryptoProvider before the kube client
     // opens TLS to the apiserver (KubeExecutor); install it once at startup.
@@ -459,8 +508,31 @@ pub async fn run(seams: Seams) -> Result<()> {
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(3600);
+                // Archive-before-purge (ee/STATE_STORE.md hot/cold split):
+                // GC_ARCHIVE_URL (s3://…, feature archive-s3) or GC_ARCHIVE_DIR
+                // — expired runs are exported to the sink and only verified
+                // exports are purged. A misconfigured sink is a startup error:
+                // never fall back to purging unarchived history.
+                let archive = gc::ArchiveSink::from_env()?;
                 let (p, l) = (pool.clone(), Arc::clone(&is_leader));
-                tokio::spawn(async move { gc::run(p, retention, interval, l).await });
+                tokio::spawn(async move { gc::run(p, retention, interval, l, archive).await });
+            }
+
+            // Stale-ready (unclaimable-class) alert — on by default in any
+            // resident daemon; READY_AGE_ALERT_SECS=0 disables.
+            let ready_alert_secs: i64 = std::env::var("READY_AGE_ALERT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300);
+            if ready_alert_secs > 0 {
+                let check_interval: u64 = std::env::var("READY_AGE_CHECK_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(60);
+                let (p, l) = (pool.clone(), Arc::clone(&is_leader));
+                tokio::spawn(async move {
+                    stale_ready::run(p, ready_alert_secs, check_interval, l).await
+                });
             }
         }
     }
@@ -573,6 +645,15 @@ pub async fn run(seams: Seams) -> Result<()> {
         for run_id in db::fire_deadline_alerts(&pool).await? {
             tracing::warn!(%run_id, "run exceeded its soft deadline — SLA alert emitted");
             metrics.inc_deadline_alerts();
+            // Push the SLA breach to any notify.webhook / notify.slack targets
+            // (fire-once is guaranteed by fire_deadline_alerts above). Spawned
+            // so a slow target can't stall the reconcile tick.
+            {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    notify::notify_run_event(&pool, &run_id, "deadline_exceeded").await;
+                });
+            }
         }
 
         // ── Step 1d: expire human approval gates (#19) ──────────────────────
@@ -589,7 +670,9 @@ pub async fn run(seams: Seams) -> Result<()> {
         // ── Step 3: claim and dispatch ──────────────────────────────────────
         let capacity = workers.size().saturating_sub(in_flight);
         if capacity > 0 {
-            let claimed = db::claim_ready(&pool, &worker_id, capacity as i64).await?;
+            let claimed =
+                db::claim_ready_classes(&pool, &worker_id, capacity as i64, &runner_classes)
+                    .await?;
             for task in claimed {
                 let (mut ctx, max_attempts, retry_delay_secs, retry_max_delay_secs) = match &task.input {
                     Some(json) => match serde_json::from_str::<dag::TaskSpec>(json) {
@@ -681,22 +764,23 @@ pub async fn run(seams: Seams) -> Result<()> {
                 }
 
                 // Resolve `value_from` secret refs into concrete env values just
-                // before dispatch (#9). A missing secret fails the task rather
-                // than running it with an empty credential.
-                match dagron_executor::secrets::resolve(&ctx.env) {
-                    Ok(resolved) => ctx.env = resolved,
-                    Err(e) => {
-                        tracing::error!(task = %task.name, task_id = %task.id, error = %e, "secret resolution failed — marking task failed");
-                        db::mark_task_failed(
-                            &pool,
-                            &task.id,
-                            &worker_id,
-                            task.version.saturating_add(1),
-                            Some(format!("secret resolution failed: {e}")),
-                        )
-                        .await?;
-                        continue;
-                    }
+                // before dispatch (#9): the run's environment secret store
+                // first (DB, decrypted), then process env / secrets dir. A
+                // missing secret fails the task rather than running it with an
+                // empty credential.
+                if let Err(e) =
+                    environments::resolve_secrets(&pool, &task.run_id, &mut ctx.env).await
+                {
+                    tracing::error!(task = %task.name, task_id = %task.id, error = %e, "secret resolution failed — marking task failed");
+                    db::mark_task_failed(
+                        &pool,
+                        &task.id,
+                        &worker_id,
+                        task.version.saturating_add(1),
+                        Some(format!("secret resolution failed: {e}")),
+                    )
+                    .await?;
+                    continue;
                 }
 
                 info!(
@@ -747,6 +831,84 @@ pub async fn run(seams: Seams) -> Result<()> {
             in_flight = in_flight.saturating_sub(1);
 
             if result.success {
+                // Loop operator (`repeat:`): a successful iteration only counts
+                // as task success once `until` holds. Otherwise the task is
+                // re-queued (reusing the retry machinery: fence-guarded ready +
+                // scheduled_at delay; `attempt` doubles as the iteration count),
+                // and after max_iterations the loop fails loudly — a condition
+                // that never came true is an error, not a success.
+                let repeat = match db::task_input_json(&pool, &result.task_id).await {
+                    Ok(Some(json)) => serde_json::from_str::<dag::TaskSpec>(&json)
+                        .ok()
+                        .and_then(|s| s.repeat),
+                    _ => None,
+                };
+                if let Some(rep) = repeat {
+                    let iteration = result.attempt + 1; // the iteration that just ran
+                    let output = result.output.clone().unwrap_or_default();
+                    let mut ctx = std::collections::BTreeMap::new();
+                    ctx.insert("output".to_string(), output.trim().to_string());
+                    ctx.insert("attempt".to_string(), iteration.to_string());
+                    let done = dagron_core::expand::eval_when(&dagron_core::expand::substitute(
+                        &rep.until, &ctx,
+                    ));
+                    match done {
+                        Ok(true) => {} // condition met — fall through to success
+                        Ok(false) if iteration < rep.max_iterations as i64 => {
+                            let delay = i64::try_from(rep.delay_secs).unwrap_or(i64::MAX);
+                            let retry_at =
+                                (chrono::Utc::now() + chrono::TimeDelta::seconds(delay)).to_rfc3339();
+                            info!(
+                                task_id = %result.task_id,
+                                iteration,
+                                max_iterations = rep.max_iterations,
+                                delay_secs = rep.delay_secs,
+                                "repeat.until not yet satisfied — re-queueing iteration"
+                            );
+                            db::retry_task(
+                                &pool,
+                                &result.task_id,
+                                &result.worker_id,
+                                result.fence,
+                                result.output,
+                                retry_at,
+                            )
+                            .await?;
+                            continue;
+                        }
+                        Ok(false) => {
+                            info!(task_id = %result.task_id, iteration, "repeat.until never satisfied — failing task");
+                            metrics.inc_failed();
+                            seams.meter.on_task_completed(false).await;
+                            db::mark_task_failed(
+                                &pool,
+                                &result.task_id,
+                                &result.worker_id,
+                                result.fence,
+                                Some(format!(
+                                    "repeat.until '{}' not satisfied after {} iterations; last output:\n{}",
+                                    rep.until, iteration, output
+                                )),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        Err(e) => {
+                            metrics.inc_failed();
+                            seams.meter.on_task_completed(false).await;
+                            db::mark_task_failed(
+                                &pool,
+                                &result.task_id,
+                                &result.worker_id,
+                                result.fence,
+                                Some(format!("repeat.until '{}' failed to evaluate: {e}", rep.until)),
+                            )
+                            .await?;
+                            continue;
+                        }
+                    }
+                }
+
                 info!(task_id = %result.task_id, "task succeeded");
                 metrics.inc_succeeded();
                 seams.meter.on_task_completed(true).await; // extension seam (usage accounting)
@@ -835,6 +997,18 @@ pub async fn run(seams: Seams) -> Result<()> {
             // affects run execution).
             if let Some(forge) = &forge {
                 post_forge_status(forge, &pool, &run_id, &status.to_string()).await;
+            }
+            // Operator notifications: push the terminal status to any
+            // notify.webhook / notify.slack targets in the run's spec. Spawned
+            // so up to four sequential HTTP posts (each with a 10s timeout)
+            // can't stall task dispatch for every other run in this tick.
+            {
+                let pool = pool.clone();
+                let run_id = run_id.clone();
+                let status = status.to_string();
+                tokio::spawn(async move {
+                    notify::notify_run_event(&pool, &run_id, &status).await;
+                });
             }
         }
 

@@ -32,7 +32,7 @@ spec:
       {{- end }}
       containers:
         - name: frontend
-          image: {{ .Values.frontend.image | quote }}
+          image: {{ include "dagron.image" (dict "image" $.Values.frontend.image "root" $) | quote }}
           imagePullPolicy: {{ .Values.frontend.imagePullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false

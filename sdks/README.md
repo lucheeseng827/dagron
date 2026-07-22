@@ -5,7 +5,9 @@ your language of choice. The SDKs emit JSON — valid dagron input, since dagron
 parses YAML and JSON is a YAML subset — and submit it through the gateway.
 
 - [`typescript/`](typescript) — `@dagron/sdk` (ESM, zero deps + `.d.ts` types). DAG
-  builder + submit.
+  builder **plus a full `Client`** mirroring the Python client's control-plane
+  surface (runs, approvals, workflows, schedules, backfill jobs, dead-letters,
+  GitOps, SSE streaming).
 - [`python/`](python) — `dagron` (standard-library only). DAG builder **plus a full
   `Client`** covering the whole `dagron-api` control plane (runs, workflows,
   schedules, dead-letters, GitOps). See [`python/README.md`](python/README.md) and
@@ -22,6 +24,17 @@ dag.task("load", { image: "alpine", command: ["true"], dependsOn: [extract] });
 
 await dag.submit("http://localhost:8080", { token: process.env.DAGRON_TOKEN });
 // or: console.log(dag.toJSON())
+```
+
+Or drive the control plane with `Client` (same surface as the Python client):
+
+```ts
+import { Client } from "@dagron/sdk";
+
+const api = new Client("http://localhost:8080", { token: process.env.DAGRON_TOKEN });
+const runId = await api.submitRun(dag);
+for await (const ev of api.streamRun(runId)) console.log(ev.event, ev.data);
+await api.approveTask(runId, "review-gate"); // type: approval gates
 ```
 
 Test: `cd typescript && node --test`.

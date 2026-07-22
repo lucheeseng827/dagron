@@ -43,6 +43,11 @@ use tracing::{error, info};
 /// The OpenAPI spec, embedded at compile time so the binary is self-describing.
 const OPENAPI_YAML: &str = include_str!("../openapi.yaml");
 
+/// Swagger UI assets, vendored and embedded so `/docs` renders with no outbound
+/// internet (air-gap). Pinned version in `assets/swagger-ui/VERSION`.
+const SWAGGER_UI_CSS: &[u8] = include_bytes!("../assets/swagger-ui/swagger-ui.css");
+const SWAGGER_UI_JS: &[u8] = include_bytes!("../assets/swagger-ui/swagger-ui-bundle.js");
+
 use crate::dag::DagGraph;
 use crate::db;
 use crate::metrics::Metrics;
@@ -77,6 +82,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/openapi.yaml", get(openapi_yaml))
         .route("/openapi.json", get(openapi_json))
         .route("/docs", get(docs))
+        .route("/docs/swagger-ui.css", get(swagger_ui_css))
+        .route("/docs/swagger-ui-bundle.js", get(swagger_ui_js))
         .route("/runs", get(list_runs).post(submit_run))
         .route("/runs/{id}", get(get_run))
         .route("/runs/{id}/wait", get(wait_run))
@@ -117,8 +124,9 @@ async fn openapi_json() -> Result<Json<&'static serde_json::Value>, ApiError> {
     Ok(Json(SPEC.get().expect("spec initialized above")))
 }
 
-/// A self-contained Swagger UI page pointing at `/openapi.yaml`. UI assets load
-/// from a CDN, so the page needs outbound internet; the raw spec does not.
+/// A self-contained Swagger UI page pointing at `/openapi.yaml`. Assets are
+/// served from this binary (`/docs/swagger-ui.*`, vendored), so the page works
+/// with no outbound internet — same air-gap posture as the rest of the engine.
 async fn docs() -> Html<&'static str> {
     Html(
         r##"<!DOCTYPE html>
@@ -127,17 +135,30 @@ async fn docs() -> Html<&'static str> {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>module-54 scheduler — API docs</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css" />
+  <link rel="stylesheet" href="/docs/swagger-ui.css" />
 </head>
 <body>
   <div id="swagger-ui"></div>
-  <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js" crossorigin></script>
+  <script src="/docs/swagger-ui-bundle.js"></script>
   <script>
     window.ui = SwaggerUIBundle({ url: "/openapi.yaml", dom_id: "#swagger-ui" });
   </script>
 </body>
 </html>"##,
     )
+}
+
+/// Vendored Swagger UI assets, served locally so `/docs` needs no CDN (air-gap).
+async fn swagger_ui_css() -> Response {
+    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], SWAGGER_UI_CSS).into_response()
+}
+
+async fn swagger_ui_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        SWAGGER_UI_JS,
+    )
+        .into_response()
 }
 
 async fn metrics(State(st): State<ApiState>) -> Result<Response, ApiError> {
@@ -252,7 +273,12 @@ async fn submit_run(
     Query(q): Query<SubmitQuery>,
     body: String,
 ) -> Result<Response, ApiError> {
-    let dag = DagGraph::from_yaml(&body)
+    // `{{ env.* }}` variables from the spec's declared environment; an unknown
+    // environment is a 400, not a run without its variables.
+    let env_params = crate::environments::template_params(&st.pool, &body)
+        .await
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e}")))?;
+    let dag = DagGraph::from_yaml_with_params(&body, &env_params)
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("invalid DAG: {e}")))?;
 
     // Admission control: shed load before it becomes an unbounded backlog. This
@@ -628,6 +654,28 @@ mod tests {
         // Both run mutations are documented.
         assert!(spec["paths"]["/runs"].get("post").is_some());
         assert!(spec["paths"]["/runs/{id}/cancel"].get("post").is_some());
+    }
+
+    /// Air-gap guard: `/docs` must render with no CDN, so the Swagger UI assets
+    /// are served from this binary with the right content types and non-empty
+    /// bodies. A regression here would silently re-break the offline docs page.
+    #[tokio::test]
+    async fn swagger_ui_assets_are_served_locally() {
+        for (resp, want_ct) in [
+            (swagger_ui_css().await, "text/css"),
+            (swagger_ui_js().await, "application/javascript"),
+        ] {
+            assert_eq!(resp.status(), StatusCode::OK);
+            let ct = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(ct.starts_with(want_ct), "unexpected content-type {ct:?}");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            assert!(!body.is_empty(), "vendored asset body is empty");
+        }
     }
 
     /// Per-test SQLite database in a unique temp file.

@@ -3,6 +3,15 @@
 nameOverride: ""
 fullnameOverride: ""
 
+# Global values are shared with subcharts. `imageRegistry` relocates every image
+# in the chart to a private mirror with a single value — the air-gap install
+# lever (ee/DEPLOYMENT_BLUEPRINT.md). It replaces the registry host of images
+# that carry one (postgres:16-alpine → <registry>/postgres:16-alpine) and
+# prepends to bare images. Empty = images used verbatim (unchanged).
+#   --set global.imageRegistry=registry.corp.internal
+global:
+  imageRegistry: ""
+
 # imagePullSecrets applied to every pod (e.g. an ECR pull secret).
 # imagePullSecrets:
 #   - name: ecr-creds
@@ -23,8 +32,11 @@ engine:
   # Task executor: "k8s" runs each task as a one-shot Pod in this namespace.
   # Use "local" to run tasks in-process (no pod-create RBAC needed).
   executor: k8s
-  # Default image for task pods when a task doesn't specify its own.
-  taskImage: alpine:latest
+  # Default image for task pods when a task doesn't specify its own. Pinned (not
+  # `:latest`) so imagePullPolicy: IfNotPresent can actually cache it and an
+  # air-gapped mirror has a stable tag to hold. Override per task via
+  # `docker_image:`, or relocate via global.imageRegistry.
+  taskImage: alpine:3.21
   workerCount: 4
   # Admission cap for POST /runs: the engine sheds load with 429 + Retry-After
   # once this many runs are active (pending/running), the API-path backpressure
@@ -120,6 +132,26 @@ dagronApi:
   resources:
     requests: {cpu: 50m, memory: 64Mi}
     limits: {memory: 256Mi}
+
+# ── Environment secrets (UI-managed variable sets, AES-256-GCM) ──────────────
+# One key, shared by dagron-api (encrypts secret values on write) and the
+# engine (decrypts them at task dispatch) — both deployments get
+# DAGRON_ENV_SECRET_KEY from the same Secret. Leave everything empty to run
+# without the feature: the Environments page still manages plain variables,
+# but storing a secret returns 503 until a key is configured.
+envSecrets:
+  # Inline key. Any non-empty string works (hashed to key length); 32 bytes of
+  # base64 is used verbatim. Lands in the chart-managed Secret and therefore
+  # in helm history — prefer existingSecret for anything real.
+  key: ""
+  # Env var / Secret key name both processes read.
+  keyName: DAGRON_ENV_SECRET_KEY
+  # Preferred for prod: a pre-created Secret holding the key under keyName,
+  # so it never touches values files or helm history:
+  #   kubectl -n <ns> create secret generic dagron-env-key \
+  #     --from-literal=DAGRON_ENV_SECRET_KEY="$(openssl rand -base64 32)"
+  existingSecret:
+    name: ""
 
 # ── Frontend (Next.js UI) ────────────────────────────────────────────────────
 frontend:

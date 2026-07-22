@@ -1,6 +1,6 @@
 {
   "name": "@dagron/sdk",
-  "version": "0.1.1",
+  "version": "0.3.0",
   "description": "Define dagron DAGs in TypeScript/JavaScript and submit them to dagron-api.",
   "type": "module",
   "main": "index.mjs",

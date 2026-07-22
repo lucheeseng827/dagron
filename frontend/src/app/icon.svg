@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="dagron">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1" gradientTransform="rotate(15 .5 .5)">
+      <stop offset="0" stop-color="#f0a35e"/>
+      <stop offset="0.55" stop-color="#e8833a"/>
+      <stop offset="1" stop-color="#c25a1e"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="17" fill="url(#g)"/>
+  <g fill="none" stroke="#1a1207" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="20,21 31,32 20,43"/>
+    <polyline points="33,21 44,32 33,43" stroke-opacity="0.5"/>
+  </g>
+</svg>

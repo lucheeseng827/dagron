@@ -19,6 +19,28 @@ kubernetes = ["dagron-executor/kubernetes"]
 # Optional feature: auto-backfill sweep loop, run_reruns ledger,
 # parameterized rerun metrics, and outbox eventing. Implies `ops`.
 enterprise = ["dagron-core/enterprise", "ops"]
+# Cloud GC archive sinks (GC_ARCHIVE_URL=<scheme>://…): archive-before-purge
+# writes run documents straight to object storage instead of a local dir. One
+# feature per backend; each pulls its object_store backend + the shared URL
+# dispatch (src/objstore.rs). S3-compatible endpoints (MinIO/Ceph) ride
+# `archive-s3` via AWS_ENDPOINT_URL — no separate feature needed.
+archive-s3 = ["archive-cloud", "object_store/aws"]
+archive-gcs = ["archive-cloud", "object_store/gcp"]
+archive-azure = ["archive-cloud", "object_store/azure"]
+# Internal: shared object-store plumbing enabled by the cloud backends above.
+# Not meant to be enabled on its own.
+archive-cloud = ["dep:object_store", "ops"]
+# `dagron archive-compact`: fold archived run-*.json documents into a
+# date-partitioned Parquet dataset (analytics tier). Heavy (arrow + parquet),
+# hence its own feature; combine with `archive-s3` to compact an S3 archive.
+archive-parquet = [
+    "dep:object_store",
+    "dep:parquet",
+    "dep:arrow-array",
+    "dep:arrow-schema",
+    "dep:arrow-json",
+    "ops",
+]
 
 [dependencies]
 dagron-core = { path = "../dagron-core", default-features = false }
@@ -33,6 +55,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 chrono = "0.4"
+# Outbound notify.webhook / notify.slack posts (same TLS stack as dagron-forge).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+# Decrypting environment secrets at dispatch (dagron-api encrypts on write).
+dagron-crypto = { path = "../dagron-crypto" }
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
@@ -42,6 +68,16 @@ axum = { version = "0.8", optional = true }
 cron = { version = "0.16", optional = true }
 # IANA timezone database for DST-safe per-schedule cron (ops-only, like `cron`).
 chrono-tz = { version = "0.10", optional = true }
+# Cloud archive sinks (features `archive-s3`/`archive-gcs`/`archive-azure`). A
+# single-object PUT is the durability boundary, matching the local sink's fsync
+# contract. Backend sub-features (aws/gcp/azure) are enabled by those features.
+object_store = { version = "0.11", optional = true }
+# Parquet compaction (feature `archive-parquet`); versions pinned together —
+# arrow 53.x pairs with parquet 53.x and object_store 0.11.
+parquet = { version = "53", optional = true, features = ["arrow"] }
+arrow-array = { version = "53", optional = true }
+arrow-schema = { version = "53", optional = true }
+arrow-json = { version = "53", optional = true }
 
 [dev-dependencies]
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }

@@ -67,7 +67,7 @@ spec:
       {{- end }}
       containers:
         - name: engine
-          image: {{ .Values.engine.image | quote }}
+          image: {{ include "dagron.image" (dict "image" $.Values.engine.image "root" $) | quote }}
           imagePullPolicy: {{ .Values.engine.imagePullPolicy }}
           # No readOnlyRootFilesystem: the entrypoint seeds /workflows on the
           # image's root fs. Everything else is locked down.
@@ -88,7 +88,7 @@ spec:
             - name: K8S_NAMESPACE
               value: {{ .Release.Namespace | quote }}
             - name: K8S_IMAGE
-              value: {{ .Values.engine.taskImage | quote }}
+              value: {{ include "dagron.image" (dict "image" $.Values.engine.taskImage "root" $) | quote }}
             - name: WORKER_COUNT
               value: {{ .Values.engine.workerCount | quote }}
             - name: DB_SCHEDULES
@@ -100,6 +100,15 @@ spec:
               value: {{ .Values.engine.maxInflightRuns | quote }}
             - name: RUST_LOG
               value: {{ .Values.engine.rustLog | quote }}
+            {{- if eq (include "dagron.envSecretsEnabled" .) "true" }}
+            # Decrypts environment secrets at task dispatch (dagron-api holds
+            # the same key to encrypt them on write).
+            - name: {{ include "dagron.envSecretKeyName" . }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "dagron.envSecretName" . }}
+                  key: {{ include "dagron.envSecretKeyName" . }}
+            {{- end }}
             {{- with .Values.engine.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

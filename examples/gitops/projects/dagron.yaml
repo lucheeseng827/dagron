@@ -1,0 +1,47 @@
+# AppProject — the trust boundary for everything in this demo. Both the platform
+# Application and every Application the workflows ApplicationSet generates run
+# under this project, so its allow-lists bound what GitOps may touch.
+#
+# Tighten for production: replace sourceRepos "*" with your exact repo URL, and
+# swap the "*" namespace destination for the explicit namespaces below.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: dagron
+  namespace: argocd
+  # Keep the project until its child apps are gone.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: dagron platform + declarative workflows
+
+  sourceRepos:
+    # The repo holding this chart + these manifests. Replace with your fork/mirror.
+    - https://github.com/lucheeseng827/nick-rust-project.git
+    - https://github.com/lucheeseng827/nick-rust-project
+
+  # Where apps in this project may deploy. Same (in-cluster) API server; only the
+  # namespaces the platform and the per-team workflows land in. The AppProject,
+  # platform Application, and ApplicationSet objects themselves live in argocd but
+  # are applied by the root app under the built-in `default` project, so this
+  # project needs no argocd destination.
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: dagron          # the platform: engine, api, operator, postgres
+    - server: https://kubernetes.default.svc
+      namespace: team-*          # per-team workflow namespaces (team-data, team-payments)
+
+  # The Helm chart creates cluster-scoped objects: the two dagron CRDs and the
+  # operator's ClusterRole/ClusterRoleBinding (it watches CRs cluster-wide).
+  clusterResourceWhitelist:
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+
+  # Namespaced resources apps may create. "*/*" for the demo; narrow as needed.
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"

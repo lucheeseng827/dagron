@@ -1,0 +1,77 @@
+# LAYER 1 — the dagron platform, deployed declaratively from the Helm chart.
+#
+# This installs the two dagron CRDs (Workflow, CronWorkflow), the engine, the
+# operator that reconciles those CRDs into engine runs, and a throwaway in-cluster
+# Postgres. Sync-wave "0" so the CRDs + operator exist BEFORE the workflows
+# ApplicationSet (wave "1") starts applying Workflow/CronWorkflow CRs.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: dagron-platform
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: dagron
+  source:
+    repoURL: https://github.com/lucheeseng827/nick-rust-project.git
+    # Point this at the branch/tag holding the chart. `main` once merged; use your
+    # working branch to try it before merge.
+    targetRevision: main
+    path: rust_modules/lab/module_54/terraform/charts/dagron
+    helm:
+      releaseName: dagron
+      # Inline demo values. In production keep these in a values-<env>.yaml in Git
+      # and reference them with `valueFiles:` instead of inlining.
+      values: |
+        # --- engine ------------------------------------------------------------
+        engine:
+          # `local` runs each task in-process in the engine pod — no task-pod RBAC,
+          # no task images. Perfect for a kind demo. Switch to `k8s` for real
+          # fan-out (one pod per task) and give tasks a docker_image.
+          executor: local
+          workerCount: 4
+          # DB-backed schedules must be ON for CronWorkflow CRs to actually fire.
+          dbSchedules: true
+          rustLog: info,dagron_engine=debug
+        # --- operator (NOT in the chart's default values — enabled by defining it)
+        # Watches Workflow/CronWorkflow CRs cluster-wide and turns each into a run.
+        operator:
+          image: mancube/dagron-operator:0.3.0
+          imagePullPolicy: IfNotPresent
+          replicas: 1
+          rustLog: info,dagron_operator=debug
+          rbac:
+            create: true
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 128Mi}
+        # --- datastore: throwaway in-cluster Postgres (do NOT use for real data) -
+        postgres:
+          enabled: true
+        # --- UI off for the minimal workflows demo. Flip these on (and set
+        #     dagronApi.jwtSecret + admin.*) to get the dashboard.
+        dagronApi:
+          enabled: false
+        frontend:
+          enabled: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: dagron
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      # dagron CRDs are large; server-side apply avoids the last-applied annotation
+      # size limit and reconciles CRD schema changes cleanly.
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m

@@ -49,12 +49,15 @@ export function statusColor(status: string): string {
     case "cancelled":
     case "skipped":
       return "#484f58"; // muted
+    case "awaiting_approval":
+      return "#a371f7"; // purple — a human gate, distinct from machine states
     default:
       return "#6e7681";
   }
 }
 
-/// Human label for a status (title-cased).
+/// Human label for a status (title-cased; underscores become spaces).
 export function statusLabel(status: TaskStatus): string {
+  if (status === "awaiting_approval") return "Awaiting approval";
   return status.charAt(0).toUpperCase() + status.slice(1);
 }

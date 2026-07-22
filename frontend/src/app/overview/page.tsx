@@ -1,12 +1,14 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
-import { listGitRepos, listRuns, listWorkflows } from "@/lib/dagron-api";
+import LiveToggle from "@/components/LiveToggle";
+import { getHealth, listGitRepos, listRuns, listWorkflows } from "@/lib/dagron-api";
 import { statusColor } from "@/lib/adapter";
 import { errMsg } from "@/lib/err";
+import { useLiveRefresh, useLiveUpdates } from "@/lib/live";
 import { fromNow, timeAgo } from "@/lib/time";
-import type { GitRepo, GitRepoState, RunSummary, TaskStatus, WorkflowRow } from "@/types/dagron";
+import type { GitRepo, GitRepoState, HealthResponse, RunSummary, TaskStatus, WorkflowRow } from "@/types/dagron";
 
 const REPO_COLOR: Record<GitRepoState, string> = {
   Synced: "var(--green)",
@@ -24,18 +26,31 @@ export default function OverviewPage() {
   const [wfs, setWfs] = useState<WorkflowRow[]>([]);
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [repos, setRepos] = useState<GitRepo[]>([]);
+  const [health, setHealth] = useState<HealthResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [live] = useLiveUpdates();
 
-  useEffect(() => {
-    const load = () => {
-      listWorkflows().then(setWfs).catch((e) => setError(errMsg(e)));
-      listRuns({ limit: 200 }).then(setRuns).catch(() => {});
-      listGitRepos().then(setRepos).catch(() => {});
-    };
-    load();
-    const t = setInterval(load, 5000);
-    return () => clearInterval(t);
+  const load = useCallback(() => {
+    listWorkflows().then(setWfs).catch((e) => setError(errMsg(e)));
+    listRuns({ limit: 200 }).then(setRuns).catch(() => {});
+    listGitRepos().then(setRepos).catch(() => {});
+    getHealth().then(setHealth).catch(() => {});
   }, []);
+
+  useEffect(() => load(), [load]);
+  // Live mode: run activity streams in via SSE (replaces the old 5s poll)…
+  const conn = useLiveRefresh(live, load);
+  // …plus a slow poll for what doesn't emit task events (GitOps sync state,
+  // schedule next-fire times, health counters). Paused mode does no background
+  // reads at all, and hidden tabs skip the tick — the SSE reopen on tab
+  // re-show reloads everything anyway.
+  useEffect(() => {
+    if (!live) return;
+    const t = setInterval(() => {
+      if (!document.hidden) load();
+    }, 30_000);
+    return () => clearInterval(t);
+  }, [live, load]);
 
   // KPIs
   const total = wfs.length;
@@ -69,44 +84,67 @@ export default function OverviewPage() {
           </h1>
           <p className="dy-subtitle">Scheduler health, upcoming runs, and GitOps sync at a glance.</p>
         </div>
-        <Link href="/workflows/new" className="dy-btn dy-btn-primary">
-          + New workflow
-        </Link>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <LiveToggle status={conn} onRefresh={load} />
+          <Link href="/workflows/new" className="dy-btn dy-btn-primary">
+            + New workflow
+          </Link>
+        </div>
       </div>
       {error && <p style={{ color: "var(--red)" }}>{error}</p>}
 
-      {/* KPI row */}
+      {/* Attention strip: things a human should act on, one click away. */}
+      {health && (health.awaiting_approvals > 0 || health.dead_letters > 0) && (
+        <div style={{ display: "flex", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
+          {health.awaiting_approvals > 0 && (
+            <Link href="/approvals" className="dy-card" style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 16px", borderColor: "rgba(163,113,247,0.5)", color: "var(--fg)" }}>
+              <span className="dy-dot" style={{ background: "#a371f7" }} />
+              <strong>{health.awaiting_approvals}</strong> run{health.awaiting_approvals === 1 ? "" : "s"} awaiting approval
+              <span style={{ color: "var(--dim)" }}>→</span>
+            </Link>
+          )}
+          {health.dead_letters > 0 && (
+            <Link href="/dead-letters" className="dy-card" style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 16px", borderColor: "rgba(248,81,73,0.5)", color: "var(--fg)" }}>
+              <span className="dy-dot" style={{ background: "var(--red)" }} />
+              <strong>{health.dead_letters}</strong> dead letter{health.dead_letters === 1 ? "" : "s"} parked
+              <span style={{ color: "var(--dim)" }}>→</span>
+            </Link>
+          )}
+        </div>
+      )}
+
+      {/* KPI row — each card links to the screen that answers its question. */}
       <div className="dy-kpis">
-        <div className="dy-kpi">
+        <Link href="/workflows" className="dy-kpi" style={{ color: "var(--fg)", display: "block" }}>
           <div className="dy-kpi-label">Active workflows</div>
           <div className="dy-kpi-value">
             {active}
             <span style={{ fontSize: 14, color: "var(--dim)", fontWeight: 500 }}> / {total}</span>
           </div>
           <div className="dy-kpi-sub" style={{ color: "var(--green)" }}>{active} with active schedule</div>
-        </div>
-        <div className="dy-kpi">
+        </Link>
+        <Link href={failToday ? "/runs?status=failed" : "/runs"} className="dy-kpi" style={{ color: "var(--fg)", display: "block" }} title={failToday ? "View today's failures" : "View runs"}>
           <div className="dy-kpi-label">Runs today</div>
           <div className="dy-kpi-value">{todays.length}</div>
           <div className="dy-kpi-sub">
             <span style={{ color: "var(--green)" }}>{okToday} ok</span> ·{" "}
             <span style={{ color: failToday ? "var(--red)" : "var(--muted)" }}>{failToday} failed</span>
           </div>
-        </div>
-        <div className="dy-kpi">
+        </Link>
+        <Link href="/metrics" className="dy-kpi" style={{ color: "var(--fg)", display: "block" }}>
           <div className="dy-kpi-label">Success rate · 7d</div>
           <div className="dy-kpi-value">{successRate}%</div>
           <div className="dy-bar">
             <div className="dy-bar-fill" style={{ width: `${successRate}%` }} />
           </div>
-        </div>
-        <div className="dy-kpi">
+        </Link>
+        <Link href="/gitops" className="dy-kpi" style={{ color: "var(--fg)", display: "block" }}>
           <div className="dy-kpi-label">GitOps sync</div>
           <div className="dy-kpi-value" style={{ color: outOfSync ? "var(--amber)" : undefined }}>
             {outOfSync ? `${outOfSync} drift` : "in sync"}
           </div>
           <div className="dy-kpi-sub">{synced} synced · {outOfSync} out-of-sync</div>
-        </div>
+        </Link>
       </div>
 
       {/* two columns */}

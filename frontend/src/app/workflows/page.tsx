@@ -3,9 +3,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import LiveToggle from "@/components/LiveToggle";
 import { deleteWorkflow, listWorkflows, runWorkflow, updateSchedule } from "@/lib/dagron-api";
 import { statusColor } from "@/lib/adapter";
 import { errMsg } from "@/lib/err";
+import { useLiveRefresh, useLiveUpdates } from "@/lib/live";
 import { timeAgo, fromNow } from "@/lib/time";
 import type { TaskStatus, WorkflowRow } from "@/types/dagron";
 
@@ -22,6 +24,8 @@ export default function WorkflowsPage() {
   const [filter, setFilter] = useState<Filter>("all");
   const [view, setView] = useState<ViewMode>("table");
 
+  const [live] = useLiveUpdates();
+
   const load = useCallback(() => {
     listWorkflows()
       .then((data) => {
@@ -31,6 +35,9 @@ export default function WorkflowsPage() {
       .catch((e) => setError(errMsg(e)));
   }, []);
   useEffect(() => load(), [load]);
+  // Live mode: run activity changes last-run/history/success columns — refetch
+  // on events from the account-wide stream instead of polling.
+  const conn = useLiveRefresh(live, load);
 
   const counts = useMemo(
     () => ({
@@ -99,6 +106,7 @@ export default function WorkflowsPage() {
           </p>
         </div>
         <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <LiveToggle status={conn} onRefresh={load} />
           <div style={{ display: "flex", gap: 3, background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: 3 }}>
             {(["table", "board"] as const).map((v) => (
               <button key={v} onClick={() => setView(v)} className={`dy-pill ${view === v ? "dy-pill-active" : ""}`} style={{ cursor: "pointer", textTransform: "capitalize" }}>
@@ -151,7 +159,7 @@ export default function WorkflowsPage() {
               {/* workflow */}
               <div style={{ minWidth: 0 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <Link href={`/workflows/${r.id}`} style={{ fontWeight: 600, color: "var(--fg)" }}>
+                  <Link href={`/workflows/${r.id}/history`} style={{ fontWeight: 600, color: "var(--fg)" }} title="Run history & task health">
                     {r.name}
                   </Link>
                   <SourceBadge source={r.source} />
@@ -208,7 +216,7 @@ export default function WorkflowsPage() {
       ) : (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(320px,1fr))", gap: 14 }}>
           {shown.map((r) => (
-            <Link key={r.id} href={`/workflows/${r.id}`} className="dy-card" style={{ display: "block", color: "var(--fg)", position: "relative", opacity: r.paused ? 0.65 : 1 }}>
+            <Link key={r.id} href={`/workflows/${r.id}/history`} className="dy-card" style={{ display: "block", color: "var(--fg)", position: "relative", opacity: r.paused ? 0.65 : 1 }}>
               <div style={{ position: "absolute", top: 0, left: 0, width: 3, height: "100%", background: statusColor((r.last_status ?? "pending") as TaskStatus) }} />
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
                 <strong>{r.name}</strong>

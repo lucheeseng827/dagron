@@ -56,6 +56,96 @@ pub async fn metrics(
     Ok(Json(MetricsResponse { runs_by_status: runs, tasks_by_status: tasks, dead_letters }))
 }
 
+// ── Metrics time-series ─────────────────────────────────────────────────────
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct DayBucket {
+    /// Bucket day, `YYYY-MM-DD` (UTC).
+    pub day: String,
+    pub succeeded: i64,
+    pub failed: i64,
+    pub cancelled: i64,
+    /// Still pending/running when queried.
+    pub active: i64,
+    /// Mean wall-clock of finished runs that day, seconds. Null = none finished.
+    pub avg_duration_secs: Option<f64>,
+    pub max_duration_secs: Option<f64>,
+}
+
+#[derive(Deserialize)]
+pub struct TimeseriesParams {
+    /// Look-back window in days (default 14, clamped to [1, 90]).
+    pub days: Option<i64>,
+    /// Restrict to one workflow (definition name, exact match).
+    pub name: Option<String>,
+}
+
+/// `GET /api/metrics/timeseries?days=&name=` — per-day run counts by outcome and
+/// duration stats, for the Metrics charts and the workflow detail trend.
+/// Timestamps are stored as RFC-3339 TEXT, so buckets cast through timestamptz.
+pub async fn metrics_timeseries(
+    _auth: AuthUser,
+    State(state): State<AppState>,
+    Query(params): Query<TimeseriesParams>,
+) -> Result<Json<Vec<DayBucket>>, StatusCode> {
+    let days = params.days.unwrap_or(14).clamp(1, 90);
+    let rows = sqlx::query_as::<_, DayBucket>(
+        "SELECT to_char(date_trunc('day', wr.created_at::timestamptz), 'YYYY-MM-DD') AS day,
+                COUNT(*) FILTER (WHERE wr.status = 'succeeded') AS succeeded,
+                COUNT(*) FILTER (WHERE wr.status = 'failed') AS failed,
+                COUNT(*) FILTER (WHERE wr.status = 'cancelled') AS cancelled,
+                COUNT(*) FILTER (WHERE wr.status IN ('pending','running')) AS active,
+                AVG(EXTRACT(EPOCH FROM (wr.finished_at::timestamptz - wr.created_at::timestamptz))::float8)
+                    FILTER (WHERE wr.finished_at IS NOT NULL) AS avg_duration_secs,
+                MAX(EXTRACT(EPOCH FROM (wr.finished_at::timestamptz - wr.created_at::timestamptz))::float8)
+                    FILTER (WHERE wr.finished_at IS NOT NULL) AS max_duration_secs
+         FROM workflow_runs wr
+         LEFT JOIN workflow_definitions d ON d.id = wr.definition_id
+         WHERE wr.created_at::timestamptz >= date_trunc('day', now()) - make_interval(days => $1::int)
+           AND ($2::text IS NULL OR d.name = $2)
+         GROUP BY 1 ORDER BY 1",
+    )
+    .bind(days)
+    .bind(&params.name)
+    .fetch_all(&state.read_pool)
+    .await
+    .map_err(internal)?;
+    Ok(Json(rows))
+}
+
+// ── Pending approval gates ──────────────────────────────────────────────────
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct PendingApproval {
+    pub run_id: String,
+    pub task_id: String,
+    pub task_name: String,
+    pub workflow_name: Option<String>,
+    /// When the gate parked (task scheduled_at), oldest first.
+    pub since: Option<String>,
+}
+
+/// `GET /api/approvals` — every task parked in `awaiting_approval`, oldest
+/// first: the human-in-the-loop worklist behind the sidebar badge.
+pub async fn list_approvals(
+    _auth: AuthUser,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<PendingApproval>>, StatusCode> {
+    let rows = sqlx::query_as::<_, PendingApproval>(
+        "SELECT t.run_id, t.id AS task_id, t.name AS task_name,
+                d.name AS workflow_name, t.scheduled_at AS since
+         FROM task_runs t
+         JOIN workflow_runs wr ON wr.id = t.run_id
+         LEFT JOIN workflow_definitions d ON d.id = wr.definition_id
+         WHERE t.status = 'awaiting_approval'
+         ORDER BY t.scheduled_at ASC NULLS FIRST",
+    )
+    .fetch_all(&state.read_pool)
+    .await
+    .map_err(internal)?;
+    Ok(Json(rows))
+}
+
 // ── Dead letters ────────────────────────────────────────────────────────────
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -138,7 +228,8 @@ pub async fn redrive_dead_letter(
 
     // Resolve any `workflow_ref` chains so redrive behaves exactly like submit.
     let expanded = crate::expand::expand_workflow_refs(&state, spec).await?;
-    let run_id = control::create_run(&state, &expanded, &dl.payload)
+    let prepared = control::prepare_spec(&state, expanded).await?;
+    let run_id = control::create_run(&state, &prepared, &dl.payload)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
     Ok(Json(RedriveResponse { run_id, redriven_from: id }))

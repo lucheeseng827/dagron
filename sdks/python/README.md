@@ -74,12 +74,14 @@ except DagronError as e:
 
 `login` · `logout` · `me` · `create_user` · `submit_run` · `list_runs` · `get_run`
 · `get_run_graph` · `get_task_logs` · `cancel_run` · `rerun_run` · `resubmit_run`
-· `retry_task` · `stream_run` · `wait_for_run` · `list_workflows` · `get_workflow`
-· `create_workflow` · `update_workflow` · `delete_workflow` · `run_workflow`
-· `sync_workflow_to_git` · `list_schedules` · `create_schedule` · `update_schedule`
-· `delete_schedule` · `backfill_schedule` · `list_dead_letters`
-· `redrive_dead_letter` · `discard_dead_letter` · `list_git_repos`
-· `connect_git_repo` · `sync_git_repo` · `disconnect_git_repo` · `metrics` · `healthz`
+· `retry_task` · `approve_task` · `reject_task` · `stream_run` · `wait_for_run`
+· `list_workflows` · `get_workflow` · `create_workflow` · `update_workflow`
+· `delete_workflow` · `run_workflow` · `sync_workflow_to_git` · `list_schedules`
+· `create_schedule` · `update_schedule` · `delete_schedule` · `backfill_schedule`
+· `create_backfill` · `list_backfills` · `get_backfill` · `cancel_backfill`
+· `list_dead_letters` · `redrive_dead_letter` · `discard_dead_letter`
+· `list_git_repos` · `connect_git_repo` · `sync_git_repo` · `disconnect_git_repo`
+· `metrics` · `healthz`
 
 ## Test
 

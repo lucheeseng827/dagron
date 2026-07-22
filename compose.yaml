@@ -13,6 +13,11 @@ name: dagron-ui
 # Dev-only secret (≥32 chars, as dagron-api now requires). Change for any real deploy.
 x-jwt-secret: &jwt_secret dev-insecure-jwt-secret-change-me-please
 
+# Dev-only key for UI-managed environment secrets (AES-256-GCM). Shared by
+# dagron-api (encrypts on write) and the engine (decrypts at dispatch) — both
+# services below reference this anchor. Change for any real deploy.
+x-env-secret-key: &env_secret_key dev-insecure-env-secret-key-change-me
+
 services:
   postgres:
     image: docker.io/library/postgres:16-alpine
@@ -39,6 +44,7 @@ services:
       DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
       API_ADDR: 0.0.0.0:8787   # keeps the process resident + serves the internal ops API
       EXECUTOR: local
+      DAGRON_ENV_SECRET_KEY: *env_secret_key
       RUST_LOG: info
     depends_on:
       postgres:
@@ -51,6 +57,7 @@ services:
     environment:
       DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
       DAGRON_JWT_SECRET: *jwt_secret
+      DAGRON_ENV_SECRET_KEY: *env_secret_key
       # Local stack is plain HTTP, so don't mark the session cookie Secure
       # (a Secure cookie wouldn't be stored over http://). Leave default (true) in prod.
       DAGRON_COOKIE_SECURE: "false"

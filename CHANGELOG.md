@@ -6,6 +6,125 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- **Live-updating UI with a global pause toggle** — the Runs, Workflows, and
+  Overview pages now refresh in realtime off a new account-wide SSE endpoint
+  (`GET /api/events/stream`, fanned out from the same shared Postgres
+  `LISTEN task_events` as the per-run stream), replacing Overview's fixed 5s
+  poll with event-driven refetches (debounced 400ms, flushed at least every 2s
+  during bursts; a slow 30s poll keeps GitOps sync state and next-fire times
+  fresh). A **Live/Paused pill** on each page header (and the run detail
+  header) toggles one persisted preference (`localStorage`, synced across tabs
+  and pages): paused holds no streams open and does zero background reads —
+  data loads once, with a ⟳ manual-refresh button — for sessions where live
+  reads are too costly; resuming (or an SSE reconnect) refetches to catch up.
+  Hidden tabs cost nothing either: streams close on tab hide and reopen on
+  re-show (with a catch-up refetch), and Overview's slow poll skips ticks
+  while hidden.
+- **DAG layout directions** (frontend) — the DAG graph (Submit live preview and
+  the run viewer) now offers three layouts via a ↓/→/↘ segmented control on the
+  canvas: vertical (top→bottom, the old default), horizontal (left→right, with
+  edges leaving node sides), and a diagonal cascade (ranks step down-and-right
+  like a staircase). The choice persists in localStorage and follows the user
+  across views.
+- **Resizable editor/preview split** (frontend) — the border between the YAML
+  editor and the live DAG preview on Submit (and the rerun dialog) is now a
+  draggable divider: slide it to grow either pane (clamped 20–80%), double-click
+  to reset to even, and the ratio persists across sessions.
+- **Offline UI assets (no CDN)** — the frontend self-hosts the Monaco editor
+  (staged into `public/monaco/vs` at build, no `cdn.jsdelivr.net`) and the engine
+  serves vendored Swagger UI assets at `/docs`, so no browser asset needs a CDN.
+- **Native GCS + Azure Blob archive backends** (multi-cloud) — the GC archive
+  sink, `dagron archive-compact`, and the `dagron-api` archive-history reads now
+  speak `gs://` (feature `archive-gcs`) and `az://`/`azure://` (`archive-azure`)
+  natively, alongside `s3://` (`archive-s3`, which also covers S3-compatible
+  MinIO/Ceph). `GC_ARCHIVE_URL`'s scheme selects the backend; credentials come
+  from each backend's standard env (`AWS_*`/`GOOGLE_*`/`AZURE_*`). URL→store
+  dispatch is centralized in a small `objstore` module in both crates; a scheme
+  whose backend feature isn't compiled in is a hard startup error, never a
+  silent plain purge.
+- **Archive history reads** — the archive-before-purge GC now upserts an
+  `archived_runs` index row (run_id, name, status, timestamps; SQLite
+  migration 020 / Postgres 024) before purging, and `dagron-api` gains
+  `GET /api/archive/runs` (index-only list, filter by `name`, paged) and
+  `GET /api/archive/runs/{id}` (fetches the run's `dagron.run-archive.v1`
+  document from `GC_ARCHIVE_DIR`/`GC_ARCHIVE_URL`; the api's `archive-s3`
+  feature mirrors the engine's). Purge now fails closed on an index-write
+  failure too — an archived-but-unlisted run would be invisible history.
+- **Parquet compaction** (`dagron archive-compact`, cargo feature
+  `archive-parquet`) — a bounded, CronJob-shaped sweep that folds archived
+  `run-*.json` documents older than `GC_ARCHIVE_COMPACT_MIN_AGE_DAYS`
+  (default 30) into a date-partitioned Parquet dataset
+  (`compact/tasks/dt=<date>/part-<uuid>.parquet`, one row per task with run
+  columns denormalized), stamps `archived_runs.compacted_at`/`parquet_path`,
+  and deletes source documents **only after** the part file verifiably
+  landed (at-least-once across crashes — dedup on `(run_id, task_id)` when
+  querying). Works over both the dir sink and, with `archive-s3`, the S3
+  sink. A compacted run's detail endpoint answers 410 Gone with the
+  `parquet_path`.
+- **Split LISTEN DSN** (`DATABASE_LISTEN_URL`) — the engine's reconcile-loop
+  `Waker` and dagron-api's shared SSE listener connect their session-scoped
+  `LISTEN` to this URL when set (the direct Postgres endpoint), while
+  `DATABASE_URL` may point at transaction-mode PgBouncer — which cannot serve
+  `LISTEN`. Unset = the listener shares the pool config, exactly as before.
+  Unlocks pooled query traffic on shared state-store cells.
+- **S3-native GC archive sink** (`GC_ARCHIVE_URL=s3://bucket[/prefix]`,
+  cargo feature `archive-s3`) — archive-before-purge without the intermediary
+  volume: each expired run's `dagron.run-archive.v1` document is one atomic S3
+  `PUT` (credentials/region/endpoint from standard `AWS_*` env), and only
+  verified PUTs are purged. Setting the URL without the feature is a startup
+  error (same contract as `EXECUTOR=kubernetes` without `kubernetes`), and
+  `GC_ARCHIVE_DIR` local archiving is unchanged.
+- **Runner-class routing** (`runner_class`) — segment the scheduler fleet by
+  workload shape. A task (or a whole DAG via a spec-level default) may name a
+  **runner class** (`[a-z0-9_-]{1,64}`, default `default`); the class is
+  persisted on `task_runs` (SQLite migration 019 / Postgres 022, with a
+  class-scoped partial ready-index) and a scheduler started with
+  `RUNNER_CLASSES=etl,pulse` claims **only** those classes
+  (`db::claim_ready_classes`, both backends — same `SKIP LOCKED`/CAS + lease +
+  fence contract). Unset `RUNNER_CLASSES` claims every class, so existing
+  single-pool deployments are unchanged. Template expansion substitutes
+  `{{ param }}`s in `runner_class` like `docker_image`; invalid names fail
+  validation at submit (spec) or startup (env). SDKs:
+  `Dag(name, runner_class=...)` / `task(..., runner_class=...)` (Python),
+  `new Dag(name, {runnerClass})` / `task(..., {runnerClass})` (TypeScript).
+- **`DB_MAX_CONNECTIONS`** — the Postgres pool size (previously hard-coded 8)
+  is env-tunable (min 2), so many lean engines can share one pooled state
+  cluster.
+- **Archive-before-purge retention GC** (`GC_ARCHIVE_DIR`) — with an archive
+  directory configured, the leadership-gated GC sweep first exports each
+  expired terminal run as a self-contained JSON document
+  (`dagron.run-archive.v1`: run + definition + task rows + outbox events),
+  written atomically (tmp → fsync → rename), and purges **only** the runs
+  whose export verifiably landed (`db::archivable_runs` +
+  `db::purge_runs_by_id`, both backends). A failed write keeps the run in the
+  hot store; re-archiving after a crash is idempotent. Unset, GC behaves
+  exactly as before.
+- **Per-class backlog gauges + stale-ready alert** — `/metrics` now exposes
+  `scheduler_ready_tasks_by_class{runner_class=…}` and
+  `scheduler_ready_oldest_age_seconds{runner_class=…}`, and a leadership-gated
+  loop WARNs when a class's oldest ready task waits longer than
+  `READY_AGE_ALERT_SECS` (default 300 s; `0` disables;
+  `READY_AGE_CHECK_INTERVAL_SECS` tunes the cadence). Catches the
+  segmentation footgun where every scheduler's `RUNNER_CLASSES` excludes a
+  class and its tasks age silently.
+
+### Fixed
+- **Approval-gate timeouts in lean builds** — `db::resolve_approval` /
+  `db::resolve_expired_approvals` were `ops`-gated while the reconcile loop
+  calls the sweep unconditionally, so an engine built without the `ops`
+  feature failed to compile (and, conceptually, a lean engine would never
+  fail-safe an expired gate). Both are now available in every build.
+- **SDKs cover the 0.3.0 API.** The Python SDK (`dagron` 0.3.0) gains `approve_task`
+  / `reject_task` for `type: approval` gates, the durable backfill-job methods
+  (`create_backfill` / `list_backfills` / `get_backfill` / `cancel_backfill` over
+  `/api/backfills`), and an optional `path` on `connect_git_repo`. The TypeScript
+  SDK (`@dagron/sdk` 0.3.0) gains a full `Client` class (it previously shipped only
+  the `Dag` builder) mirroring the Python client's whole surface, including the same
+  new 0.3.0 methods and an SSE `streamRun` / `waitForRun`. (The TS package version
+  jumps `0.1.1 → 0.3.0`, skipping `0.2.0`, to line up with the dagron-api / Python
+  SDK version — no `0.2.0` TS release was lost.)
+
 ## [0.3.0] - 2026-07-08
 
 ### Added

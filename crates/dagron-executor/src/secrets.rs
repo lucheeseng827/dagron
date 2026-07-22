@@ -52,7 +52,10 @@ pub fn resolve(env: &[EnvVar]) -> Result<Vec<EnvVar>> {
 }
 
 /// Look up one secret by name from the process env or the secrets dir.
-fn lookup(name: &str) -> Result<String> {
+/// Resolve one secret name from the process environment (`DAGRON_SECRET_<NAME>`)
+/// or the secrets dir. Public so the engine can use it as the fallback tier
+/// behind the DB-backed environment secret store.
+pub fn lookup(name: &str) -> Result<String> {
     let env_key = format!(
         "DAGRON_SECRET_{}",
         name.to_uppercase()

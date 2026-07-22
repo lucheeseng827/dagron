@@ -30,7 +30,10 @@ submit workflows, watch runs stream, inspect the DAG, and read task logs.
 ## Why dagron
 
 - **Lightweight** — a Rust binary, no Python/Celery/etc. to operate.
-- **Declarative & GitOps-friendly** — workflows are plain YAML you can version.
+- **Declarative & GitOps-friendly** — workflows are plain YAML you can version;
+  deploy them from Git with Argo CD via a workflows ApplicationSet
+  ([`docs/GITOPS_ARGOCD.md`](docs/GITOPS_ARGOCD.md), runnable demo in
+  [`examples/gitops/`](examples/gitops/)).
 - **Pluggable** — two small traits are the whole extension surface:
   - [`Executor`](crates/dagron-executor/src/executor.rs) — *how a task runs*
     (ships `LocalExecutor` subprocesses, plus Docker and Kubernetes backends
@@ -194,8 +197,101 @@ tasks:
   - { name: build, command: ["make"] }
 ```
 
+Operator notifications ride the same `notify:` block: a **Slack incoming
+webhook** (`notify.slack`, fires on `failed` + `deadline_exceeded` by default)
+and a **generic JSON webhook** (`notify.webhook`, fires on every outcome by
+default). Both accept an `on:` list (`succeeded` / `failed` / `cancelled` /
+`deadline_exceeded`) to widen or narrow that, template `{{ param }}`s in their
+URLs, and are best-effort — a notification target being down never affects run
+execution:
+
+```yaml
+notify:
+  slack:
+    webhook_url: "{{ slack_webhook }}"     # incidents only, by default
+  webhook:
+    url: https://ops.example.com/hooks/dagron
+    on: [failed, deadline_exceeded]
+```
+
+Instance-wide defaults for both targets can also be configured in the UI
+(sidebar → **Notifications**, stored via `PUT /api/settings/notifications`):
+the engine applies them to every run *in addition to* per-workflow `notify:`
+blocks, skipping any URL a spec already fired so nothing notifies twice.
+
 A workflow's latest run status is also available as an embeddable SVG badge at
 `GET /api/badges/<workflow-name>` (public, status label only).
+
+### Environments: variables + secrets per deployment target
+
+A workflow pins a named **environment** (managed in the UI under
+*Environments*, or via `/api/environments`) and one spec runs against staging
+or prod by changing a single line. Variables template as `{{ env.NAME }}`;
+secrets are **write-only** (stored AES-256-GCM-encrypted under
+`DAGRON_ENV_SECRET_KEY`, shared by dagron-api and the engine) and resolve via
+the existing `value_from` seam at dispatch — falling back to
+`DAGRON_SECRET_*` / `DAGRON_SECRETS_DIR`, so SOPS/External-Secrets setups
+keep working unchanged:
+
+```yaml
+name: etl
+environment: prod            # {{ env.* }} + secrets come from here
+tasks:
+  - name: load
+    command: ["etl", "--bucket", "{{ env.BUCKET }}"]
+    env:
+      - { name: DB_PASSWORD, value_from: { secret: DB_PASSWORD } }
+```
+
+### Less repetition: `task_defaults`
+
+Declared once, merged into every task (a task wins by setting its own value;
+default `env` vars are prepended so same-named task vars shadow them):
+
+```yaml
+task_defaults:
+  max_attempts: 3
+  retry_delay_secs: 10
+  timeout_secs: 300
+  docker_image: etl-base:1.4
+tasks:
+  - { name: extract, command: ["extract"] }        # inherits all defaults
+  - { name: load, command: ["load"], max_attempts: 1 }  # overrides retries
+```
+
+Combined with `templates` (reusable sub-DAGs) and `workflow_ref` (chaining
+saved workflows), most copy-paste between tasks and workflows disappears.
+
+### Branching and loops
+
+Two `when:` flavors, told apart by what the condition references. A condition
+over parameters is decided at run creation (false ⇒ the task never exists —
+the recursive-template base case). A condition referencing an upstream task's
+**output** is evaluated by the engine when the task becomes ready, so a check
+task's *result* branches the DAG at runtime; the referenced task must be in
+`depends_on`:
+
+```yaml
+tasks:
+  - { name: check, command: ["decide-deploy"] }        # prints "go" or "hold"
+  - name: deploy
+    command: ["ship"]
+    depends_on: [check]
+    when: "{{ tasks.check.output }} == go"             # false ⇒ skipped
+```
+
+The `repeat:` loop operator re-runs a task until a condition on its own
+output holds (`{{ output }}`, `{{ attempt }}` are bound) — the
+poll-until-done pattern, bounded so it can never wedge a run:
+
+```yaml
+  - name: wait-for-export
+    command: ["check-export-status"]                    # prints "done" when ready
+    repeat: { until: "{{ output }} == done", max_iterations: 60, delay_secs: 30 }
+```
+
+Exhausting `max_iterations` **fails** the task (a condition that never came
+true is an error, not a success).
 
 ### Call it as a durable function
 

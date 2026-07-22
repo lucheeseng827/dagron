@@ -286,10 +286,58 @@ pub async fn run_workflow(
     // Resolve any `workflow_ref` chains (this workflow calling other saved
     // workflows) into one flat DAG before the run is created.
     let expanded = crate::expand::expand_workflow_refs(&state, spec).await?;
-    let run_id = control::create_run(&state, &expanded, &spec_yaml)
+    let prepared = control::prepare_spec(&state, expanded).await?;
+    let run_id = control::create_run(&state, &prepared, &spec_yaml)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
     Ok(Json(serde_json::json!({ "run_id": run_id, "workflow_id": id })))
+}
+
+#[derive(Deserialize)]
+pub struct WorkflowRunsParams {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// `GET /api/workflows/:id/runs?limit=&offset=` — this workflow's run history,
+/// newest first. Runs are matched by definition **name** — the only linkage
+/// that exists: each run snapshots its own `workflow_definitions` row (a fresh
+/// id per run), so there is no FK from runs to the `workflows` table, and the
+/// list digest in `list_workflows` uses the same name rule. Consequence: a
+/// renamed workflow starts a fresh history (documented in API.md).
+/// Backs the read-oriented workflow detail page.
+pub async fn workflow_runs(
+    _auth: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<WorkflowRunsParams>,
+) -> Result<Json<Vec<crate::routes::runs::RunSummary>>, (StatusCode, String)> {
+    let name: Option<String> = sqlx::query_scalar("SELECT name FROM workflows WHERE id = $1")
+        .bind(&id)
+        .fetch_optional(&state.read_pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    let name = name.ok_or((StatusCode::NOT_FOUND, format!("workflow '{id}' not found")))?;
+
+    let limit = params.limit.unwrap_or(50).clamp(1, 500);
+    let offset = params.offset.unwrap_or(0).max(0);
+    let rows = sqlx::query_as::<_, crate::routes::runs::RunSummary>(&format!(
+        "{}
+         WHERE d.name = $1
+         ORDER BY wr.created_at DESC
+         LIMIT $2 OFFSET $3",
+        crate::routes::runs::SUMMARY_SELECT
+    ))
+    .bind(&name)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.read_pool)
+    .await
+    .map_err(|e| {
+        tracing::error!(error = ?e, "workflow runs query failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+    })?;
+    Ok(Json(rows))
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────

@@ -551,6 +551,11 @@ pub(crate) struct TaskSpecInput {
     pub(crate) timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) docker_image: Option<String>,
+    /// Runner-pool routing (engine `runner_class`): stamped on the task row so
+    /// a segmented scheduler (`RUNNER_CLASSES`) claims it. Falls back to the
+    /// spec-level class, then `"default"` — mirroring engine `create_run`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runner_class: Option<String>,
     /// Chain another **saved** workflow as this step. At run-creation dagron-api
     /// loads that workflow's spec and inlines its tasks in place of this one
     /// (see [`crate::expand`]). A task is either a leaf (`command`) or a call
@@ -568,6 +573,66 @@ pub(crate) struct TaskSpecInput {
     pub(crate) approval_timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) approval_on_timeout: Option<String>,
+    /// Environment variables (engine `env`): literal `value` or
+    /// `value_from: {secret: NAME}` resolved at dispatch (environment secret
+    /// store first, then process env / secrets dir).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) env: Vec<EnvVarInput>,
+    /// Conditional gate (engine `when`). On this path two forms are accepted:
+    /// a parameter condition (evaluated at submit — false drops the task, its
+    /// dependents proceed) or a runtime condition referencing
+    /// `{{ tasks.<dep>.output }}` (persisted; the engine evaluates it at
+    /// readiness so an upstream's result can branch the DAG).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) when: Option<String>,
+    /// Loop operator (engine `repeat`): re-run until `until` holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) repeat: Option<RepeatInput>,
+}
+
+/// Mirror of engine `dag::EnvVar` (same field names → same stored JSON).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct EnvVarInput {
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) value_from: Option<SecretRefInput>,
+}
+
+/// Mirror of engine `dag::SecretRef`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct SecretRefInput {
+    pub(crate) secret: String,
+}
+
+/// Mirror of engine `dag::RepeatSpec`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct RepeatInput {
+    pub(crate) until: String,
+    pub(crate) max_iterations: u32,
+    #[serde(default)]
+    pub(crate) delay_secs: u64,
+}
+
+/// Mirror of engine `dag::TaskDefaults` (the DRY block): fields set here fill
+/// every task that doesn't override them, exactly like the engine-side merge.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct TaskDefaultsInput {
+    #[serde(default)]
+    pub(crate) max_attempts: Option<u32>,
+    #[serde(default)]
+    pub(crate) retry_delay_secs: Option<u64>,
+    #[serde(default)]
+    pub(crate) retry_max_delay_secs: Option<u64>,
+    #[serde(default)]
+    pub(crate) timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub(crate) docker_image: Option<String>,
+    #[serde(default)]
+    pub(crate) runner_class: Option<String>,
+    #[serde(default)]
+    pub(crate) env: Vec<EnvVarInput>,
 }
 
 impl TaskSpecInput {
@@ -595,6 +660,23 @@ pub(crate) struct DagSpecInput {
     /// real task.
     #[serde(default)]
     pub(crate) result_from: Option<String>,
+    /// Template parameters: `{{ name }}` references in task commands /
+    /// docker_image / env values / when conditions are substituted at submit.
+    #[serde(default)]
+    pub(crate) parameters: std::collections::BTreeMap<String, String>,
+    /// Named environment (variable set + secrets): its variables join the
+    /// substitution scope as `{{ env.NAME }}`, its name is stamped on the run
+    /// so the engine resolves its secrets at dispatch. Unknown = 400.
+    #[serde(default)]
+    pub(crate) environment: Option<String>,
+    /// Workflow-wide task defaults (the DRY block), merged into every task at
+    /// submit — a task wins by setting its own value.
+    #[serde(default)]
+    pub(crate) task_defaults: Option<TaskDefaultsInput>,
+    /// Spec-level runner class (engine `DagSpec::runner_class`): the fallback
+    /// for tasks that don't set their own, applied at run creation.
+    #[serde(default)]
+    pub(crate) runner_class: Option<String>,
     pub(crate) tasks: Vec<TaskSpecInput>,
 }
 
@@ -611,6 +693,11 @@ pub(crate) fn parse_and_validate(yaml: &str) -> Result<DagSpecInput, (StatusCode
             format!("invalid run_timeout_secs=0 in DAG '{}'; expected >= 1 (or omit)", spec.name),
         ));
     }
+    if let Some(class) = &spec.runner_class {
+        validate_runner_class(class).map_err(|e| {
+            (StatusCode::BAD_REQUEST, format!("invalid runner_class in DAG '{}': {e}", spec.name))
+        })?;
+    }
     if let Some(rf) = &spec.result_from {
         if !spec.tasks.iter().any(|t| &t.name == rf) {
             return Err((
@@ -621,6 +708,24 @@ pub(crate) fn parse_and_validate(yaml: &str) -> Result<DagSpecInput, (StatusCode
     }
     validate_graph(&spec.name, &spec.tasks)?;
     Ok(spec)
+}
+
+/// Runner-class validation, mirroring core `dag::validate_runner_class`
+/// (dagron-api cannot depend on dagron-core — see `src/tmpl.rs` for why):
+/// lowercase `[a-z0-9_-]`, 1–64 chars, and not the reserved `"other"` (the
+/// metrics tail bucket).
+fn validate_runner_class(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 64 {
+        return Err(format!("runner_class must be 1-64 characters, got {} ('{name}')", name.len()));
+    }
+    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-'))
+    {
+        return Err(format!("runner_class '{name}' may only contain [a-z0-9_-]"));
+    }
+    if name == "other" {
+        return Err("runner_class 'other' is reserved (it is the metrics tail bucket)".to_string());
+    }
+    Ok(())
 }
 
 /// Structural DAG validation: every task is a leaf or a chain (not both/neither),
@@ -646,6 +751,48 @@ pub(crate) fn validate_graph(
                     StatusCode::BAD_REQUEST,
                     format!("task '{}' has invalid trigger_rule '{rule}' (expected one of {TRIGGER_RULES:?})", t.name),
                 ));
+            }
+        }
+        // `repeat:` loop-operator validation (mirrors core from_spec).
+        if let Some(rep) = &t.repeat {
+            if rep.until.trim().is_empty() {
+                return Err((StatusCode::BAD_REQUEST, format!("task '{}' repeat.until is empty", t.name)));
+            }
+            if rep.max_iterations == 0 {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("task '{}' repeat.max_iterations must be >= 1", t.name),
+                ));
+            }
+            if t.is_approval() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("task '{}' cannot combine `repeat` with an approval gate", t.name),
+                ));
+            }
+        }
+        if let Some(class) = &t.runner_class {
+            validate_runner_class(class).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid runner_class for task '{}': {e}", t.name),
+                )
+            })?;
+        }
+        // A runtime `when` may only reference tasks it depends on — an output
+        // the gate is guaranteed to have when the engine evaluates readiness.
+        if let Some(cond) = &t.when {
+            for referenced in crate::tmpl::when_output_refs(cond) {
+                if !t.depends_on.contains(&referenced) {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "task '{}' when references '{{{{ tasks.{referenced}.output }}}}' but does \
+                             not depend on '{referenced}' — add it to depends_on",
+                            t.name
+                        ),
+                    ));
+                }
             }
         }
         // An approval gate (#19) is a command-less leaf that waits for a human, so
@@ -718,7 +865,8 @@ pub async fn submit_run(
 ) -> Result<(StatusCode, Json<SubmitResponse>), (StatusCode, String)> {
     let spec = parse_and_validate(&body.yaml)?;
     let expanded = crate::expand::expand_workflow_refs(&state, spec).await?;
-    let run_id = create_run(&state, &expanded, &body.yaml).await.map_err(|e| {
+    let prepared = prepare_spec(&state, expanded).await?;
+    let run_id = create_run(&state, &prepared, &body.yaml).await.map_err(|e| {
         tracing::error!(error = ?e, "create_run failed");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -751,11 +899,132 @@ pub async fn resubmit_run(
 
     let spec = parse_and_validate(&yaml)?;
     let expanded = crate::expand::expand_workflow_refs(&state, spec).await?;
-    let run_id = create_run(&state, &expanded, &yaml).await.map_err(|e| {
+    let prepared = prepare_spec(&state, expanded).await?;
+    let run_id = create_run(&state, &prepared, &yaml).await.map_err(|e| {
         tracing::error!(error = ?e, "resubmit create_run failed");
         (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())
     })?;
     Ok((StatusCode::CREATED, Json(SubmitResponse { run_id })))
+}
+
+/// Submit-time preparation, run after `workflow_ref` expansion and before
+/// [`create_run`]: merge `task_defaults` into every task, build the `{{ }}`
+/// substitution scope (spec `parameters` + the declared environment's
+/// variables as `env.*` keys), evaluate parameter-time `when:` conditions
+/// (false ⇒ the task is dropped and scrubbed from dependents' `depends_on`,
+/// so they proceed on their remaining deps — skip semantics), and substitute
+/// the scope into task fields. Runtime `when:` conditions (referencing
+/// `tasks.*.output`) survive verbatim for the engine.
+pub(crate) async fn prepare_spec(
+    state: &AppState,
+    mut spec: DagSpecInput,
+) -> Result<DagSpecInput, (StatusCode, String)> {
+    // task_defaults merge (same rules as engine expand::apply_task_defaults).
+    if let Some(d) = spec.task_defaults.take() {
+        for t in spec.tasks.iter_mut() {
+            if t.max_attempts == 1 {
+                if let Some(v) = d.max_attempts {
+                    t.max_attempts = v;
+                }
+            }
+            if t.retry_delay_secs == 0 {
+                if let Some(v) = d.retry_delay_secs {
+                    t.retry_delay_secs = v;
+                }
+            }
+            if t.retry_max_delay_secs.is_none() {
+                t.retry_max_delay_secs = d.retry_max_delay_secs;
+            }
+            if t.timeout_secs.is_none() {
+                t.timeout_secs = d.timeout_secs;
+            }
+            if t.docker_image.is_none() {
+                t.docker_image = d.docker_image.clone();
+            }
+            if t.runner_class.is_none() {
+                t.runner_class = d.runner_class.clone();
+            }
+            if !d.env.is_empty() {
+                let mut env = d.env.clone();
+                env.append(&mut t.env);
+                t.env = env;
+            }
+        }
+    }
+
+    // Substitution scope: parameters + `env.NAME` variables. A declared but
+    // unknown environment is a 400 — a spec pinned to prod must not silently
+    // run without prod's variables.
+    let mut ctx = spec.parameters.clone();
+    if let Some(env_name) = &spec.environment {
+        let vars: Option<String> =
+            sqlx::query_scalar("SELECT variables FROM environments WHERE name = $1")
+                .bind(env_name)
+                .fetch_optional(&state.read_pool)
+                .await
+                .map_err(internal_msg)?;
+        let Some(vars) = vars else {
+            return Err((StatusCode::BAD_REQUEST, format!("environment '{env_name}' not found")));
+        };
+        // Malformed variables fail as loudly as an unknown environment — a spec
+        // pinned to prod must not silently run without prod's variables.
+        let vars: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&vars).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("environment '{env_name}' has malformed variables: {e}"),
+                )
+            })?;
+        for (k, v) in vars {
+            ctx.insert(format!("env.{k}"), v);
+        }
+    }
+
+    // Parameter-time `when:`: decide task fate now; keep runtime gates.
+    let mut dropped: HashSet<String> = HashSet::new();
+    for t in spec.tasks.iter_mut() {
+        let Some(cond) = &t.when else { continue };
+        let resolved = crate::tmpl::substitute(cond, &ctx);
+        if crate::tmpl::when_output_refs(&resolved).is_empty() {
+            let keep = crate::tmpl::eval_when(&resolved).map_err(|e| {
+                (StatusCode::BAD_REQUEST, format!("task '{}' when: {e}", t.name))
+            })?;
+            if !keep {
+                dropped.insert(t.name.clone());
+            }
+            t.when = None; // consumed at submit
+        } else {
+            t.when = Some(resolved); // runtime gate, engine evaluates
+        }
+    }
+    if !dropped.is_empty() {
+        spec.tasks.retain(|t| !dropped.contains(&t.name));
+        for t in spec.tasks.iter_mut() {
+            t.depends_on.retain(|d| !dropped.contains(d));
+        }
+        // Re-validate: a surviving runtime `when` may reference a task that was
+        // just dropped (its dep got scrubbed above) — that gate could never be
+        // evaluated, so reject it at submit rather than strand the run.
+        validate_graph(&spec.name, &spec.tasks)?;
+    }
+
+    // Substitute the scope into task string fields (mirror of core build_leaf
+    // coverage for the fields this path models).
+    if !ctx.is_empty() {
+        for t in spec.tasks.iter_mut() {
+            t.command = t.command.iter().map(|a| crate::tmpl::substitute(a, &ctx)).collect();
+            t.docker_image = t.docker_image.as_ref().map(|s| crate::tmpl::substitute(s, &ctx));
+            t.runner_class = t.runner_class.as_ref().map(|s| crate::tmpl::substitute(s, &ctx));
+            for e in t.env.iter_mut() {
+                e.value = crate::tmpl::substitute(&e.value, &ctx);
+            }
+            if let Some(rep) = t.repeat.as_mut() {
+                rep.until = crate::tmpl::substitute(&rep.until, &ctx);
+            }
+        }
+    }
+
+    Ok(spec)
 }
 
 /// Insert definition + run + tasks + edges, mirroring engine `db::postgres::create_run`.
@@ -786,8 +1055,8 @@ pub(crate) async fn create_run(
     sqlx::query("INSERT INTO workflow_definitions (id, name, spec, created_at) VALUES ($1,$2,$3,$4)")
         .bind(&def_id).bind(&spec.name).bind(yaml).bind(&now)
         .execute(&mut *tx).await?;
-    sqlx::query("INSERT INTO workflow_runs (id, definition_id, status, created_at, deadline_at, result_from) VALUES ($1,$2,'running',$3,$4,$5)")
-        .bind(&run_id).bind(&def_id).bind(&now).bind(&deadline_at).bind(&spec.result_from)
+    sqlx::query("INSERT INTO workflow_runs (id, definition_id, status, created_at, deadline_at, result_from, environment) VALUES ($1,$2,'running',$3,$4,$5,$6)")
+        .bind(&run_id).bind(&def_id).bind(&now).bind(&deadline_at).bind(&spec.result_from).bind(&spec.environment)
         .execute(&mut *tx).await?;
 
     let mut ids: HashMap<String, String> = HashMap::new();
@@ -795,12 +1064,30 @@ pub(crate) async fn create_run(
         let task_id = Uuid::new_v4().to_string();
         let input_json = serde_json::to_string(t)?; // matches dag::TaskSpec shape
         let trigger_rule = t.trigger_rule.as_deref().unwrap_or("all_success");
+        // Approval gate (#19): the engine's advance_ready_tasks keys off the
+        // `is_approval` COLUMN (not the input JSON) to park a ready task in
+        // `awaiting_approval` instead of dispatching it. Engine create_run sets
+        // it; this API mirror must too, or a `type: approval` task submitted via
+        // POST /api/runs lands with is_approval=0 and the executor runs it as a
+        // command-less task ("empty command" failure). Timeout knobs pair with it.
+        let is_approval = i64::from(t.is_approval());
+        let approval_timeout = t.approval_timeout_secs.map(|s| s as i64);
+        let approval_on_timeout = t.approval_on_timeout.as_deref();
+        // Task → spec-level → 'default', mirroring engine create_run: the
+        // segmented claim path filters on this COLUMN, not the input JSON.
+        let runner_class = t
+            .runner_class
+            .as_deref()
+            .or(spec.runner_class.as_deref())
+            .unwrap_or("default");
         sqlx::query(
-            "INSERT INTO task_runs (id, run_id, name, status, remaining_deps, input, scheduled_at, trigger_rule)
-             VALUES ($1,$2,$3,'pending',$4,$5,$6,$7)",
+            "INSERT INTO task_runs (id, run_id, name, status, remaining_deps, input, scheduled_at, trigger_rule,
+                                    is_approval, approval_timeout_secs, approval_on_timeout, runner_class)
+             VALUES ($1,$2,$3,'pending',$4,$5,$6,$7,$8,$9,$10,$11)",
         )
         .bind(&task_id).bind(&run_id).bind(&t.name)
         .bind(indeg[t.name.as_str()]).bind(&input_json).bind(&now).bind(trigger_rule)
+        .bind(is_approval).bind(approval_timeout).bind(approval_on_timeout).bind(runner_class)
         .execute(&mut *tx).await?;
         ids.insert(t.name.clone(), task_id);
     }

@@ -22,7 +22,21 @@ pub struct RunSummary {
     /// Workflow/DAG name from the run's definition (LEFT JOIN; None if the
     /// definition row is missing). Surfaced as the "Workflow" column in the UI.
     pub name: Option<String>,
+    /// What started this run — derived, no schema change: a
+    /// `schedule_backfills` row claims it as a backfill, a stamped
+    /// `schedule_id` marks a cron fire, anything else was human-initiated.
+    pub trigger_kind: String,
 }
+
+/// SELECT list + joins shared by the run list and per-workflow runs: summary
+/// columns, the definition name, and the derived trigger kind.
+pub(crate) const SUMMARY_SELECT: &str = "SELECT wr.id, wr.definition_id, wr.status, wr.created_at, wr.finished_at, d.name,
+        CASE WHEN sb.run_id IS NOT NULL THEN 'backfill'
+             WHEN wr.schedule_id IS NOT NULL THEN 'schedule'
+             ELSE 'manual' END AS trigger_kind
+ FROM workflow_runs wr
+ LEFT JOIN workflow_definitions d ON d.id = wr.definition_id
+ LEFT JOIN schedule_backfills sb ON sb.run_id = wr.id";
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct TaskRow {
@@ -44,17 +58,26 @@ pub struct RunDetail {
     pub output: Option<String>,
     pub created_at: String,
     pub finished_at: Option<String>,
+    /// Workflow/DAG name from the run's definition (for the header + backlink).
+    pub name: Option<String>,
+    /// Derived trigger kind: manual | schedule | backfill.
+    pub trigger_kind: String,
     pub tasks: Vec<TaskRow>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ListParams {
     pub status: Option<String>,
+    /// Filter to one workflow's runs (definition name, exact match).
+    pub name: Option<String>,
+    /// Filter by trigger kind: manual | schedule | backfill.
+    pub trigger: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
 
-/// `GET /api/runs?status=&limit=&offset=` — most-recent-first run list.
+/// `GET /api/runs?status=&name=&trigger=&limit=&offset=` — most-recent-first
+/// run list with optional status / workflow-name / trigger filters.
 pub async fn list_runs(
     _auth: AuthUser,
     State(state): State<AppState>,
@@ -63,17 +86,22 @@ pub async fn list_runs(
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let offset = params.offset.unwrap_or(0).max(0);
 
-    // Bind status as an optional filter: when None, the `$1 IS NULL` branch keeps
-    // every row, so one parameterized query serves both filtered and unfiltered.
-    let rows = sqlx::query_as::<_, RunSummary>(
-        "SELECT wr.id, wr.definition_id, wr.status, wr.created_at, wr.finished_at, d.name
-         FROM workflow_runs wr
-         LEFT JOIN workflow_definitions d ON d.id = wr.definition_id
+    // Bind each filter as optional: when None, the `$n IS NULL` branch keeps
+    // every row, so one parameterized query serves all filter combinations.
+    let rows = sqlx::query_as::<_, RunSummary>(&format!(
+        "{SUMMARY_SELECT}
          WHERE ($1::text IS NULL OR wr.status = $1)
+           AND ($2::text IS NULL OR d.name = $2)
+           AND ($3::text IS NULL OR
+                CASE WHEN sb.run_id IS NOT NULL THEN 'backfill'
+                     WHEN wr.schedule_id IS NOT NULL THEN 'schedule'
+                     ELSE 'manual' END = $3)
          ORDER BY wr.created_at DESC
-         LIMIT $2 OFFSET $3",
-    )
+         LIMIT $4 OFFSET $5"
+    ))
     .bind(&params.status)
+    .bind(&params.name)
+    .bind(&params.trigger)
     .bind(limit)
     .bind(offset)
     .fetch_all(&state.read_pool)
@@ -90,8 +118,15 @@ pub async fn get_run(
     Path(id): Path<String>,
 ) -> Result<Json<RunDetail>, StatusCode> {
     let run = sqlx::query_as::<_, RunSummaryFull>(
-        "SELECT id, definition_id, status, input, output, created_at, finished_at
-         FROM workflow_runs WHERE id = $1",
+        "SELECT wr.id, wr.definition_id, wr.status, wr.input, wr.output,
+                wr.created_at, wr.finished_at, d.name,
+                CASE WHEN sb.run_id IS NOT NULL THEN 'backfill'
+                     WHEN wr.schedule_id IS NOT NULL THEN 'schedule'
+                     ELSE 'manual' END AS trigger_kind
+         FROM workflow_runs wr
+         LEFT JOIN workflow_definitions d ON d.id = wr.definition_id
+         LEFT JOIN schedule_backfills sb ON sb.run_id = wr.id
+         WHERE wr.id = $1",
     )
     .bind(&id)
     .fetch_optional(&state.read_pool)
@@ -116,8 +151,39 @@ pub async fn get_run(
         output: run.output,
         created_at: run.created_at,
         finished_at: run.finished_at,
+        name: run.name,
+        trigger_kind: run.trigger_kind,
         tasks,
     }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct RunSpec {
+    /// The stored, un-expanded DAG YAML this run was created from.
+    pub yaml: String,
+    /// The workflow/DAG name from the definition row (if the column is set).
+    pub name: Option<String>,
+}
+
+/// `GET /api/runs/:id/spec` — the DAG spec (YAML) this run was created from, so
+/// the UI can pre-fill a "re-run with changes" editor. Read-only; mirrors the
+/// SELECT used by `resubmit_run`. 404 if the run (or its definition) is unknown.
+pub async fn get_run_spec(
+    _auth: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<RunSpec>, StatusCode> {
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT d.spec, d.name FROM workflow_runs r
+         JOIN workflow_definitions d ON d.id = r.definition_id
+         WHERE r.id = $1",
+    )
+    .bind(&id)
+    .fetch_optional(&state.read_pool)
+    .await
+    .map_err(internal)?;
+    let (yaml, name) = row.ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(RunSpec { yaml, name }))
 }
 
 #[derive(sqlx::FromRow)]
@@ -129,6 +195,8 @@ struct RunSummaryFull {
     output: Option<String>,
     created_at: String,
     finished_at: Option<String>,
+    name: Option<String>,
+    trigger_kind: String,
 }
 
 #[derive(Debug, Deserialize)]
