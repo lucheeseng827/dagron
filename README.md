@@ -8,11 +8,12 @@ binary, zero infrastructure to get started.
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/dagron-workflow)](https://artifacthub.io/packages/search?repo=dagron-workflow)
 
-**Status: pre-release** (crate `0.1.0`, `CHANGELOG.md` still *Unreleased* — no
-tagged version or published artifacts yet). Everything shown below — engine,
-API, UI stack — is built and runs locally today. dagron's bet is a lean trade:
-one static Rust binary, plain YAML, and a database as the only state — durable
-workflow orchestration with no control plane and no cluster to operate.
+**Status: released** — multi-arch images (`mancube/dagron-engine`, `-api`,
+`-frontend`) and an OCI Helm chart (`oci://registry-1.docker.io/mancube/dagron`,
+listed on [Artifact Hub](https://artifacthub.io/packages/search?repo=dagron-workflow))
+are published per tagged release. dagron's bet is a lean trade: one static Rust
+binary, plain YAML, and a database as the only state — durable workflow
+orchestration with no control plane and no cluster to operate.
 
 ## See it in action
 
@@ -31,10 +32,8 @@ submit workflows, watch runs stream, inspect the DAG, and read task logs.
 ## Why dagron
 
 - **Lightweight** — a Rust binary, no Python/Celery/etc. to operate.
-- **Declarative & GitOps-friendly** — workflows are plain YAML you can version;
-  deploy them from Git with Argo CD via a workflows ApplicationSet
-  ([`docs/GITOPS_ARGOCD.md`](docs/GITOPS_ARGOCD.md), runnable demo in
-  [`examples/gitops/`](examples/gitops/)).
+- **Declarative & GitOps-friendly** — workflows are plain YAML you can version
+  and sync from Git (runnable demo in [`examples/gitops/`](examples/gitops/)).
 - **Pluggable** — two small traits are the whole extension surface:
   - [`Executor`](crates/dagron-executor/src/executor.rs) — *how a task runs*
     (ships `LocalExecutor` subprocesses, plus Docker and Kubernetes backends
@@ -46,6 +45,10 @@ submit workflows, watch runs stream, inspect the DAG, and read task logs.
   feature to `postgres` for multi-node.
 
 ## Quick start
+
+> **New here?** The [**how-to guide**](docs/HOWTO.md) has copy-paste recipes:
+> start a workflow via the CLI and via REST, chain one workflow from another,
+> monitor runs, and wire secrets/environment variables.
 
 **Option A — the full stack with UI** (needs podman or docker; ~a few minutes
 on first build):
@@ -391,15 +394,6 @@ positional arg, Cargo feature and config file in one table.
 [`docs/API.md`](docs/API.md) — both HTTP surfaces, endpoint by endpoint.
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — deploy, upgrade, backup per
 backend, monitoring, security posture, symptom-first troubleshooting.
-
-## License & extensibility
-
-dagron is licensed under **Apache-2.0** (see [LICENSE](LICENSE)) — you can run it
-on your own hardware, indefinitely and for free. The engine is built around
-extension seams (`Seams`): identity, ingestion sources, and run-lifecycle hooks
-are traits, so additional backends (SSO, queue sources, automatic
-backfill/self-healing) can plug in behind the same interfaces without forking the
-core.
 
 ## Contributing
 

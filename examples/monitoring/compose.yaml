@@ -1,0 +1,56 @@
+# Monitoring stack for dagron: Prometheus scrapes the engine's /metrics and
+# Grafana renders the bundled dashboard. Run the root dagron stack first
+# (`docker compose up` in the module root) — this joins its network and scrapes
+# the engine by service name.
+#
+#   docker compose up            # in rust_modules/lab/module_54 (the engine)
+#   docker compose -f examples/monitoring/compose.yaml up   # this stack
+#
+# Grafana: http://localhost:3001 (admin / admin, change on first login or via env).
+# Prometheus: http://localhost:9090
+name: dagron-monitoring
+
+services:
+  prometheus:
+    image: docker.io/prom/prometheus:v2.54.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    networks:
+      - dagron
+      - default
+
+  grafana:
+    image: docker.io/grafana/grafana:11.2.0
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"      # read-only viewing without login (local dev)
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3001:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus-data: {}
+  grafana-data: {}
+
+networks:
+  # The network the root dagron compose stack (project name `dagron-ui`) creates.
+  # `docker compose up` there must be running first. Rename if your project name
+  # differs (`docker network ls` to check).
+  dagron:
+    external: true
+    name: dagron-ui_default
+  default: {}

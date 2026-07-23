@@ -1,0 +1,170 @@
+{
+  "uid": "dagron-overview",
+  "title": "dagron — overview",
+  "tags": ["dagron"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Uptime",
+      "datasource": { "type": "prometheus", "uid": "dagron-prom" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "scheduler_uptime_seconds" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Runs created /s",
+      "datasource": { "type": "prometheus", "uid": "dagron-prom" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "decimals": 2 }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "rate(scheduler_runs_created_total[5m])" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Tasks succeeded /s",
+      "datasource": { "type": "prometheus", "uid": "dagron-prom" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "decimals": 2 }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "rate(scheduler_tasks_succeeded_total[5m])" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Dead letters (parked)",
+      "datasource": { "type": "prometheus", "uid": "dagron-prom" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "scheduler_dead_letters" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Runs by status",
+      "datasource": { "type": "prometheus", "uid": "dagron-prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 20, "stacking": { "mode": "normal" } } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "scheduler_runs", "legendFormat": "{{status}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Tasks by status",
+      "datasource": { "type": "prometheus", "uid": "dagron-prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 20, "stacking": { "mode": "normal" } } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "scheduler_tasks", "legendFormat": "{{status}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Task throughput (/s)",
+      "datasource": { "type": "prometheus", "uid": "dagron-prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "rate(scheduler_tasks_dispatched_total[5m])", "legendFormat": "dispatched" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "rate(scheduler_tasks_succeeded_total[5m])", "legendFormat": "succeeded" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "rate(scheduler_tasks_failed_total[5m])", "legendFormat": "failed" },
+        { "refId": "D", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "rate(scheduler_tasks_retried_total[5m])", "legendFormat": "retried" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Run outcomes (/s)",
+      "datasource": { "type": "prometheus", "uid": "dagron-prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "rate(scheduler_runs_created_total[5m])", "legendFormat": "created" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "rate(scheduler_runs_deadline_exceeded_total[5m])", "legendFormat": "deadline exceeded" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "rate(scheduler_deadline_alerts_total[5m])", "legendFormat": "deadline alerts" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Task duration (claim→finish)",
+      "datasource": { "type": "prometheus", "uid": "dagron-prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 0 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "histogram_quantile(0.50, sum(rate(scheduler_task_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p50" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "histogram_quantile(0.95, sum(rate(scheduler_task_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "histogram_quantile(0.99, sum(rate(scheduler_task_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Reconcile tick duration",
+      "datasource": { "type": "prometheus", "uid": "dagron-prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 0 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "histogram_quantile(0.50, sum(rate(scheduler_reconcile_tick_seconds_bucket[5m])) by (le))", "legendFormat": "p50" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "histogram_quantile(0.95, sum(rate(scheduler_reconcile_tick_seconds_bucket[5m])) by (le))", "legendFormat": "p95" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "histogram_quantile(0.99, sum(rate(scheduler_reconcile_tick_seconds_bucket[5m])) by (le))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Backlog — queue depth & oldest ready age",
+      "datasource": { "type": "prometheus", "uid": "dagron-prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": [
+          { "matcher": { "id": "byFrameRefID", "options": "C" }, "properties": [ { "id": "unit", "value": "s" }, { "id": "custom.axisPlacement", "value": "right" } ] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "scheduler_queue_depth", "legendFormat": "queue depth (total)" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "scheduler_ready_tasks_by_class", "legendFormat": "ready: {{runner_class}}" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "max(scheduler_ready_oldest_age_seconds)", "legendFormat": "oldest ready age" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "DB connection pool",
+      "datasource": { "type": "prometheus", "uid": "dagron-prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "scheduler_db_pool_connections", "legendFormat": "open" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "scheduler_db_pool_in_use", "legendFormat": "in use" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "dagron-prom" }, "expr": "scheduler_db_pool_max", "legendFormat": "max" }
+      ]
+    }
+  ]
+}
