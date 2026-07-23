@@ -20,13 +20,15 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
-# ── Runtime: distroless node — only the standalone server + static assets ───────
-# Distroless (gcr.io/distroless/nodejs22-debian12) ships the node runtime and
-# nothing else: no shell, no package manager, no bundled global npm — which strips
-# the OS/npm CVEs a full node:*-slim image carries (perl, util-linux-extra, and
-# npm's own tar/sigstore/brace-expansion deps). The `:nonroot` tag runs as an
-# unprivileged user (uid 65532). ENTRYPOINT is already `node`, so CMD is the script.
-FROM gcr.io/distroless/nodejs22-debian12:nonroot AS runner
+# ── Runtime: Chainguard node — only the standalone server + static assets ───────
+# Distroless node runtime with a Wolfi base that is continuously rebuilt as
+# upstream security patches land — so it carries no shell, no package manager, no
+# bundled global npm, AND (unlike gcr.io/distroless/nodejs22-debian12, which lagged
+# on the openssl deb12u2 refresh and shipped a CRITICAL libssl3) it stays at zero
+# known CVEs. Runs as an unprivileged user (uid 65532); ENTRYPOINT is `node`, so
+# CMD is the script. `:latest` is a rolling tag — that is the point (auto-patched);
+# the app is node-version-agnostic (standalone JS + N-API sharp), verified running.
+FROM cgr.dev/chainguard/node:latest AS runner
 WORKDIR /app
 ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \

@@ -49,11 +49,21 @@ poll the tool in a loop instead of holding a long-lived stream.
 
 ## Run
 
+Build from source, or use the published OSS image (`mancube/dagron-mcp`,
+multi-arch, distroless — the same open server, containerized):
+
 ```sh
-cargo run -p dagron-mcp        # speaks JSON-RPC over stdio
+cargo run -p dagron-mcp        # from source; speaks JSON-RPC over stdio
+
+# or the published image (stdio over `docker run -i`)
+docker run -i --rm \
+  -e DAGRON_API_URL=http://host.docker.internal:8080 \
+  -e DAGRON_MCP_TOKEN=<session-jwt> \
+  mancube/dagron-mcp
 ```
 
-Register it with an MCP client (example `mcpServers` entry):
+Register it with an MCP client — either the binary or the image (example
+`mcpServers` entries):
 
 ```json
 {
@@ -62,6 +72,16 @@ Register it with an MCP client (example `mcpServers` entry):
       "command": "dagron-mcp",
       "env": {
         "DAGRON_API_URL": "http://localhost:8080",
+        "DAGRON_MCP_TOKEN": "<session-jwt>"
+      }
+    },
+    "dagron-docker": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm",
+               "-e", "DAGRON_API_URL", "-e", "DAGRON_MCP_TOKEN",
+               "mancube/dagron-mcp"],
+      "env": {
+        "DAGRON_API_URL": "http://host.docker.internal:8080",
         "DAGRON_MCP_TOKEN": "<session-jwt>"
       }
     }

@@ -67,6 +67,10 @@ jobs:
             context: "./frontend"
             file: "./frontend/Dockerfile"
             build_args: ""
+          - name: dagron-mcp
+            context: "."
+            file: "./crates/dagron-mcp/Dockerfile"
+            build_args: ""
         arch: [amd64, arm64]
         # `arch` is a real matrix axis, so these includes attach the platform +
         # runner to each (image × arch) combination rather than adding new legs.
@@ -126,7 +130,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [dagron-engine, dagron-api, dagron-frontend]
+        image: [dagron-engine, dagron-api, dagron-frontend, dagron-mcp]
     steps:
       - name: Collect this image's per-arch digests
         uses: actions/download-artifact@v4

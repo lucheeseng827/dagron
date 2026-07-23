@@ -15,7 +15,7 @@
 # `repositoryID` + owner email are intentionally left blank in the public repo
 # (avoid publishing a personal email). Fill both locally right before the
 # one-time `oras push` — the email must match your Artifact Hub account.
-repositoryID: ""
+repositoryID: e35ce735-3a91-475a-8545-8639c3337974
 owners:
   - name: lucheeseng827
-    email: ""
+    email: lu.cheeseng827@gmail.com
