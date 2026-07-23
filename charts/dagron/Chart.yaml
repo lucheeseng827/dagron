@@ -5,10 +5,70 @@ description: |
   UI gateway, the Next.js frontend, and a throwaway in-cluster Postgres for testing.
   Runs on kind/k3d/k3s/EKS.
 type: application
-version: 0.3.0
-# appVersion tracks the dagron image; override images via values.yaml.
-appVersion: "0.3.0"
+# version / appVersion are overwritten with the release tag at package time
+# (helm package --version/--app-version), so the OCI artifact is always stamped;
+# these defaults just keep a `helm package` from the source tree sane.
+version: 0.4.0
+appVersion: "0.4.0"
+kubeVersion: ">=1.24.0-0"
+home: https://github.com/lucheeseng827/dagron
+sources:
+  - https://github.com/lucheeseng827/dagron
+icon: https://raw.githubusercontent.com/lucheeseng827/dagron/main/frontend/src/app/icon.svg
 keywords:
   - dagron
   - workflow
   - dag
+  - orchestration
+  - scheduler
+  - pipelines
+maintainers:
+  - name: lucheeseng827
+    url: https://github.com/lucheeseng827
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/prerelease: "false"
+  artifacthub.io/category: integration-delivery
+  artifacthub.io/links: |
+    - name: source
+      url: https://github.com/lucheeseng827/dagron
+    - name: changelog
+      url: https://github.com/lucheeseng827/dagron/blob/main/CHANGELOG.md
+    - name: container images
+      url: https://hub.docker.com/r/mancube/dagron-engine
+  # Image tags are kept in lockstep with the chart version at package time
+  # (docker.yml stamps `mancube/dagron-*:<ver>` here to $V). postgres is the
+  # throwaway in-cluster test DB — whitelisted so it is not tracked for updates.
+  artifacthub.io/images: |
+    - name: engine
+      image: mancube/dagron-engine:0.4.0
+      platforms:
+        - linux/amd64
+        - linux/arm64
+    - name: api
+      image: mancube/dagron-api:0.4.0
+      platforms:
+        - linux/amd64
+        - linux/arm64
+    - name: frontend
+      image: mancube/dagron-frontend:0.4.0
+      platforms:
+        - linux/amd64
+        - linux/arm64
+    - name: postgres-test
+      image: postgres:16-alpine
+      whitelisted: true
+      platforms:
+        - linux/amd64
+        - linux/arm64
+  artifacthub.io/screenshots: |
+    - title: Overview
+      url: https://raw.githubusercontent.com/lucheeseng827/dagron/main/docs/images/overview.png
+    - title: Run graph (DAG)
+      url: https://raw.githubusercontent.com/lucheeseng827/dagron/main/docs/images/run-graph.png
+    - title: Workflows
+      url: https://raw.githubusercontent.com/lucheeseng827/dagron/main/docs/images/workflows.png
+    - title: Runs
+      url: https://raw.githubusercontent.com/lucheeseng827/dagron/main/docs/images/runs.png
+    - title: Metrics
+      url: https://raw.githubusercontent.com/lucheeseng827/dagron/main/docs/images/metrics.png

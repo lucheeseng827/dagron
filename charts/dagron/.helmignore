@@ -3,3 +3,6 @@
 *.bak
 *.orig
 .DS_Store
+# Artifact Hub repo-ownership metadata — published to the OCI registry
+# separately via `oras push`, never bundled into the chart package.
+artifacthub-repo.yml

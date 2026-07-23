@@ -1,0 +1,21 @@
+# Artifact Hub repository metadata (ownership / Verified Publisher claim).
+#
+# This file is NOT part of the chart package (see .helmignore). For an OCI
+# registry it is published separately, once, alongside the chart repo:
+#
+#   oras push registry-1.docker.io/mancube/dagron:artifacthub.io \
+#     artifacthub-repo.yml:application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml
+#
+# Steps:
+#   1. Add the repo on Artifact Hub with URL
+#      oci://registry-1.docker.io/mancube/dagron
+#   2. Copy the repository ID it assigns into `repositoryID` below.
+#   3. Run the oras push above (Helm >= 3.8 environment with oras installed).
+#
+# `repositoryID` + owner email are intentionally left blank in the public repo
+# (avoid publishing a personal email). Fill both locally right before the
+# one-time `oras push` — the email must match your Artifact Hub account.
+repositoryID: ""
+owners:
+  - name: lucheeseng827
+    email: ""

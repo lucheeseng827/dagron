@@ -190,6 +190,14 @@ jobs:
           else
             V="${GITHUB_REF_NAME#v}"   # refs/tags/v0.3.0 -> 0.3.0
           fi
+          V="${V#v}"   # normalize a leading v (workflow_dispatch input may include one)
+          # $V is interpolated into sed replacements below (values.yaml, Chart.yaml);
+          # reject anything that isn't a plain semver so a stray `&`/`\`/typo can't
+          # corrupt the substitution instead of failing loudly here.
+          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::not a valid semver: $V"
+            exit 1
+          fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "chart version $V"
 
@@ -206,6 +214,11 @@ jobs:
           # vX.Y.Z chart pulls vX.Y.Z images (not a stale tag).
           sed -i -E "s#^([[:space:]]*image: [^[:space:]]+/dagron-[a-z]+:).*#\1${V}#" \
             charts/dagron/values.yaml
+          # Same lockstep for the Artifact Hub `artifacthub.io/images` annotation
+          # tags in Chart.yaml (mancube/dagron-<name>:<semver> -> $V), so the
+          # listed images match the release.
+          sed -i -E "s#(mancube/dagron-[a-z]+:)[0-9]+\.[0-9]+\.[0-9]+#\1${V}#g" \
+            charts/dagron/Chart.yaml
           helm package charts/dagron --version "$V" --app-version "$V" -d dist
           # Seatbelt: refuse to publish if a closed operator/CRD manifest is present.
           if tar -tzf "dist/dagron-$V.tgz" | grep -E 'templates/operator\.yaml|/crds/'; then
