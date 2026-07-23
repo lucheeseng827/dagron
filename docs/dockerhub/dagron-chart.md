@@ -6,18 +6,18 @@ A Helm chart published as an **OCI artifact**. It wires the three dagron images 
 
 - **Artifact:** `oci://registry-1.docker.io/mancube/dagron`
 - **Deploys:** engine · dagron-api · frontend · (optional) Postgres
-- **Source / full docs:** github.com/lucheeseng827/dagron · Apache-2.0
+- **Website:** dagron.dev · **Source / full docs:** github.com/lucheeseng827/dagron · Apache-2.0
 
 ## Versions
 
 | Version | Notes |
 |---|---|
-| `0.3.0` | pulls the `0.3.0` images |
+| `0.4.3` | pulls the `0.4.3` images |
 
 ## Install
 
 ```bash
-helm install dagron oci://registry-1.docker.io/mancube/dagron --version 0.3.0 \
+helm install dagron oci://registry-1.docker.io/mancube/dagron --version 0.4.3 \
   -n dagron --create-namespace \
   --set ingress.enabled=true --set-string ingress.host='dagron.your-host.example.com' \
   --set ingress.tls.enabled=true --set-string ingress.tls.secretName='dagron-tls' \
@@ -28,15 +28,15 @@ helm install dagron oci://registry-1.docker.io/mancube/dagron --version 0.3.0 \
 Inspect first:
 
 ```bash
-helm show values oci://registry-1.docker.io/mancube/dagron --version 0.3.0
-helm template dagron oci://registry-1.docker.io/mancube/dagron --version 0.3.0   # render without installing
+helm show values oci://registry-1.docker.io/mancube/dagron --version 0.4.3
+helm template dagron oci://registry-1.docker.io/mancube/dagron --version 0.4.3   # render without installing
 ```
 
 ## Common values
 
 | Value | Meaning |
 |---|---|
-| `engine.image` / `dagronApi.image` / `frontend.image` | image refs (default the matching `0.3.0` tags). |
+| `engine.image` / `dagronApi.image` / `frontend.image` | image refs (default the matching `0.4.3` tags). |
 | `dagronApi.jwtSecret` | **required** — session-cookie signing key (≥32 chars). |
 | `dagronApi.admin.{email,password,name}` | bootstrap admin user. |
 | `ingress.*` | host + TLS for the console. |

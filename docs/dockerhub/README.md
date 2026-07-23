@@ -49,6 +49,7 @@ along that path.
 | [`mancube/dagron-engine`](https://hub.docker.com/r/mancube/dagron-engine) | [`dagron-engine.md`](./dagron-engine.md) | the workflow/DAG engine |
 | [`mancube/dagron-api`](https://hub.docker.com/r/mancube/dagron-api) | [`dagron-api.md`](./dagron-api.md) | auth + management API |
 | [`mancube/dagron-frontend`](https://hub.docker.com/r/mancube/dagron-frontend) | [`dagron-frontend.md`](./dagron-frontend.md) | Next.js operator console |
+| [`mancube/dagron-mcp`](https://hub.docker.com/r/mancube/dagron-mcp) | [`dagron-mcp.md`](./dagron-mcp.md) | MCP server (drive dagron from an AI agent) |
 | `oci://registry-1.docker.io/mancube/dagron` | [`dagron-chart.md`](./dagron-chart.md) | Helm chart (the full stack) |
 
-All three images are published **`linux/amd64` + `linux/arm64`** at `0.3.0` + `latest`.
+All four images are published **`linux/amd64` + `linux/arm64`** at `0.4.3` + `latest`.

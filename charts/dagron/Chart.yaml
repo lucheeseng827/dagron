@@ -11,7 +11,7 @@ type: application
 version: 0.4.0
 appVersion: "0.4.0"
 kubeVersion: ">=1.24.0-0"
-home: https://github.com/lucheeseng827/dagron
+home: https://dagron.dev
 sources:
   - https://github.com/lucheeseng827/dagron
 icon: https://raw.githubusercontent.com/lucheeseng827/dagron/main/frontend/src/app/icon.svg
@@ -30,6 +30,8 @@ annotations:
   artifacthub.io/prerelease: "false"
   artifacthub.io/category: integration-delivery
   artifacthub.io/links: |
+    - name: website
+      url: https://dagron.dev
     - name: source
       url: https://github.com/lucheeseng827/dagron
     - name: changelog
