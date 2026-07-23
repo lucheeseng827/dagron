@@ -20,8 +20,13 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
-# ── Runtime: only the standalone server + static assets ─────────────────────────
-FROM node:22-slim AS runner
+# ── Runtime: distroless node — only the standalone server + static assets ───────
+# Distroless (gcr.io/distroless/nodejs22-debian12) ships the node runtime and
+# nothing else: no shell, no package manager, no bundled global npm — which strips
+# the OS/npm CVEs a full node:*-slim image carries (perl, util-linux-extra, and
+# npm's own tar/sigstore/brace-expansion deps). The `:nonroot` tag runs as an
+# unprivileged user (uid 65532). ENTRYPOINT is already `node`, so CMD is the script.
+FROM gcr.io/distroless/nodejs22-debian12:nonroot AS runner
 WORKDIR /app
 ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \
@@ -34,6 +39,4 @@ COPY --from=builder /app/.next/static ./.next/static
 # Monaco runtime (public/monaco/vs, staged at build) ships and serves offline.
 COPY --from=builder /app/public ./public
 EXPOSE 3000
-# node:22-slim ships a non-root `node` user (uid 1000) — drop root before serving.
-USER node
-CMD ["node", "server.js"]
+CMD ["server.js"]
