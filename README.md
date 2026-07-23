@@ -6,6 +6,7 @@ succeed — concurrently, with retries and exponential backoff. Single static
 binary, zero infrastructure to get started.
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/dagron-workflow)](https://artifacthub.io/packages/search?repo=dagron-workflow)
 
 **Status: pre-release** (crate `0.1.0`, `CHANGELOG.md` still *Unreleased* — no
 tagged version or published artifacts yet). Everything shown below — engine,
