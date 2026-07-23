@@ -6,7 +6,12 @@ succeed — concurrently, with retries and exponential backoff. Single static
 binary, zero infrastructure to get started.
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/lucheeseng827/dagron?sort=semver)](https://github.com/lucheeseng827/dagron/releases)
+[![Build](https://img.shields.io/github/actions/workflow/status/lucheeseng827/dagron/docker.yml?label=images)](https://github.com/lucheeseng827/dagron/actions/workflows/docker.yml)
 [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/dagron-workflow)](https://artifacthub.io/packages/search?repo=dagron-workflow)
+[![Docker pulls](https://img.shields.io/docker/pulls/mancube/dagron-engine)](https://hub.docker.com/r/mancube/dagron-engine)
+[![Engine image size](https://img.shields.io/docker/image-size/mancube/dagron-engine?sort=semver&label=engine%20image)](https://hub.docker.com/r/mancube/dagron-engine)
+[![Platforms](https://img.shields.io/badge/platform-linux%2Famd64%20%7C%20arm64-informational)](https://hub.docker.com/r/mancube/dagron-engine)
 
 **Status: released** — multi-arch images (`mancube/dagron-engine`, `-api`,
 `-frontend`) and an OCI Helm chart (`oci://registry-1.docker.io/mancube/dagron`,

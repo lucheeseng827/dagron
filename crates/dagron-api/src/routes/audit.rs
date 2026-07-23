@@ -65,6 +65,65 @@ fn skip_audit(path: &str) -> bool {
     matches!(path, "/api/login" | "/api/logout")
 }
 
+// ── central audit sink (optional) ────────────────────────────────────────────
+// When `DAGRON_AUDIT_SINK_URL` is set, every recorded event is also forwarded to
+// a central audit sink so one tamper-evident log spans all services (the local
+// `audit_log` table then acts as a per-service buffer, and the sink is the
+// source of truth). Fire-and-forget: forwarding never adds latency to — or can
+// fail — the request being audited.
+
+#[cfg(feature = "enterprise")]
+struct AuditSink {
+    url: String,
+    token: Option<String>,
+    client: reqwest::Client,
+}
+
+/// Lazily resolve the sink config from the environment (once per process).
+#[cfg(feature = "enterprise")]
+fn audit_sink() -> Option<&'static AuditSink> {
+    use std::sync::OnceLock;
+    static SINK: OnceLock<Option<AuditSink>> = OnceLock::new();
+    SINK.get_or_init(|| {
+        let url = std::env::var("DAGRON_AUDIT_SINK_URL")
+            .ok()
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())?;
+        let token = std::env::var("DAGRON_AUDIT_SINK_TOKEN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        Some(AuditSink { url, token, client: reqwest::Client::new() })
+    })
+    .as_ref()
+}
+
+/// Best-effort forward of one event to the central sink. No-op if unconfigured.
+#[cfg(feature = "enterprise")]
+fn forward_audit(actor: &str, method: &str, path: &str, status: i64) {
+    let Some(sink) = audit_sink() else { return };
+    let body = serde_json::json!({
+        "actor": actor,
+        "actor_type": "dataplane",
+        "action": format!("{method} {path}"),
+        "target_type": "http",
+        "target_id": path,
+        "metadata": { "method": method, "path": path, "status": status, "source": "dagron-api" },
+    });
+    let url = format!("{}/audit/ingest", sink.url);
+    let client = sink.client.clone();
+    let token = sink.token.clone();
+    tokio::spawn(async move {
+        let mut req = client.post(&url).json(&body);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        if let Err(e) = req.send().await {
+            tracing::warn!(error = ?e, "audit forward failed");
+        }
+    });
+}
+
 /// Middleware: viewer read-only gate + success-audit for mutating requests.
 /// OSS builds: a pure passthrough (no RBAC enforcement, nothing recorded).
 ///
@@ -132,6 +191,8 @@ pub async fn audit_mutations(
             {
                 tracing::warn!(error = ?e, %path, "audit insert failed");
             }
+            // G4.5: also forward to the central audit sink (single source of truth).
+            forward_audit(&c.email, &method, &path, status);
         }
     }
 
@@ -182,5 +243,22 @@ pub async fn list_audit(
         tracing::error!(error = ?e, "audit query failed");
         (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
     })?;
+    // G4.3: reading the audit trail is itself an audited, accountable event (SOC 2
+    // CC7). Recorded after the fetch so it does not appear in this response.
+    let read_id = Uuid::new_v4().to_string();
+    let read_at = chrono::Utc::now().to_rfc3339();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO audit_log (id, at, user_email, method, path, status)
+         VALUES ($1,$2,$3,'GET','/api/audit',200)",
+    )
+    .bind(&read_id)
+    .bind(&read_at)
+    .bind(&claims.email)
+    .execute(&state.write_pool)
+    .await
+    {
+        tracing::warn!(error = ?e, "audit read-event insert failed");
+    }
+    forward_audit(&claims.email, "GET", "/api/audit", 200);
     Ok(Json(rows))
 }
