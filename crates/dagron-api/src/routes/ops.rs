@@ -210,7 +210,7 @@ pub async fn redrive_dead_letter(
     .ok_or((StatusCode::NOT_FOUND, format!("dead letter '{id}' not found")))?;
 
     // Validate the parked payload before claiming.
-    let spec = control::parse_and_validate(&dl.payload)?;
+    control::parse_and_validate(&dl.payload)?;
 
     // Claim by delete: only the caller that removes the row proceeds to create.
     let claimed = sqlx::query("DELETE FROM dead_letters WHERE id = $1")
@@ -226,12 +226,8 @@ pub async fn redrive_dead_letter(
         ));
     }
 
-    // Resolve any `workflow_ref` chains so redrive behaves exactly like submit.
-    let expanded = crate::expand::expand_workflow_refs(&state, spec).await?;
-    let prepared = control::prepare_spec(&state, expanded).await?;
-    let run_id = control::create_run(&state, &prepared, &dl.payload)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    // Same pipeline as submit, so a redriven payload behaves identically.
+    let run_id = control::submit_yaml(&state, &dl.payload, &dl.payload).await?;
     Ok(Json(RedriveResponse { run_id, redriven_from: id }))
 }
 

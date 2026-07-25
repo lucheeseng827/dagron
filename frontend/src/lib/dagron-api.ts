@@ -6,10 +6,13 @@ import type {
   ArchivedRunSummary,
   AuditEntry,
   BackfillView,
+  Dataset,
+  DatasetEvent,
   DayBucket,
   DeadLetter,
   EnvironmentView,
   GitRepo,
+  GitRepoList,
   GraphResponse,
   HealthResponse,
   MetricsResponse,
@@ -245,6 +248,16 @@ export const listArchivedRuns = (params?: {
 export const getArchivedRun = (id: string): Promise<ArchivedRunDoc> =>
   apiFetch(`/archive/runs/${encodeURIComponent(id)}`);
 
+// ── datasets (data-aware scheduling) ─────────────────────────────────────────
+/// The dataset registry, most recently updated first, each row carrying the
+/// workflows subscribed to it via `on_datasets:`.
+export const listDatasets = (limit = 100): Promise<Dataset[]> =>
+  apiFetch(`/datasets?limit=${limit}`);
+
+/// The append-only lineage ledger, newest first; `uri` scopes it to one dataset.
+export const listDatasetEvents = (uri?: string, limit = 100): Promise<DatasetEvent[]> =>
+  apiFetch(`/datasets/events?limit=${limit}${uri ? `&uri=${encodeURIComponent(uri)}` : ""}`);
+
 // ── workflows (first-class) ──────────────────────────────────────────────────
 export const listWorkflows = (): Promise<WorkflowRow[]> => apiFetch(`/workflows`);
 
@@ -399,7 +412,7 @@ export const globalSearch = (q: string, limit = 8): Promise<SearchResponse> =>
   apiFetch(`/search?q=${encodeURIComponent(q)}&limit=${limit}`);
 
 // ── GitOps repository registry ───────────────────────────────────────────────
-export const listGitRepos = (): Promise<GitRepo[]> => apiFetch(`/git-repos`);
+export const listGitRepos = (): Promise<GitRepoList> => apiFetch(`/git-repos`);
 
 export const connectGitRepo = (
   url: string,

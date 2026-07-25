@@ -1,0 +1,72 @@
+# Case study 04 — LLM content pipeline with human sign-off.
+#
+#   generate (LLM or offline stub) ─▶ review (type: approval) ─▶ publish
+#
+# The generate step is the durable-LLM-call pattern: its output file under the
+# run's artifacts doubles as the idempotency check, so a retry (or an engine
+# crash mid-run) never re-spends tokens. With ANTHROPIC_API_KEY set on the
+# engine it calls the Messages API; without it, a deterministic offline stub
+# keeps the study runnable anywhere. The approval gate parks the run until a
+# human approves/rejects via the API/UI (auto-reject after 10 minutes), and
+# `result_from` makes the whole run a durable function returning the published
+# copy. Walkthrough: README (approve via curl).
+name: llm_content_pipeline
+result_from: publish
+parameters:
+  topic: "the new streaming ingestion source"
+tasks:
+  - name: generate
+    timeout_secs: 120
+    max_attempts: 3
+    retry_delay_secs: 2
+    env:
+      - { name: PROMPT, value: "Write two crisp release-note bullets announcing {{ topic }}. Plain text bullets only." }
+    command:
+      - sh
+      - -c
+      # The cache check trusts only the FINAL artifact: generation lands in a
+      # same-directory temp file, is validated, then atomically renamed to
+      # $out — a crash mid-write can never leave a truncated draft that a
+      # retry would "cache-hit" and publish. The API path uses python3 for
+      # real JSON encoding/decoding (quotes/newlines in the prompt or the
+      # completion survive intact); the offline stub needs no python.
+      - |
+        set -eu
+        : "${DAGRON_ARTIFACTS:?set DAGRON_ARTIFACT_DIR on the engine}"
+        out="$DAGRON_ARTIFACTS/draft.md"
+        tmp="$out.tmp"
+        rm -f "$tmp"
+        if [ -s "$out" ]; then                      # idempotent retry: no double-spend
+          echo "draft already generated — skipping the model call"; cat "$out"; exit 0
+        fi
+        if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+          payload=$(python3 -c 'import json,os; print(json.dumps({"model": os.environ.get("ANTHROPIC_MODEL","claude-sonnet-4-5"), "max_tokens": 300, "messages": [{"role": "user", "content": os.environ["PROMPT"]}]}))')
+          curl -sf https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "$payload" \
+            | python3 -c 'import json,sys; print("".join(b.get("text","") for b in json.load(sys.stdin)["content"]))' > "$tmp"
+        else
+          {
+            echo "- Streaming ingestion is now built in: point SOURCE=stream at an NDJSON feed and every event becomes a durable, retried, observable workflow run."
+            echo "- Offsets commit only after a run is durably created, so a crash never loses or double-runs an event."
+          } > "$tmp"
+        fi
+        [ -s "$tmp" ] || { rm -f "$tmp"; echo "empty draft" >&2; exit 1; }
+        mv "$tmp" "$out"
+        echo "draft ready:"; cat "$out"
+  - name: review
+    type: approval                      # human gate: approve/reject via API or UI
+    depends_on: [generate]
+    approval_timeout_secs: 600          # fail safe: auto-reject after 10 min
+  - name: publish
+    depends_on: [review]
+    timeout_secs: 30
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        cp "$DAGRON_ARTIFACTS/draft.md" "$DAGRON_ARTIFACTS/published.md"
+        echo "published:"; cat "$DAGRON_ARTIFACTS/published.md"

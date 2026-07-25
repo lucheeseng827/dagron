@@ -27,7 +27,7 @@ The engine must expose `/metrics`, which needs:
 
 ## Run it
 
-From the module root (`rust_modules/lab/module_54`):
+From the repository root:
 
 ```console
 # 1. bring up the dagron stack (creates the dagron-ui_default network)

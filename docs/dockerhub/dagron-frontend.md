@@ -13,14 +13,14 @@
 | Tag | Notes |
 |---|---|
 | `latest` | newest release |
-| `0.4.3` | pinned version (= current `latest`) |
+| `0.5.0` | pinned version (= current `latest`) |
 
-Pin in production: `mancube/dagron-frontend:0.4.3`.
+Pin in production: `mancube/dagron-frontend:0.5.0`.
 
 ## Run
 
 ```bash
-docker run -p 3000:3000 mancube/dagron-frontend:0.4.3
+docker run -p 3000:3000 mancube/dagron-frontend:0.5.0
 # then open http://localhost:3000  (sign in with the dagron-api admin user)
 ```
 

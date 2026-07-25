@@ -33,7 +33,7 @@ export default function OverviewPage() {
   const load = useCallback(() => {
     listWorkflows().then(setWfs).catch((e) => setError(errMsg(e)));
     listRuns({ limit: 200 }).then(setRuns).catch(() => {});
-    listGitRepos().then(setRepos).catch(() => {});
+    listGitRepos().then((r) => setRepos(r.repos)).catch(() => {});
     getHealth().then(setHealth).catch(() => {});
   }, []);
 

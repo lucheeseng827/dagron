@@ -1,4 +1,4 @@
-//! Chain saved workflows: resolve every `workflow_ref` into a flat, leaf-only DAG.
+//! Chain saved workflows: resolve every `workflow_ref` into a flat DAG.
 //!
 //! A workflow authored in the UI can use a task to **call another saved
 //! workflow** instead of running a command:
@@ -11,63 +11,85 @@
 //!   - { name: notify,  command: ["sh", "-c", "echo done"], depends_on: [etl] }
 //! ```
 //!
-//! At run-creation (the `POST /api/runs` and `POST /api/workflows/:id/run`
-//! paths) dagron-api loads the referenced workflow's spec from the `workflows`
-//! table and **inlines** its tasks in place of the call task, namespaced under
-//! the call's name (`etl.<task>`). Dependencies are rewired so the call's
-//! upstreams feed the sub-DAG's roots and the call's downstreams wait on its
-//! exits — exactly the engine's inline-template expansion ([`crate::dag`] in the
-//! engine), but the "template" is a stored workflow resolved over the DB.
+//! At run creation dagron-api loads the referenced workflow's spec from the
+//! `workflows` table and **inlines** its tasks in place of the call task,
+//! namespaced under the call's name (`etl.<task>`). Dependencies are rewired so
+//! the call's upstreams feed the sub-DAG's roots and the call's downstreams wait
+//! on its exits. The result is an ordinary DAG the engine understands —
+//! `workflow_ref` never reaches it.
 //!
-//! The result is an ordinary flat DAG: the engine and its executors never see a
-//! `workflow_ref`, so nothing downstream changes — a chained workflow is just a
-//! bigger DAG. References resolve recursively (a child may chain its own
-//! children); cross-workflow cycles, runaway nesting, and reference explosions
-//! fail loudly with a 400 rather than looping or exhausting memory.
+//! **This rewiring happens in YAML space, deliberately.** Every task field is
+//! copied as an opaque mapping rather than through a typed mirror of
+//! `dag::TaskSpec`. The previous implementation re-declared the spec types here
+//! and in `routes::control`, and every field those mirrors had not learned about
+//! was silently dropped on submit — fan-out, `resources`, `wait`, `cache`,
+//! `pool`, `priority`, `produces`, and more. Copying mappings cannot drift: a
+//! field added to the engine's spec flows through untouched, including one added
+//! after this code was written.
+//!
+//! References resolve recursively (a child may chain its own children);
+//! cross-workflow cycles, runaway nesting, and reference explosions fail loudly
+//! with a 400 rather than looping or exhausting memory.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 
 use axum::http::StatusCode;
+use serde_yaml::{Mapping, Value};
 
-use crate::routes::control::{validate_graph, DagSpecInput, TaskSpecInput};
 use crate::state::AppState;
 
 /// Bound on `workflow_ref` nesting depth. A chain deeper than this is almost
-/// certainly an unintended cycle the name-based guard didn't catch; fail rather
-/// than recurse without end.
+/// certainly an unintended cycle the name-based guard didn't catch.
 const MAX_DEPTH: usize = 32;
-/// Bound on the total expanded task count so a wide/deep reference fan-out fails
-/// loudly instead of exhausting memory.
+/// Bound on the total expanded task count so a wide/deep fan-out fails loudly
+/// instead of exhausting memory.
 const MAX_TASKS: usize = 10_000;
 
-/// Resolve every `workflow_ref` in `spec` into a flat, leaf-only [`DagSpecInput`].
-///
-/// Two phases: (1) load every transitively-referenced workflow spec from the DB
-/// once, then (2) expand purely in memory. Splitting them keeps the recursive
-/// rewiring synchronous and unit-testable without a database.
-pub(crate) async fn expand_workflow_refs(
-    state: &AppState,
-    spec: DagSpecInput,
-) -> Result<DagSpecInput, (StatusCode, String)> {
-    // Fast path: a workflow with no chains needs no DB work or rewiring.
-    if !references_any(&spec) {
-        return Ok(spec);
-    }
-    let refs = collect_referenced_specs(state, &spec).await?;
-    expand_pure(spec, &refs).map_err(|m| (StatusCode::BAD_REQUEST, m))
+type ApiError = (StatusCode, String);
+
+fn bad(msg: impl Into<String>) -> ApiError {
+    (StatusCode::BAD_REQUEST, msg.into())
 }
 
-/// True if any task in `spec` chains another workflow.
-fn references_any(spec: &DagSpecInput) -> bool {
-    spec.tasks.iter().any(|t| t.workflow_ref.is_some())
+/// Resolve every `workflow_ref` in `yaml`, returning the flattened spec YAML.
+///
+/// Returns the input untouched when nothing chains, so the common path pays only
+/// one parse and no database work.
+pub(crate) async fn expand_workflow_refs(
+    state: &AppState,
+    yaml: &str,
+) -> Result<String, ApiError> {
+    let root: Value = serde_yaml::from_str(yaml).map_err(|e| bad(format!("invalid spec: {e}")))?;
+    if direct_refs(&root).is_empty() {
+        return Ok(yaml.to_string());
+    }
+    let refs = collect_referenced_specs(state, &root).await?;
+    let expanded = expand_pure(root, &refs)?;
+    serde_yaml::to_string(&expanded)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("re-serializing spec: {e}")))
+}
+
+/// The task list of a spec, or an empty slice when absent/misshapen — malformed
+/// specs are rejected by the engine's parser later with a better message than
+/// anything this module could produce.
+fn tasks_of(spec: &Value) -> &[Value] {
+    spec.get("tasks").and_then(Value::as_sequence).map(|s| s.as_slice()).unwrap_or(&[])
+}
+
+fn str_field(task: &Value, key: &str) -> Option<String> {
+    task.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+fn depends_on(task: &Value) -> Vec<String> {
+    task.get("depends_on")
+        .and_then(Value::as_sequence)
+        .map(|s| s.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
 }
 
 /// The names a spec directly chains (one entry per `workflow_ref` task).
-fn direct_refs(spec: &DagSpecInput) -> Vec<String> {
-    spec.tasks
-        .iter()
-        .filter_map(|t| t.workflow_ref.clone())
-        .collect()
+fn direct_refs(spec: &Value) -> Vec<String> {
+    tasks_of(spec).iter().filter_map(|t| str_field(t, "workflow_ref")).collect()
 }
 
 /// Load every workflow transitively referenced from `root`, keyed by name. Dedups
@@ -75,9 +97,9 @@ fn direct_refs(spec: &DagSpecInput) -> Vec<String> {
 /// reported during expansion, with the offending chain in the message).
 async fn collect_referenced_specs(
     state: &AppState,
-    root: &DagSpecInput,
-) -> Result<HashMap<String, DagSpecInput>, (StatusCode, String)> {
-    let mut out: HashMap<String, DagSpecInput> = HashMap::new();
+    root: &Value,
+) -> Result<HashMap<String, Value>, ApiError> {
+    let mut out: HashMap<String, Value> = HashMap::new();
     let mut stack: Vec<String> = direct_refs(root);
     while let Some(name) = stack.pop() {
         if out.contains_key(&name) {
@@ -89,23 +111,26 @@ async fn collect_referenced_specs(
             .await
             .map_err(|e| {
                 tracing::error!(error = ?e, "loading referenced workflow");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error".to_string(),
-                )
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())
             })?;
         let yaml = yaml.ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("references unknown workflow '{name}' — save that workflow first"),
-            )
+            bad(format!("references unknown workflow '{name}' — save that workflow first"))
         })?;
-        let child: DagSpecInput = serde_yaml::from_str(&yaml).map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("referenced workflow '{name}' has an invalid spec: {e}"),
-            )
-        })?;
+        let child: Value = serde_yaml::from_str(&yaml)
+            .map_err(|e| bad(format!("referenced workflow '{name}' has an invalid spec: {e}")))?;
+        // Inlining copies a child's `tasks:` into the root but not its
+        // `templates:` block, so a child that calls its own templates would land
+        // in the root with nothing to resolve against — the engine would then
+        // fail with a bare "unknown template". Say so here, where the cause is
+        // still visible.
+        if child.get("templates").and_then(Value::as_sequence).is_some_and(|t| !t.is_empty()) {
+            return Err(bad(format!(
+                "referenced workflow '{name}' declares `templates:` — a chained workflow is \
+                 inlined task-by-task, so its templates would not come with it. Move those \
+                 templates into this workflow and call them with `template:`, or drop the \
+                 `workflow_ref` and inline the steps directly."
+            )));
+        }
         for r in direct_refs(&child) {
             stack.push(r);
         }
@@ -114,396 +139,287 @@ async fn collect_referenced_specs(
     Ok(out)
 }
 
-/// One task's expansion: the produced leaf tasks plus the boundary node sets used
-/// to rewire dependencies in the enclosing list.
+/// One task's expansion: the produced tasks plus the boundary node sets used to
+/// rewire dependencies in the enclosing list.
 struct Expanded {
-    /// Output tasks with no *internal* dependency — they inherit the call's
-    /// external `depends_on`.
+    /// Tasks with no *internal* dependency — they inherit the call's external
+    /// `depends_on`.
     roots: Vec<String>,
-    /// Output tasks nothing internal depends on — the call's dependents attach here.
+    /// Tasks nothing internal depends on — the call's dependents attach here.
     exits: Vec<String>,
-    /// Fully-wired leaf tasks (root nodes have empty `depends_on`, filled by the
-    /// enclosing list).
-    tasks: Vec<TaskSpecInput>,
+    /// Fully-wired tasks (roots have empty `depends_on`, filled by the caller).
+    tasks: Vec<Value>,
 }
 
-/// Expand `root`'s tasks into a flat DAG using the preloaded reference specs.
-fn expand_pure(
-    root: DagSpecInput,
-    refs: &HashMap<String, DagSpecInput>,
-) -> Result<DagSpecInput, String> {
+/// Expand `root`'s tasks in place, using the preloaded reference specs.
+fn expand_pure(mut root: Value, refs: &HashMap<String, Value>) -> Result<Value, ApiError> {
     let mut budget = MAX_TASKS;
-    // The path seeds cross-workflow cycle detection: the root's own name plus the
-    // chain of references currently being expanded.
-    let mut path: Vec<String> = vec![root.name.clone()];
-    let e = expand_list(&root.tasks, "", refs, &mut path, &mut budget)?;
-    // Defense-in-depth: the rewired flat DAG must still be acyclic with unique
-    // names (it always is for acyclic inputs, but cheap to assert).
-    validate_graph(&root.name, &e.tasks).map_err(|(_, m)| m)?;
-    // `result_from` is copied from the authored spec, but a `workflow_ref` task it
-    // named may have been expanded into namespaced leaves — so re-check it against
-    // the *expanded* task names the run will actually carry.
-    if let Some(result_from) = &root.result_from {
-        if !e.tasks.iter().any(|t| &t.name == result_from) {
-            return Err(format!(
-                "result_from names unknown task '{result_from}' after expansion in workflow '{}'",
-                root.name
-            ));
-        }
-    }
-    Ok(DagSpecInput {
-        name: root.name,
-        run_timeout_secs: root.run_timeout_secs,
-        result_from: root.result_from,
-        parameters: root.parameters,
-        environment: root.environment,
-        task_defaults: root.task_defaults,
-        runner_class: root.runner_class,
-        tasks: e.tasks,
-    })
+    let tasks = expand_list(tasks_of(&root), "", refs, 0, &mut budget, &mut Vec::new())?;
+    let map = root.as_mapping_mut().ok_or_else(|| bad("spec must be a mapping"))?;
+    map.insert(Value::from("tasks"), Value::Sequence(tasks));
+    Ok(root)
 }
 
-/// Expand a list of sibling tasks, wiring their inter-dependencies. Mirrors the
-/// engine's `expand::expand_list`: expand each task on its own, then rewire each
-/// sub-DAG's roots onto the exit sets of the siblings the task depends on.
+/// Expand a task list, rewiring each call task's neighbours around its sub-DAG.
+/// `prefix` namespaces inlined names; `chain` carries the reference path for
+/// cycle reporting.
 fn expand_list(
-    tasks: &[TaskSpecInput],
+    tasks: &[Value],
     prefix: &str,
-    refs: &HashMap<String, DagSpecInput>,
-    path: &mut Vec<String>,
+    refs: &HashMap<String, Value>,
+    depth: usize,
     budget: &mut usize,
-) -> Result<Expanded, String> {
-    // Expand each task first (deps wired in a second pass).
-    let mut per: BTreeMap<String, Expanded> = BTreeMap::new();
-    for t in tasks {
-        if per.contains_key(&t.name) {
-            return Err(format!("duplicate task name '{}'", t.name));
-        }
-        let e = expand_one(t, prefix, refs, path, budget)?;
-        per.insert(t.name.clone(), e);
+    chain: &mut Vec<String>,
+) -> Result<Vec<Value>, ApiError> {
+    if depth > MAX_DEPTH {
+        return Err(bad(format!("workflow_ref nesting exceeds {MAX_DEPTH} levels")));
+    }
+    // Per-task expansion first, so the rewiring pass below can map a call task's
+    // name to the boundary nodes that replaced it.
+    let mut expansions: Vec<(String, Expanded)> = Vec::new();
+    for task in tasks {
+        let Some(name) = str_field(task, "name") else {
+            return Err(bad("every task needs a `name`"));
+        };
+        let expanded = expand_one(task, &name, prefix, refs, depth, budget, chain)?;
+        expansions.push((name, expanded));
     }
 
-    // Sibling names that something depends on — used to compute the list's exits.
-    let mut depended: BTreeSet<&str> = BTreeSet::new();
-    for t in tasks {
-        for d in &t.depends_on {
-            depended.insert(d.as_str());
-        }
-    }
-
-    let mut out_tasks: Vec<TaskSpecInput> = Vec::new();
-    let mut list_roots: Vec<String> = Vec::new();
-    let mut list_exits: Vec<String> = Vec::new();
-
-    for t in tasks {
-        // External deps for this task = the exit nodes of each sibling it depends on.
-        let mut dep_exits: Vec<String> = Vec::new();
-        for d in &t.depends_on {
-            let de = per
-                .get(d)
-                .ok_or_else(|| format!("task '{}' depends on unknown task '{}'", t.name, d))?;
-            dep_exits.extend(de.exits.iter().cloned());
-        }
-
-        let e = &per[&t.name];
-        let rootset: BTreeSet<&str> = e.roots.iter().map(String::as_str).collect();
-        for task in &e.tasks {
-            let mut task = task.clone();
-            if rootset.contains(task.name.as_str()) {
-                task.depends_on = dep_exits.clone();
+    // Rewire: a dependency on a call task becomes a dependency on that call's
+    // exits; a call's roots inherit the call's own upstreams (already rewired).
+    let boundary: HashMap<&str, (&Vec<String>, &Vec<String>)> =
+        expansions.iter().map(|(n, e)| (n.as_str(), (&e.roots, &e.exits))).collect();
+    let mut out: Vec<Value> = Vec::new();
+    for (name, expanded) in &expansions {
+        // The call's own upstreams, resolved through any upstream call tasks.
+        let original = tasks.iter().find(|t| str_field(t, "name").as_deref() == Some(name));
+        let mut upstreams: Vec<String> = Vec::new();
+        for dep in original.map(depends_on).unwrap_or_default() {
+            match boundary.get(dep.as_str()) {
+                Some((_, exits)) => upstreams.extend(exits.iter().cloned()),
+                // A dep on a name that is not in this list is left verbatim; the
+                // engine's validator reports it with full context.
+                None => upstreams.push(qualify(prefix, &dep)),
             }
-            out_tasks.push(task);
         }
-
-        if t.depends_on.is_empty() {
-            list_roots.extend(e.roots.iter().cloned());
-        }
-        if !depended.contains(t.name.as_str()) {
-            list_exits.extend(e.exits.iter().cloned());
+        for mut task in expanded.tasks.clone() {
+            let tname = str_field(&task, "name").unwrap_or_default();
+            if expanded.roots.contains(&tname) {
+                let mut deps: BTreeSet<String> = depends_on(&task).into_iter().collect();
+                deps.extend(upstreams.iter().cloned());
+                set_depends_on(&mut task, deps.into_iter().collect())?;
+            }
+            out.push(task);
         }
     }
-
-    Ok(Expanded {
-        roots: list_roots,
-        exits: list_exits,
-        tasks: out_tasks,
-    })
+    Ok(out)
 }
 
-/// Expand a single task: a leaf becomes one task; a `workflow_ref` call expands
-/// the referenced workflow's tasks (recursively) under a `name.` prefix.
+/// Expand one task: a plain task is copied (namespaced); a `workflow_ref` task is
+/// replaced by the referenced workflow's tasks, namespaced under the call's name.
 fn expand_one(
-    task: &TaskSpecInput,
+    task: &Value,
+    name: &str,
     prefix: &str,
-    refs: &HashMap<String, DagSpecInput>,
-    path: &mut Vec<String>,
+    refs: &HashMap<String, Value>,
+    depth: usize,
     budget: &mut usize,
-) -> Result<Expanded, String> {
-    let base = format!("{prefix}{}", task.name);
-    match &task.workflow_ref {
-        Some(ref_name) => {
-            if !task.command.is_empty() {
-                return Err(format!(
-                    "task '{}' sets both `command` and `workflow_ref` — a task is one or the other",
-                    task.name
-                ));
-            }
-            if path.iter().any(|n| n == ref_name) {
-                return Err(format!(
-                    "workflow reference cycle: {} -> {ref_name}",
-                    path.join(" -> ")
-                ));
-            }
-            if path.len() >= MAX_DEPTH {
-                return Err(format!(
-                    "workflow nesting exceeded depth {MAX_DEPTH} at task '{}' (reference cycle?)",
-                    task.name
-                ));
-            }
-            let child = refs.get(ref_name).ok_or_else(|| {
-                format!(
-                    "task '{}' references unknown workflow '{}'",
-                    task.name, ref_name
-                )
-            })?;
-
-            let sub_prefix = format!("{base}.");
-            path.push(ref_name.clone());
-            let e = expand_list(&child.tasks, &sub_prefix, refs, path, budget)?;
-            path.pop();
-
-            if e.tasks.is_empty() {
-                return Err(format!(
-                    "task '{}' references workflow '{}', which has no tasks",
-                    task.name, ref_name
-                ));
-            }
-            Ok(e)
+    chain: &mut Vec<String>,
+) -> Result<Expanded, ApiError> {
+    let qualified = qualify(prefix, name);
+    let Some(target) = str_field(task, "workflow_ref") else {
+        // Ordinary task: copy verbatim, only the name is namespaced. Every other
+        // field — including ones this crate has never heard of — rides along.
+        if *budget == 0 {
+            return Err(bad(format!("expanded workflow exceeds {MAX_TASKS} tasks")));
         }
-        None => {
-            if task.command.is_empty() {
-                return Err(format!(
-                    "task '{}' has neither a `command` (leaf) nor a `workflow_ref` (chain)",
-                    task.name
-                ));
-            }
-            if *budget == 0 {
-                return Err(format!(
-                    "workflow expanded past {MAX_TASKS} tasks — a reference fan-out blew up"
-                ));
-            }
-            *budget -= 1;
-            Ok(Expanded {
-                roots: vec![base.clone()],
-                exits: vec![base.clone()],
-                tasks: vec![leaf(task, base)],
-            })
+        *budget -= 1;
+        let mut copy = task.clone();
+        set_str(&mut copy, "name", &qualified)?;
+        // Deps are cleared here and rewritten by the caller, which is the only
+        // place that knows whether a named dep expanded into a sub-DAG (attach to
+        // its exits) or stayed one task (namespace it). Qualifying them here too
+        // left the pre-expansion name behind next to the rewired one.
+        set_depends_on(&mut copy, Vec::new())?;
+        return Ok(Expanded {
+            roots: vec![qualified.clone()],
+            exits: vec![qualified.clone()],
+            tasks: vec![copy],
+        });
+    };
+
+    if chain.contains(&target) {
+        chain.push(target.clone());
+        return Err(bad(format!("workflow_ref cycle: {}", chain.join(" → "))));
+    }
+    // A call task is a placeholder, not a task: anything else on it would be
+    // dropped by the inlining below — the exact silent-drop class this file
+    // exists to prevent — so reject it rather than lose it.
+    if let Some(map) = task.as_mapping() {
+        let extra: Vec<String> = map
+            .keys()
+            .filter_map(Value::as_str)
+            .filter(|k| !matches!(*k, "name" | "workflow_ref" | "depends_on"))
+            .map(str::to_string)
+            .collect();
+        if !extra.is_empty() {
+            return Err(bad(format!(
+                "task '{name}' uses workflow_ref, so these fields are not supported here: {}",
+                extra.join(", ")
+            )));
         }
+    }
+    let child = refs
+        .get(&target)
+        .ok_or_else(|| bad(format!("references unknown workflow '{target}'")))?;
+    let child_tasks = tasks_of(child);
+    if child_tasks.is_empty() {
+        return Err(bad(format!("referenced workflow '{target}' has no tasks")));
+    }
+
+    chain.push(target.clone());
+    let inner = expand_list(child_tasks, &qualified, refs, depth + 1, budget, chain)?;
+    chain.pop();
+
+    // Boundaries of the inlined sub-DAG: roots depend on nothing inside it,
+    // exits have nothing inside depending on them.
+    let inner_names: BTreeSet<String> =
+        inner.iter().filter_map(|t| str_field(t, "name")).collect();
+    let mut depended_on: BTreeSet<String> = BTreeSet::new();
+    let mut roots: Vec<String> = Vec::new();
+    for t in &inner {
+        let deps = depends_on(t);
+        for d in &deps {
+            depended_on.insert(d.clone());
+        }
+        if deps.iter().all(|d| !inner_names.contains(d)) {
+            if let Some(n) = str_field(t, "name") {
+                roots.push(n);
+            }
+        }
+    }
+    let exits: Vec<String> =
+        inner_names.iter().filter(|n| !depended_on.contains(*n)).cloned().collect();
+
+    Ok(Expanded { roots, exits, tasks: inner })
+}
+
+fn qualify(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}.{name}")
     }
 }
 
-/// Materialize an inlined leaf: the called task's fields under the namespaced
-/// `name`, with `depends_on` cleared (the enclosing list wires it) and no
-/// `workflow_ref` (it has been resolved).
-fn leaf(task: &TaskSpecInput, name: String) -> TaskSpecInput {
-    TaskSpecInput {
-        name,
-        command: task.command.clone(),
-        depends_on: vec![],
-        input: task.input.clone(),
-        trigger_rule: task.trigger_rule.clone(),
-        max_attempts: task.max_attempts,
-        retry_delay_secs: task.retry_delay_secs,
-        retry_max_delay_secs: task.retry_max_delay_secs,
-        timeout_secs: task.timeout_secs,
-        docker_image: task.docker_image.clone(),
-        runner_class: task.runner_class.clone(),
-        workflow_ref: None,
-        task_type: task.task_type.clone(),
-        approval_timeout_secs: task.approval_timeout_secs,
-        approval_on_timeout: task.approval_on_timeout.clone(),
-        env: task.env.clone(),
-        // `when` inside an inlined workflow would need dependency-name
-        // namespacing to stay correct; runtime gates are validated against
-        // depends_on earlier, and inlined tasks' deps are rewired here — so a
-        // gate survives only with its (already-validated) dependency names.
-        when: task.when.clone(),
-        repeat: task.repeat.clone(),
-    }
+fn set_str(task: &mut Value, key: &str, val: &str) -> Result<(), ApiError> {
+    task.as_mapping_mut()
+        .ok_or_else(|| bad("each task must be a mapping"))?
+        .insert(Value::from(key), Value::from(val));
+    Ok(())
+}
+
+fn set_depends_on(task: &mut Value, deps: Vec<String>) -> Result<(), ApiError> {
+    let map: &mut Mapping =
+        task.as_mapping_mut().ok_or_else(|| bad("each task must be a mapping"))?;
+    map.insert(
+        Value::from("depends_on"),
+        Value::Sequence(deps.into_iter().map(Value::from).collect()),
+    );
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn parse(yaml: &str) -> DagSpecInput {
+    fn v(yaml: &str) -> Value {
         serde_yaml::from_str(yaml).expect("parse spec")
     }
 
-    /// name -> sorted depends_on, for order-independent assertions.
-    fn deps(spec: &DagSpecInput) -> BTreeMap<String, Vec<String>> {
-        spec.tasks
+    fn names(spec: &Value) -> Vec<String> {
+        tasks_of(spec).iter().filter_map(|t| str_field(t, "name")).collect()
+    }
+
+    fn deps_of(spec: &Value, name: &str) -> Vec<String> {
+        tasks_of(spec)
             .iter()
-            .map(|t| {
-                let mut d = t.depends_on.clone();
-                d.sort();
-                (t.name.clone(), d)
-            })
-            .collect()
+            .find(|t| str_field(t, "name").as_deref() == Some(name))
+            .map(depends_on)
+            .unwrap_or_default()
     }
-
-    fn names(spec: &DagSpecInput) -> Vec<String> {
-        let mut n: Vec<String> = spec.tasks.iter().map(|t| t.name.clone()).collect();
-        n.sort();
-        n
-    }
-
-    const ETL: &str = r#"
-name: etl
-tasks:
-  - { name: build,   command: ["true"] }
-  - { name: process, command: ["true"], depends_on: [build] }
-  - { name: publish, command: ["true"], depends_on: [process] }
-"#;
 
     #[test]
     fn leaf_only_passthrough() {
-        let root = parse(
-            r#"
-name: w
-tasks:
-  - { name: a, command: ["true"] }
-  - { name: b, command: ["true"], depends_on: [a] }
-"#,
-        );
-        let out = expand_pure(root, &HashMap::new()).unwrap();
+        let spec = v("name: p\ntasks:\n  - name: a\n    command: [\"true\"]\n  - name: b\n    command: [\"true\"]\n    depends_on: [a]\n");
+        let out = expand_pure(spec, &HashMap::new()).unwrap();
         assert_eq!(names(&out), vec!["a", "b"]);
-        assert_eq!(deps(&out)["b"], vec!["a"]);
+        assert_eq!(deps_of(&out, "b"), vec!["a"]);
+    }
+
+    /// The regression this rewrite exists for: fields the API never modelled
+    /// (fan-out, sensors, cache, pool, priority, produces, resources) must
+    /// survive expansion untouched, including inside an inlined child.
+    #[test]
+    fn unmodelled_fields_survive() {
+        let child = v("name: c\ntasks:\n  - name: gate\n    type: wait\n    wait: { for: 5m }\n");
+        let refs = HashMap::from([("c".to_string(), child)]);
+        let spec = v("name: p\ntasks:\n  - name: shard\n    with_items: [a, b]\n    pool: etl\n    priority: 9\n    cache: { key: k }\n    produces: [\"s3://x\"]\n    resources: { gpu: { count: 2 } }\n    command: [\"echo\", \"{{ item }}\"]\n  - name: call\n    workflow_ref: c\n    depends_on: [shard]\n");
+        let out = expand_pure(spec, &refs).unwrap();
+
+        let shard = tasks_of(&out).iter().find(|t| str_field(t, "name").as_deref() == Some("shard")).unwrap();
+        assert!(shard.get("with_items").is_some(), "with_items dropped");
+        assert_eq!(shard.get("pool").and_then(Value::as_str), Some("etl"));
+        assert_eq!(shard.get("priority").and_then(Value::as_u64), Some(9));
+        assert!(shard.get("cache").is_some(), "cache dropped");
+        assert!(shard.get("produces").is_some(), "produces dropped");
+        assert!(shard.get("resources").is_some(), "resources dropped");
+
+        // The inlined sensor keeps `type` AND its `wait:` block — dropping the
+        // latter made the engine dispatch it to a worker, where it failed.
+        let gate = tasks_of(&out).iter().find(|t| str_field(t, "name").as_deref() == Some("call.gate")).unwrap();
+        assert_eq!(gate.get("type").and_then(Value::as_str), Some("wait"));
+        assert!(gate.get("wait").is_some(), "wait block dropped");
+        assert_eq!(deps_of(&out, "call.gate"), vec!["shard"]);
     }
 
     #[test]
-    fn workflow_ref_inlines_and_rewires_deps() {
-        // prepare -> etl(build->process->publish) -> notify
-        let root = parse(
-            r#"
-name: parent
-tasks:
-  - { name: prepare, command: ["true"] }
-  - { name: etl,     workflow_ref: etl, depends_on: [prepare] }
-  - { name: notify,  command: ["true"], depends_on: [etl] }
-"#,
-        );
-        let mut refs = HashMap::new();
-        refs.insert("etl".to_string(), parse(ETL));
-        let out = expand_pure(root, &refs).unwrap();
-
-        assert_eq!(
-            names(&out),
-            vec![
-                "etl.build",
-                "etl.process",
-                "etl.publish",
-                "notify",
-                "prepare"
-            ]
-        );
-        let d = deps(&out);
-        // sub-DAG root inherits the call's upstream …
-        assert_eq!(d["etl.build"], vec!["prepare"]);
-        assert_eq!(d["etl.process"], vec!["etl.build"]);
-        assert_eq!(d["etl.publish"], vec!["etl.process"]);
-        // … and the call's downstream waits on the sub-DAG's exit.
-        assert_eq!(d["notify"], vec!["etl.publish"]);
-        // Every surviving task is a runnable leaf — no refs leak to the engine.
-        assert!(out
-            .tasks
-            .iter()
-            .all(|t| t.workflow_ref.is_none() && !t.command.is_empty()));
+    fn inlines_and_rewires_a_reference() {
+        let child = v("name: c\ntasks:\n  - name: x\n    command: [\"true\"]\n  - name: y\n    command: [\"true\"]\n    depends_on: [x]\n");
+        let refs = HashMap::from([("c".to_string(), child)]);
+        let spec = v("name: p\ntasks:\n  - name: pre\n    command: [\"true\"]\n  - name: call\n    workflow_ref: c\n    depends_on: [pre]\n  - name: post\n    command: [\"true\"]\n    depends_on: [call]\n");
+        let out = expand_pure(spec, &refs).unwrap();
+        assert_eq!(names(&out), vec!["pre", "call.x", "call.y", "post"]);
+        assert_eq!(deps_of(&out, "call.x"), vec!["pre"], "root inherits the call's upstream");
+        assert_eq!(deps_of(&out, "call.y"), vec!["call.x"], "internal edge preserved");
+        assert_eq!(deps_of(&out, "post"), vec!["call.y"], "dependent attaches to the exit");
     }
 
     #[test]
-    fn nested_refs_resolve_recursively() {
-        let root = parse("name: r\ntasks:\n  - { name: a, workflow_ref: c }\n");
-        let mut refs = HashMap::new();
-        refs.insert(
-            "c".to_string(),
-            parse("name: c\ntasks:\n  - { name: b, workflow_ref: g }\n"),
-        );
-        refs.insert(
-            "g".to_string(),
-            parse("name: g\ntasks:\n  - { name: step, command: [\"true\"] }\n"),
-        );
-        let out = expand_pure(root, &refs).unwrap();
-        assert_eq!(names(&out), vec!["a.b.step"]);
-        assert_eq!(out.tasks[0].command, vec!["true"]);
+    fn rejects_extra_fields_on_a_call_task() {
+        let child = v("name: c\ntasks:\n  - name: x\n    command: [\"true\"]\n");
+        let refs = HashMap::from([("c".to_string(), child)]);
+        let spec = v("name: p\ntasks:\n  - name: call\n    workflow_ref: c\n    pool: etl\n");
+        let err = expand_pure(spec, &refs).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("pool"), "got: {}", err.1);
     }
 
     #[test]
-    fn fan_in_over_two_chained_workflows() {
-        // two parallel calls to the same workflow, joined by a leaf
-        let root = parse(
-            r#"
-name: parent
-tasks:
-  - { name: left,  workflow_ref: etl }
-  - { name: right, workflow_ref: etl }
-  - { name: join,  command: ["true"], depends_on: [left, right] }
-"#,
-        );
-        let mut refs = HashMap::new();
-        refs.insert("etl".to_string(), parse(ETL));
-        let out = expand_pure(root, &refs).unwrap();
-        // join fans in over both sub-DAG exits
-        assert_eq!(deps(&out)["join"], vec!["left.publish", "right.publish"]);
+    fn rejects_a_reference_cycle() {
+        let a = v("name: a\ntasks:\n  - name: t\n    workflow_ref: b\n");
+        let b = v("name: b\ntasks:\n  - name: t\n    workflow_ref: a\n");
+        let refs = HashMap::from([("a".to_string(), a), ("b".to_string(), b.clone())]);
+        let spec = v("name: root\ntasks:\n  - name: call\n    workflow_ref: b\n");
+        let err = expand_pure(spec, &refs).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("cycle"), "got: {}", err.1);
     }
 
     #[test]
-    fn self_reference_is_rejected() {
-        let root = parse("name: a\ntasks:\n  - { name: t, workflow_ref: a }\n");
-        let mut refs = HashMap::new();
-        refs.insert(
-            "a".to_string(),
-            parse("name: a\ntasks:\n  - { name: t, workflow_ref: a }\n"),
-        );
-        let err = expand_pure(root, &refs).unwrap_err();
-        assert!(err.contains("cycle"), "got: {err}");
-    }
-
-    #[test]
-    fn mutual_reference_cycle_is_rejected() {
-        let root = parse("name: a\ntasks:\n  - { name: t, workflow_ref: b }\n");
-        let mut refs = HashMap::new();
-        refs.insert(
-            "a".to_string(),
-            parse("name: a\ntasks:\n  - { name: t, workflow_ref: b }\n"),
-        );
-        refs.insert(
-            "b".to_string(),
-            parse("name: b\ntasks:\n  - { name: t, workflow_ref: a }\n"),
-        );
-        let err = expand_pure(root, &refs).unwrap_err();
-        assert!(err.contains("cycle"), "got: {err}");
-    }
-
-    #[test]
-    fn unknown_reference_is_rejected() {
-        let root = parse("name: w\ntasks:\n  - { name: a, workflow_ref: nope }\n");
-        let err = expand_pure(root, &HashMap::new()).unwrap_err();
-        assert!(err.contains("unknown workflow 'nope'"), "got: {err}");
-    }
-
-    #[test]
-    fn task_with_neither_command_nor_ref_is_rejected() {
-        let root = parse("name: w\ntasks:\n  - { name: a }\n");
-        let err = expand_pure(root, &HashMap::new()).unwrap_err();
-        assert!(err.contains("neither"), "got: {err}");
-    }
-
-    #[test]
-    fn task_with_both_command_and_ref_is_rejected() {
-        let root =
-            parse("name: w\ntasks:\n  - { name: a, command: [\"true\"], workflow_ref: x }\n");
-        let err = expand_pure(root, &HashMap::new()).unwrap_err();
-        assert!(err.contains("both"), "got: {err}");
+    fn rejects_unknown_reference() {
+        let spec = v("name: p\ntasks:\n  - name: call\n    workflow_ref: nope\n");
+        let err = expand_pure(spec, &HashMap::new()).unwrap_err();
+        assert!(err.1.contains("unknown workflow 'nope'"), "got: {}", err.1);
     }
 }

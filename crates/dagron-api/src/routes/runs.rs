@@ -47,6 +47,22 @@ pub struct TaskRow {
     pub output: Option<String>,
     pub scheduled_at: Option<String>,
     pub finished_at: Option<String>,
+    /// Why a parked task is parked. Each park form keeps the row `running` with
+    /// a NULL lease, so without these the console cannot tell "waiting on
+    /// something" from "hung": the time sensor's deadline, the HTTP sensor's
+    /// endpoint, the dataset sensor's URI, and the sub-workflow trigger's child
+    /// run id (which also gives the console a parent → child link).
+    pub wake_at: Option<String>,
+    pub wait_url: Option<String>,
+    pub wait_dataset: Option<String>,
+    pub sub_run_id: Option<String>,
+    /// Scheduling metadata worth seeing next to a task: the named pool it drew a
+    /// slot from (#21), its dispatch priority (#25), and whether it was resolved
+    /// from the memoization store instead of executed (#22) — the last of which
+    /// explains an otherwise inexplicable 0s success.
+    pub pool: Option<String>,
+    pub priority: i64,
+    pub cache_hit: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -135,7 +151,9 @@ pub async fn get_run(
     .ok_or(StatusCode::NOT_FOUND)?;
 
     let tasks = sqlx::query_as::<_, TaskRow>(
-        "SELECT id, name, status, attempt, output, scheduled_at, finished_at
+        "SELECT id, name, status, attempt, output, scheduled_at, finished_at,
+                wake_at, wait_url, wait_dataset, sub_run_id,
+                pool, priority, cache_hit
          FROM task_runs WHERE run_id = $1 ORDER BY name",
     )
     .bind(&id)

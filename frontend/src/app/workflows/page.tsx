@@ -22,6 +22,7 @@ export default function WorkflowsPage() {
   const [busy, setBusy] = useState<string | null>(null);
   const [q, setQ] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
+  const [tagFilter, setTagFilter] = useState<string | null>(null);
   const [view, setView] = useState<ViewMode>("table");
 
   const [live] = useLiveUpdates();
@@ -54,10 +55,11 @@ export default function WorkflowsPage() {
       if (filter === "active" && !(r.has_schedule && !r.paused)) return false;
       if (filter === "paused" && !r.paused) return false;
       if (filter === "gitops" && r.source !== "git") return false;
-      if (needle && !(`${r.name} ${r.description ?? ""}`.toLowerCase().includes(needle))) return false;
+      if (tagFilter && !(r.tags ?? []).includes(tagFilter)) return false;
+      if (needle && !(`${r.name} ${r.description ?? ""} ${(r.tags ?? []).join(" ")}`.toLowerCase().includes(needle))) return false;
       return true;
     });
-  }, [rows, q, filter]);
+  }, [rows, q, filter, tagFilter]);
 
   const onRun = async (id: string) => {
     setBusy(id);
@@ -140,6 +142,17 @@ export default function WorkflowsPage() {
             </button>
           ))}
         </div>
+        {tagFilter && (
+          <button
+            type="button"
+            onClick={() => setTagFilter(null)}
+            title="Clear tag filter"
+            className="dy-pill dy-pill-active"
+            style={{ cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6 }}
+          >
+            #{tagFilter} <span aria-hidden style={{ opacity: 0.7 }}>✕</span>
+          </button>
+        )}
       </div>
 
       {error && <p style={{ color: "var(--red)" }}>{error}</p>}
@@ -168,6 +181,13 @@ export default function WorkflowsPage() {
                 {r.description && (
                   <div style={{ fontSize: 12.5, color: "var(--muted)", marginTop: 3, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                     {r.description}
+                  </div>
+                )}
+                {(r.tags ?? []).length > 0 && (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 5 }}>
+                    {(r.tags ?? []).map((t) => (
+                      <TagChip key={t} tag={t} active={t === tagFilter} onClick={() => setTagFilter(t === tagFilter ? null : t)} />
+                    ))}
                   </div>
                 )}
               </div>
@@ -216,25 +236,44 @@ export default function WorkflowsPage() {
       ) : (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(320px,1fr))", gap: 14 }}>
           {shown.map((r) => (
-            <Link key={r.id} href={`/workflows/${r.id}/history`} className="dy-card" style={{ display: "block", color: "var(--fg)", position: "relative", opacity: r.paused ? 0.65 : 1 }}>
+            // The card is a plain container, not a Link: the tag chips are
+            // real buttons, and nesting a button inside an anchor is invalid
+            // HTML — it also swallowed the click, so filtering by tag navigated
+            // to history instead. The link now covers the card body only, with
+            // the chips as siblings that filter exactly as they do in the table.
+            <div key={r.id} className="dy-card" style={{ position: "relative", opacity: r.paused ? 0.65 : 1 }}>
               <div style={{ position: "absolute", top: 0, left: 0, width: 3, height: "100%", background: statusColor((r.last_status ?? "pending") as TaskStatus) }} />
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                <strong>{r.name}</strong>
-                <SourceBadge source={r.source} />
-                {r.paused && <Tag text="PAUSED" color="var(--muted)" bg="rgba(139,148,158,0.13)" />}
-              </div>
-              {r.description && <div style={{ fontSize: 12.5, color: "var(--muted)", marginBottom: 10 }}>{r.description}</div>}
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-                <LastRun status={r.last_status} at={r.last_at} compact />
-                <span style={{ marginLeft: "auto", fontWeight: 600, color: rateColor(r.success_rate) }}>
-                  {r.success_rate == null ? "—" : `${r.success_rate}%`}
-                </span>
-              </div>
-              <Sparkline history={r.history} />
-              <div className="mono" style={{ fontSize: 12, color: "var(--dim)", marginTop: 10 }}>
-                {r.cron_expr ? `⏱ ${r.cron_expr}` : "manual"}
-              </div>
-            </Link>
+              <Link href={`/workflows/${r.id}/history`} style={{ display: "block", color: "var(--fg)" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                  <strong>{r.name}</strong>
+                  <SourceBadge source={r.source} />
+                  {r.paused && <Tag text="PAUSED" color="var(--muted)" bg="rgba(139,148,158,0.13)" />}
+                </div>
+                {r.description && <div style={{ fontSize: 12.5, color: "var(--muted)", marginBottom: 10 }}>{r.description}</div>}
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                  <LastRun status={r.last_status} at={r.last_at} compact />
+                  <span style={{ marginLeft: "auto", fontWeight: 600, color: rateColor(r.success_rate) }}>
+                    {r.success_rate == null ? "—" : `${r.success_rate}%`}
+                  </span>
+                </div>
+                <Sparkline history={r.history} />
+                <div className="mono" style={{ fontSize: 12, color: "var(--dim)", marginTop: 10 }}>
+                  {r.cron_expr ? `⏱ ${r.cron_expr}` : "manual"}
+                </div>
+              </Link>
+              {(r.tags ?? []).length > 0 && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 10 }}>
+                  {(r.tags ?? []).map((t) => (
+                    <TagChip
+                      key={t}
+                      tag={t}
+                      active={t === tagFilter}
+                      onClick={() => setTagFilter(t === tagFilter ? null : t)}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
           ))}
           {shown.length === 0 && <p className="dy-empty">No workflows match.</p>}
         </div>
@@ -255,6 +294,48 @@ function Tag({ text, color, bg }: { text: string; color: string; bg: string }) {
     <span style={{ fontSize: 9.5, fontWeight: 600, padding: "2px 7px", borderRadius: 999, color, background: bg, flexShrink: 0 }}>
       {text}
     </span>
+  );
+}
+
+// Deterministic color per tag (Airflow #16432 colored tags): same tag → same
+// chip color across the board, so a tag is visually recognizable.
+const TAG_PALETTE: { color: string; bg: string }[] = [
+  { color: "var(--blue)", bg: "rgba(47,129,247,0.13)" },
+  { color: "var(--accent)", bg: "rgba(232,131,58,0.13)" },
+  { color: "#3fb950", bg: "rgba(63,185,80,0.14)" },
+  { color: "#a371f7", bg: "rgba(163,113,247,0.14)" },
+  { color: "#e3b341", bg: "rgba(227,179,65,0.14)" },
+  { color: "#f778ba", bg: "rgba(247,120,186,0.14)" },
+];
+function tagColor(tag: string): { color: string; bg: string } {
+  let h = 0;
+  for (let i = 0; i < tag.length; i++) h = (h * 31 + tag.charCodeAt(i)) >>> 0;
+  return TAG_PALETTE[h % TAG_PALETTE.length];
+}
+
+// A colored tag chip; clickable to filter the list by that tag (#26).
+function TagChip({ tag, active, onClick }: { tag: string; active?: boolean; onClick?: () => void }) {
+  const c = tagColor(tag);
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={onClick ? `Filter by tag "${tag}"` : tag}
+      style={{
+        fontSize: 9.5,
+        fontWeight: 600,
+        padding: "2px 7px",
+        borderRadius: 999,
+        color: c.color,
+        background: c.bg,
+        border: `1px solid ${active ? c.color : "transparent"}`,
+        cursor: onClick ? "pointer" : "default",
+        flexShrink: 0,
+        lineHeight: 1.4,
+      }}
+    >
+      #{tag}
+    </button>
   );
 }
 

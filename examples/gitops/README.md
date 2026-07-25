@@ -51,7 +51,7 @@ examples/gitops/
   features (the published `0.3.0` does; a sqlite-only local build does not).
 
 > **Point the manifests at your repo.** Every manifest defaults `repoURL` to
-> `https://github.com/lucheeseng827/nick-rust-project.git` and `targetRevision` to
+> `https://github.com/lucheeseng827/dagron.git` and `targetRevision` to
 > `main`. If you forked, or you're trying this on a branch before merge, set both
 > to match — e.g. `targetRevision: claude/gitops-argocd-appsets-guide-7u9kki`:
 > ```bash
@@ -62,7 +62,7 @@ examples/gitops/
 ## Deploy — one command
 
 ```bash
-kubectl apply -f rust_modules/lab/module_54/examples/gitops/bootstrap/root-app.yaml
+kubectl apply -f examples/gitops/bootstrap/root-app.yaml
 ```
 
 That app-of-apps root pulls in the AppProject, the platform Application (wave 0),
@@ -122,7 +122,7 @@ Edit a DAG and push — no `kubectl apply`:
 
 ```bash
 # add a task, or change a schedule, then:
-git add rust_modules/lab/module_54/examples/gitops/workflows/team-data/etl-diamond.workflow.yaml
+git add examples/gitops/workflows/team-data/etl-diamond.workflow.yaml
 git commit -m "etl-diamond: add validate task"
 git push
 ```
@@ -135,7 +135,7 @@ generates a new Application on its own.
 ## Teardown
 
 ```bash
-kubectl -n argocd delete -f rust_modules/lab/module_54/examples/gitops/bootstrap/root-app.yaml
+kubectl -n argocd delete -f examples/gitops/bootstrap/root-app.yaml
 # or drop the whole cluster:
 kind delete cluster --name dagron-gitops
 ```

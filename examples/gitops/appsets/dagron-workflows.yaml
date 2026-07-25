@@ -26,10 +26,10 @@ spec:
     # Git directory generator: every immediate subfolder of workflows/ becomes a
     # generator "row" exposing {{path}}, {{path.basename}}, etc.
     - git:
-        repoURL: https://github.com/lucheeseng827/nick-rust-project.git
+        repoURL: https://github.com/lucheeseng827/dagron.git
         revision: main
         directories:
-          - path: rust_modules/lab/module_54/examples/gitops/workflows/*
+          - path: examples/gitops/workflows/*
   template:
     metadata:
       # e.g. dagron-wf-team-data
@@ -40,7 +40,7 @@ spec:
     spec:
       project: dagron
       source:
-        repoURL: https://github.com/lucheeseng827/nick-rust-project.git
+        repoURL: https://github.com/lucheeseng827/dagron.git
         revision: main
         # The matched folder — Argo applies every manifest in it.
         path: "{{path}}"

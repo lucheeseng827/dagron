@@ -3,7 +3,7 @@
   "title": "dagron — overview",
   "tags": ["dagron"],
   "timezone": "browser",
-  "schemaVersion": 39,
+  "schemaVersion": 41,
   "version": 1,
   "refresh": "15s",
   "time": { "from": "now-1h", "to": "now" },

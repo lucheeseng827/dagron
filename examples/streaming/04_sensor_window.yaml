@@ -1,0 +1,53 @@
+# Sensor micro-batch windower (case study 04) — the batching half of streaming.
+#
+# Cron fires this workflow once a minute (04_cron.yaml); each run aggregates
+# the one-minute window ENDING at its `{{ scheduled_time }}` from the readings
+# stream. Keying the window off the schedule's nominal fire time (not "now")
+# is what makes runs replayable: a backfilled or caught-up run computes *its*
+# minute, byte-for-byte the same.
+name: sensor_window
+parameters:
+  scheduled_time: ""          # injected by cron/schedule fires (RFC-3339)
+  stream: data/sensors.ndjson
+tasks:
+  - name: window
+    command:
+      - sh
+      - -c
+      # Producer lines are exactly {"ts":<epoch>,"celsius":<n.n>}, so a
+      # portable awk field split on [:,}] yields ts=$2, celsius=$4. The window
+      # end comes from scheduled_time on GNU *and* BSD/macOS date; a non-empty
+      # timestamp that parses on neither FAILS the task (never silently
+      # aggregate "now" in place of the scheduled window — that would corrupt
+      # backfills). Empty scheduled_time = the immediate positional run, which
+      # legitimately windows up to now.
+      - |
+        st="{{ scheduled_time }}"
+        if [ -n "$st" ]; then
+          end=$(date -d "$st" +%s 2>/dev/null) || \
+          end=$(date -j -f "%Y-%m-%dT%H:%M:%S" "$(printf %s "$st" | cut -c1-19)" +%s 2>/dev/null) || true
+          [ -n "${end:-}" ] || { echo "cannot parse scheduled_time '$st'" >&2; exit 1; }
+        else
+          end=$(date +%s)
+        fi
+        start=$((end - 60))
+        mkdir -p data/windows && touch "{{ stream }}"
+        row=$(awk -F'[:,}]' -v s="$start" -v e="$end" '
+          { ts = $2; c = $4
+            if (ts >= s && ts < e) { n++; sum += c
+              if (min == "" || c < min) min = c
+              if (c > max) max = c } }
+          END { if (n) printf "%d,%d,%s,%s,%.2f", s, n, min, max, sum/n
+                else  printf "%d,0,,,", s }' "{{ stream }}")
+        # Idempotent by window key: a retry or a replay of the same scheduled
+        # minute atomically REPLACES its window file instead of appending a
+        # duplicate row; the .tsv is rebuilt from the per-window files.
+        printf '%s\n' "$row" > "data/windows/$start.row.tmp"
+        mv "data/windows/$start.row.tmp" "data/windows/$start.row"
+        cat data/windows/*.row 2>/dev/null | sort -n > data/sensor_windows.tsv
+        echo "window row: $row"
+    timeout_secs: 30
+  - name: report
+    depends_on: [window]
+    command: ["sh", "-c", "echo windows so far: $(wc -l < data/sensor_windows.tsv)"]
+    timeout_secs: 30

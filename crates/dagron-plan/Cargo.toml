@@ -14,8 +14,12 @@ path = "src/lib.rs"
 
 [dependencies]
 # The plan resolves both specs through the exact parse → expand → validate
-# pipeline the engine uses, so "plan" reflects what would actually run. sqlite is
-# dagron-core's default backend feature (a backend must be selected to compile);
-# nothing here touches a datastore.
+# pipeline the engine uses — only the `dag`/`expand` model, nothing here touches
+# a datastore, so which backend feature is active doesn't matter functionally.
+# core still requires exactly one to compile at all; take its sqlite default so
+# `cargo build`/`test -p dagron-plan` work standalone with no extra flags.
+# dagron-api's postgres-only dagron-core dependency is built in its own
+# separate CI step (dagron-ee-guard.yml) specifically so it never has to unify
+# features with this crate's choice.
 dagron-core = { path = "../dagron-core" }
 anyhow = "1"

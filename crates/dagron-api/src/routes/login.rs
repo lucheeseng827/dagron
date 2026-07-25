@@ -6,8 +6,6 @@
 //! users. On startup `bootstrap_admin` seeds a first admin from env so the very
 //! first login needs no manual DB step.
 
-use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
-use argon2::Argon2;
 use axum::extract::State;
 use axum::http::header::SET_COOKIE;
 use axum::http::{HeaderValue, StatusCode};
@@ -18,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth::{AuthUser, SessionClaims, SESSION_COOKIE};
+use crate::pwhash;
 use crate::state::AppState;
 
 /// Default session lifetime; override with DAGRON_SESSION_TTL_SECS.
@@ -152,7 +151,7 @@ pub async fn create_user(
         return Err((StatusCode::BAD_REQUEST, "password must be at least 8 characters".to_string()));
     }
 
-    let hash = hash_password(&body.password).map_err(|e| {
+    let hash = pwhash::hash(body.password.clone()).await.map_err(|e| {
         tracing::error!(error = ?e, "hashing password failed");
         (StatusCode::INTERNAL_SERVER_ERROR, "unable to create user".to_string())
     })?;
@@ -225,15 +224,6 @@ pub async fn list_users(
     ))
 }
 
-/// Argon2id hash of `password` with a random salt (PHC string form).
-fn hash_password(password: &str) -> anyhow::Result<String> {
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map(|h| h.to_string())
-        .map_err(|e| anyhow::anyhow!("argon2: {e}"))
-}
-
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 
 /// Ensure the `users` table exists. dagron-api is its sole owner (the engine
@@ -274,7 +264,7 @@ pub async fn bootstrap_admin(pool: &sqlx::postgres::PgPool) -> anyhow::Result<()
     }
     let name = std::env::var("DAGRON_ADMIN_NAME").unwrap_or_else(|_| "Administrator".to_string());
 
-    let hash = hash_password(&password)?;
+    let hash = pwhash::hash(password.clone()).await?;
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
 

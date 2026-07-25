@@ -5,7 +5,7 @@ fullnameOverride: ""
 
 # Global values are shared with subcharts. `imageRegistry` relocates every image
 # in the chart to a private mirror with a single value — the air-gap install
-# lever (ee/DEPLOYMENT_BLUEPRINT.md). It replaces the registry host of images
+# lever. It replaces the registry host of images
 # that carry one (postgres:16-alpine → <registry>/postgres:16-alpine) and
 # prepends to bare images. Empty = images used verbatim (unchanged).
 #   --set global.imageRegistry=registry.corp.internal
@@ -25,7 +25,7 @@ imagePullSecrets: []
 # `kubernetes` cargo features. The module Dockerfile defaults to a sqlite-only
 # build — see terraform/README.md §"Building the images".
 engine:
-  image: mancube/dagron-engine:0.3.0
+  image: mancube/dagron-engine:0.5.0
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 8080
@@ -97,9 +97,40 @@ externalDatabaseSecret:
 # ── dagron-api (authenticated UI gateway) ───────────────────────────────────
 # Stateless edge over the same Postgres the engine writes; owns login (its own
 # HS256 session JWT) and serves the UI's REST + SSE. Scales to N replicas.
+# ── GitOps worker (optional) ─────────────────────────────────────────────────
+# Reconciles workflow definitions from the Git repos registered in the console.
+# OFF by default: most installs never connect a repository, and this is the one
+# image that carries a `git` binary — which is why it is a separate deployable
+# rather than something dagron-api shells out to.
+#
+# Enabling it is what makes the console's "no GitOps worker running" indicator
+# go green; without it, repos can be registered but nothing polls them.
+gitops:
+  enabled: false
+  # First published in 0.5.0. Release packaging rewrites this tag to the release
+  # version (docker.yml), so the pin here only matters to a repo checkout.
+  image: mancube/dagron-gitops:0.5.0
+  imagePullPolicy: IfNotPresent
+  # Seconds between auto-sync reconciles per repo. A manual Sync is immediate.
+  pollSecs: 60
+  rustLog: info
+  # Token for private repositories, read from a Secret you create. Sent only to
+  # trusted forge hosts over HTTPS; leave name empty for public repos.
+  #   kubectl create secret generic dagron-git   #     --from-literal=DAGRON_GIT_TOKEN=ghp_xxx
+  tokenSecret:
+    name: ""
+    key: DAGRON_GIT_TOKEN
+  # Disposable clone scratch (the root filesystem is read-only). Raise it if you
+  # sync a large monorepo.
+  scratchSizeLimit: 1Gi
+  extraEnv: []
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {memory: 256Mi}
+
 dagronApi:
   enabled: true
-  image: mancube/dagron-api:0.3.0
+  image: mancube/dagron-api:0.5.0
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 8080
@@ -156,7 +187,7 @@ envSecrets:
 # ── Frontend (Next.js UI) ────────────────────────────────────────────────────
 frontend:
   enabled: true
-  image: mancube/dagron-frontend:0.3.0
+  image: mancube/dagron-frontend:0.5.0
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 3000

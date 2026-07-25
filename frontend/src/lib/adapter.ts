@@ -61,3 +61,35 @@ export function statusLabel(status: TaskStatus): string {
   if (status === "awaiting_approval") return "Awaiting approval";
   return status.charAt(0).toUpperCase() + status.slice(1);
 }
+
+/// Why a task is parked, or `null` if it isn't.
+///
+/// Every park form — the time / HTTP / dataset wait sensors and the
+/// sub-workflow trigger — deliberately leaves the row `running` with no lease
+/// (no extra status, no CHECK rebuild server-side). The cost is that a parked
+/// task and a hung one are indistinguishable in a status column, so the API
+/// carries the reason and this turns it into something readable. `runLink` is
+/// set only for a sub-workflow trigger: the child run is navigable.
+export interface WaitingOn {
+  /// Short badge text, e.g. "Waiting on dataset".
+  label: string;
+  /// The specific thing waited on (URI, endpoint, wake time, child run id).
+  detail: string;
+  /// Run id to link to, when the thing waited on is a run.
+  runLink?: string;
+}
+
+export function waitingOn(
+  task: Pick<TaskRow, "status" | "wake_at" | "wait_url" | "wait_dataset" | "sub_run_id"> | null | undefined,
+): WaitingOn | null {
+  // Only a live row is parked: a resolved sensor keeps its wake_at/wait_url for
+  // the record, and showing "waiting" on a succeeded task would be a lie.
+  if (!task || task.status !== "running") return null;
+  if (task.sub_run_id) {
+    return { label: "Waiting on sub-workflow", detail: task.sub_run_id, runLink: task.sub_run_id };
+  }
+  if (task.wait_dataset) return { label: "Waiting on dataset", detail: task.wait_dataset };
+  if (task.wait_url) return { label: "Waiting on endpoint", detail: task.wait_url };
+  if (task.wake_at) return { label: "Waiting until", detail: task.wake_at };
+  return null;
+}

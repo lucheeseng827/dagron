@@ -1,0 +1,58 @@
+# Case study 05 — train → eval → promote, gated on measured quality.
+#
+#   train ─▶ converge (repeat: poll until loss plateaus, bounded)
+#         ─▶ evaluate (prints "ship" or "hold")
+#         ─▶ deploy   (exists only if evaluate said "ship")
+#         ─▶ hold     (runs only on the reject path)
+#
+# The promotion decision is the engine evaluating `when:` over the evaluate
+# task's OUTPUT at runtime — no glue code deciding outside the DAG. THRESHOLD
+# (default 90) is the promotion bar: run with THRESHOLD=99 on the engine to
+# watch the reject path. `repeat:` is the poll-until-converged loop, bounded
+# so a stuck run fails loudly instead of wedging.
+name: model_eval_gate
+deadline: { in: 10m }                   # soft SLA: alert if promotion drags
+tasks:
+  - name: train
+    timeout_secs: 60
+    command: ["sh", "-c", "echo training quick baseline && sleep 2 && echo done"]
+  - name: converge
+    depends_on: [train]
+    timeout_secs: 30
+    # Iteration i sees loss 5/i — "converged" once loss < 1 (iteration 6); a
+    # loop that never converged would FAIL after 10 iterations, not hang. The
+    # iteration counter persists in the run's artifacts (falling back to a
+    # /tmp dir keyed by the injected DAGRON_RUN_ID).
+    repeat: { until: "{{ output }} == converged", max_iterations: 10, delay_secs: 1 }
+    command:
+      - sh
+      - -c
+      - |
+        dir="${DAGRON_ARTIFACTS:-/tmp/dagron-${DAGRON_RUN_ID:-demo}}"; mkdir -p "$dir"
+        i=$(( $(cat "$dir/iters" 2>/dev/null || echo 0) + 1 )); echo "$i" > "$dir/iters"
+        loss=$(awk -v a="$i" 'BEGIN{ printf "%.2f", 5/a }')
+        echo "iteration $i loss=$loss" >&2
+        awk -v l="$loss" 'BEGIN { print (l < 1.0) ? "converged" : "training" }'
+  - name: evaluate
+    depends_on: [converge]
+    timeout_secs: 30
+    # Deterministic "accuracy=93" vs the promotion bar. THRESHOLD is read from
+    # the engine's environment (LocalExecutor inherits it), default 90 — so
+    # `THRESHOLD=99 dagron …` flips the run onto the reject path.
+    command:
+      - sh
+      - -c
+      - |
+        accuracy=93
+        echo "accuracy=$accuracy threshold=${THRESHOLD:-90}" >&2
+        [ "$accuracy" -ge "${THRESHOLD:-90}" ] && echo ship || echo hold
+  - name: deploy
+    depends_on: [evaluate]
+    when: "{{ tasks.evaluate.output }} == ship"
+    timeout_secs: 30
+    command: ["sh", "-c", "echo promoting model to serving — quality bar cleared"]
+  - name: hold
+    depends_on: [evaluate]
+    when: "{{ tasks.evaluate.output }} == hold"
+    timeout_secs: 30
+    command: ["sh", "-c", "echo model held back — accuracy under the bar"]

@@ -1,5 +1,34 @@
 use serde::{Deserialize, Serialize};
 
+/// `create_run` refused to start a run because the named workflow already has
+/// `max_active_runs` runs in flight (parity fast-win #21 — Argo #12757 /
+/// Prefect deployment concurrency limits). A typed error so callers can
+/// distinguish "at capacity, try later" from a real failure: the API maps it to
+/// HTTP 429, the queue source requeues the message instead of dead-lettering it,
+/// and the schedule/backfill loops skip the fire (backfill releases its slot and
+/// retries when capacity frees).
+#[derive(Debug, Clone)]
+pub struct MaxActiveRunsReached {
+    /// The workflow (definition) name that is at its concurrency cap.
+    pub name: String,
+    /// The configured `max_active_runs` for the workflow.
+    pub max: u32,
+    /// How many runs of the workflow were active when admission was refused.
+    pub active: i64,
+}
+
+impl std::fmt::Display for MaxActiveRunsReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "max_active_runs ({}) reached for workflow '{}' ({} active)",
+            self.max, self.name, self.active
+        )
+    }
+}
+
+impl std::error::Error for MaxActiveRunsReached {}
+
 /// The trigger rules a task may declare (`trigger_rule:`), deciding whether it
 /// runs once all its dependencies are terminal. `all_success` is the default
 /// (and the historical behavior). Unknown values are rejected at validation.
@@ -30,6 +59,27 @@ pub fn trigger_rule_ready(rule: &str, dep_statuses: &[String]) -> bool {
         // all_success (default + unknown-safe): every dependency succeeded.
         _ => dep_statuses.iter().all(|s| s == "succeeded"),
     }
+}
+
+/// Decide whether a **failed** task attempt should be retried (fast-win #24).
+///
+/// `attempt` is the attempt number that just ran (1-based). The normal rule is
+/// "retry while attempts remain" (`attempt < max_attempts`). The one exception:
+/// a task killed by its `timeout_secs` deadline (`timed_out`) whose
+/// `retry_on_timeout` is `false` is **not** retried — a deadline kill usually
+/// recurs, so retrying just burns the remaining budget and delays the failure
+/// (Airflow #9232). Timeout-only: a non-zero exit or backend error
+/// (`timed_out == false`) always follows the normal attempts rule.
+pub fn should_retry_failed(
+    attempt: i64,
+    max_attempts: u32,
+    timed_out: bool,
+    retry_on_timeout: bool,
+) -> bool {
+    if timed_out && !retry_on_timeout {
+        return false;
+    }
+    attempt < max_attempts as i64
 }
 
 /// A claimed transactional-outbox event, handed to a delivery worker. Written in
@@ -170,6 +220,34 @@ pub struct TaskRun {
     pub version: i64,
     pub scheduled_at: Option<String>,
     pub finished_at: Option<String>,
+    /// Named concurrency pool this task draws a slot from (`pool:` in the spec),
+    /// or `None` for an unpooled task. The claim gates pooled tasks against the
+    /// pool's configured capacity (#21). `#[sqlx(default)]` so a projection that
+    /// does not select `pool` still maps (→ `None`).
+    #[sqlx(default)]
+    pub pool: Option<String>,
+    /// Why a task is **parked**. Every park form deliberately keeps the row
+    /// `running` with a NULL lease (no new status, no CHECK rebuild) — which
+    /// leaves a reader unable to tell "waiting on something" from "stuck". These
+    /// four are the reason, exactly one of them set on a parked row:
+    /// the time sensor's deadline (#27), the HTTP sensor's endpoint, the dataset
+    /// sensor's URI, and the sub-workflow trigger's child run (#23).
+    /// All `#[sqlx(default)]`, so leaner projections still map.
+    /// Dispatch priority among simultaneously-ready tasks (#25), and whether the
+    /// row was resolved from the memoization store rather than executed (#22) —
+    /// a cache hit is otherwise indistinguishable from a fast success.
+    #[sqlx(default)]
+    pub priority: i64,
+    #[sqlx(default)]
+    pub cache_hit: bool,
+    #[sqlx(default)]
+    pub wake_at: Option<String>,
+    #[sqlx(default)]
+    pub wait_url: Option<String>,
+    #[sqlx(default)]
+    pub wait_dataset: Option<String>,
+    #[sqlx(default)]
+    pub sub_run_id: Option<String>,
 }
 
 // Constructed only by the ops read API (`db::get_run`); a lean build never
@@ -341,6 +419,25 @@ pub struct BackfillJob {
     pub updated_at: String,
 }
 
+/// A dataset trigger the sweep just claimed (data-aware scheduling). Produced by
+/// `db::claim_due_dataset_triggers` when a registered workflow's subscribed
+/// dataset(s) recorded new updates: the claimer CAS-advanced the subscription
+/// cursor(s), so exactly one scheduler owns this fire (HA-safe, no leadership).
+/// The engine then loads the workflow's spec and creates the run; if run
+/// creation is refused (e.g. `max_active_runs`), it restores the cursors from
+/// `advanced` so the fire retries on a later sweep.
+#[derive(Debug, Clone)]
+pub struct DatasetFire {
+    /// Registered workflow to fire.
+    pub workflow_name: String,
+    /// The subscribed dataset whose update triggered this fire (with several
+    /// fresh datasets in one sweep, the first — updates coalesce into one run).
+    pub trigger_uri: String,
+    /// Every cursor this claim advanced: `(uri, previous, new)`. Kept for
+    /// rollback when the fire cannot create its run.
+    pub advanced: Vec<(String, i64, i64)>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +476,22 @@ mod tests {
         // Unknown rule falls back to all_success semantics (safe default).
         assert!(trigger_rule_ready("bogus", &v(&["succeeded"])));
         assert!(!trigger_rule_ready("bogus", &v(&["failed"])));
+    }
+
+    #[test]
+    fn retry_gate_honors_retry_on_timeout() {
+        // Non-timeout failure: the normal attempts rule, regardless of the flag.
+        assert!(should_retry_failed(1, 3, false, true), "attempts remain → retry");
+        assert!(should_retry_failed(1, 3, false, false), "flag is timeout-only");
+        assert!(!should_retry_failed(3, 3, false, true), "no attempts left → fail");
+
+        // Timeout failure with retry_on_timeout=true: normal attempts rule.
+        assert!(should_retry_failed(1, 3, true, true), "timeout still retried by default");
+        assert!(!should_retry_failed(3, 3, true, true), "…but not past max_attempts");
+
+        // Timeout failure with retry_on_timeout=false: never retried, even with
+        // attempts to spare — the #24 behavior.
+        assert!(!should_retry_failed(1, 3, true, false), "opted-out timeout fails at once");
+        assert!(!should_retry_failed(1, 10, true, false));
     }
 }

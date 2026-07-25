@@ -8,7 +8,7 @@ into the repo's description, or sync it). Keep these in step with releases.
 `dagron` is a **workflow/DAG orchestrator**: operators drive it from a console,
 the control plane parses a DAG and reconciles task state, and it dispatches each
 ready task to a worker. It owns the schedule → dispatch → track loop — it is the
-thing that runs your tasks, not the tasks themselves. The four artifacts split
+thing that runs your tasks, not the tasks themselves. The artifacts below split
 along that path.
 
 ```
@@ -50,6 +50,7 @@ along that path.
 | [`mancube/dagron-api`](https://hub.docker.com/r/mancube/dagron-api) | [`dagron-api.md`](./dagron-api.md) | auth + management API |
 | [`mancube/dagron-frontend`](https://hub.docker.com/r/mancube/dagron-frontend) | [`dagron-frontend.md`](./dagron-frontend.md) | Next.js operator console |
 | [`mancube/dagron-mcp`](https://hub.docker.com/r/mancube/dagron-mcp) | [`dagron-mcp.md`](./dagron-mcp.md) | MCP server (drive dagron from an AI agent) |
+| [`mancube/dagron-gitops`](https://hub.docker.com/r/mancube/dagron-gitops) | [`dagron-gitops.md`](./dagron-gitops.md) | GitOps worker (repo → workflow definitions; the only image with `git`) |
 | `oci://registry-1.docker.io/mancube/dagron` | [`dagron-chart.md`](./dagron-chart.md) | Helm chart (the full stack) |
 
-All four images are published **`linux/amd64` + `linux/arm64`** at `0.4.3` + `latest`.
+All five images are published **`linux/amd64` + `linux/arm64`** at the release version + `latest`.

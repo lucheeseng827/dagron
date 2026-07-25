@@ -16,6 +16,7 @@ type IconName =
   | "metrics"
   | "approvals"
   | "backfills"
+  | "datasets"
   | "users"
   | "audit"
   | "bell"
@@ -40,6 +41,7 @@ const MAIN: NavItem[] = [
   { href: "/gitops", label: "GitOps", icon: "gitops", badge: "dot" },
 ];
 const OPS: NavItem[] = [
+  { href: "/datasets", label: "Datasets", icon: "datasets" },
   { href: "/environments", label: "Environments", icon: "envs" },
   { href: "/backfills", label: "Backfills", icon: "backfills" },
   { href: "/dead-letters", label: "Dead letters", icon: "dead", badge: "deadCount" },
@@ -304,6 +306,15 @@ function NavIcon({ name }: { name: IconName }) {
         <svg {...p}>
           <polyline points="1 4 1 10 7 10" />
           <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
+        </svg>
+      );
+    case "datasets":
+      // Stacked cylinder — the datastore glyph, matching the outline set.
+      return (
+        <svg {...p}>
+          <ellipse cx="12" cy="5" rx="9" ry="3" />
+          <path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5" />
+          <path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3" />
         </svg>
       );
     case "users":

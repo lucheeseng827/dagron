@@ -64,7 +64,9 @@ pub struct EnvironmentView {
     pub variables: BTreeMap<String, String>,
     /// Names only — secret values are write-only by design.
     pub secret_names: Vec<String>,
-    /// Whether the server can store secrets (DAGRON_ENV_SECRET_KEY configured).
+    /// Whether the server can store secrets — true when the legacy
+    /// `DAGRON_ENV_SECRET_KEY` **or** an envelope KEK provider
+    /// (`DAGRON_ENV_KEK_PROVIDER`) is configured.
     pub secrets_configured: bool,
     pub created_at: String,
     pub updated_at: String,
@@ -107,7 +109,10 @@ async fn fetch_view(state: &AppState, id: &str) -> Result<Option<EnvironmentView
         description,
         variables: serde_json::from_str(&variables).unwrap_or_default(),
         secret_names,
-        secrets_configured: dagron_crypto::key_configured(),
+        // Secret storage is available via either the legacy single key or an
+        // envelope KEK provider (BYOK/KMS).
+        secrets_configured: dagron_crypto::key_configured()
+            || matches!(dagron_crypto::provider_from_env(), Ok(Some(_))),
         created_at,
         updated_at,
     }))
@@ -280,8 +285,12 @@ pub async fn put_secret(
     if body.value.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "secret value must not be empty".to_string()));
     }
-    let key = dagron_crypto::load_key().map_err(|e| {
-        (StatusCode::SERVICE_UNAVAILABLE, format!("secret storage not configured: {e}"))
+    // Envelope-encrypt (v2) when a KEK provider is configured (BYOK/KMS); otherwise
+    // fall back to the legacy single-key (v1). Reads dispatch on the stored
+    // version, so enabling a provider is a safe, opt-in migration — old v1 secrets
+    // keep decrypting.
+    let provider = dagron_crypto::provider_from_env().map_err(|e| {
+        (StatusCode::SERVICE_UNAVAILABLE, format!("KEK provider misconfigured: {e}"))
     })?;
     let exists: Option<String> = sqlx::query_scalar("SELECT id FROM environments WHERE id = $1")
         .bind(&id)
@@ -291,8 +300,17 @@ pub async fn put_secret(
     if exists.is_none() {
         return Err((StatusCode::NOT_FOUND, format!("environment '{id}' not found")));
     }
-    let ciphertext = dagron_crypto::encrypt(&key, &body.value)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    let ciphertext = match &provider {
+        Some(p) => dagron_crypto::encrypt_envelope(p.as_ref(), &body.value)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("envelope encrypt failed: {e}")))?,
+        None => {
+            let key = dagron_crypto::load_key().map_err(|e| {
+                (StatusCode::SERVICE_UNAVAILABLE, format!("secret storage not configured: {e}"))
+            })?;
+            dagron_crypto::encrypt(&key, &body.value)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?
+        }
+    };
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO environment_secrets (environment_id, name, ciphertext, updated_at)

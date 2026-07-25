@@ -7,7 +7,7 @@
 //! dependency edges, and now-orphaned definitions in one transaction
 //! ([`db::gc_old_runs`]).
 //!
-//! **Archive-before-purge** (ee/STATE_STORE.md hot/cold split): when an
+//! **Archive-before-purge** (the hot/cold split): when an
 //! [`ArchiveSink`] is configured, each eligible run is first exported as a
 //! self-contained JSON document ([`db::archivable_runs`] — run + definition +
 //! tasks + outbox events) and only the runs whose export verifiably landed are

@@ -22,7 +22,7 @@ import {
   retryTask,
 } from "@/lib/dagron-api";
 import { subscribeRun } from "@/lib/dagron-stream";
-import { statusColor } from "@/lib/adapter";
+import { statusColor, waitingOn } from "@/lib/adapter";
 import { useLiveUpdates, type ConnStatus } from "@/lib/live";
 import { absTime, duration } from "@/lib/time";
 import type { GraphResponse, RunDetail } from "@/types/dagron";
@@ -179,6 +179,10 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
     void act(() => rejectTask(id, tid), "Gate rejected");
   };
 
+  // The open task's row from the run detail: the park reason and scheduling
+  // facts the logs endpoint doesn't carry (a parked task has no logs at all).
+  const selectedTask = selected ? run?.tasks.find((t) => t.id === selected) : undefined;
+
   const runActive = run ? !TERMINAL.has(run.status) : false;
   // A failed/cancelled run can resume from its failure frontier.
   const runRerunnable = run ? run.status === "failed" || run.status === "cancelled" : false;
@@ -284,6 +288,13 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
           runId={id}
           taskId={selected}
           onClose={() => setSelected(null)}
+          // Park reason comes from the run detail, not the logs endpoint: a
+          // parked task has no output to tail, which is exactly why it needs a
+          // reason shown.
+          waiting={waitingOn(selectedTask)}
+          pool={selectedTask?.pool}
+          priority={selectedTask?.priority}
+          cacheHit={selectedTask?.cache_hit}
           actions={(logs) => (
             <>
               {logs.status === "awaiting_approval" && (

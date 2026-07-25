@@ -558,11 +558,25 @@ pub(crate) struct TaskSpecInput {
     pub(crate) runner_class: Option<String>,
     /// Chain another **saved** workflow as this step. At run-creation dagron-api
     /// loads that workflow's spec and inlines its tasks in place of this one
-    /// (see [`crate::expand`]). A task is either a leaf (`command`) or a call
-    /// (`workflow_ref`), never both. Resolved away before the run is created, so
-    /// it never reaches the engine.
+    /// (see [`crate::expand`]). Resolved away before the run is created, so it
+    /// never reaches the engine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) workflow_ref: Option<String>,
+    /// Call a **template** — a reusable sub-DAG declared in this spec's
+    /// [`DagSpecInput::templates`] — instead of running a container (engine
+    /// `template`, the DAG-of-DAGs pattern). The engine's expander inlines the
+    /// template's tasks in place of this one at run creation, wiring this task's
+    /// upstreams to the sub-DAG's roots and its downstreams to the sub-DAG's exits.
+    ///
+    /// A task is exactly one of: a leaf (`command`), a call (`template`), or a
+    /// chain (`workflow_ref`) — see [`validate_graph`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) template: Option<String>,
+    /// Arguments for the called template, filling its declared `parameters`
+    /// (engine `arguments`). Values may reference the caller's scope via
+    /// `{{ name }}`. Only meaningful alongside `template`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) arguments: std::collections::BTreeMap<String, String>,
     /// Task kind (engine `type`). `type: approval` makes this a human approval
     /// gate (#19) — a command-less leaf that parks in `awaiting_approval`.
     /// Round-tripped into the stored task JSON so the engine sees it.
@@ -615,6 +629,19 @@ pub(crate) struct RepeatInput {
     pub(crate) delay_secs: u64,
 }
 
+/// Mirror of engine `dag::TemplateSpec` — a named, reusable sub-DAG that a task
+/// calls with `template:`. Its tasks live in their own namespace: `depends_on`
+/// inside a template refers to the template's own tasks, and the expander
+/// prefixes every produced task with the calling task's name (`run-etl.build`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct TemplateSpecInput {
+    pub(crate) name: String,
+    /// Default parameter values, overridable per call via the task's `arguments`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) parameters: std::collections::BTreeMap<String, String>,
+    pub(crate) tasks: Vec<TaskSpecInput>,
+}
+
 /// Mirror of engine `dag::TaskDefaults` (the DRY block): fields set here fill
 /// every task that doesn't override them, exactly like the engine-side merge.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -640,6 +667,14 @@ impl TaskSpecInput {
     pub(crate) fn is_approval(&self) -> bool {
         self.task_type.as_deref() == Some("approval")
     }
+    /// Whether this task is a `type: workflow` sub-workflow trigger (#23).
+    pub(crate) fn is_workflow(&self) -> bool {
+        self.task_type.as_deref() == Some("workflow")
+    }
+    /// Whether this task is a `type: wait` sensor (#27) — time, HTTP, or dataset.
+    pub(crate) fn is_wait(&self) -> bool {
+        self.task_type.as_deref() == Some("wait")
+    }
 }
 
 fn default_max_attempts() -> u32 {
@@ -664,6 +699,12 @@ pub(crate) struct DagSpecInput {
     /// docker_image / env values / when conditions are substituted at submit.
     #[serde(default)]
     pub(crate) parameters: std::collections::BTreeMap<String, String>,
+    /// Reusable sub-DAGs (engine `templates`), each callable from a task's
+    /// `template:` — the DAG-of-DAGs pattern. Validated here (names unique, each
+    /// sub-graph well-formed, every call resolves) and expanded inline by the
+    /// engine's parser at run creation, so nothing downstream sees a call task.
+    #[serde(default)]
+    pub(crate) templates: Vec<TemplateSpecInput>,
     /// Named environment (variable set + secrets): its variables join the
     /// substitution scope as `{{ env.NAME }}`, its name is stamped on the run
     /// so the engine resolves its secrets at dispatch. Unknown = 400.
@@ -682,8 +723,10 @@ pub(crate) struct DagSpecInput {
 
 /// Parse + validate a DAG YAML (duplicate-name, unknown-dep, cycle). Shared by
 /// submit and dead-letter redrive. Returns the spec or a (status, message) error.
-/// This validates the *authored* spec; `workflow_ref` call tasks are checked for
-/// structure here and resolved later by [`crate::expand`].
+/// This validates the *authored* spec — `workflow_ref` chains and `template:`
+/// calls are checked for structure here and expanded later ([`crate::expand`] and
+/// the engine's parser respectively), so the graph seen here is the one a human
+/// wrote and the one the visual editor draws.
 pub(crate) fn parse_and_validate(yaml: &str) -> Result<DagSpecInput, (StatusCode, String)> {
     let spec: DagSpecInput = serde_yaml::from_str(yaml)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid YAML: {e}")))?;
@@ -706,8 +749,59 @@ pub(crate) fn parse_and_validate(yaml: &str) -> Result<DagSpecInput, (StatusCode
             ));
         }
     }
-    validate_graph(&spec.name, &spec.tasks)?;
+    validate_templates(&spec)?;
+    validate_graph(&spec.name, &spec.tasks, &spec.templates)?;
     Ok(spec)
+}
+
+/// Validate the `templates:` block: names are unique and non-empty, no template
+/// is empty, and each template's task list is itself a well-formed sub-graph
+/// (templates may call other templates, so the same declaration set is in scope).
+///
+/// Mirrors the checks in `dagron_core::expand`, which is what actually inlines
+/// these at run creation. Doing them here means a bad sub-DAG is a 400 on save —
+/// the console's visual editor never stores a workflow it can draw but not run.
+fn validate_templates(spec: &DagSpecInput) -> Result<(), (StatusCode, String)> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for t in &spec.templates {
+        if t.name.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("a template in DAG '{}' has an empty name", spec.name),
+            ));
+        }
+        if !seen.insert(t.name.as_str()) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("duplicate template name '{}' in DAG '{}'", t.name, spec.name),
+            ));
+        }
+        if t.tasks.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("template '{}' in DAG '{}' has no tasks", t.name, spec.name),
+            ));
+        }
+    }
+    for t in &spec.templates {
+        // A `workflow_ref` inside a template would be dropped silently: the chain
+        // expander ([`crate::expand`]) only rewrites top-level tasks, and the
+        // engine's spec model has no such field. Refuse instead of losing it.
+        for task in &t.tasks {
+            if task.workflow_ref.is_some() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "task '{}' in template '{}' sets `workflow_ref` — chaining a saved \
+                         workflow is only supported on top-level tasks; call a `template:` instead",
+                        task.name, t.name
+                    ),
+                ));
+            }
+        }
+        validate_graph(&format!("{} (template '{}')", spec.name, t.name), &t.tasks, &spec.templates)?;
+    }
+    Ok(())
 }
 
 /// Runner-class validation, mirroring core `dag::validate_runner_class`
@@ -728,13 +822,23 @@ fn validate_runner_class(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Structural DAG validation: every task is a leaf or a chain (not both/neither),
-/// task names are unique, every `depends_on` resolves, and the graph is acyclic.
-/// Reused on both the authored spec and the flattened spec the `workflow_ref`
-/// expander produces.
+/// Structural DAG validation: every task is exactly one kind (leaf / call /
+/// chain), task names are unique, and the (resolvable) graph is acyclic. Runs on
+/// the *authored*, unexpanded spec — before `workflow_ref` inlining, templating,
+/// and `with_items` fan-out (`submit_yaml`) — so any check here must not assume
+/// those have happened. A `depends_on`/`runner_class` that only resolves after
+/// expansion (e.g. it targets a name inside a referenced sub-workflow, or is a
+/// `{{ }}` template) is left for the engine's own post-expansion validation
+/// (`dagron_core::dag::DagGraph::from_yaml_with_params`) rather than rejected
+/// here, so a spec the engine would accept is never 400'd early.
+///
+/// `templates` is the set of declarations a `template:` call may name. It is the
+/// same set for the top-level graph and for each template's own sub-graph, since
+/// a template may call another template.
 pub(crate) fn validate_graph(
     name: &str,
     tasks: &[TaskSpecInput],
+    templates: &[TemplateSpecInput],
 ) -> Result<(), (StatusCode, String)> {
     let mut graph = DiGraph::<(), ()>::new();
     let mut idx = HashMap::new();
@@ -771,13 +875,19 @@ pub(crate) fn validate_graph(
                 ));
             }
         }
+        // A templated runner_class (`{{ param }}`) only becomes a real class
+        // name after submit_yaml's substitution pass — checking the raw string's
+        // charset here would 400 a spec the engine would accept. The engine
+        // re-validates the substituted value itself (dag::from_spec).
         if let Some(class) = &t.runner_class {
-            validate_runner_class(class).map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid runner_class for task '{}': {e}", t.name),
-                )
-            })?;
+            if !class.contains("{{") {
+                validate_runner_class(class).map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid runner_class for task '{}': {e}", t.name),
+                    )
+                })?;
+            }
         }
         // A runtime `when` may only reference tasks it depends on — an output
         // the gate is guaranteed to have when the engine evaluates readiness.
@@ -795,53 +905,329 @@ pub(crate) fn validate_graph(
                 }
             }
         }
-        // An approval gate (#19) is a command-less leaf that waits for a human, so
-        // it is exempt from the leaf/chain rule (but must not carry either).
-        if t.is_approval() {
-            if !t.command.is_empty() || t.workflow_ref.is_some() {
+        // Command-less task kinds are exempt from the leaf/chain rule (but must
+        // not carry either): an approval gate waits for a human (#19), a
+        // sub-workflow trigger runs a child workflow (#23), and a wait sensor
+        // defers on a timer / endpoint / dataset (#27). This list must track
+        // `dag::validate`'s — it is the same rule stated twice, and when #716
+        // added the last two kinds only the engine's copy learned about them, so
+        // saving a workflow containing a sensor or a trigger failed here while
+        // submitting the identical spec as a run succeeded.
+        if t.is_approval() || t.is_workflow() || t.is_wait() {
+            if !t.command.is_empty() || t.workflow_ref.is_some() || t.template.is_some() {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    format!("approval task '{}' cannot set `command` or `workflow_ref`", t.name),
+                    format!(
+                        "task '{}' is a command-less kind (approval / workflow / wait) and cannot set `command`, `template` or `workflow_ref`",
+                        t.name
+                    ),
                 ));
             }
         } else {
-            // A task is exactly one of: a leaf (`command`) or a chain (`workflow_ref`).
-            // Catches a command-less task on the no-reference path too (where the
-            // expander, which also checks this, is skipped).
-            match (!t.command.is_empty(), t.workflow_ref.is_some()) {
-                (true, true) => {
+            // A task is exactly one of: a leaf (`command`), a call into a declared
+            // template (`template`), or a chain into a saved workflow
+            // (`workflow_ref`). Catches a command-less task on the no-reference
+            // path too (where the expander, which also checks this, is skipped).
+            let kinds = [!t.command.is_empty(), t.template.is_some(), t.workflow_ref.is_some()];
+            match kinds.iter().filter(|set| **set).count() {
+                0 => {
                     return Err((
                         StatusCode::BAD_REQUEST,
-                        format!("task '{}' sets both `command` and `workflow_ref` — use exactly one", t.name),
+                        format!(
+                            "task '{}' needs a `command` (leaf), a `template` (sub-DAG call) or a `workflow_ref` (chain)",
+                            t.name
+                        ),
                     ));
                 }
-                (false, false) => {
+                1 => {}
+                _ => {
                     return Err((
                         StatusCode::BAD_REQUEST,
-                        format!("task '{}' needs a `command` (leaf) or a `workflow_ref` (chain)", t.name),
+                        format!(
+                            "task '{}' sets more than one of `command` / `template` / `workflow_ref` — use exactly one",
+                            t.name
+                        ),
                     ));
                 }
-                _ => {}
             }
+        }
+        // A call must name a template this spec declares. Unlike `workflow_ref`
+        // (which resolves against the saved-workflow table at run creation), a
+        // template is local to the spec, so this is fully checkable at save time.
+        if let Some(called) = &t.template {
+            if !templates.iter().any(|tpl| &tpl.name == called) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "task '{}' calls unknown template '{called}' in DAG '{name}' — declare it under `templates:`",
+                        t.name
+                    ),
+                ));
+            }
+        } else if !t.arguments.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("task '{}' sets `arguments` without a `template` to pass them to", t.name),
+            ));
         }
         idx.insert(t.name.clone(), graph.add_node(()));
     }
+    // Names a dependency may legitimately forward-reference: a task inside a
+    // workflow_ref-referenced sub-workflow, namespaced only after expansion
+    // (e.g. `call.inner` for a task named `call` with `workflow_ref: child`).
+    let chains: HashSet<&str> =
+        tasks.iter().filter(|t| t.workflow_ref.is_some()).map(|t| t.name.as_str()).collect();
     for t in tasks {
         let to = idx[&t.name];
         for dep in &t.depends_on {
-            let Some(&from) = idx.get(dep) else {
+            if let Some(&from) = idx.get(dep) {
+                graph.add_edge(from, to, ());
+                continue;
+            }
+            // Not a top-level authored name. If it's namespaced under a
+            // workflow_ref task in this spec, defer to the engine's
+            // post-expansion validation — this pre-check can't see inside the
+            // chain. Anything else is a genuinely unknown dependency.
+            if !chains.iter().any(|c| dep == c || dep.starts_with(&format!("{c}."))) {
                 return Err((
                     StatusCode::BAD_REQUEST,
                     format!("task '{}' depends on unknown task '{}'", t.name, dep),
                 ));
-            };
-            graph.add_edge(from, to, ());
+            }
         }
     }
     if is_cyclic_directed(&graph) {
         return Err((StatusCode::BAD_REQUEST, format!("DAG '{}' contains a cycle", name)));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod validate_graph_tests {
+    use super::parse_and_validate;
+
+    /// `parse_and_validate` runs on the authored, unexpanded YAML — it must not
+    /// reject a `depends_on` that only resolves after `workflow_ref` inlining
+    /// (the engine's own post-expansion validation is the authority on that).
+    #[test]
+    fn allows_a_dep_on_a_workflow_ref_internal_task() {
+        let spec = "
+name: parent
+tasks:
+  - name: prepare
+    command: [\"true\"]
+  - name: call
+    workflow_ref: child
+    depends_on: [prepare]
+  - name: notify
+    command: [\"echo\", \"done\"]
+    depends_on: [call.inner]
+";
+        parse_and_validate(spec).expect("a forward-reference into a workflow_ref chain must not 400");
+    }
+
+    /// A `depends_on` on a name that isn't a sibling and isn't namespace-shaped
+    /// like a workflow_ref reference (no workflow_ref task present at all) is
+    /// still caught eagerly here — this is what lets gitrepos.rs's sync-time
+    /// scan (`fetch_and_validate`, which also calls this) flag a broken synced
+    /// workflow file immediately rather than only at submit time.
+    #[test]
+    fn still_rejects_a_genuinely_unknown_dep() {
+        let spec = "
+name: p
+tasks:
+  - name: a
+    command: [\"true\"]
+    depends_on: [ghost]
+";
+        let err = parse_and_validate(spec).unwrap_err();
+        assert!(err.1.contains("unknown task 'ghost'"), "got: {}", err.1);
+    }
+
+    /// A templated `runner_class` only becomes a real class name after
+    /// submit_yaml's substitution — the raw charset check must not fire on it.
+    #[test]
+    fn allows_a_templated_runner_class() {
+        let spec = "
+name: p
+tasks:
+  - name: a
+    command: [\"true\"]
+    runner_class: \"{{ params.class }}\"
+";
+        parse_and_validate(spec).expect("a templated runner_class must not 400 before substitution");
+    }
+
+    /// A non-templated, invalid runner_class is still caught early (fast
+    /// feedback on the common typo case, no expansion needed to know it's bad).
+    #[test]
+    fn still_rejects_a_plain_invalid_runner_class() {
+        let spec = "
+name: p
+tasks:
+  - name: a
+    command: [\"true\"]
+    runner_class: \"Not Valid!\"
+";
+        let err = parse_and_validate(spec).unwrap_err();
+        assert!(err.1.contains("runner_class"), "got: {}", err.1);
+    }
+
+    // ── `templates:` / `template:` — the DAG-of-DAGs pattern ─────────────────
+    // The engine has expanded template calls since day one, but this validator
+    // (which every save/submit path goes through) knew only `command` and
+    // `workflow_ref`, so `examples/templates/01_dag_of_dags.yaml` was a 400 —
+    // unsaveable through the API and therefore unopenable in the console editor.
+
+    /// `examples/templates/01_dag_of_dags.yaml`, verbatim.
+    const DAG_OF_DAGS: &str = "
+name: dag-of-dags
+templates:
+  - name: etl
+    tasks:
+      - { name: build,   command: [\"sh\", \"-c\", \"echo build\"] }
+      - { name: process, command: [\"sh\", \"-c\", \"echo process\"], depends_on: [build] }
+      - { name: publish, command: [\"sh\", \"-c\", \"echo publish\"], depends_on: [process] }
+tasks:
+  - { name: prepare, command: [\"sh\", \"-c\", \"echo prepare\"] }
+  - { name: run-etl, template: etl, depends_on: [prepare] }
+  - { name: notify,  command: [\"sh\", \"-c\", \"echo done\"], depends_on: [run-etl] }
+";
+
+    #[test]
+    fn accepts_a_template_call() {
+        parse_and_validate(DAG_OF_DAGS).expect("the DAG-of-DAGs example must validate");
+    }
+
+    /// The same spec must survive the engine's own parser + expander, which is
+    /// what actually runs it — this is the end-to-end guard against the two
+    /// validators drifting apart again.
+    #[test]
+    fn the_engine_expands_the_same_spec() {
+        let dag = dagron_core::dag::DagGraph::from_yaml(DAG_OF_DAGS)
+            .expect("the engine must expand what this validator accepts");
+        let names: Vec<&str> = dag.spec.tasks.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"run-etl.build"), "got: {names:?}");
+        assert!(names.contains(&"run-etl.publish"), "got: {names:?}");
+    }
+
+    #[test]
+    fn rejects_a_call_to_an_undeclared_template() {
+        let spec = "
+name: p
+tasks:
+  - { name: a, template: nope }
+";
+        let err = parse_and_validate(spec).unwrap_err();
+        assert!(err.1.contains("unknown template 'nope'"), "got: {}", err.1);
+    }
+
+    #[test]
+    fn rejects_a_task_that_is_two_kinds_at_once() {
+        let spec = "
+name: p
+templates:
+  - name: t
+    tasks:
+      - { name: inner, command: [\"true\"] }
+tasks:
+  - { name: a, template: t, command: [\"true\"] }
+";
+        let err = parse_and_validate(spec).unwrap_err();
+        assert!(err.1.contains("more than one of"), "got: {}", err.1);
+    }
+
+    /// A template's own task list is a graph too — a broken edge inside it is a
+    /// save-time 400, not a run-time surprise.
+    #[test]
+    fn validates_inside_a_template() {
+        let spec = "
+name: p
+templates:
+  - name: t
+    tasks:
+      - { name: inner, command: [\"true\"], depends_on: [ghost] }
+tasks:
+  - { name: a, template: t }
+";
+        let err = parse_and_validate(spec).unwrap_err();
+        assert!(err.1.contains("unknown task 'ghost'"), "got: {}", err.1);
+    }
+
+    /// `workflow_ref` is resolved by the API's chain expander, which only walks
+    /// top-level tasks — inside a template it would be silently dropped, so it is
+    /// refused instead.
+    #[test]
+    fn rejects_a_workflow_ref_inside_a_template() {
+        let spec = "
+name: p
+templates:
+  - name: t
+    tasks:
+      - { name: inner, workflow_ref: other }
+tasks:
+  - { name: a, template: t }
+";
+        let err = parse_and_validate(spec).unwrap_err();
+        assert!(err.1.contains("only supported on top-level tasks"), "got: {}", err.1);
+    }
+
+    #[test]
+    fn rejects_duplicate_template_names() {
+        let spec = "
+name: p
+templates:
+  - { name: t, tasks: [{ name: x, command: [\"true\"] }] }
+  - { name: t, tasks: [{ name: y, command: [\"true\"] }] }
+tasks:
+  - { name: a, template: t }
+";
+        let err = parse_and_validate(spec).unwrap_err();
+        assert!(err.1.contains("duplicate template name 't'"), "got: {}", err.1);
+    }
+
+    /// The console and the engine must agree on where the Enterprise line is.
+    ///
+    /// `parse_and_validate` hands specs to `dagron_core`'s parser, so whether a
+    /// multi-dataset spec is accepted depends on the features dagron-api forwards
+    /// to dagron-core — not on dagron-api's own `enterprise` flag. They were not
+    /// wired together, so an Enterprise build of the console refused specs the
+    /// Enterprise engine beside it accepted, and told the operator to go buy the
+    /// edition they already had.
+    #[test]
+    fn the_dataset_composition_line_matches_the_engine() {
+        let multi = "
+name: p
+on_datasets: [\"a://b\", \"a://c\"]
+datasets_mode: all
+tasks:
+  - { name: t, command: [\"true\"] }
+";
+        // parse_and_validate is dagron-api's own mirror and does not gate this;
+        // the authority is dagron_core's parser, which submit_yaml routes through.
+        let core = dagron_core::dag::DagGraph::from_yaml(multi);
+        #[cfg(feature = "enterprise")]
+        {
+            let dag = core.expect("an enterprise build must accept multi-dataset composition");
+            assert_eq!(dag.spec.on_datasets.len(), 2);
+        }
+        #[cfg(not(feature = "enterprise"))]
+        {
+            let err = core.err().expect("an open build refuses multi-dataset composition").to_string();
+            assert!(err.contains("dagron Enterprise"), "signpost names the edition: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_arguments_without_a_template() {
+        let spec = "
+name: p
+tasks:
+  - { name: a, command: [\"true\"], arguments: { x: \"1\" } }
+";
+        let err = parse_and_validate(spec).unwrap_err();
+        assert!(err.1.contains("`arguments` without a `template`"), "got: {}", err.1);
+    }
 }
 
 #[derive(Deserialize)]
@@ -863,18 +1249,96 @@ pub async fn submit_run(
     State(state): State<AppState>,
     Json(body): Json<SubmitBody>,
 ) -> Result<(StatusCode, Json<SubmitResponse>), (StatusCode, String)> {
-    let spec = parse_and_validate(&body.yaml)?;
-    let expanded = crate::expand::expand_workflow_refs(&state, spec).await?;
-    let prepared = prepare_spec(&state, expanded).await?;
-    let run_id = create_run(&state, &prepared, &body.yaml).await.map_err(|e| {
-        tracing::error!(error = ?e, "create_run failed");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal server error".to_string(),
-        )
-    })?;
-
+    parse_and_validate(&body.yaml)?;
+    let run_id = submit_yaml(&state, &body.yaml, &body.yaml).await?;
     Ok((StatusCode::CREATED, Json(SubmitResponse { run_id })))
+}
+
+/// Create a run from spec YAML: inline `workflow_ref` chains, fold the declared
+/// environment's variables into the substitution scope, then hand the result to
+/// the **engine's** parser and run writer.
+///
+/// `authored_yaml` is what gets stored as the run's definition (the spec a human
+/// wrote, chains unresolved), while `yaml` is what actually runs.
+///
+/// This exists because dagron-api used to parse tasks into its own mirror of
+/// `dag::TaskSpec` and write `task_runs` itself. Both mirrors drifted: the spec
+/// mirror carried 18 of 35 fields, so submitting through the console silently
+/// dropped `with_items`, `resources`, `wait`, `cache`, `pool`, `priority`,
+/// `produces`, `workflow` and more — a `with_items` task ran once with `{{ item }}`
+/// unsubstituted, and a wait sensor was dispatched to a worker where it failed
+/// instead of parking. The row writer drifted separately (#657's `is_approval`).
+/// Routing both through `dagron_core` makes that class of bug impossible: one
+/// parser, one writer, shared with the engine.
+pub(crate) async fn submit_yaml(
+    state: &AppState,
+    yaml: &str,
+    authored_yaml: &str,
+) -> Result<String, (StatusCode, String)> {
+    let expanded = crate::expand::expand_workflow_refs(state, yaml).await?;
+    let params = environment_params(state, &expanded).await?;
+    // The engine's own parse → expand (task_defaults, parameters, templates,
+    // fan-out, submit-time `when:`) → validate pipeline.
+    let dag = dagron_core::dag::DagGraph::from_yaml_with_params(&expanded, &params)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid DAG: {e}")))?;
+    dagron_core::db::create_run(&state.write_pool, &dag, authored_yaml).await.map_err(|e| {
+        // A per-workflow concurrency cap is a capacity condition, not a failure:
+        // answer 429 like the engine's ops API, never 500. (No Retry-After here —
+        // every handler on this path shares the plain (StatusCode, String) error
+        // type, which doesn't carry headers; the engine's equivalent is a single
+        // handler free to return a header-bearing tuple directly.)
+        if let Some(m) = e.downcast_ref::<dagron_core::models::MaxActiveRunsReached>() {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "max_active_runs reached for workflow '{}' ({} active, cap {})",
+                    m.name, m.active, m.max
+                ),
+            );
+        }
+        tracing::error!(error = ?e, "create_run failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())
+    })
+}
+
+/// The declared environment's variables as `env.NAME` substitution keys.
+///
+/// The engine resolves an environment's *secrets* at dispatch; its plain
+/// variables are substituted at submit, which is this gateway's job. Feeding
+/// them in as parameter overrides means the engine's substitution does the work
+/// — no second implementation of `{{ }}`.
+async fn environment_params(
+    state: &AppState,
+    yaml: &str,
+) -> Result<std::collections::BTreeMap<String, String>, (StatusCode, String)> {
+    let mut out = std::collections::BTreeMap::new();
+    let doc: serde_yaml::Value = serde_yaml::from_str(yaml)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid YAML: {e}")))?;
+    let Some(env_name) = doc.get("environment").and_then(serde_yaml::Value::as_str) else {
+        return Ok(out);
+    };
+    let vars: Option<String> =
+        sqlx::query_scalar("SELECT variables FROM environments WHERE name = $1")
+            .bind(env_name)
+            .fetch_optional(&state.read_pool)
+            .await
+            .map_err(internal_msg)?;
+    // A declared but unknown environment is a 400 — a spec pinned to prod must
+    // not silently run without prod's variables.
+    let Some(vars) = vars else {
+        return Err((StatusCode::BAD_REQUEST, format!("environment '{env_name}' not found")));
+    };
+    let vars: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(&vars).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("environment '{env_name}' has malformed variables: {e}"),
+            )
+        })?;
+    for (k, v) in vars {
+        out.insert(format!("env.{k}"), v);
+    }
+    Ok(out)
 }
 
 /// `POST /api/runs/:id/resubmit` — start a **fresh** run from this run's stored
@@ -897,13 +1361,8 @@ pub async fn resubmit_run(
     .map_err(internal_msg)?;
     let yaml = yaml.ok_or((StatusCode::NOT_FOUND, format!("run '{id}' not found")))?;
 
-    let spec = parse_and_validate(&yaml)?;
-    let expanded = crate::expand::expand_workflow_refs(&state, spec).await?;
-    let prepared = prepare_spec(&state, expanded).await?;
-    let run_id = create_run(&state, &prepared, &yaml).await.map_err(|e| {
-        tracing::error!(error = ?e, "resubmit create_run failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())
-    })?;
+    parse_and_validate(&yaml)?;
+    let run_id = submit_yaml(&state, &yaml, &yaml).await?;
     Ok((StatusCode::CREATED, Json(SubmitResponse { run_id })))
 }
 
@@ -1005,7 +1464,7 @@ pub(crate) async fn prepare_spec(
         // Re-validate: a surviving runtime `when` may reference a task that was
         // just dropped (its dep got scrubbed above) — that gate could never be
         // evaluated, so reject it at submit rather than strand the run.
-        validate_graph(&spec.name, &spec.tasks)?;
+        validate_graph(&spec.name, &spec.tasks, &spec.templates)?;
     }
 
     // Substitute the scope into task string fields (mirror of core build_leaf

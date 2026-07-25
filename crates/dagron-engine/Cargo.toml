@@ -16,9 +16,16 @@ postgres = ["dagron-core/postgres"]
 ops = ["dep:axum", "dep:cron", "dep:chrono-tz", "dagron-core/ops"]
 # Kubernetes pod executor (EXECUTOR=kubernetes).
 kubernetes = ["dagron-executor/kubernetes"]
+# OpenTelemetry integration (#28): inject a W3C `traceparent` into each
+# dispatched task's env so its own instrumentation joins an external trace
+# (external-trace embedding), and — via `dagron-logging/otel` — install an OTLP
+# (HTTP/protobuf) span exporter when `OTEL_EXPORTER_OTLP_ENDPOINT` is set so the
+# engine's own spans are delivered too (#28 follow-on). Off by default =
+# unchanged env and no opentelemetry dependency.
+otel = ["dagron-logging/otel", "dep:opentelemetry", "dep:tracing-opentelemetry"]
 # Optional feature: auto-backfill sweep loop, run_reruns ledger,
 # parameterized rerun metrics, and outbox eventing. Implies `ops`.
-enterprise = ["dagron-core/enterprise", "ops"]
+enterprise = ["dagron-core/enterprise", "dagron-artifact/enterprise", "dagron-crypto/enterprise", "ops"]
 # Cloud GC archive sinks (GC_ARCHIVE_URL=<scheme>://…): archive-before-purge
 # writes run documents straight to object storage instead of a local dir. One
 # feature per backend; each pulls its object_store backend + the shared URL
@@ -50,6 +57,13 @@ dagron-lineage = { path = "../dagron-lineage" }
 dagron-forge = { path = "../dagron-forge" }
 dagron-artifact = { path = "../dagron-artifact" }
 dagron-logging = { path = "../dagron-logging" }
+
+# OpenTelemetry context propagation (optional, `otel` feature): inject the
+# *active* span's W3C context into each task's TRACEPARENT, so task telemetry
+# is a child of the exported `task.dispatch` span rather than an unrelated
+# trace. Versions track dagron-logging's exporter stack.
+opentelemetry = { version = "0.32", optional = true }
+tracing-opentelemetry = { version = "0.33", optional = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "sync", "time", "net"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

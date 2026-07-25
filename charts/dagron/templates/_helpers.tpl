@@ -20,7 +20,7 @@ helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
 {{/*
 Resolve an image reference against an optional `global.imageRegistry` — the
 one lever that relocates every image to a private mirror for an air-gapped
-install (ee/DEPLOYMENT_BLUEPRINT.md). When set, it REPLACES the registry host
+install. When set, it REPLACES the registry host
 of an image that already carries one (ghcr.io/…, host:port/…) and is PREPENDED
 to a bare image (mancube/…, alpine:3.21). Unset ⇒ the image is used verbatim,
 so existing installs are unchanged. Per-image values still win when overridden.

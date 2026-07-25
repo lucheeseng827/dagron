@@ -4,8 +4,32 @@ version = "0.1.0"
 edition = "2021"
 description = "Shared secret-value encryption for dagron (AES-256-GCM, env-derived key). Dependency-free of sqlx/features so both dagron-api and dagron-engine can use it."
 
+[features]
+# Envelope encryption: KEK providers (BYOK/KMS-wrapped data keys), encrypted
+# artifacts at rest, and the key-rotation sweep. Enterprise — the open build
+# keeps the `v1:` single-key path for environment secrets, which is what the
+# compose stack and docs/HOWTO.md §5 use. Enforced in `build_provider`, the one
+# funnel every KEK consumer goes through.
+enterprise = []
+# Native AWS KMS KEK provider (DAGRON_ENV_KEK_PROVIDER=awskms). Off by default so
+# the base crate stays a lean, SDK-free crypto primitive; opt in where a real
+# cloud KMS wraps the data keys. Other clouds/HSMs use the dependency-free command
+# seam (CommandKmsProvider) without this feature.
+kms-aws = ["dep:aws-config", "dep:aws-sdk-kms", "dep:tokio"]
+# Native GCP Cloud KMS KEK provider (DAGRON_ENV_KEK_PROVIDER=gcpkms).
+kms-gcp = ["dep:google-cloud-kms", "dep:tokio"]
+# Native Azure Key Vault KEK provider (DAGRON_ENV_KEK_PROVIDER=azurekv).
+kms-azure = ["dep:azure_security_keyvault_keys", "dep:azure_identity", "dep:azure_core", "dep:tokio"]
+
 [dependencies]
 aes-gcm = "0.10"
 sha2 = "0.10"
 base64 = "0.22"
 anyhow = "1"
+aws-config = { version = "1", optional = true }
+aws-sdk-kms = { version = "1", optional = true }
+google-cloud-kms = { version = "0.6", optional = true }
+azure_security_keyvault_keys = { version = "0.4", optional = true }
+azure_identity = { version = "0.25", optional = true }
+azure_core = { version = "0.25", optional = true }
+tokio = { version = "1", features = ["rt"], optional = true }

@@ -1,7 +1,8 @@
 // Starter workflows offered on the "New workflow" screen so a first-time user
-// isn't faced with a blank editor. Each is a complete, runnable DAG spec; the
-// last two demonstrate chaining one saved workflow from another via
-// `workflow_ref` (see docs/WORKFLOW_UI_GUIDE.md).
+// isn't faced with a blank editor. Each is a complete, runnable DAG spec. The
+// last three demonstrate composition: a `templates:` sub-DAG called with
+// `template:` (self-contained), and chaining one *saved* workflow from another
+// via `workflow_ref` (see docs/WORKFLOW_UI_GUIDE.md).
 
 export interface Starter {
   id: string;
@@ -71,6 +72,29 @@ tasks:
   - name: publish
     command: ["sh", "-c", "echo publish"]
     depends_on: [process]
+`,
+  },
+  {
+    id: "dag-of-dags",
+    label: "DAG of DAGs (template call)",
+    description:
+      "A reusable sub-DAG declared inline and called as one step — no second workflow to save first.",
+    spec: `name: dag-of-dags
+
+# A template is a reusable sub-DAG. Unlike \`workflow_ref\` (which chains another
+# SAVED workflow), a template lives in this spec, so this example runs on its own.
+templates:
+  - name: etl
+    tasks:
+      - { name: build,   command: ["sh", "-c", "echo build"] }
+      - { name: process, command: ["sh", "-c", "echo process"], depends_on: [build] }
+      - { name: publish, command: ["sh", "-c", "echo publish"], depends_on: [process] }
+
+tasks:
+  - { name: prepare, command: ["sh", "-c", "echo prepare"] }
+  # Expands to run-etl.build → run-etl.process → run-etl.publish when the run starts.
+  - { name: run-etl, template: etl, depends_on: [prepare] }
+  - { name: notify,  command: ["sh", "-c", "echo done"], depends_on: [run-etl] }
 `,
   },
   {

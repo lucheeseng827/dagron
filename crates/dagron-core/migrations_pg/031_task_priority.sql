@@ -1,0 +1,13 @@
+-- Task dispatch priority (spec fast-win #25 — Airflow `priority_weight` /
+-- Argo Kueue analog). Among the tasks that are `ready` at the same moment a
+-- scheduler claims higher `priority` first (claim_ready ORDER BY priority DESC,
+-- scheduled_at). Persisted per row so a retry / lease recovery keeps its place.
+-- DEFAULT 0 leaves every existing task, and every task that names no priority,
+-- exactly as before (a pure tiebreak within the scheduled_at order).
+-- Mirrors migrations/026_task_priority.sql (SQLite).
+--
+-- The priority-first ready index lives in 032 as CREATE INDEX CONCURRENTLY: a
+-- plain CREATE INDEX here would take a lock that blocks writers on a populated
+-- task_runs while migrations run at engine connect, and CONCURRENTLY needs its
+-- own no-transaction, single-statement file (same split as 022/023).
+ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS priority BIGINT NOT NULL DEFAULT 0;

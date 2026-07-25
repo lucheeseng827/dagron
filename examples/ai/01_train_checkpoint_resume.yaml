@@ -1,0 +1,58 @@
+# Case study 01 — training that survives preemption (checkpoint-aware resume).
+#
+# A 10-epoch "training loop" that checkpoints every epoch via the file
+# convention (write the checkpoint, point $DAGRON_CHECKPOINT_DIR/latest at it)
+# and simulates a spot preemption by dying after epoch 4 of a fresh attempt.
+# The retry is dispatched with DAGRON_RESUME_FROM and continues at epoch 5 —
+# the plan's "resume from the last checkpoint, not attempt-0" demo, runnable
+# in one shot:
+#
+#   DAGRON_ARTIFACT_DIR=$PWD/artifacts dagron 01_train_checkpoint_resume.yaml
+#
+# Requires the artifact store (DAGRON_ARTIFACT_DIR) for the checkpoint dir.
+# A real trainer does exactly this shape: load DAGRON_RESUME_FROM if set,
+# torch.save + update `latest` each epoch, and trap the provider's preemption
+# notice to flush a final checkpoint before exit.
+name: train_checkpoint_resume
+tasks:
+  - name: train
+    max_attempts: 3          # a preemption is just a retry that resumes
+    retry_delay_secs: 1
+    timeout_secs: 120
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        : "${DAGRON_CHECKPOINT_DIR:?set DAGRON_ARTIFACT_DIR on the engine to enable checkpoints}"
+        start=1
+        if [ -n "${DAGRON_RESUME_FROM:-}" ] && [ -f "$DAGRON_RESUME_FROM" ]; then
+          start=$(( $(cat "$DAGRON_RESUME_FROM") + 1 ))
+          echo "resuming from $DAGRON_RESUME_FROM (epoch $((start - 1)) done)"
+        else
+          echo "fresh start — no checkpoint to resume"
+        fi
+        for epoch in $(seq "$start" 10); do
+          sleep 1                                   # one "epoch" of work
+          loss=$(awk -v e="$epoch" 'BEGIN { printf "%.3f", 2.0 / e }')
+          ck="$DAGRON_CHECKPOINT_DIR/epoch-$epoch.ckpt"
+          echo "$epoch" > "$ck"                     # the "model weights"
+          echo "$ck" > "$DAGRON_CHECKPOINT_DIR/latest"
+          echo "epoch $epoch done loss=$loss (checkpointed)"
+          if [ "$epoch" -eq 4 ] && [ -z "${DAGRON_RESUME_FROM:-}" ]; then
+            echo "simulated spot preemption — instance reclaimed" >&2
+            exit 1
+          fi
+        done
+        echo "training complete at epoch 10"
+  - name: package
+    depends_on: [train]
+    timeout_secs: 30
+    command:
+      - sh
+      - -c
+      # Sibling-task artifacts ride the run's shared dir: train's checkpoints
+      # live under $DAGRON_ARTIFACTS/.checkpoints/train/.
+      - |
+        latest=$(cat "$DAGRON_ARTIFACTS/.checkpoints/train/latest" 2>/dev/null || true)
+        echo "packaging model from final checkpoint: ${latest:-<none>}"

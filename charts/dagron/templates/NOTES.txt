@@ -11,8 +11,16 @@ Components:
 {{- if .Values.operator }}
   operator    {{ .Values.operator.image }}
 {{- end }}
+{{- if .Values.gitops.enabled }}
+  gitops      {{ .Values.gitops.image }}   (polls every {{ .Values.gitops.pollSecs }}s)
+{{- end }}
 {{- if .Values.postgres.enabled }}
   postgres    in-cluster (throwaway — do NOT use for real data)
+{{- end }}
+{{- if not .Values.gitops.enabled }}
+
+Connecting Git repositories? Nothing polls them until the GitOps worker runs:
+  --set gitops.enabled=true
 {{- end }}
 
 Reach the UI:

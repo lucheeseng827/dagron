@@ -1,0 +1,42 @@
+# Pattern 03 — fetch the script when the run starts (host executor)
+#
+# For a script that changes faster than you want to rebuild an image. The trade
+# is real: the run now depends on whatever that URL served at the moment it ran,
+# so pin an immutable object (a commit sha, a versioned S3 key) unless you
+# genuinely want "latest".
+#
+# HOST EXECUTOR (`fetch-once` → `run-script`)
+#   With DAGRON_ARTIFACT_DIR set on the engine, every task in a run gets the same
+#   per-run directory in `DAGRON_ARTIFACTS`, so one task can fetch and the others
+#   can run it. That directory is on the **engine host** and neither container
+#   executor mounts it — this pair is host-executor only. For the container
+#   executor, where there is no shared directory to use, each task must fetch for
+#   itself: see the companion `03_fetch_in_container.yaml`.
+name: etl-fetched-script
+
+parameters:
+  # Pin this. A moving target here is a run you cannot reproduce.
+  script_url: "https://raw.githubusercontent.com/example/ops/9f2c1ab/etl/transform.sh"
+
+tasks:
+  - name: fetch-once
+    command:
+      - "sh"
+      - "-c"
+      # Require the per-run artifact directory — never fall back to a shared
+      # /tmp, where a concurrent run (or a task that lands on another replica)
+      # would read the wrong `transform.sh`.
+      - >-
+        set -eu;
+        d="${DAGRON_ARTIFACTS:?DAGRON_ARTIFACT_DIR must be configured}";
+        wget -qO "$d/transform.sh" "{{ script_url }}";
+        chmod +x "$d/transform.sh";
+        echo "fetched $(wc -c < "$d/transform.sh") bytes"
+    max_attempts: 3
+    retry_delay_secs: 5
+    timeout_secs: 120
+
+  - name: run-script
+    command: ["sh", "-c", 'set -eu; "${DAGRON_ARTIFACTS:?DAGRON_ARTIFACT_DIR must be configured}/transform.sh" --shard 3']
+    depends_on: [fetch-once]
+    timeout_secs: 900

@@ -16,11 +16,11 @@ metadata:
 spec:
   project: dagron
   source:
-    repoURL: https://github.com/lucheeseng827/nick-rust-project.git
+    repoURL: https://github.com/lucheeseng827/dagron.git
     # Point this at the branch/tag holding the chart. `main` once merged; use your
     # working branch to try it before merge.
     targetRevision: main
-    path: rust_modules/lab/module_54/terraform/charts/dagron
+    path: charts/dagron
     helm:
       releaseName: dagron
       # Inline demo values. In production keep these in a values-<env>.yaml in Git

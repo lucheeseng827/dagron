@@ -1,4 +1,4 @@
-//! Archived-run history reads (ee/STATE_STORE.md hot/cold split).
+//! Archived-run history reads (the hot/cold split).
 //!
 //! Once the archive-before-purge GC moves a terminal run out of the hot store,
 //! it lives on as a `run-<id>.json` document in the archive sink, mapped by the

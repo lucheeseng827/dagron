@@ -1,7 +1,8 @@
 "use client";
 
 import { Handle, Position, type NodeProps } from "@xyflow/react";
-import { statusColor, statusLabel } from "@/lib/adapter";
+import { statusColor, statusLabel, type WaitingOn } from "@/lib/adapter";
+import { fromNow } from "@/lib/time";
 import type { TaskStatus } from "@/types/dagron";
 
 export interface StatusNodeData {
@@ -11,11 +12,22 @@ export interface StatusNodeData {
   /// Set when this task chains another saved workflow (a `workflow_ref` call).
   /// Rendered as a sub-workflow node rather than a plain command step.
   workflowRef?: string;
+  /// Set when this task calls a `templates:` sub-DAG (a `template:` call).
+  /// Rendered like a chained workflow — it is one node standing for several.
+  templateRef?: string;
+  /// How many tasks the called template declares, for the node's subtitle.
+  templateTasks?: number;
   /// Container image the task runs in (editor view); shown as a badge line.
   dockerImage?: string;
   /// Run view: dispatch/finish instants, for the duration line on the node.
   scheduledAt?: string | null;
   finishedAt?: string | null;
+  /// Run view: why this node is parked (wait sensor / sub-workflow trigger), or
+  /// null when it isn't. A parked node is `running`, so without this its clock
+  /// just keeps counting and it reads as hung.
+  waiting?: WaitingOn | null;
+  /// Run view: resolved from the memoization cache rather than executed.
+  cacheHit?: boolean;
   [key: string]: unknown;
 }
 
@@ -34,6 +46,16 @@ function nodeDuration(d: StatusNodeData): string | null {
   return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
+/// What a parked node shows where its duration would go. A node is ~190px wide,
+/// so a dataset URI or endpoint never fits — the kind of wait is what's useful
+/// at a glance, with the full value on the status badge's tooltip.
+function shortDetail(w: WaitingOn): string {
+  if (w.runLink) return "sub-workflow";
+  if (w.label === "Waiting until") return fromNow(w.detail);
+  if (w.label === "Waiting on dataset") return "dataset";
+  return "endpoint";
+}
+
 /// DAG node: name + status badge, colored by task status. A task that
 /// chains another workflow renders with a sub-workflow badge instead.
 /// Handle positions come from the layout (top/bottom for vertical and
@@ -41,7 +63,11 @@ function nodeDuration(d: StatusNodeData): string | null {
 export default function StatusNode({ data, sourcePosition, targetPosition }: NodeProps) {
   const d = data as StatusNodeData;
   const color = statusColor(d.status);
-  const isRef = typeof d.workflowRef === "string" && d.workflowRef.length > 0;
+  const isWorkflowRef = typeof d.workflowRef === "string" && d.workflowRef.length > 0;
+  const isTemplate = typeof d.templateRef === "string" && d.templateRef.length > 0;
+  // Both kinds are *calls*: one node standing for a sub-DAG the canvas doesn't
+  // draw, so they share the dashed outline and the sub-workflow subtitle.
+  const isRef = isWorkflowRef || isTemplate;
   return (
     <div
       style={{
@@ -61,12 +87,21 @@ export default function StatusNode({ data, sourcePosition, targetPosition }: Nod
       <div style={{ fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
         {d.name}
       </div>
-      {isRef && (
+      {isWorkflowRef && (
         <div
           style={{ color: "var(--muted)", fontSize: 11, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
           title={`Runs saved workflow: ${d.workflowRef}`}
         >
           ⧉ {d.workflowRef}
+        </div>
+      )}
+      {isTemplate && (
+        <div
+          style={{ color: "var(--muted)", fontSize: 11, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+          title={`Calls template: ${d.templateRef}`}
+        >
+          ⧉ {d.templateRef}
+          {d.templateTasks ? ` · ${d.templateTasks} tasks` : ""}
         </div>
       )}
       {!isRef && d.dockerImage && (
@@ -78,9 +113,23 @@ export default function StatusNode({ data, sourcePosition, targetPosition }: Nod
         </div>
       )}
       <div style={{ display: "flex", justifyContent: "space-between", gap: 6, marginTop: 4 }}>
-        <span style={{ color, fontSize: 11 }}>{isRef ? "sub-workflow" : statusLabel(d.status)}</span>
+        <span
+          style={{ color: d.waiting ? "var(--blue)" : color, fontSize: 11 }}
+          title={d.waiting ? `${d.waiting.label}: ${d.waiting.detail}` : undefined}
+        >
+          {isTemplate
+            ? "sub-DAG"
+            : isWorkflowRef
+              ? "sub-workflow"
+              : d.waiting
+                ? "⏸ waiting"
+                : statusLabel(d.status)}
+        </span>
         <span style={{ color: "var(--muted)", fontSize: 11, whiteSpace: "nowrap" }}>
-          {nodeDuration(d) ?? ""}
+          {/* A parked task's elapsed clock only measures how long it has been
+              waiting, which reads as "stuck for 4h" — the reason belongs there
+              instead. A cache hit has no runtime to report at all. */}
+          {d.waiting ? shortDetail(d.waiting) : d.cacheHit ? "⚡ cached" : (nodeDuration(d) ?? "")}
           {d.attempt > 1 ? ` · try ${d.attempt}` : ""}
         </span>
       </div>

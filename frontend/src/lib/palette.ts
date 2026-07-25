@@ -405,6 +405,40 @@ export const SNIPPETS: Snippet[] = [
     makeTask: () => ({ command: [], workflow_ref: "my-saved-workflow" }),
   },
   {
+    id: "subdag",
+    label: "Sub-DAG (template call)",
+    description: "Declare a reusable sub-DAG and call it — the DAG-of-DAGs pattern.",
+    category: "Control flow",
+    // A "run" snippet, not a "task" one: a call is only valid alongside the
+    // `templates:` entry it names, so the block has to add both at once.
+    kind: "run",
+    patchRun: (model) => {
+      const name = uniqueTemplateName("sub-dag", model);
+      model.templates = [
+        ...model.templates,
+        {
+          name,
+          parameters: { input: "data.csv" },
+          tasks: [
+            { name: "fetch", command: ["sh", "-c", "echo fetch {{ input }}"], depends_on: [] },
+            { name: "transform", command: ["sh", "-c", "echo transform"], depends_on: ["fetch"] },
+          ],
+        },
+      ];
+      model.tasks = [
+        ...model.tasks,
+        {
+          name: uniqueName(`run-${name}`, model.tasks),
+          command: [],
+          depends_on: leafNames(model.tasks),
+          template: name,
+          arguments: { input: "data.csv" },
+        },
+      ];
+      return undefined;
+    },
+  },
+  {
     id: "cleanup",
     label: "Cleanup (always runs)",
     description: "Fires when upstream finishes, pass or fail (all_done).",
@@ -562,6 +596,16 @@ function uniqueName(base: string, tasks: Task[]): string {
   }
 }
 
+/// Generate a unique template name ("sub-dag", "sub-dag-2", …).
+function uniqueTemplateName(base: string, model: WorkflowModel): string {
+  const names = new Set(model.templates.map((t) => t.name));
+  if (!names.has(base)) return base;
+  for (let i = 2; ; i++) {
+    const n = `${base}-${i}`;
+    if (!names.has(n)) return n;
+  }
+}
+
 /// Leaf tasks (nothing depends on them) — where an appended step chains on.
 export function leafNames(tasks: Task[]): string[] {
   const depended = new Set(tasks.flatMap((t) => t.depends_on));
@@ -585,7 +629,7 @@ export function buildPaletteTask(
 export function applySnippet(spec: string, snippet: Snippet): { spec?: string; error?: string } {
   let model: WorkflowModel;
   if (spec.trim() === "") {
-    model = { name: "my-pipeline", tasks: [] };
+    model = { name: "my-pipeline", tasks: [], templates: [] };
   } else {
     const parsed = parseModel(spec);
     if (!parsed.model) return { error: parsed.error ?? "spec does not parse" };

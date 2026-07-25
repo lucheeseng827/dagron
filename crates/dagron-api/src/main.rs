@@ -18,6 +18,8 @@ mod tmpl;
 // Cloud archive URL → object_store dispatch (s3/gs/az) for /api/archive fetches.
 #[cfg(feature = "archive-cloud")]
 mod objstore;
+mod pwhash;
+mod ratelimit;
 mod routes;
 mod state;
 mod stream;
@@ -79,6 +81,16 @@ async fn main() -> Result<()> {
     let identity: Arc<dyn dagron_identity::IdentityProvider> =
         Arc::new(identity::LocalIdentityProvider::new(pool.clone()));
 
+    // Programmatic artifact store (put/get by key), transparently envelope-
+    // encrypted when a KEK provider is configured. A *misconfigured* provider
+    // fails startup here rather than silently storing plaintext.
+    let artifact_store = dagron_artifact::store_from_env()
+        .context("configuring the artifact store (DAGRON_ARTIFACT_DIR / KEK provider)")?;
+    if artifact_store.is_some() {
+        let encrypted = matches!(dagron_crypto::provider_from_env(), Ok(Some(_)));
+        info!(encrypted, "artifact API enabled (PUT/GET /api/runs/*/artifacts/*)");
+    }
+
     let state = AppState {
         read_pool: pool.clone(),
         write_pool: pool.clone(),
@@ -86,6 +98,9 @@ async fn main() -> Result<()> {
         jwt_secret,
         cookie_secure,
         identity,
+        artifact_store,
+        rotation_lock: Arc::new(tokio::sync::Mutex::new(())),
+        login_limiter: Arc::new(ratelimit::RateLimiter::from_env()),
     };
 
     // dagron-api owns the users table; ensure it exists before serving login.
@@ -128,7 +143,6 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         // Self-contained auth: login + logout (public) + user management (admin-only).
-        .route("/api/login", post(routes::login::login))
         .route("/api/logout", post(routes::login::logout))
         .route(
             "/api/users",
@@ -188,6 +202,11 @@ async fn main() -> Result<()> {
         .route("/api/metrics/timeseries", get(routes::ops::metrics_timeseries))
         // Human-in-the-loop worklist: every gate parked in awaiting_approval.
         .route("/api/approvals", get(routes::ops::list_approvals))
+        // Data-aware scheduling: the dataset registry + its lineage ledger. Read
+        // -only here — updates come from `produces:` tasks (or the Enterprise
+        // external-events route on the engine).
+        .route("/api/datasets", get(routes::datasets::list_datasets))
+        .route("/api/datasets/events", get(routes::datasets::list_dataset_events))
         .route("/api/dead-letters", get(routes::ops::list_dead_letters))
         .route("/api/dead-letters/{id}/redrive", post(routes::ops::redrive_dead_letter))
         .route("/api/dead-letters/{id}", axum::routing::delete(routes::ops::delete_dead_letter))
@@ -233,20 +252,63 @@ async fn main() -> Result<()> {
         .route("/api/backfills/{id}", get(routes::backfills::get))
         .route("/api/backfills/{id}/cancel", post(routes::backfills::cancel));
 
-    // Enterprise routes (docs/COMMERCIALIZATION.md §3): the audit trail read.
+    // Admin: store-wide artifact key rotation (KEK_OLD → current KEK). Rotation
+    // only means anything where a KEK exists, and KEKs are Enterprise
+    // (`dagron_crypto::build_provider`) — so the route is absent from an open
+    // build rather than present and guaranteed to fail.
+    #[cfg(feature = "enterprise")]
+    let app = app.route("/api/artifacts/rotate", post(routes::artifacts::rotate_artifacts));
+
+    // Enterprise routes (the open-core split): the audit trail read.
     // OSS builds answer 404 here, matching the feature being absent.
     #[cfg(feature = "enterprise")]
     let app = app.route("/api/audit", get(routes::audit::list_audit));
 
+    // Core routes keep the tight 1 MiB body cap (submit YAML etc.) to resist abuse.
+    let app = app.layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024));
+
+    // Artifact PUT carries data blobs (checkpoints/outputs) that legitimately
+    // exceed the core cap, so its routes get a larger, separately-configured limit
+    // (`DAGRON_ARTIFACT_MAX_BYTES`, default 128 MiB). NOTE: bodies are buffered in
+    // memory — streaming very large artifacts is a follow-up.
+    let artifact_max = std::env::var("DAGRON_ARTIFACT_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(128 * 1024 * 1024);
+    let artifacts = Router::new()
+        .route(
+            "/api/runs/{run_id}/artifacts/{task}/{name}",
+            axum::routing::put(routes::artifacts::put_artifact)
+                .get(routes::artifacts::get_artifact),
+        )
+        .route(
+            "/api/runs/{run_id}/artifacts/{task}/{name}/exists",
+            get(routes::artifacts::artifact_exists),
+        )
+        // Disable the extractor's default 2 MiB cap so the tower limit below is the
+        // single, explicit body ceiling for artifacts.
+        .layer(axum::extract::DefaultBodyLimit::disable())
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(artifact_max));
+
+    // Login is the one unauthenticated route that costs an Argon2 verify per
+    // call, so it carries a per-client budget the other routes don't need. Its
+    // own Router keeps the middleware off everything else.
+    let login = Router::new()
+        .route("/api/login", post(routes::login::login))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            ratelimit::login_rate_limit,
+        ));
+
     let app = app
+        .merge(login)
+        .merge(artifacts)
         // Viewer read-only enforcement + audit trail for successful mutations
-        // (a passthrough on OSS builds — see routes/audit.rs).
+        // (a passthrough on OSS builds — see routes/audit.rs). Applies to both.
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             routes::audit::audit_mutations,
         ))
-        // Cap request bodies (submit YAML) to resist abuse.
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024))
         .layer(TraceLayer::new_for_http())
         // Dev CORS: permissive. Tighten to the frontend origin in production.
         .layer(CorsLayer::permissive())
@@ -255,7 +317,14 @@ async fn main() -> Result<()> {
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await.context("binding listener")?;
     info!(%addr, "dagron-api listening");
-    axum::serve(listener, app).await.context("serving")?;
+    // with_connect_info so the login limiter can key on the socket peer — the
+    // one client identifier a caller cannot forge (see `ratelimit::client_key`).
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .context("serving")?;
     Ok(())
 }
 

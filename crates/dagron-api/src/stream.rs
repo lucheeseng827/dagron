@@ -44,7 +44,7 @@ async fn run_listener(pool: &PgPool, tx: &broadcast::Sender<TaskEvent>) -> anyho
     // DATABASE_LISTEN_URL: on a shared state-store cell the query pools point
     // at PgBouncer (transaction mode), which cannot serve a session-scoped
     // LISTEN — this listener must hit the direct Postgres endpoint
-    // (ee/STATE_STORE.md split-DSN item). Unset = share the pool config.
+    // (the split-DSN setup). Unset = share the pool config.
     let mut listener = match std::env::var("DATABASE_LISTEN_URL") {
         Ok(url) if !url.trim().is_empty() => PgListener::connect(url.trim()).await?,
         _ => PgListener::connect_with(pool).await?,

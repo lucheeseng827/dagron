@@ -1,0 +1,32 @@
+# Case study 02 — GPU pool routing (`runner_class` + `resources.gpu`).
+#
+# `train` may only be claimed by schedulers serving the `spot-gpu` class;
+# `evaluate` only by the `cpu` pool; `report` takes the default class. Start
+# one scheduler per pool (README walkthrough) and watch each terminal claim
+# exactly its stage. On the Kubernetes executor, `resources.gpu` lands as
+# limits["nvidia.com/gpu"] on the train pod; Local/Docker executors ignore
+# resources, so the routing demo runs anywhere.
+name: gpu_pool_routing
+tasks:
+  - name: train
+    runner_class: spot-gpu
+    timeout_secs: 60
+    resources:
+      gpu: { count: 4 }                       # → limits["nvidia.com/gpu"]="4"
+      requests: { cpu: "8", memory: "32Gi" }
+    command:
+      - sh
+      - -c
+      - echo "training on the spot GPU pool (worker=${HOSTNAME:-local})" && sleep 3 && echo done
+  - name: evaluate
+    depends_on: [train]
+    runner_class: cpu
+    timeout_secs: 60
+    command:
+      - sh
+      - -c
+      - echo "evaluating on the CPU pool" && sleep 2 && echo "accuracy=0.94"
+  - name: report
+    depends_on: [evaluate]
+    timeout_secs: 30
+    command: ["sh", "-c", "echo run complete — stages placed by runner_class"]

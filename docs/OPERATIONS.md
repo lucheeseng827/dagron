@@ -2,7 +2,9 @@
 
 Deploying, upgrading, backing up and debugging a dagron installation. Knobs
 live in [`CONFIG.md`](CONFIG.md); endpoints in [`API.md`](API.md); internals in
-[`ARCHITECTURE.md`](ARCHITECTURE.md).
+[`ARCHITECTURE.md`](ARCHITECTURE.md). Backup, upgrade and disaster-recovery
+**procedures** — including recovering from a lost database or a migration that
+fails mid-upgrade — are in [`BACKUP_RECOVERY.md`](BACKUP_RECOVERY.md).
 
 ## Deploy
 
@@ -30,9 +32,15 @@ resident; with none set, a file run drains and exits 0.
 ## Upgrade / rollback
 
 - Schema migrations are **embedded and run automatically at startup** (sqlx;
-  `crates/dagron-core/migrations*/`). They are **forward-only** — there are no
-  down migrations, so rollback = restore the pre-upgrade backup and start the
-  old binary. Back up first, always.
+  `crates/dagron-core/migrations*/`). There is no `dagron migrate` command —
+  starting an engine is what migrates. They are **forward-only** — no down
+  migrations, so rollback = restore the pre-upgrade backup and start the old
+  binary. Back up first, always.
+- A failed migration is fail-fast, not half-applied: the transaction rolls back,
+  the engine exits non-zero, and the database is left where it was.
+- Step-by-step upgrade order, and what to do when a migration errors, refuses to
+  start (`previously applied but has been modified`), or you have to go
+  backwards: [`BACKUP_RECOVERY.md` §4](BACKUP_RECOVERY.md) and §6.
 - The stack upgrades in place: stop, swap image/binary, start. Multi-node
   (Postgres) engines coordinate through the DB — leases expire (default 30 s)
   and a surviving node reclaims orphaned tasks, so a rolling restart does not
@@ -51,6 +59,21 @@ The database is the **only** state. Executors and workers are stateless;
 If you use the artifact store (`DAGRON_ARTIFACT_DIR`) or GitOps workflow dir
 (`WORKFLOW_DIR`), those directories are re-creatable inputs, not state — but
 back them up if your workflows are not in git.
+
+Two things the table above does **not** cover, and both bite:
+
+- **`DAGRON_ENV_SECRET_KEY` is not in the database.** The ciphertext of every
+  stored environment secret is; the key is an env var. Lose it and those secrets
+  are unrecoverable — back it up in a secret manager, kept apart from the dumps.
+- **Restore the whole database, never a table subset.** `dagron-api` creates its
+  own tables (`users`, `environments`, `environment_secrets`, `git_repos`, …)
+  with `CREATE TABLE IF NOT EXISTS`, so a dump missing them restores "cleanly"
+  and it recreates them **empty** — every user and secret silently gone.
+
+Ready-made scripts and a restore rehearsal you can run in minutes:
+[`../scripts/backup-postgres.sh`](../scripts/backup-postgres.sh),
+[`../scripts/restore-postgres.sh`](../scripts/restore-postgres.sh),
+[`BACKUP_RECOVERY.md` §5](BACKUP_RECOVERY.md).
 
 ## Monitoring
 

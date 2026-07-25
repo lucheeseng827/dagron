@@ -33,10 +33,10 @@ spec:
                   dagron: "true"
           # Leg 2: the team folders. Exposes {{.path.basename}} + {{.path.path}}.
           - git:
-              repoURL: https://github.com/lucheeseng827/nick-rust-project.git
+              repoURL: https://github.com/lucheeseng827/dagron.git
               revision: main
               directories:
-                - path: rust_modules/lab/module_54/examples/gitops/workflows/*
+                - path: examples/gitops/workflows/*
   template:
     metadata:
       name: "dagron-wf-{{.name}}-{{.path.basename}}"
@@ -47,7 +47,7 @@ spec:
     spec:
       project: dagron
       source:
-        repoURL: https://github.com/lucheeseng827/nick-rust-project.git
+        repoURL: https://github.com/lucheeseng827/dagron.git
         revision: main
         path: "{{.path.path}}"
       destination:

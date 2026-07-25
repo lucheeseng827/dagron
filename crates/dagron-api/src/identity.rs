@@ -5,11 +5,11 @@
 //! session cookie either way (see [`routes::login`](crate::routes::login)).
 
 use anyhow::Result;
-use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordVerifier, SaltString};
-use argon2::{Argon2, PasswordHasher};
 use async_trait::async_trait;
 use dagron_identity::{IdentityProvider, VerifiedUser};
 use sqlx::postgres::PgPool;
+
+use crate::pwhash;
 
 /// Verifies email + password against the `users` table (argon2 PHC hashes).
 pub struct LocalIdentityProvider {
@@ -37,26 +37,18 @@ impl IdentityProvider for LocalIdentityProvider {
                 .fetch_optional(&self.pool)
                 .await?;
 
-        // To avoid leaking which emails exist via response timing, the no-such-user
-        // path still performs an Argon2 verify against a fixed dummy hash.
-        let (id, db_email, name, pw_hash, groups) = match row {
-            Some(r) => r,
-            None => {
-                if let Ok(dummy) = PasswordHash::new(dummy_pw_hash()) {
-                    let _ = Argon2::default().verify_password(password.as_bytes(), &dummy);
-                }
-                return Ok(None);
-            }
-        };
-
-        let parsed = PasswordHash::new(&pw_hash)
-            .map_err(|e| anyhow::anyhow!("stored password hash is malformed: {e}"))?;
-        if Argon2::default()
-            .verify_password(password.as_bytes(), &parsed)
-            .is_err()
-        {
+        // Hashing is bounded and off the async runtime — see `crate::pwhash`. The
+        // no-such-user case goes through the same call (with `None`), which still
+        // runs a full verify against a dummy hash, so response time doesn't leak
+        // which emails exist.
+        let stored = row.as_ref().map(|(_, _, _, pw_hash, _)| pw_hash.clone());
+        if !pwhash::verify(password.to_string(), stored).await? {
             return Ok(None);
         }
+        let Some((id, db_email, name, _pw_hash, groups)) = row else {
+            // Unreachable: `verify` returns false for `None`, handled above.
+            return Ok(None);
+        };
 
         // Surface corrupt authorization data rather than silently treating it as
         // "no groups" — an empty set here would be a quiet RBAC downgrade.
@@ -71,18 +63,4 @@ impl IdentityProvider for LocalIdentityProvider {
             groups,
         }))
     }
-}
-
-/// A fixed, lazily-computed Argon2 hash used only to equalize timing on the
-/// no-such-user path, so account existence can't be probed via response time.
-/// Never matches a real password.
-fn dummy_pw_hash() -> &'static str {
-    static H: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    H.get_or_init(|| {
-        let salt = SaltString::generate(&mut OsRng);
-        Argon2::default()
-            .hash_password(b"timing-equalizer-not-a-real-password", &salt)
-            .expect("hashing the dummy password should not fail")
-            .to_string()
-    })
 }

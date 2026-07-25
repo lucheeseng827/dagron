@@ -2,16 +2,42 @@
 name = "dagron-artifact"
 version = "0.1.0"
 edition = "2021"
-description = "dagron artifact store seam: the ArtifactStore trait + a local-filesystem default. Passes data files between tasks in a run; an S3/GCS backend plugs in behind the same trait."
+description = "dagron artifact store seam: the ArtifactStore trait + a local-filesystem default and S3/GCS/Azure object-store backends (features s3/gcs/azure) behind the same trait. Passes data files between tasks in a run and holds checkpoint artifacts for cross-machine resume."
 
 [lib]
 name = "dagron_artifact"
 path = "src/lib.rs"
 
+[features]
+# Cloud object-store backends (DAGRON_ARTIFACT_URL=<scheme>://bucket/prefix) —
+# the multi-cloud checkpoint substrate. One feature per backend; S3-compatible
+# MinIO/Ceph rides `s3` via AWS_ENDPOINT_URL. `cloud` is the shared adapter
+# (implied by any backend; usable alone for a custom/in-memory ObjectStore).
+s3 = ["cloud", "object_store/aws"]
+gcs = ["cloud", "object_store/gcp"]
+azure = ["cloud", "object_store/azure"]
+cloud = ["dep:object_store", "dep:futures-util"]
+# Encrypted artifacts at rest + the rotation sweep. Enterprise; forwards to the
+# KEK gate in dagron-crypto, which is where the line is actually enforced.
+enterprise = ["dagron-crypto/enterprise"]
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-tokio = { version = "1", features = ["fs", "rt"] }
+tokio = { version = "1", features = ["fs", "rt", "io-util"] }
+tracing = "0.1"
+# Streaming decrypt: build an error-propagating byte stream + adapt it to AsyncRead.
+async-stream = "0.3"
+bytes = "1"
+futures-core = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
+# Cloud backends (features `s3`/`gcs`/`azure`) — same object_store 0.11 line as
+# the archive sinks, so one client stack serves both.
+object_store = { version = "0.11", optional = true }
+futures-util = { version = "0.3", optional = true }
+# Envelope encryption for at-rest artifacts (G-C2). Default (SDK-free) features —
+# BYOK/KMS providers are selected at the call site via dagron_crypto::provider_from_env.
+dagron-crypto = { path = "../dagron-crypto" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }

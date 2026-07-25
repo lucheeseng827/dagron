@@ -1,0 +1,95 @@
+{{- if .Values.gitops.enabled }}
+# dagron-gitops — the GitOps worker: reconciles workflow definitions from the Git
+# repositories registered in the console into the same Postgres dagron-api owns.
+#
+# OFF BY DEFAULT, matching how it deploys everywhere else (compose puts it behind
+# a `gitops` profile). It is the one dagron image that carries a `git` binary,
+# which is exactly why it is a separate deployable: dagron-api stays distroless
+# and subprocess-free for the majority of installs that never connect a repo.
+#
+# No Service and no probes: this is a polling worker, not a server. It listens on
+# nothing, so a readiness probe would have nothing to ask.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dagron.fullname" . }}-gitops
+  labels:
+    {{- include "dagron.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gitops
+spec:
+  # Deliberately 1. Each replica polls every registered repo on its own timer;
+  # a second one duplicates that work against the same rows for no benefit.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: gitops
+  template:
+    metadata:
+      labels:
+        {{- include "dagron.labels" . | nindent 8 }}
+        app.kubernetes.io/component: gitops
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: gitops
+          image: {{ include "dagron.image" (dict "image" $.Values.gitops.image "root" $) | quote }}
+          imagePullPolicy: {{ .Values.gitops.imagePullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            # Stays read-only like its siblings: the only thing this worker
+            # writes is a clone, and that goes to the emptyDir mounted at /tmp.
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "dagron.dbSecretName" . }}
+                  key: {{ include "dagron.dbSecretKey" . }}
+            - name: GITOPS_POLL_SECS
+              value: {{ .Values.gitops.pollSecs | quote }}
+            - name: RUST_LOG
+              value: {{ .Values.gitops.rustLog | quote }}
+            # git wants somewhere to resolve config from; point it at the same
+            # writable scratch so it never probes an unwritable $HOME.
+            - name: HOME
+              value: /tmp
+            {{- if .Values.gitops.tokenSecret.name }}
+            # Forge token for private repositories. Sent only to trusted forge
+            # hosts over HTTPS; leave unset for public repos.
+            - name: DAGRON_GIT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.gitops.tokenSecret.name }}
+                  key: {{ .Values.gitops.tokenSecret.key | default "DAGRON_GIT_TOKEN" }}
+            {{- end }}
+            {{- with .Values.gitops.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            # MUST be /tmp: the worker clones into `std::env::temp_dir()`
+            # (crates/dagron-gitops/src/sync.rs), which is /tmp unless TMPDIR
+            # says otherwise. Mount it anywhere else and every sync fails on a
+            # read-only filesystem.
+            - name: scratch
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.gitops.resources | nindent 12 }}
+      volumes:
+        # Checkouts are disposable — the repo is the source of truth and every
+        # reconcile re-reads it, so nothing here needs to survive a restart.
+        - name: scratch
+          emptyDir:
+            sizeLimit: {{ .Values.gitops.scratchSizeLimit }}
+{{- end }}

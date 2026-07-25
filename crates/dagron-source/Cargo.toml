@@ -2,7 +2,7 @@
 name = "dagron-source"
 version = "0.1.0"
 edition = "2021"
-description = "dagron workflow ingestion: the WorkflowSource trait + File/Channel built-in sources, a SourceFactory extension seam, and the ractor IngestActor that turns submissions into runs. Queue backends (Redis/SQS/Kafka/NATS) plug in behind the SourceFactory seam."
+description = "dagron workflow ingestion: the WorkflowSource trait + File/Stream/Channel built-in sources (SOURCE=stream follows an NDJSON file/pipe with a durable offset checkpoint), a SourceFactory extension seam, and the ractor IngestActor that turns submissions into runs. Managed broker connectors (Redis/SQS/Kafka/NATS) plug in behind the SourceFactory seam."
 
 [lib]
 name = "dagron_source"
@@ -21,7 +21,7 @@ postgres = ["dagron-core/postgres"]
 # validates payloads against the core DAG model. No backend feature needed here:
 # the actor only calls db::create_run, which both backends expose identically.
 dagron-core = { path = "../dagron-core", default-features = false }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "fs", "io-util"] }
 async-trait = "0.1"
 anyhow = "1"
 tracing = "0.1"
@@ -37,3 +37,4 @@ ractor = "0.10"
 # build of the engine from also dragging in sqlite) and sqlx for the assertions.
 dagron-core = { path = "../dagron-core", features = ["sqlite"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }
+chrono = "0.4"

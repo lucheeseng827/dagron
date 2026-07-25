@@ -24,9 +24,31 @@ export interface Task {
   /// (`command`) or a call (`workflow_ref`) — the server inlines the referenced
   /// workflow at run time. Mutually exclusive with `command`.
   workflow_ref?: string;
+  /// Call a `templates:` sub-DAG declared in the same spec (engine `template`) —
+  /// the DAG-of-DAGs pattern. Like `workflow_ref` this is a *call*, not a leaf:
+  /// mutually exclusive with `command`, and expanded into the template's tasks
+  /// (named `<task>.<inner>`) when the run is created.
+  template?: string;
+  /// Arguments for the called template, filling its declared `parameters`.
+  /// Only meaningful with `template`.
+  arguments?: Record<string, string>;
   /// Spec keys this editor doesn't model (e.g. `env`, `input`, `type: approval`
   /// knobs) preserved verbatim so the visual round-trip is lossless — switching
-  /// to the visual tab never silently drops a field.
+  /// to the visual tab never silently drops a field. Fields the *visual model*
+  /// cannot honestly represent (fan-out, sensors, …) don't rely on this: they
+  /// lock the visual tab outright, see `spec-support.ts`.
+  _extra?: Record<string, unknown>;
+}
+
+/// A `templates:` entry — a reusable sub-DAG a task calls with `template:`.
+/// Its tasks live in their own namespace (`depends_on` inside a template refers
+/// to the template's own tasks), so they are modeled but edited separately from
+/// the main graph.
+export interface Template {
+  name: string;
+  /// Default parameter values, overridable per call via the task's `arguments`.
+  parameters?: Record<string, string>;
+  tasks: Task[];
   _extra?: Record<string, unknown>;
 }
 
@@ -43,13 +65,15 @@ export const TRIGGER_RULES = [
 export interface WorkflowModel {
   name: string;
   tasks: Task[];
-  /// Top-level spec keys this editor doesn't model (e.g. `parameters`,
-  /// `templates`), preserved verbatim across the visual round-trip.
+  /// Reusable sub-DAGs (`templates:`) callable from a task's `template:`.
+  templates: Template[];
+  /// Top-level spec keys this editor doesn't model (e.g. `parameters`, `tags`),
+  /// preserved verbatim across the visual round-trip.
   _extra?: Record<string, unknown>;
 }
 
 /// Task keys the editor models directly; everything else rides in `Task._extra`.
-const KNOWN_TASK_KEYS = new Set([
+export const KNOWN_TASK_KEYS = new Set([
   "name",
   "command",
   "depends_on",
@@ -59,7 +83,12 @@ const KNOWN_TASK_KEYS = new Set([
   "docker_image",
   "trigger_rule",
   "workflow_ref",
+  "template",
+  "arguments",
 ]);
+
+/// Top-level keys the editor models directly.
+export const KNOWN_SPEC_KEYS = new Set(["name", "tasks", "templates"]);
 
 const num = (v: unknown): number | undefined =>
   typeof v === "number" && Number.isFinite(v) ? v : undefined;
@@ -70,6 +99,61 @@ function extraKeys(src: Record<string, unknown>, known: (k: string) => boolean):
   const out: Record<string, unknown> = {};
   for (const k of Object.keys(src)) if (!known(k)) out[k] = src[k];
   return Object.keys(out).length ? out : undefined;
+}
+
+/// A string→string map (a `parameters:` / `arguments:` block), or undefined when
+/// the value isn't one. Non-string scalars are stringified — YAML `count: 3`
+/// parses as a number but the engine's parameter maps are string-valued.
+function strMap(v: unknown): Record<string, string> | undefined {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+  const out: Record<string, string> = {};
+  for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+    if (val != null && typeof val !== "object") out[k] = String(val);
+  }
+  return out;
+}
+
+/// Parse one task entry. Returns an error string instead of a task when the
+/// entry is unusable as a graph node.
+function parseTask(rawUnknown: unknown): { task?: Task; error?: string } {
+  const raw = rawUnknown as Record<string, unknown>;
+  if (!raw || typeof raw.name !== "string") {
+    return { error: "every task needs a string `name`" };
+  }
+  const command = Array.isArray(raw.command) ? raw.command.map((c) => String(c)) : [];
+  const depends_on = Array.isArray(raw.depends_on)
+    ? raw.depends_on.filter((d): d is string => typeof d === "string")
+    : [];
+  return {
+    task: {
+      name: raw.name,
+      command,
+      depends_on,
+      max_attempts: num(raw.max_attempts),
+      retry_delay_secs: num(raw.retry_delay_secs),
+      timeout_secs: num(raw.timeout_secs),
+      docker_image: typeof raw.docker_image === "string" ? raw.docker_image : undefined,
+      trigger_rule: typeof raw.trigger_rule === "string" ? raw.trigger_rule : undefined,
+      workflow_ref: typeof raw.workflow_ref === "string" ? raw.workflow_ref : undefined,
+      template: typeof raw.template === "string" ? raw.template : undefined,
+      arguments: strMap(raw.arguments),
+      _extra: extraKeys(raw, (k) => KNOWN_TASK_KEYS.has(k)),
+    },
+  };
+}
+
+/// Parse a task list, rejecting duplicate names (they are the graph node ids).
+function parseTasks(rawTasks: unknown[]): { tasks?: Task[]; error?: string } {
+  const tasks: Task[] = [];
+  const seen = new Set<string>();
+  for (const rawUnknown of rawTasks) {
+    const { task, error } = parseTask(rawUnknown);
+    if (!task) return { error };
+    if (seen.has(task.name)) return { error: `duplicate task name: ${task.name}` };
+    seen.add(task.name);
+    tasks.push(task);
+  }
+  return { tasks };
 }
 
 /// Parse a YAML spec into the editable model, or return an error string.
@@ -83,40 +167,42 @@ export function parseModel(specYaml: string): { model?: WorkflowModel; error?: s
   if (!doc || typeof doc !== "object" || !Array.isArray(doc.tasks)) {
     return { error: "spec must have a `tasks:` list" };
   }
-  const tasks: Task[] = [];
-  const seen = new Set<string>();
-  for (const rawUnknown of doc.tasks as unknown[]) {
-    const raw = rawUnknown as Record<string, unknown>;
-    if (!raw || typeof raw.name !== "string") {
-      return { error: "every task needs a string `name`" };
+  const { tasks, error } = parseTasks(doc.tasks as unknown[]);
+  if (!tasks) return { error };
+
+  const templates: Template[] = [];
+  if (doc.templates !== undefined) {
+    if (!Array.isArray(doc.templates)) {
+      return { error: "`templates:` must be a list" };
     }
-    // Names are the graph node ids, so they must be unique.
-    if (seen.has(raw.name)) {
-      return { error: `duplicate task name: ${raw.name}` };
+    const seen = new Set<string>();
+    for (const rawUnknown of doc.templates as unknown[]) {
+      const raw = rawUnknown as Record<string, unknown>;
+      if (!raw || typeof raw.name !== "string") {
+        return { error: "every template needs a string `name`" };
+      }
+      if (seen.has(raw.name)) return { error: `duplicate template name: ${raw.name}` };
+      seen.add(raw.name);
+      if (!Array.isArray(raw.tasks)) {
+        return { error: `template '${raw.name}' needs a \`tasks:\` list` };
+      }
+      const inner = parseTasks(raw.tasks as unknown[]);
+      if (!inner.tasks) return { error: `template '${raw.name}': ${inner.error}` };
+      templates.push({
+        name: raw.name,
+        parameters: strMap(raw.parameters),
+        tasks: inner.tasks,
+        _extra: extraKeys(raw, (k) => k === "name" || k === "parameters" || k === "tasks"),
+      });
     }
-    seen.add(raw.name);
-    const command = Array.isArray(raw.command) ? raw.command.map((c) => String(c)) : [];
-    const depends_on = Array.isArray(raw.depends_on)
-      ? raw.depends_on.filter((d): d is string => typeof d === "string")
-      : [];
-    tasks.push({
-      name: raw.name,
-      command,
-      depends_on,
-      max_attempts: num(raw.max_attempts),
-      retry_delay_secs: num(raw.retry_delay_secs),
-      timeout_secs: num(raw.timeout_secs),
-      docker_image: typeof raw.docker_image === "string" ? raw.docker_image : undefined,
-      trigger_rule: typeof raw.trigger_rule === "string" ? raw.trigger_rule : undefined,
-      workflow_ref: typeof raw.workflow_ref === "string" ? raw.workflow_ref : undefined,
-      _extra: extraKeys(raw, (k) => KNOWN_TASK_KEYS.has(k)),
-    });
   }
+
   return {
     model: {
       name: typeof doc.name === "string" ? doc.name : "",
       tasks,
-      _extra: extraKeys(doc, (k) => k === "name" || k === "tasks"),
+      templates,
+      _extra: extraKeys(doc, (k) => KNOWN_SPEC_KEYS.has(k)),
     },
   };
 }
@@ -128,29 +214,45 @@ export function modelToYaml(model: WorkflowModel): string {
   const obj: Record<string, unknown> = {};
   if (model.name) obj.name = model.name;
   for (const [k, v] of Object.entries(model._extra ?? {})) {
-    if (k !== "name" && k !== "tasks") obj[k] = v;
+    if (!KNOWN_SPEC_KEYS.has(k)) obj[k] = v;
   }
-  obj.tasks = model.tasks.map((t) => {
-    const o: Record<string, unknown> = { name: t.name };
-    // Preserve authored values losslessly: emit workflow_ref whenever present
-    // (even ""), and command unless an empty array is superseded by a ref or by
-    // an approval gate (a command-less leaf by definition — `command: []` would
-    // be a semantic no-op the engine tolerates but the docs say not to write).
-    const isApproval = t._extra?.type === "approval";
-    if (t.workflow_ref !== undefined) o.workflow_ref = t.workflow_ref;
-    if (t.command.length > 0 || (t.workflow_ref === undefined && !isApproval)) o.command = t.command;
-    if (t.depends_on.length) o.depends_on = t.depends_on;
-    if (t.max_attempts != null) o.max_attempts = t.max_attempts;
-    if (t.retry_delay_secs != null) o.retry_delay_secs = t.retry_delay_secs;
-    if (t.timeout_secs != null) o.timeout_secs = t.timeout_secs;
-    if (t.docker_image) o.docker_image = t.docker_image;
-    if (t.trigger_rule) o.trigger_rule = t.trigger_rule;
-    for (const [k, v] of Object.entries(t._extra ?? {})) {
-      if (!KNOWN_TASK_KEYS.has(k)) o[k] = v;
-    }
-    return o;
-  });
+  // Templates precede the tasks that call them, as in the engine's examples.
+  if (model.templates.length) {
+    obj.templates = model.templates.map((tpl) => {
+      const o: Record<string, unknown> = { name: tpl.name };
+      if (tpl.parameters && Object.keys(tpl.parameters).length) o.parameters = tpl.parameters;
+      for (const [k, v] of Object.entries(tpl._extra ?? {})) o[k] = v;
+      o.tasks = tpl.tasks.map(taskToYaml);
+      return o;
+    });
+  }
+  obj.tasks = model.tasks.map(taskToYaml);
   return yaml.dump(obj, { lineWidth: 100, noRefs: true });
+}
+
+/// Serialize one task. Preserves authored values losslessly: a call field
+/// (`workflow_ref` / `template`) is emitted whenever present (even ""), and
+/// `command` unless an empty array is superseded by a call or by an approval
+/// gate (a command-less leaf by definition — `command: []` would be a semantic
+/// no-op the engine tolerates but the docs say not to write).
+function taskToYaml(t: Task): Record<string, unknown> {
+  const o: Record<string, unknown> = { name: t.name };
+  const isApproval = t._extra?.type === "approval";
+  const isCall = t.workflow_ref !== undefined || t.template !== undefined;
+  if (t.workflow_ref !== undefined) o.workflow_ref = t.workflow_ref;
+  if (t.template !== undefined) o.template = t.template;
+  if (t.arguments && Object.keys(t.arguments).length) o.arguments = t.arguments;
+  if (t.command.length > 0 || (!isCall && !isApproval)) o.command = t.command;
+  if (t.depends_on.length) o.depends_on = t.depends_on;
+  if (t.max_attempts != null) o.max_attempts = t.max_attempts;
+  if (t.retry_delay_secs != null) o.retry_delay_secs = t.retry_delay_secs;
+  if (t.timeout_secs != null) o.timeout_secs = t.timeout_secs;
+  if (t.docker_image) o.docker_image = t.docker_image;
+  if (t.trigger_rule) o.trigger_rule = t.trigger_rule;
+  for (const [k, v] of Object.entries(t._extra ?? {})) {
+    if (!KNOWN_TASK_KEYS.has(k)) o[k] = v;
+  }
+  return o;
 }
 
 /// Tokenize a command line into argv, respecting single/double quotes and

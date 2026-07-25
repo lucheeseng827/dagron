@@ -338,6 +338,47 @@ curl -s "localhost:8787/runs/$RUN/tasks/$TASK/logs?offset=0"
 
 Secrets are masked in the live stream just like the final output.
 
+### Streaming: events in, workflows out
+
+`SOURCE=stream` follows an append-only NDJSON file or named pipe — one workflow
+submission per line, **exactly-once** (the line's offset commits in the same
+datastore transaction as the run it becomes), poison lines dead-lettered
+instead of wedging the stream. Anything that appends lines
+is a producer (`kafkacat`, `psql COPY`, `tail -f app.log | jq -c`):
+
+```bash
+touch events.ndjson    # the path must exist at startup (STREAM_MODE=auto)
+SOURCE=stream STREAM_PATH=./events.ndjson ./dagron ./events.ndjson &
+echo '{"name":"handle_order","tasks":[{"name":"p","command":["echo","o-1001"]}]}' >> events.ndjson
+```
+
+Semantics, replay/drain modes, and five runnable case studies:
+[`docs/STREAMING.md`](docs/STREAMING.md) + [`examples/streaming/`](examples/streaming/).
+Managed broker connectors (Kafka, NATS, SQS, Redis) and the CloudEvents webhook
+gateway ship with [dagron Enterprise](#dagron-enterprise) behind the same seam.
+
+### AI workloads: long, preemptible, checkpointed
+
+Long tasks are first-class: workers **heartbeat** a running task's lease (a
+task may run for hours; a dead worker's task is re-dispatched in seconds), and
+**checkpoint-aware resume** hands a retry the last committed checkpoint via
+`DAGRON_RESUME_FROM` — resume from epoch N, not epoch 0. `resources.gpu` sugar
+plus `runner_class` pools (`spot-gpu` / `ondemand-gpu` / `cpu`) route each
+stage to the right capacity:
+
+```yaml
+tasks:
+  - name: train
+    command: ["python", "train.py"]       # reports checkpoints; resumes on retry
+    runner_class: spot-gpu
+    timeout_secs: 14400
+    max_attempts: 5                        # preemption = a retry that resumes
+    resources: { gpu: { count: 4 } }
+```
+
+The contract and five runnable case studies:
+[`docs/AI_WORKLOADS.md`](docs/AI_WORKLOADS.md) + [`examples/ai/`](examples/ai/).
+
 The runner rejects duplicate task names, unknown dependencies, and cycles before
 running anything — and `dagron validate <file|dir> [--json]` runs those same
 checks offline (no database, no server), so you can lint workflow YAML in
@@ -399,6 +440,24 @@ positional arg, Cargo feature and config file in one table.
 [`docs/API.md`](docs/API.md) — both HTTP surfaces, endpoint by endpoint.
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — deploy, upgrade, backup per
 backend, monitoring, security posture, symptom-first troubleshooting.
+
+## dagron Enterprise
+
+Everything on this page is Apache-2.0 and complete on its own — the engine
+here is the same code the commercial fleet runs. **dagron Enterprise** adds
+the managed layer around a fleet of engines:
+
+| Open source (this repo) | dagron Enterprise adds |
+|---|---|
+| `SOURCE=stream`, exactly-once transactional offsets, the `SourceFactory` seam | Managed broker connectors — Kafka, NATS, SQS, Redis — with broker-native dead-letter routing; native Postgres change-data-capture on the same exactly-once substrate; the CloudEvents webhook gateway; a streams data plane (transforms, live repartitioning) |
+| Lease heartbeat, checkpoint resume, `resources.gpu`, `runner_class` pools | Placement policy over the pools — spot-first with starvation/preemption fallback, cost/preemption-aware multi-cloud routing, quotas, workspace isolation; maintained ML runner images |
+| Durable LLM steps as plain `command:` tasks | A hardened LLM task binary (idempotent retries, output capture, credential egress guard) and natural-language workflow generation validated against the engine's own parser |
+| Self-contained auth, single team | Enterprise identity (single sign-on, role-based access), audit trail, and the managed cloud |
+
+Selecting an enterprise connector kind in this build (e.g. `SOURCE=kafka`)
+errors with a pointer back to this section — the open path (`SOURCE=stream`,
+the seam) always works, and a pipeline proven on it moves to a managed
+connector by changing environment variables, not workflows.
 
 ## Contributing
 

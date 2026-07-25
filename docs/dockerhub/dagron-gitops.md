@@ -1,0 +1,63 @@
+# dagron GitOps worker (`mancube/dagron-gitops`)
+
+**Reconciles workflow definitions from Git into dagron — the deploy half of "your DAGs live in a repo".**
+
+- **Image:** `mancube/dagron-gitops` — a Rust binary on **debian-slim**, running as **nonroot**.
+- **Arch:** `linux/amd64`, `linux/arm64`
+- **Runtime:** a polling worker · **no ports** · needs `DATABASE_URL`
+- **Talks to:** the same Postgres `dagron-api` writes, plus your Git forge over HTTPS
+- **Website:** dagron.dev · **Source / full docs:** github.com/lucheeseng827/dagron · Apache-2.0
+
+## Why it is a separate image
+
+This is the **one dagron image that carries a `git` binary**, and that is the
+whole point of the split. GitOps shells out to `git`; every other runtime image
+stays distroless and subprocess-free for the majority of deployments that never
+connect a repository. You deploy this one **only if you use GitOps** — and when
+it is absent the console says so plainly rather than pretending auto-sync is on
+while nothing is polling.
+
+## What it does
+
+Scans the configured repos for YAML files carrying a `tasks:` key, validates each
+one with the **engine's own parser** (so a file that syncs is a file the engine
+can actually run), and upserts it as a workflow definition. Files that aren't
+specs are skipped rather than reported as errors. The reconcile is idempotent —
+the same commit synced twice is a no-op beyond `updated_at`.
+
+## Configuration
+
+| Variable | Default | What it does |
+|---|---|---|
+| `DATABASE_URL` | **required** | The Postgres dagron-api owns (this worker waits for its schema). |
+| `GITOPS_POLL_SECS` | `60` | Seconds between auto-sync reconciles per repo. Manual sync is immediate. |
+| `DAGRON_GIT_TOKEN` | unset | Forge token. Sent only to trusted forge hosts over HTTPS; leave unset for public repos. |
+| `RUST_LOG` | `info` | Log level. |
+
+## Tags
+
+| Tag | Notes |
+|---|---|
+| `latest` | newest release |
+| `0.5.0` | pinned version (= current `latest`); first release of this image |
+
+## Quick start
+
+Repositories are connected from the console (**GitOps** in the sidebar) or the
+API; this worker only reconciles what is registered there.
+
+```bash
+docker run -d --name dagron-gitops \
+  -e DATABASE_URL='postgres://dagron:PW@db:5432/dagron' \
+  -e GITOPS_POLL_SECS=60 \
+  mancube/dagron-gitops:latest
+```
+
+In the bundled compose stack it is opt-in, matching how it deploys:
+
+```bash
+podman compose --profile gitops up -d
+```
+
+Repos, sync status and the "no GitOps worker running" indicator all live in the
+console; this image is the thing that makes that indicator go green.

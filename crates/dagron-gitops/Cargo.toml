@@ -1,0 +1,24 @@
+[package]
+name = "dagron-gitops"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "dagron GitOps worker — polls connected repos, validates their workflow specs, and reconciles them into the workflows table. Ships as its own optional image so the API gateway stays distroless and never shells out."
+
+[[bin]]
+name = "dagron-gitops"
+path = "src/main.rs"
+
+[dependencies]
+# Spec validation uses the engine's own parser, so a repo file that syncs is a
+# file the engine can actually run. `postgres` — this worker shares dagron-api's
+# datastore, which is Postgres-only.
+dagron-core = { path = "../dagron-core", default-features = false, features = ["postgres"] }
+dagron-logging = { path = "../dagron-logging" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "signal"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros"] }
+anyhow = "1"
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
+serde_yaml = "0.9"
+tracing = "0.1"

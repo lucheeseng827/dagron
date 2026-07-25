@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,10 @@ pub struct Workflow {
     pub description: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Organizational labels parsed from the spec (#26). `#[sqlx(default)]` so the
+    /// row query (which doesn't select a `tags` column) maps; set from the spec.
+    #[sqlx(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -58,12 +62,22 @@ pub struct WorkflowRow {
     pub history: Vec<String>,
     pub success_rate: Option<i64>,
     pub run_count: i64,
+    /// Organizational labels declared in the spec (#26).
+    pub tags: Vec<String>,
+}
+
+/// Query params for `GET /api/workflows`. `?tag=<t>` returns only workflows
+/// carrying that tag (#26).
+#[derive(Deserialize)]
+pub struct ListQuery {
+    pub tag: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
 struct WfBase {
     id: String,
     name: String,
+    spec: String,
     description: Option<String>,
     created_at: String,
     updated_at: String,
@@ -83,13 +97,26 @@ struct RunStat {
     created_at: String,
 }
 
+/// Extract a workflow's `tags` from its stored spec YAML (#26) — a lenient
+/// partial parse (empty on error or when none are declared), so no denormalized
+/// column has to be kept in sync and tags always reflect the current definition.
+fn parse_tags(yaml: &str) -> Vec<String> {
+    #[derive(Deserialize)]
+    struct TagsOnly {
+        #[serde(default)]
+        tags: Vec<String>,
+    }
+    serde_yaml::from_str::<TagsOnly>(yaml).map(|t| t.tags).unwrap_or_default()
+}
+
 /// `GET /api/workflows` — enriched rows (definition + schedule + run digest).
 pub async fn list_workflows(
     _auth: AuthUser,
     State(state): State<AppState>,
+    Query(q): Query<ListQuery>,
 ) -> Result<Json<Vec<WorkflowRow>>, StatusCode> {
     let wfs = sqlx::query_as::<_, WfBase>(
-        "SELECT id, name, description, created_at, updated_at FROM workflows ORDER BY name",
+        "SELECT id, name, spec, description, created_at, updated_at FROM workflows ORDER BY name",
     )
     .fetch_all(&state.read_pool)
     .await
@@ -133,6 +160,9 @@ pub async fn list_workflows(
 
     let mut rows = Vec::with_capacity(wfs.len());
     for w in wfs {
+        // Tags are parsed from the stored spec (no denormalized column to keep in
+        // sync), so they always reflect the current definition (#26).
+        let tags = parse_tags(&w.spec);
         let sched = sched_by_workflow.get(w.id.as_str()).copied();
         // runs for this workflow name, newest first
         let mine: Vec<&RunStat> = runs_by_name.get(w.name.as_str()).cloned().unwrap_or_default();
@@ -155,12 +185,17 @@ pub async fn list_workflows(
             history,
             success_rate,
             run_count: total,
+            tags,
             id: w.id,
             name: w.name,
             description: w.description,
             created_at: w.created_at,
             updated_at: w.updated_at,
         });
+    }
+    // Optional tag filter (#26): keep only workflows carrying the requested tag.
+    if let Some(tag) = q.tag.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        rows.retain(|r| r.tags.iter().any(|t| t == tag));
     }
     Ok(Json(rows))
 }
@@ -171,7 +206,7 @@ pub async fn get_workflow(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Workflow>, StatusCode> {
-    let wf = sqlx::query_as::<_, Workflow>(
+    let mut wf = sqlx::query_as::<_, Workflow>(
         "SELECT id, name, spec, description, created_at, updated_at FROM workflows WHERE id = $1",
     )
     .bind(&id)
@@ -179,6 +214,7 @@ pub async fn get_workflow(
     .await
     .map_err(internal)?
     .ok_or(StatusCode::NOT_FOUND)?;
+    wf.tags = parse_tags(&wf.spec);
     Ok(Json(wf))
 }
 
@@ -209,7 +245,15 @@ pub async fn create_workflow(
 
     Ok((
         StatusCode::CREATED,
-        Json(Workflow { id, name, spec: body.spec, description, created_at: now.clone(), updated_at: now }),
+        Json(Workflow {
+            tags: parse_tags(&body.spec),
+            id,
+            name,
+            spec: body.spec,
+            description,
+            created_at: now.clone(),
+            updated_at: now,
+        }),
     ))
 }
 
@@ -247,7 +291,15 @@ pub async fn update_workflow(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
-    Ok(Json(Workflow { id, name, spec: body.spec, description, created_at, updated_at: now }))
+    Ok(Json(Workflow {
+        tags: parse_tags(&body.spec),
+        id,
+        name,
+        spec: body.spec,
+        description,
+        created_at,
+        updated_at: now,
+    }))
 }
 
 /// `DELETE /api/workflows/:id`. 404 if absent.
@@ -282,14 +334,10 @@ pub async fn run_workflow(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
     let spec_yaml = spec_yaml.ok_or((StatusCode::NOT_FOUND, format!("workflow '{id}' not found")))?;
 
-    let spec = control::parse_and_validate(&spec_yaml)?;
-    // Resolve any `workflow_ref` chains (this workflow calling other saved
-    // workflows) into one flat DAG before the run is created.
-    let expanded = crate::expand::expand_workflow_refs(&state, spec).await?;
-    let prepared = control::prepare_spec(&state, expanded).await?;
-    let run_id = control::create_run(&state, &prepared, &spec_yaml)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    control::parse_and_validate(&spec_yaml)?;
+    // Same pipeline as `POST /api/runs`: `workflow_ref` chains inlined, then the
+    // engine's own parser and run writer.
+    let run_id = control::submit_yaml(&state, &spec_yaml, &spec_yaml).await?;
     Ok(Json(serde_json::json!({ "run_id": run_id, "workflow_id": id })))
 }
 

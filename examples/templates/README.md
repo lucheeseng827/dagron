@@ -8,6 +8,19 @@ reconcile loop / executors run it unchanged — a sub-workflow is just a bigger 
 Implemented in [`src/expand.rs`](../../src/expand.rs); expansion runs inside
 `DagGraph::from_yaml`, so it works on every submit path (API, cron, file ingest).
 
+In the console these specs save and run like any other, and the plain call —
+pattern 01 below — is editable in the **visual** editor: a `template:` task is a
+sub-DAG node whose panel picks the template and fills its arguments
+([`docs/WORKFLOW_UI_GUIDE.md` §5.5](../../docs/WORKFLOW_UI_GUIDE.md)). The
+patterns that change the *shape* of the graph (fan-out, recursion, conditionals)
+are YAML-only there: the canvas draws one node per task and cannot honestly draw
+a task that becomes N.
+
+Templates are **DAG** reuse, not **code** reuse: they dedupe steps and
+parameterize them with `arguments:`. If what you actually want is to stop
+inlining a long shell script, that is a different question —
+[`../scripts/`](../scripts/README.md).
+
 ## Schema additions
 
 ```yaml

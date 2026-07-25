@@ -61,6 +61,13 @@ management API on `127.0.0.1:8787` (SQLite `workflow.db` by default):
 dagron dev path/to/workflow.yaml
 ```
 
+`dev` is a subcommand token, so the positionals shift right —
+`dagron dev [dag-file] [db-target]`. A single argument after `dev` is the
+**workflow**, never the datastore: `dagron dev my.db` tries to ingest `my.db`
+as YAML and still writes to `workflow.db`. To pick the datastore, pass both
+(`dagron dev my.yaml my.db`). The startup line names the datastore in use —
+read it first when runs land somewhere you didn't expect.
+
 **Explicit file + datastore** — positional `<dag-file> [db-target]`; the second
 arg is a SQLite file path or a Postgres URL:
 
@@ -258,9 +265,73 @@ on the engine host. For knobs the chart doesn't model, `engine.extraEnv` /
 
 ---
 
+## 6. Long scripts: where the code lives
+
+A task's `command:` is argv. There is **no `script:` field and no file-include
+directive** — a spec never pulls in another file. So "my script is 400 lines"
+is really *where does the code live so the executor can reach it*.
+
+Only three things cross into the task process: `command:` (argv), `env:` (every
+backend), and `docker_image:` (container backends). `input:` does **not** — it is
+stored on the task row, never passed to the process. Two constraints decide the
+rest: **no executor mounts host paths** (the Docker backend uses a default
+`HostConfig` with no binds; the Kubernetes backend declares no volumes), and
+`DAGRON_ARTIFACTS` is a host directory, so it can pass files between *host* tasks
+but cannot carry a script into a container.
+
+| | approach | when |
+| --- | --- | --- |
+| 1 | **bake it into the image** — `command: ["/app/bin/transform.sh", "--shard", "3"]` | docker/k8s; the default answer. The script's version is the image tag, so a pinned re-run runs the code that ran then. |
+| 2 | **absolute path on the engine host** — `command: ["bash", "/opt/dagron/scripts/x.sh"]` | `EXECUTOR=local` only. |
+| 3 | **fetch when the run starts** into `$DAGRON_ARTIFACTS` (host) or inside each container | the script changes faster than you rebuild images. |
+| 4 | **the body in an env var** — `command: ["sh", "-c", 'eval "$SCRIPT"']` | tens of lines, no build pipeline. |
+
+Two traps worth stating outright:
+
+- For **2**, use absolute paths — the executor sets no working directory, so a
+  relative path resolves against the *engine process's* cwd, not the workflow's
+  location. And every engine replica needs the file: any replica may claim any
+  task, so a script on one box fails whenever another wins the claim.
+- For **4**, the body travels as data rather than argv, which removes the
+  shell-quoting hazard, but it is still inlined — re-parsed every run, diffed on
+  every GitOps sync, and submitted through an API that caps bodies at 1 MiB.
+
+```yaml
+# pattern 4 — runnable as-is
+tasks:
+  - name: transform
+    command: ["sh", "-c", 'eval "$SCRIPT"']
+    env:
+      - name: SHARD
+        value: "3"
+      - name: SCRIPT
+        value: |
+          set -eu
+          echo "transform starting (shard=${SHARD})"
+```
+
+Things that look like answers but aren't: **YAML anchors** only dedupe within one
+document; **`templates:`** is DAG reuse, not code reuse (it dedupes *steps*, and
+won't shorten a `command:`); **GitOps sync** stores files that have a `tasks:`
+key and ships nothing else to your executors. To keep the script in its own repo
+file, assemble the spec in CI or an SDK step and submit the result.
+
+Worked examples for all four, plus what to validate:
+[`../examples/scripts/`](../examples/scripts/README.md).
+
+---
+
 ## See also
 
 - [`../examples/`](../examples/) — runnable workflow specs.
+- [`../examples/scripts/`](../examples/scripts/README.md) — the four places a
+  long script can live, and which reach which executor (§6).
+- [`STREAMING.md`](STREAMING.md) — events → workflows: the built-in stream
+  source, delivery semantics, and five case studies
+  ([`../examples/streaming/`](../examples/streaming/)).
+- [`AI_WORKLOADS.md`](AI_WORKLOADS.md) — long/checkpointed tasks, the resume
+  contract, GPU routing, and five case studies
+  ([`../examples/ai/`](../examples/ai/)).
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — component design, the task state machine,
   and event/call sequences.
 - [`../README.md`](../README.md) — install (OCI Helm chart / images) and the

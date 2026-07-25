@@ -72,7 +72,7 @@ flowchart LR
 
 ## 2. Workspace & component architecture
 
-The engine is a Cargo **workspace** under `module_54/`. The root `dagron` package's
+The engine is a Cargo **workspace** at the repository root. The root `dagron` package's
 `src/main.rs` is a one-call shell over the **`dagron-engine`** library crate, which owns
 config, the multi-run reconcile loop, the `Seams` extension seam, and the ops modules —
 and wires the reusable library crates in `crates/` together. Alternate builds can plug

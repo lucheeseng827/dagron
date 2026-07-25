@@ -11,10 +11,31 @@ use tokio::time::{timeout, Duration};
 // ── Shared types ─────────────────────────────────────────────────────────────
 
 /// Output returned by every executor backend.
+#[derive(Debug)]
 pub struct ExecOutput {
     pub success: bool,
     pub output: String,
 }
+
+/// Marker error for a task killed by its `timeout_secs` deadline — as opposed to
+/// a non-zero exit or a spawn/backend error. Every executor backend returns this
+/// (wrapped in `anyhow`) when it aborts a task at the deadline, so the worker can
+/// `downcast` and tell the reconcile loop the failure was a timeout. That lets a
+/// task with `retry_on_timeout: false` (fast-win #24) skip the retry a deadline
+/// kill would otherwise burn (such kills usually recur). Carries the deadline for
+/// the message.
+#[derive(Debug)]
+pub struct TimeoutError {
+    pub secs: u64,
+}
+
+impl std::fmt::Display for TimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "command timed out after {}s", self.secs)
+    }
+}
+
+impl std::error::Error for TimeoutError {}
 
 /// One incremental chunk of a running task's output, streamed for live tailing
 /// (fast-win #17). The executor emits these through a [`LogSink`] as output
@@ -162,7 +183,7 @@ pub async fn run_command(
 
     let output = timeout(Duration::from_secs(secs), cmd.output())
         .await
-        .map_err(|_| anyhow::anyhow!("command timed out after {secs}s"))??;
+        .map_err(|_| anyhow::Error::new(TimeoutError { secs }))??;
 
     let exit_code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -235,7 +256,7 @@ async fn run_command_streaming(
 
     let (status, stdout_s, stderr_s) = timeout(Duration::from_secs(secs), combined)
         .await
-        .map_err(|_| anyhow::anyhow!("command timed out after {secs}s"))??;
+        .map_err(|_| anyhow::Error::new(TimeoutError { secs }))??;
 
     if !stderr_s.is_empty() {
         let redactor = crate::redact::Redactor::from_task_env(env);
@@ -290,5 +311,41 @@ mod tests {
         let out = LocalExecutor.execute(&ctx).await.unwrap();
         assert!(out.success);
         assert_eq!(out.output, "hi", "no trailing newline added on the buffered path");
+    }
+
+    /// A task that outruns its `timeout_secs` deadline returns an error that
+    /// downcasts to [`TimeoutError`], so the reconcile loop can distinguish a
+    /// deadline kill from a non-zero exit and honor `retry_on_timeout` (#24).
+    /// Covers both the buffered and the streaming (log-sink) paths.
+    #[tokio::test]
+    async fn timeout_is_a_typed_timeout_error() {
+        // Buffered path.
+        let ctx = ExecContext::new(vec!["sleep".to_string(), "5".to_string()], Some(1), None);
+        let err = LocalExecutor.execute(&ctx).await.expect_err("must time out");
+        assert!(err.is::<TimeoutError>(), "buffered timeout must be a TimeoutError, got: {err}");
+
+        // Streaming path (log sink wired).
+        let (tx, _rx) = mpsc::unbounded_channel::<LogChunk>();
+        let sink = LogSink::new(tx, "t".to_string(), 1, crate::redact::Redactor::default());
+        let ctx = ExecContext {
+            command: vec!["sleep".to_string(), "5".to_string()],
+            timeout_secs: Some(1),
+            docker_image: None,
+            env: vec![],
+            resources: None,
+            service_account: None,
+            log_sink: Some(sink),
+        };
+        let err = LocalExecutor.execute(&ctx).await.expect_err("must time out");
+        assert!(err.is::<TimeoutError>(), "streaming timeout must be a TimeoutError, got: {err}");
+    }
+
+    /// A plain non-zero exit is NOT a timeout — it stays a normal failure so the
+    /// usual attempts-based retry still applies.
+    #[tokio::test]
+    async fn nonzero_exit_is_not_a_timeout() {
+        let ctx = ExecContext::new(vec!["false".to_string()], Some(10), None);
+        let out = LocalExecutor.execute(&ctx).await.expect("false exits cleanly, non-zero");
+        assert!(!out.success, "`false` exits non-zero");
     }
 }

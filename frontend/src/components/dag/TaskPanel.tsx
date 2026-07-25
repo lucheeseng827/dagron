@@ -1,8 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import { getTaskLogs } from "@/lib/dagron-api";
-import { statusColor, statusLabel } from "@/lib/adapter";
+import { statusColor, statusLabel, type WaitingOn } from "@/lib/adapter";
+import { absTime, fromNow } from "@/lib/time";
 import type { TaskLogs } from "@/types/dagron";
 
 export interface TaskPanelProps {
@@ -11,6 +13,16 @@ export interface TaskPanelProps {
   onClose: () => void;
   /// Render extra controls (e.g. retry/approve buttons) in the panel header.
   actions?: (logs: TaskLogs) => React.ReactNode;
+  /// Why this task is parked, from the run detail (`waitingOn`). A parked task
+  /// is `running` with no logs and no lease, so without this the panel shows a
+  /// spinner-shaped nothing and the task reads as hung.
+  waiting?: WaitingOn | null;
+  /// Scheduling facts from the run detail that the logs endpoint doesn't carry:
+  /// the pool the task drew a slot from, its dispatch priority, and whether it
+  /// was served from the memoization cache.
+  pool?: string | null;
+  priority?: number;
+  cacheHit?: boolean;
 }
 
 const TAIL_INTERVAL_MS = 2000;
@@ -18,7 +30,16 @@ const TAIL_INTERVAL_MS = 2000;
 /// Right-side drawer: task detail + logs for the clicked node. Logs tail live:
 /// after the initial full fetch, output past `next_offset` is polled and
 /// appended until the task is terminal (`eof`) — no full-refetch flicker.
-export default function TaskPanel({ runId, taskId, onClose, actions }: TaskPanelProps) {
+export default function TaskPanel({
+  runId,
+  taskId,
+  onClose,
+  actions,
+  waiting,
+  pool,
+  priority,
+  cacheHit,
+}: TaskPanelProps) {
   const [logs, setLogs] = useState<TaskLogs | null>(null);
   const [output, setOutput] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -140,6 +161,61 @@ export default function TaskPanel({ runId, taskId, onClose, actions }: TaskPanel
               </span>
             )}
           </div>
+          {(cacheHit || pool || (priority ?? 0) !== 0) && (
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", fontSize: 11 }}>
+              {cacheHit && (
+                <span className="dy-pill" title="Served from the memoization cache — no worker, no secrets, no artifacts">
+                  ⚡ cached
+                </span>
+              )}
+              {pool && (
+                <span className="dy-pill" title={`Drew a slot from concurrency pool "${pool}"`}>
+                  pool {pool}
+                </span>
+              )}
+              {(priority ?? 0) !== 0 && (
+                <span className="dy-pill" title="Dispatch priority among simultaneously-ready tasks (higher goes first)">
+                  priority {priority}
+                </span>
+              )}
+            </div>
+          )}
+          {waiting && (
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: 4,
+                padding: "0.6rem 0.7rem",
+                borderRadius: 6,
+                border: "1px solid rgba(88,166,255,0.35)",
+                background: "rgba(88,166,255,0.10)",
+                fontSize: 12.5,
+              }}
+            >
+              <span style={{ color: "var(--blue)", display: "inline-flex", alignItems: "center", gap: 6 }}>
+                <span aria-hidden>⏸</span>
+                {waiting.label}
+                {/* A time sensor's deadline is the one detail that reads better
+                    relative than absolute — "in 4m" answers "is it stuck?". */}
+                {waiting.runLink === undefined && waiting.label === "Waiting until" && (
+                  <span style={{ color: "var(--muted)" }}>{fromNow(waiting.detail)}</span>
+                )}
+              </span>
+              {waiting.runLink ? (
+                <Link href={`/runs/${waiting.runLink}`} className="mono" style={{ color: "var(--blue)", wordBreak: "break-all" }}>
+                  {waiting.detail}
+                </Link>
+              ) : (
+                <span className="mono" style={{ color: "var(--muted)", wordBreak: "break-all" }} title={absTime(waiting.detail)}>
+                  {waiting.detail}
+                </span>
+              )}
+              <span style={{ color: "var(--dim)", fontSize: 11 }}>
+                Parked — holds no worker slot. It stays “running” until this resolves.
+              </span>
+            </div>
+          )}
           {actions && <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>{actions(logs)}</div>}
           <pre
             ref={preRef}

@@ -27,7 +27,9 @@
 //! Verbosity precedence: `RUST_LOG` (if set and parseable) → `LOG_LEVEL` → `info`.
 
 use tracing_subscriber::fmt::format::FmtSpan;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
 
 /// Read a boolean-ish env var (`1`/`true`/`yes`/`on` → true, anything else →
 /// false), falling back to `default` when unset.
@@ -76,24 +78,22 @@ fn span_events() -> FmtSpan {
     }
 }
 
-/// Initialize the global tracing subscriber for `service` (e.g. `"controller"`,
-/// `"api"`, `"operator"`). Call exactly once, as early in `main` as possible. The
-/// `service` name is emitted as a field on the startup "logging initialized" line
-/// so each process is identifiable in a shared log stream. (Per-*event* service
-/// attribution would need a custom layer across the multi-threaded runtime; in
-/// practice each dagron process runs as its own container/pod, so the
-/// orchestrator's metadata already tags its downstream events.)
-///
-/// Idempotent-ish: uses `try_init` so a double-call (e.g. in tests) is a no-op
-/// rather than a panic.
-pub fn init(service: &str) {
+/// Build the fmt output as a boxed [`Layer`] so it can be composed in a
+/// `registry()` alongside other layers (the OTLP layer, when `otel` is on). The
+/// format-specific transforms (`.json()`/`.pretty()`/`.compact()`) each return a
+/// distinct type, so each arm boxes its own. Behavior matches the previous
+/// `fmt()`-builder path exactly; the verbosity [`EnvFilter`] is applied once at
+/// the registry level so every layer (fmt and OTLP) honors `RUST_LOG`/`LOG_LEVEL`.
+fn fmt_layer<S>() -> Box<dyn Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + Send + Sync,
+{
     let format = std::env::var("LOG_FORMAT")
         .unwrap_or_else(|_| "full".to_string())
         .to_ascii_lowercase();
     let json = format == "json";
 
-    let builder = tracing_subscriber::fmt()
-        .with_env_filter(build_filter())
+    let base = tracing_subscriber::fmt::layer()
         .with_target(env_bool("LOG_TARGET", true))
         .with_thread_ids(env_bool("LOG_THREAD_IDS", false))
         .with_thread_names(env_bool("LOG_THREAD_NAMES", false))
@@ -103,23 +103,153 @@ pub fn init(service: &str) {
         // (defaulting on — the fmt layer still auto-detects non-TTY downstream).
         .with_ansi(!json && env_bool("LOG_ANSI", true));
 
-    // The format-specific transforms (`.json()`, `.pretty()`, `.compact()`) each
-    // return a distinct builder type, so finalize within each arm.
     match format.as_str() {
-        "json" => builder
+        "json" => base
             .json()
             .flatten_event(true)
             .with_current_span(true)
             .with_span_list(true)
-            .try_init()
-            .ok(),
-        "pretty" => builder.pretty().try_init().ok(),
-        "compact" => builder.compact().try_init().ok(),
+            .boxed(),
+        "pretty" => base.pretty().boxed(),
+        "compact" => base.compact().boxed(),
         // "full" (default) and any unrecognized value.
-        _ => builder.try_init().ok(),
+        _ => base.boxed(),
+    }
+}
+
+#[cfg(feature = "otel")]
+static TRACER_PROVIDER: std::sync::OnceLock<opentelemetry_sdk::trace::SdkTracerProvider> =
+    std::sync::OnceLock::new();
+
+/// Flush and stop the OTLP span exporter, if one was installed.
+///
+/// Call once on a clean shutdown path, after the last work you want traced. The
+/// batch exporter holds spans between export intervals, so without this the
+/// final window is lost — precisely the spans that explain a shutdown. A no-op
+/// when the `otel` feature is off or no exporter was configured.
+pub fn shutdown() {
+    #[cfg(feature = "otel")]
+    if let Some(provider) = TRACER_PROVIDER.get() {
+        if let Err(e) = provider.shutdown() {
+            eprintln!("dagron: OTLP span exporter shutdown failed: {e}");
+        }
+    }
+}
+
+/// Initialize the global tracing subscriber for `service` (e.g. `"controller"`,
+/// `"api"`, `"operator"`). Call exactly once, as early in `main` as possible. The
+/// `service` name is emitted as a field on the startup "logging initialized" line
+/// so each process is identifiable in a shared log stream. (Per-*event* service
+/// attribution would need a custom layer across the multi-threaded runtime; in
+/// practice each dagron process runs as its own container/pod, so the
+/// orchestrator's metadata already tags its downstream events.)
+///
+/// With the `otel` feature built in **and** `OTEL_EXPORTER_OTLP_ENDPOINT` set, an
+/// OTLP (HTTP/protobuf) span exporter is also installed (#28 follow-on) so the
+/// stack's tracing spans are delivered to a collector; otherwise logging is
+/// unchanged.
+///
+/// Idempotent-ish: uses `try_init` so a double-call (e.g. in tests) is a no-op
+/// rather than a panic.
+pub fn init(service: &str) {
+    let format = std::env::var("LOG_FORMAT").unwrap_or_else(|_| "full".to_string());
+
+    let subscriber = tracing_subscriber::registry()
+        .with(build_filter())
+        .with(fmt_layer());
+
+    #[cfg(feature = "otel")]
+    match otel_layer(service) {
+        Some(layer) => {
+            subscriber.with(layer).try_init().ok();
+        }
+        None => {
+            subscriber.try_init().ok();
+        }
+    }
+    #[cfg(not(feature = "otel"))]
+    subscriber.try_init().ok();
+
+    tracing::info!(service, format = %format.to_ascii_lowercase(), "logging initialized");
+}
+
+/// Build the OpenTelemetry OTLP span-export layer (#28 follow-on), or `None` when
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` is unset (the exporter stays off) or the exporter
+/// can't be built. The exporter reads the standard `OTEL_EXPORTER_OTLP_*` env vars
+/// for its endpoint/headers/protocol, so operators tune delivery without a
+/// rebuild. A W3C `TraceContext` propagator is installed globally so a
+/// `traceparent` injected into a downstream task stitches into the same trace.
+///
+/// The `SdkTracerProvider` is handed to the global provider registry to keep it
+/// (and its background batch exporter) alive for the process lifetime.
+#[cfg(feature = "otel")]
+fn otel_layer<S>(service: &str) -> Option<Box<dyn Layer<S> + Send + Sync>>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + Send + Sync,
+{
+    use opentelemetry::trace::TracerProvider as _;
+
+    // Propagation is independent of export: it decides how a span context is
+    // *encoded* on the wire, not where spans are sent. Installing it before the
+    // endpoint gate means an `otel` build that extracts an inbound `traceparent`
+    // behaves the same whether or not a collector is configured — otherwise the
+    // global propagator stays the no-op default and silently drops the context.
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+
+    // Gate on the standard endpoint env var: unset ⇒ exporter stays off.
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+
+    // A second call (a double `init` in tests, or an embedder) must not build a
+    // *second* provider: only the one in the OnceLock is reachable from
+    // `shutdown`, so a second provider's batch queue would never be flushed and
+    // its final spans would die with the process. Reuse the stored one instead —
+    // the layer it backs is equivalent, and there stays exactly one exporter.
+    if let Some(existing) = TRACER_PROVIDER.get() {
+        let tracer = existing.tracer("dagron");
+        return Some(tracing_opentelemetry::layer().with_tracer(tracer).boxed());
+    }
+
+    // Endpoint/headers/protocol come from the standard OTEL env vars; we only
+    // need the presence check above to decide whether to enable at all.
+    let exporter = match opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .build()
+    {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("dagron: OTLP span export disabled (exporter build failed): {e}");
+            return None;
+        }
     };
 
-    tracing::info!(service, format = %format, "logging initialized");
+    let resource = opentelemetry_sdk::Resource::builder()
+        .with_service_name(format!("dagron-{service}"))
+        .build();
+
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(resource)
+        .build();
+
+    let tracer = provider.tracer("dagron");
+
+    // Keep a handle so `shutdown` can flush the batch exporter's queue on a
+    // clean exit — otherwise every span buffered since the last export interval
+    // dies with the process, which is exactly the tail you most want after a
+    // failure. The early return above guarantees this `set` is the first one, so
+    // the provider installed globally below is always the one `shutdown` holds.
+    let _ = TRACER_PROVIDER.set(provider.clone());
+
+    // Keep the provider alive process-wide.
+    opentelemetry::global::set_tracer_provider(provider);
+
+    eprintln!("dagron: OTLP span export enabled → {endpoint}");
+    Some(tracing_opentelemetry::layer().with_tracer(tracer).boxed())
 }
 
 #[cfg(test)]
@@ -163,5 +293,34 @@ mod tests {
         std::env::remove_var("LOG_LEVEL");
         // Just assert it constructs without panicking and renders a directive.
         let _ = build_filter().to_string();
+    }
+
+    /// The OTLP exporter must stay OFF unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set,
+    /// even when the `otel` feature is compiled in (#28 follow-on): no endpoint ⇒
+    /// no exporter layer, no background exporter thread.
+    #[cfg(feature = "otel")]
+    #[test]
+    fn otel_layer_off_without_endpoint() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        assert!(super::otel_layer::<tracing_subscriber::Registry>("test").is_none());
+        // A blank/whitespace endpoint is treated as unset, too.
+        std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "   ");
+        assert!(super::otel_layer::<tracing_subscriber::Registry>("test").is_none());
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+    }
+
+    /// The OTLP HTTP/protobuf exporter builds successfully with the selected
+    /// feature set (#28 follow-on) — a runtime guard that the `http-proto` +
+    /// blocking-reqwest transport is wired, not just that it compiles. Builds the
+    /// exporter in isolation (no global provider, no background thread) so it has
+    /// no side effects on the rest of the suite.
+    #[cfg(feature = "otel")]
+    #[test]
+    fn otlp_http_exporter_builds() {
+        // Shares OTEL_EXPORTER_OTLP_ENDPOINT with the gating test above.
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let exporter = opentelemetry_otlp::SpanExporter::builder().with_http().build();
+        assert!(exporter.is_ok(), "OTLP HTTP exporter must build: {:?}", exporter.err());
     }
 }

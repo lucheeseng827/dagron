@@ -93,9 +93,12 @@ pub fn router(state: ApiState) -> Router {
         .route("/runs/{id}/tasks/{task_id}/clear", post(clear_task))
         .route("/runs/{id}/tasks/{task_id}/approve", post(approve_task))
         .route("/runs/{id}/tasks/{task_id}/reject", post(reject_task))
+        .route("/runs/{id}/tasks/{task_id}/checkpoint", post(checkpoint_task))
         .route("/dead-letters", get(list_dead_letters))
         .route("/dead-letters/{id}/redrive", post(redrive_dead_letter))
         .route("/dead-letters/{id}", axum::routing::delete(delete_dead_letter))
+        .route("/datasets", get(list_datasets))
+        .route("/datasets/events", get(list_dataset_events).post(post_dataset_event))
         .with_state(state)
 }
 
@@ -302,7 +305,29 @@ async fn submit_run(
         }
     }
 
-    let run_id = db::create_run(&st.pool, &dag, &body).await?;
+    let run_id = match db::create_run(&st.pool, &dag, &body).await {
+        Ok(id) => id,
+        Err(e) => {
+            // Per-workflow concurrency cap (#21): a capacity condition, not a
+            // failure — answer 429 + Retry-After (like the inflight valve above),
+            // never 500. Any other error keeps the default 500 mapping.
+            if let Some(m) = e.downcast_ref::<dagron_core::models::MaxActiveRunsReached>() {
+                info!(workflow = %m.name, active = m.active, cap = m.max, "run rejected — at max_active_runs");
+                return Ok((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(header::RETRY_AFTER, "1")],
+                    Json(json!({
+                        "error": "max_active_runs reached",
+                        "workflow": m.name,
+                        "active": m.active,
+                        "max_active_runs": m.max,
+                    })),
+                )
+                    .into_response());
+            }
+            return Err(e.into());
+        }
+    };
     st.metrics.inc_runs_created();
     info!(%run_id, name = %dag.spec.name, wait = q.wait, "run submitted via API");
 
@@ -502,6 +527,56 @@ async fn approve_task(
     resolve_approval_gate(&st, &id, &task_id, true).await
 }
 
+/// Body of `POST /runs/{id}/tasks/{task_id}/checkpoint`.
+#[derive(serde::Deserialize)]
+struct CheckpointBody {
+    /// Where the task just committed its checkpoint (any URI/path the *next*
+    /// attempt can read — a `DAGRON_CHECKPOINT_DIR` file, an s3:// object, …).
+    uri: String,
+    /// Optional progress marker (e.g. `epoch=7`, an offset) surfaced back as
+    /// `DAGRON_RESUME_MARKER`.
+    #[serde(default)]
+    marker: Option<String>,
+}
+
+/// `POST /runs/{id}/tasks/{task_id}/checkpoint` — checkpoint-aware resume: a
+/// **running** task reports the checkpoint it just committed (typically using
+/// its injected `DAGRON_RUN_ID` / `DAGRON_TASK_ID` env). The pointer survives
+/// retries; the next attempt is dispatched with `DAGRON_RESUME_FROM[_MARKER]`
+/// so it resumes instead of restarting from zero. 404 unknown run/task, 409 if
+/// the task is not running (a parked attempt cannot overwrite a newer one's
+/// progress), 400 on an empty uri.
+async fn checkpoint_task(
+    State(st): State<ApiState>,
+    Path((id, task_id)): Path<(String, String)>,
+    Json(body): Json<CheckpointBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if body.uri.trim().is_empty() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "checkpoint uri must not be empty".into()));
+    }
+    if db::get_run(&st.pool, &id).await?.is_none() {
+        return Err(ApiError(StatusCode::NOT_FOUND, format!("run '{id}' not found")));
+    }
+    if db::record_task_checkpoint(&st.pool, &id, &task_id, body.uri.trim(), body.marker.as_deref())
+        .await?
+    {
+        return Ok(Json(json!({
+            "run_id": id,
+            "task_id": task_id,
+            "checkpoint_uri": body.uri.trim(),
+            "marker": body.marker,
+        })));
+    }
+    if db::task_exists(&st.pool, &id, &task_id).await? {
+        Err(ApiError(
+            StatusCode::CONFLICT,
+            format!("task '{task_id}' is not running — only a live attempt may report a checkpoint"),
+        ))
+    } else {
+        Err(ApiError(StatusCode::NOT_FOUND, format!("task '{task_id}' not found in run '{id}'")))
+    }
+}
+
 /// `POST /runs/{id}/tasks/{task_id}/reject` — reject a human approval gate: the
 /// task fails and its `all_success` dependents skip. Same status codes as approve.
 async fn reject_task(
@@ -546,6 +621,85 @@ async fn list_dead_letters(
     let limit = q.limit.unwrap_or(50).clamp(1, 1000);
     let dead_letters = db::list_dead_letters(&st.pool, limit).await?;
     Ok(Json(json!({ "dead_letters": dead_letters })))
+}
+
+/// The dataset registry (data-aware scheduling): every dataset ever produced,
+/// with its latest update. Feeds "what data exists and how fresh is it".
+async fn list_datasets(
+    State(st): State<ApiState>,
+    Query(q): Query<ListQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let rows = db::list_datasets(&st.pool, limit).await?;
+    let datasets: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(uri, updated_at, last_run_id, last_task, updates)| {
+            json!({
+                "uri": uri, "updated_at": updated_at, "last_run_id": last_run_id,
+                "last_task": last_task, "updates": updates,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "datasets": datasets })))
+}
+
+/// Query for the dataset-event lineage read (`?uri=` narrows to one dataset).
+#[derive(serde::Deserialize)]
+struct DatasetEventsQuery {
+    uri: Option<String>,
+    limit: Option<i64>,
+}
+
+/// The dataset lineage ledger, newest first: which run/task updated which
+/// dataset when — the cross-workflow update trail sensors and triggers key off.
+async fn list_dataset_events(
+    State(st): State<ApiState>,
+    Query(q): Query<DatasetEventsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let rows = db::list_dataset_events(&st.pool, q.uri.as_deref(), limit).await?;
+    let events: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(id, uri, workflow, run_id, task_name, source, at)| {
+            json!({
+                "id": id, "uri": uri, "workflow": workflow, "run_id": run_id,
+                "task_name": task_name, "source": source, "at": at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "events": events })))
+}
+
+/// Body for the external dataset-event POST (dagron Enterprise).
+#[derive(serde::Deserialize)]
+struct DatasetEventBody {
+    uri: String,
+}
+
+/// Record an **external** dataset event — a producer outside dagron (CDC, an
+/// object-store notification, another orchestrator) declaring "this dataset
+/// updated", waking dataset sensors and firing `on_datasets:` triggers.
+/// Ships with dagron Enterprise; the open build answers with a signpost
+/// (the SOURCE-connector funnel pattern) — its datasets update via `produces:`.
+async fn post_dataset_event(
+    State(st): State<ApiState>,
+    Json(body): Json<DatasetEventBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    dagron_core::dag::validate_dataset_uri(&body.uri)
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
+    if !cfg!(feature = "enterprise") {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "external dataset events ship with dagron Enterprise — \
+             https://github.com/lucheeseng827/dagron#dagron-enterprise. This build \
+             records dataset updates from `produces:` tasks; to signal external data, \
+             run a small task that produces the dataset (see docs/DATASETS.md)."
+                .to_string(),
+        ));
+    }
+    db::record_external_dataset_event(&st.pool, &body.uri).await?;
+    st.metrics.inc_dataset_updates();
+    Ok(Json(json!({ "recorded": body.uri })))
 }
 
 /// Re-attempt a dead letter as a fresh run. On success the dead letter is

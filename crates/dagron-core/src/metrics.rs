@@ -121,10 +121,16 @@ pub struct Metrics {
     pub runs_deadline_exceeded: AtomicU64,
     /// Soft SLA deadline alerts emitted (spec `deadline`) — run kept running.
     pub deadline_alerts: AtomicU64,
+    /// Tasks resolved from the memoization cache without executing (#22).
+    pub cache_hits: AtomicU64,
     /// Schedule fires skipped by a `when:` gate evaluating false.
     pub schedule_gated: AtomicU64,
     /// Schedules auto-stopped by a `stopStrategy` expression.
     pub schedules_stopped: AtomicU64,
+    /// Dataset updates recorded (`produces:` successes + external events).
+    pub dataset_updates: AtomicU64,
+    /// Runs fired by dataset triggers (`on_datasets:`).
+    pub dataset_fires: AtomicU64,
     /// Runs created by the auto-backfill catch-up sweep (QW3 auto-catchup). A schedule that
     /// missed fires while the scheduler was down has them materialized here.
     #[cfg(feature = "enterprise")]
@@ -167,8 +173,11 @@ impl Default for Metrics {
             dead_letters: AtomicU64::new(0),
             runs_deadline_exceeded: AtomicU64::new(0),
             deadline_alerts: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
             schedule_gated: AtomicU64::new(0),
             schedules_stopped: AtomicU64::new(0),
+            dataset_updates: AtomicU64::new(0),
+            dataset_fires: AtomicU64::new(0),
             #[cfg(feature = "enterprise")]
             catchup_runs: AtomicU64::new(0),
             #[cfg(feature = "enterprise")]
@@ -225,9 +234,20 @@ impl Metrics {
     pub fn inc_schedule_gated(&self) {
         Self::bump(&self.schedule_gated);
     }
+    pub fn inc_cache_hits(&self) {
+        Self::bump(&self.cache_hits);
+    }
     /// One schedule auto-stopped by a `stopStrategy` expression.
     pub fn inc_schedules_stopped(&self) {
         Self::bump(&self.schedules_stopped);
+    }
+    /// One dataset update recorded (a `produces:` success or an external event).
+    pub fn inc_dataset_updates(&self) {
+        Self::bump(&self.dataset_updates);
+    }
+    /// One run fired by a dataset trigger (`on_datasets:`).
+    pub fn inc_dataset_fires(&self) {
+        Self::bump(&self.dataset_fires);
     }
     /// One run materialized by the auto-backfill catch-up sweep (QW3 auto-catchup).
     #[cfg(feature = "enterprise")]
@@ -273,7 +293,7 @@ impl Metrics {
     pub fn render(&self, snap: &MetricsSnapshot, pool: Option<&DbPoolStats>) -> String {
         let mut out = String::with_capacity(2048);
 
-        let counters: [(&str, &str, u64); 10] = [
+        let counters: [(&str, &str, u64); 13] = [
             ("scheduler_runs_created_total", "Runs created by this scheduler since boot.",
              self.runs_created.load(Ordering::Relaxed)),
             ("scheduler_tasks_dispatched_total", "Tasks dispatched to the worker pool.",
@@ -290,10 +310,16 @@ impl Metrics {
              self.runs_deadline_exceeded.load(Ordering::Relaxed)),
             ("scheduler_deadline_alerts_total", "Soft SLA deadline alerts emitted (deadline).",
              self.deadline_alerts.load(Ordering::Relaxed)),
+            ("scheduler_cache_hits_total", "Tasks resolved from the memoization cache without executing.",
+             self.cache_hits.load(Ordering::Relaxed)),
             ("scheduler_schedule_gated_total", "Schedule fires skipped by a when: gate.",
              self.schedule_gated.load(Ordering::Relaxed)),
             ("scheduler_schedules_stopped_total", "Schedules auto-stopped by a stopStrategy expression.",
              self.schedules_stopped.load(Ordering::Relaxed)),
+            ("scheduler_dataset_updates_total", "Dataset updates recorded (produces: successes + external events).",
+             self.dataset_updates.load(Ordering::Relaxed)),
+            ("scheduler_dataset_fires_total", "Runs fired by dataset triggers (on_datasets:).",
+             self.dataset_fires.load(Ordering::Relaxed)),
         ];
         for (name, help, value) in counters {
             let _ = writeln!(out, "# HELP {name} {help}");

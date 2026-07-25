@@ -1,0 +1,50 @@
+# Case study 03 — sharded batch inference (`with_param` fan-out + gather).
+#
+# One template task fans out over a JSON shard list; each shard "scores" its
+# slice into the run's shared artifact dir; the gather task runs only after
+# every shard succeeded and merges the partials into one report. Shards are
+# retry-safe: an attempt overwrites only its own shard file (idempotent by
+# shard id), so a mid-batch failure re-runs one shard, not the batch.
+#
+#   DAGRON_ARTIFACT_DIR=$PWD/artifacts dagron 03_batch_inference.yaml
+name: batch_inference
+parameters:
+  shards: '["00","01","02","03"]'
+  model_rev: r42
+templates:
+  - name: score_shard
+    parameters:
+      shard: ""
+    tasks:
+      - name: score
+        timeout_secs: 60
+        max_attempts: 3
+        retry_delay_secs: 1
+        command:
+          - sh
+          - -c
+          - |
+            set -eu
+            : "${DAGRON_ARTIFACTS:?set DAGRON_ARTIFACT_DIR on the engine}"
+            out="$DAGRON_ARTIFACTS/scores-{{ shard }}.csv"
+            : > "$out"                       # idempotent: own shard only
+            for row in 1 2 3 4 5; do
+              echo "{{ shard }}-$row,$(awk -v r="$row" 'BEGIN{printf "%.4f", 1/(1+r)}')" >> "$out"
+            done
+            echo "shard {{ shard }} scored 5 rows with model {{ model_rev }}"
+tasks:
+  - name: infer
+    template: score_shard
+    with_param: "{{ shards }}"
+    arguments: { shard: "{{ item }}" }
+    instance_key: "{{ item }}"
+  - name: gather
+    depends_on: [infer]
+    timeout_secs: 60
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        cat "$DAGRON_ARTIFACTS"/scores-*.csv > "$DAGRON_ARTIFACTS/scores-all.csv"
+        echo "gathered $(wc -l < "$DAGRON_ARTIFACTS/scores-all.csv") predictions → $DAGRON_ARTIFACTS/scores-all.csv"

@@ -1,0 +1,60 @@
+# Pattern 04 — carry the script body in an env var
+#
+# Runs anywhere, needs no image build, no host file and no network. It is still
+# *inlined* in the spec — it just keeps `command:` readable instead of turning a
+# 40-line script into one unreadable argv entry.
+#
+# Use it for tens of lines, not thousands: the spec is stored and re-parsed on
+# every run, diffed on every GitOps sync, and submitted through an API that caps
+# request bodies at 1 MiB. Past that, patterns 01-03 exist.
+#
+# Why `env:` and not a longer `command:`? Two things: shell quoting stops being a
+# hazard (the body is data, not argv), and the script becomes a block-scalar in
+# the YAML — reviewable in a diff, editable without escaping.
+#
+# This example runs as-is on the local (host) executor: `dagron examples/scripts/04_env_script.yaml`
+name: etl-inline-script
+
+tasks:
+  - name: transform
+    # `sh -c 'eval "$SCRIPT"'` — the body arrives as data in the environment, so
+    # no quoting in it can break the command line.
+    command: ["sh", "-c", 'eval "$SCRIPT"']
+    env:
+      - name: SHARD
+        value: "3"
+      - name: SCRIPT
+        value: |
+          set -eu
+          echo "transform starting (shard=${SHARD})"
+
+          rows=0
+          for part in a b c; do
+            echo "  processing part ${part}"
+            rows=$((rows + 10))
+          done
+
+          if [ "$rows" -lt 10 ]; then
+            echo "too few rows: $rows" >&2
+            exit 1
+          fi
+          echo "transform done: ${rows} rows"
+
+  # Variant: pipe the body in on **stdin** instead of `eval`, so the script is
+  # never part of a command line at all. `sh -s -- <args>` reads the program from
+  # stdin and still takes positional arguments ($1, $2, …).
+  #
+  # The same shape works for any interpreter that reads stdin — swap `sh -s --`
+  # for `python3 -` (or `Rscript -`, `node -`) when the executor's image has one.
+  # It is `sh` here so this example runs on any executor without an image build;
+  # the stock engine image carries no Python.
+  - name: report
+    command: ["sh", "-c", 'printf %s "$REPORT" | sh -s -- 3 30']
+    depends_on: [transform]
+    env:
+      - name: REPORT
+        value: |
+          set -eu
+          shard="$1"
+          rows="$2"
+          printf '{"status":"ok","shard":%s,"rows":%s}\n' "$shard" "$rows"

@@ -67,12 +67,56 @@ services:
       DAGRON_ADMIN_NAME: Administrator
       PORT: "8080"
       RUST_LOG: info
+      # Argon2id needs ~19 MiB of scratch per hash. glibc *grows* its mmap
+      # threshold as it sees repeated frees that size, after which those chunks
+      # come off the heap and are never returned — RSS climbed to ~227 MB over a
+      # few dozen logins and stayed there. Pinning the threshold keeps every
+      # argon2 scratch buffer an mmap, released on free. Measured, 30 logins:
+      #   unset                     67 MB -> 227 MB
+      #   MALLOC_ARENA_MAX only    5.6 MB -> 166 MB
+      #   + threshold pinned       5.6 MB ->  5.9 MB   (flat)
+      # The arena cap stays for the idle baseline; the concurrency bound is
+      # DAGRON_PW_HASH_CONCURRENCY (default 2 → ~38 MiB live at once).
+      MALLOC_MMAP_THRESHOLD_: "131072"
+      MALLOC_ARENA_MAX: "2"
+      # The console reaches dagron-api through the frontend's /api rewrite, so
+      # every login arrives from the frontend container's address. Key the login
+      # rate limit off the forwarded client address instead — safe here because
+      # this port is bound to 127.0.0.1 and the proxy sets the header. Leave unset
+      # anywhere dagron-api is reachable directly (a caller can forge it).
+      DAGRON_TRUST_PROXY_HEADERS: "true"
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:
       postgres:
         condition: service_healthy
       engine:
+        condition: service_started
+
+  # GitOps worker — the only image that carries a `git` binary, and the only one
+  # you need if you connect repositories. Opt in with:
+  #   podman compose --profile gitops up -d
+  # Left out of the default stack on purpose: most deployments never use GitOps,
+  # and the console now says "no GitOps worker running" rather than pretending
+  # auto-sync is on when nothing is polling.
+  gitops:
+    profiles: ["gitops"]
+    build:
+      context: .
+      dockerfile: crates/dagron-gitops/Dockerfile
+    environment:
+      DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
+      # Seconds between auto-sync reconciles per repo (manual Sync is immediate).
+      GITOPS_POLL_SECS: "60"
+      # A token is sent only to trusted forge hosts over https; leave unset for
+      # public repos.
+      # DAGRON_GIT_TOKEN: ""
+      RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # dagron-api owns the schema this worker waits for.
+      dagron-api:
         condition: service_started
 
   frontend:

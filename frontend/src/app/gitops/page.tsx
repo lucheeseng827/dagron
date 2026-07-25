@@ -29,13 +29,18 @@ export default function GitOpsPage() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [showForm, setShowForm] = useState(false);
+  // Null until the first load answers; only `false` means "definitely absent".
+  const [workerOnline, setWorkerOnline] = useState<boolean | null>(null);
   const [url, setUrl] = useState("");
   const [branch, setBranch] = useState("main");
   const [autoSync, setAutoSync] = useState(true);
 
   const load = useCallback(() => {
     listGitRepos()
-      .then(setRepos)
+      .then((r) => {
+        setRepos(r.repos);
+        setWorkerOnline(r.worker_online);
+      })
       .catch((e) => setError(errMsg(e)))
       .finally(() => setLoading(false));
   }, []);
@@ -140,6 +145,23 @@ export default function GitOpsPage() {
 
       {error && <p style={{ color: "var(--red)" }}>{error}</p>}
       {loading && <p className="dy-empty">Loading…</p>}
+      {workerOnline === false && (
+        <div
+          style={{
+            border: "1px solid rgba(210,153,34,0.45)",
+            background: "rgba(210,153,34,0.10)",
+            borderRadius: 8,
+            padding: "0.75rem 0.9rem",
+            marginBottom: 12,
+            fontSize: 13,
+          }}
+        >
+          <strong style={{ color: "var(--yellow, #d29922)" }}>No GitOps worker running.</strong>{" "}
+          Repositories below will not sync until the <code>dagron-gitops</code> container is
+          deployed — syncing runs there, not in the API. Compose:{" "}
+          <code>podman compose --profile gitops up -d</code>.
+        </div>
+      )}
       {!loading && repos.length === 0 && !error && (
         <p className="dy-empty">No repositories connected. Click “+ Connect repository” to add one.</p>
       )}

@@ -32,6 +32,8 @@ export function specToGraph(specYaml: string): { graph?: GraphResponse; error?: 
     if (t && typeof t.name === "string") names.add(t.name);
   }
 
+  // Editor preview: nodes come from a spec, not a run, so there is no runtime
+  // state to carry — never parked, never cached, nothing dispatched yet.
   const nodes = [...names].map((name) => ({
     id: name,
     name,
@@ -39,6 +41,11 @@ export function specToGraph(specYaml: string): { graph?: GraphResponse; error?: 
     attempt: 0,
     scheduled_at: null,
     finished_at: null,
+    wake_at: null,
+    wait_url: null,
+    wait_dataset: null,
+    sub_run_id: null,
+    cache_hit: false,
   }));
 
   const edges: { source: string; target: string }[] = [];

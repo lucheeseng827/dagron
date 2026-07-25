@@ -98,8 +98,23 @@ impl Actor for IngestActor {
     async fn pre_start(
         &self,
         myself: ActorRef<IngestMsg>,
-        args: IngestArgs,
+        mut args: IngestArgs,
     ) -> Result<IngestState, ActorProcessingErr> {
+        // Exactly-once resume: hand the source its durably-committed cursor
+        // (written in the same transaction as the runs it accounts for) before
+        // the first recv, so a redelivered position is never re-run. Failures
+        // here degrade to at-least-once (the source's own checkpoint), never
+        // block ingestion.
+        match db::source_offset(&args.pool, &args.source_name).await {
+            Ok(committed) => {
+                if let Err(e) = args.source.set_committed_position(committed).await {
+                    warn!(error = %e, "source rejected committed position — resuming from its own checkpoint");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "committed-position lookup failed — resuming from the source's own checkpoint");
+            }
+        }
         myself.cast(IngestMsg::Poll)?;
         Ok(IngestState {
             pool: args.pool,
@@ -146,8 +161,18 @@ impl Actor for IngestActor {
         // ── Pull one submission and turn it into a run ─────────────────────────
         match state.source.recv().await {
             Ok(Some(message)) => {
+                // Exactly-once: a source with a resumable coordinate commits it
+                // in the same transaction as the run (or the dead letter) —
+                // `None` keeps the plain at-least-once path. Partitioned
+                // sources namespace their cursor row per shard.
+                let position = state
+                    .source
+                    .pending_position()
+                    .map(|pp| (pp.offset_key(&state.source_name), pp.position));
                 match DagGraph::from_yaml(&message.payload) {
-                    Ok(dag) => match db::create_run(&state.pool, &dag, &message.payload).await {
+                    Ok(dag) => match create_run_at(&state.pool, &dag, &message.payload, &position)
+                        .await
+                    {
                         Ok(run_id) => {
                             state.metrics.inc_runs_created();
                             state.failures.remove(&message.payload); // clear any prior transient failures
@@ -168,17 +193,42 @@ impl Actor for IngestActor {
                         // create_run can fail transiently (a DB blip), so retry
                         // via nack up to the threshold before giving up.
                         Err(e) => {
-                            let count =
-                                state.failures.entry(message.payload.clone()).or_insert(0);
-                            *count += 1;
-                            if *count >= state.max_validation_attempts {
-                                let failures = *count;
-                                state.failures.remove(&message.payload);
-                                dead_letter(state, &message, &e.to_string(), failures).await;
-                            } else {
-                                warn!(error = %e, attempt = *count, "create_run failed — nacking for redelivery");
+                            // Per-workflow concurrency cap (#21) is a "try later",
+                            // not a poison: requeue without counting toward the
+                            // dead-letter threshold, so a valid workflow submitted
+                            // while at capacity is never dead-lettered — it
+                            // redelivers and starts once a run slot frees.
+                            if e.downcast_ref::<dagron_core::models::MaxActiveRunsReached>()
+                                .is_some()
+                            {
+                                info!(error = %e, "at max_active_runs — nacking for later redelivery");
                                 if let Err(e) = state.source.nack(&message.handle).await {
                                     warn!(error = %e, "nack failed — message redelivers after timeout");
+                                }
+                                // Same pacing as the in-flight valve above: on a
+                                // source that redelivers promptly this would
+                                // otherwise spin recv→refuse→nack until a slot frees.
+                                tokio::time::sleep(THROTTLE).await;
+                            } else {
+                                let count =
+                                    state.failures.entry(message.payload.clone()).or_insert(0);
+                                *count += 1;
+                                if *count >= state.max_validation_attempts {
+                                    let failures = *count;
+                                    state.failures.remove(&message.payload);
+                                    dead_letter(
+                                        state,
+                                        &message,
+                                        &e.to_string(),
+                                        failures,
+                                        &position,
+                                    )
+                                    .await;
+                                } else {
+                                    warn!(error = %e, attempt = *count, "create_run failed — nacking for redelivery");
+                                    if let Err(e) = state.source.nack(&message.handle).await {
+                                        warn!(error = %e, "nack failed — message redelivers after timeout");
+                                    }
                                 }
                             }
                         }
@@ -186,7 +236,14 @@ impl Actor for IngestActor {
                     // A parse failure is deterministic — redelivering the same
                     // bytes can never succeed, so dead-letter it immediately.
                     Err(e) => {
-                        dead_letter(state, &message, &format!("invalid workflow spec: {e}"), 1).await;
+                        dead_letter(
+                            state,
+                            &message,
+                            &format!("invalid workflow spec: {e}"),
+                            1,
+                            &position,
+                        )
+                        .await;
                     }
                 }
                 myself.cast(IngestMsg::Poll)?;
@@ -197,7 +254,12 @@ impl Actor for IngestActor {
                 myself.stop(Some("source exhausted".to_string()));
             }
             Err(e) => {
-                warn!(error = %e, "source recv error — retrying after backoff");
+                // `{:#}` (not `%e`): print the whole anyhow chain. A source's
+                // outermost context ("peek logical replication changes") names
+                // the operation but not the cause, and the driver error under
+                // it is the only thing that tells an operator whether the feed
+                // is misconfigured, unauthorized, or fighting for a lock.
+                warn!(error = format!("{e:#}"), "source recv error — retrying after backoff");
                 tokio::time::sleep(ERROR_BACKOFF).await;
                 myself.cast(IngestMsg::Poll)?;
             }
@@ -207,14 +269,45 @@ impl Actor for IngestActor {
     }
 }
 
-/// Park a poison submission in the dead-letter store, then ack it off the source
-/// so it stops redelivering. A failure to persist or ack must not kill the actor
+/// Create the run, committing the source's coordinate in the same transaction
+/// when one is pending (exactly-once); without a coordinate this is plain
+/// [`db::create_run`] (at-least-once).
+async fn create_run_at(
+    pool: &db::Pool,
+    dag: &DagGraph,
+    payload: &str,
+    position: &Option<(String, String)>,
+) -> anyhow::Result<String> {
+    match position {
+        Some((key, pos)) => db::create_run_with_offset(pool, dag, payload, key, pos).await,
+        None => db::create_run(pool, dag, payload).await,
+    }
+}
+
+/// Park a poison submission in the dead-letter store — advancing the source's
+/// committed coordinate in the same transaction when one is pending, so a
+/// restart never re-parks the same event — then ack it off the source so it
+/// stops redelivering. A failure to persist or ack must not kill the actor
 /// (that would stall all ingestion); the worst case on a persist failure is the
 /// message redelivers and is retried, so log and carry on.
-async fn dead_letter(state: &mut IngestState, message: &WorkflowMessage, error: &str, failures: i64) {
-    match db::record_dead_letter(&state.pool, &message.payload, error, &state.source_name, failures)
-        .await
-    {
+async fn dead_letter(
+    state: &mut IngestState,
+    message: &WorkflowMessage,
+    error: &str,
+    failures: i64,
+    position: &Option<(String, String)>,
+) {
+    let recorded = match position {
+        Some((key, pos)) => {
+            db::record_dead_letter_with_offset(&state.pool, &message.payload, error, key, failures, pos)
+                .await
+        }
+        None => {
+            db::record_dead_letter(&state.pool, &message.payload, error, &state.source_name, failures)
+                .await
+        }
+    };
+    match recorded {
         Ok(id) => {
             state.metrics.inc_dead_letters();
             warn!(dead_letter_id = %id, failures, %error, "submission dead-lettered");
@@ -290,6 +383,117 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(runs, 1, "the valid payload still became a run");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A positioned source for the exactly-once contract: every event carries a
+    /// monotonically increasing coordinate; a fresh instance replays everything
+    /// (a "restarted broker consumer" whose own acks were lost) until the actor
+    /// hands it the datastore-committed cursor.
+    struct CursorSource {
+        events: Vec<(String, u64)>,
+        committed: u64,
+        idx: usize,
+    }
+
+    impl CursorSource {
+        fn new(events: Vec<(String, u64)>) -> Self {
+            Self { events, committed: 0, idx: 0 }
+        }
+    }
+
+    #[async_trait]
+    impl crate::source::WorkflowSource for CursorSource {
+        async fn recv(&mut self) -> anyhow::Result<Option<WorkflowMessage>> {
+            while let Some((_, pos)) = self.events.get(self.idx) {
+                if *pos > self.committed {
+                    let (payload, _) = &self.events[self.idx];
+                    return Ok(Some(WorkflowMessage {
+                        payload: payload.clone(),
+                        handle: crate::source::AckHandle::None,
+                    }));
+                }
+                self.idx += 1; // already committed — the replayed prefix
+            }
+            Ok(None) // drained
+        }
+        async fn ack(&mut self, _handle: &crate::source::AckHandle) -> anyhow::Result<()> {
+            self.idx += 1;
+            Ok(())
+        }
+        fn pending_position(&self) -> Option<crate::source::PendingPosition> {
+            self.events
+                .get(self.idx)
+                .map(|(_, pos)| crate::source::PendingPosition::whole(pos.to_string()))
+        }
+        async fn set_committed_position(&mut self, position: Option<String>) -> anyhow::Result<()> {
+            if let Some(p) = position {
+                self.committed = p.parse().unwrap_or(0);
+            }
+            Ok(())
+        }
+    }
+
+    /// Exactly-once: run + cursor commit atomically, so a full replay of the
+    /// stream (the crash-redelivery case) creates zero duplicate runs and zero
+    /// duplicate dead letters — the position table repositions the source past
+    /// everything it already accounted for, poison included.
+    #[tokio::test]
+    async fn transactional_offsets_survive_full_replay_without_duplicates() {
+        let path = std::env::temp_dir().join(format!("m54-eo-{}.db", uuid::Uuid::new_v4()));
+        let pool = db::init_pool(path.to_str().unwrap()).await.unwrap();
+        let events = || {
+            vec![
+                ("name: a\ntasks:\n  - name: t\n    command: [\"true\"]\n".to_string(), 1),
+                ("torn line, not a workflow".to_string(), 2),
+                ("name: b\ntasks:\n  - name: t\n    command: [\"true\"]\n".to_string(), 3),
+            ]
+        };
+        let run_actor = |src: CursorSource| {
+            let pool = pool.clone();
+            async move {
+                let (_a, handle) = IngestActor::spawn(
+                    None,
+                    IngestActor,
+                    IngestArgs {
+                        pool,
+                        source: Box::new(src),
+                        max_inflight_runs: 64,
+                        exhausted: Arc::new(AtomicBool::new(false)),
+                        metrics: Arc::new(Metrics::new()),
+                        source_name: "cursor-test".to_string(),
+                        max_validation_attempts: 3,
+                    },
+                )
+                .await
+                .unwrap();
+                handle.await.unwrap();
+            }
+        };
+
+        // First pass: both runs land, the poison parks, the cursor reaches 3.
+        run_actor(CursorSource::new(events())).await;
+        let runs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflow_runs").fetch_one(&pool).await.unwrap();
+        let dead: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM dead_letters").fetch_one(&pool).await.unwrap();
+        assert_eq!((runs, dead), (2, 1));
+        assert_eq!(
+            db::source_offset(&pool, "cursor-test").await.unwrap().as_deref(),
+            Some("3"),
+            "cursor committed with the work it accounts for"
+        );
+
+        // "Crash" replay: a fresh source re-offers the entire stream. The actor
+        // hands it the committed cursor; nothing is re-created or re-parked.
+        run_actor(CursorSource::new(events())).await;
+        let runs2: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflow_runs").fetch_one(&pool).await.unwrap();
+        let dead2: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM dead_letters").fetch_one(&pool).await.unwrap();
+        assert_eq!((runs2, dead2), (2, 1), "full replay creates no duplicates — exactly-once");
 
         pool.close().await;
         let _ = std::fs::remove_file(&path);

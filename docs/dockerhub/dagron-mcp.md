@@ -20,9 +20,9 @@ Eight tools over the same JWT-gated API the browser uses:
 | Tag | Notes |
 |---|---|
 | `latest` | newest release |
-| `0.4.3` | pinned version (= current `latest`) |
+| `0.5.0` | pinned version (= current `latest`) |
 
-Pin in production: `mancube/dagron-mcp:0.4.3`.
+Pin in production: `mancube/dagron-mcp:0.5.0`.
 
 ## Run
 
@@ -32,7 +32,7 @@ Launched by an MCP client over stdio — protocol on stdout, logs on stderr:
 docker run -i --rm \
   -e DAGRON_API_URL=http://host.docker.internal:8080 \
   -e DAGRON_MCP_TOKEN=<session-jwt> \
-  mancube/dagron-mcp:0.4.3
+  mancube/dagron-mcp:0.5.0
 ```
 
 MCP client (`mcpServers`) entry:
@@ -44,7 +44,7 @@ MCP client (`mcpServers`) entry:
       "command": "docker",
       "args": ["run", "-i", "--rm",
                "-e", "DAGRON_API_URL", "-e", "DAGRON_MCP_TOKEN",
-               "mancube/dagron-mcp:0.4.3"],
+               "mancube/dagron-mcp:0.5.0"],
       "env": {
         "DAGRON_API_URL": "http://host.docker.internal:8080",
         "DAGRON_MCP_TOKEN": "<session-jwt>"

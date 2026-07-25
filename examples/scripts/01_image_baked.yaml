@@ -1,0 +1,42 @@
+# Pattern 01 — bake the script into the image (recommended for docker / k8s)
+#
+# The script ships as part of the container, so `command:` is just an entrypoint
+# and an argument list. The script's version is the image tag: re-running an old
+# run with a pinned tag runs the code that ran then, which is the whole point.
+#
+# Requires: EXECUTOR=docker or kubernetes, and an image you build. Adapt the
+# image name — this spec is the shape, not a runnable demo.
+#
+#   # Dockerfile
+#   FROM python:3.12-slim
+#   COPY bin/ /app/bin/          # transform.sh, validate.py, …
+#   RUN chmod +x /app/bin/*
+#
+#   docker build -t myrepo/etl:1.4.0 . && docker push myrepo/etl:1.4.0
+name: etl-baked-image
+
+# One image for every task in the DAG — declared once here instead of per task.
+task_defaults:
+  docker_image: myrepo/etl:1.4.0
+
+tasks:
+  - name: extract
+    command: ["/app/bin/extract.sh", "--source", "warehouse"]
+
+  - name: transform
+    command: ["/app/bin/transform.sh", "--shard", "3"]
+    depends_on: [extract]
+    timeout_secs: 900
+
+  # A different interpreter from the same image — nothing about `command:` is
+  # shell-specific, it is argv.
+  - name: validate
+    command: ["python", "/app/bin/validate.py", "--strict"]
+    depends_on: [transform]
+
+  # A task that needs a *different* image just says so; the default applies only
+  # where a task doesn't override it.
+  - name: publish
+    docker_image: myrepo/publisher:2.0.1
+    command: ["/app/publish", "--target", "prod"]
+    depends_on: [validate]

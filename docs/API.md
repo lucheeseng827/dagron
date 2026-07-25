@@ -81,7 +81,7 @@ the engine wakes immediately (`src/routes/control.rs`).
 ### Archived runs (history past the hot window)
 
 Runs the archive-before-purge GC moved out of the hot store (see
-`docs/CONFIG.md` `GC_ARCHIVE_DIR`/`GC_ARCHIVE_URL` and `ee/STATE_STORE.md`).
+`docs/CONFIG.md` `GC_ARCHIVE_DIR`/`GC_ARCHIVE_URL`).
 The list reads only the `archived_runs` index; the detail endpoint fetches the
 run's `dagron.run-archive.v1` JSON document from the archive sink, so
 dagron-api must see the same `GC_ARCHIVE_DIR`/`GC_ARCHIVE_URL` env as the
@@ -103,12 +103,24 @@ engine (S3 needs the api's `archive-s3` cargo feature).
 | POST | `/api/dead-letters/{id}/redrive` | → `{run_id, redriven_from}`; `404`/`400` |
 | DELETE | `/api/dead-letters/{id}` | → `204`; `404` |
 
+### Datasets (lineage & registry — data-aware scheduling)
+
+Read-only views of the dataset registry and its append-only update ledger — the
+cross-workflow trail behind `produces:` / `on_datasets:`. Both read off the read
+pool and are auth-gated (the engine's own `/datasets` ops surface is
+unauthenticated); a dataset is updated by a task's `produces:`, never here.
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| GET | `/api/datasets` | `?limit=` (default 100, max 500) → registry, newest-updated first: `[{uri, updated_at, last_run_id, last_task, updates, consumers[]}]`. `consumers` are the `on_datasets:` subscriber workflows a producer wakes (resolved in one extra query, not one per row) |
+| GET | `/api/datasets/events` | the lineage ledger, newest first → `[{id, uri, workflow, run_id, task_id, task_name, source, at}]`. **`?uri=`** scopes the trail to one dataset (omitted = the whole ledger); **`?limit=`** default 100, max 500 |
+
 ### Workflows, schedules, GitOps
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| GET/POST | `/api/workflows` | list (enriched with schedule + recent-run digest) / create `{name?, spec, description?}` → `201`; `409` duplicate name |
-| GET/PUT/DELETE | `/api/workflows/{id}` | read / update / delete; `404`, `409` |
+| GET/POST | `/api/workflows` | list (enriched with schedule + recent-run digest) / create `{name?, spec, description?}` → `201`; `409` duplicate name. Each row carries `tags: []` — the spec's `tags:` labels, **parsed from the stored spec on read** so they always reflect the current definition. **`?tag=<t>`** returns only workflows carrying that tag |
+| GET/PUT/DELETE | `/api/workflows/{id}` | read / update / delete; `404`, `409`. The read also returns the spec's `tags: []` |
 | POST | `/api/workflows/{id}/run` | → `{run_id, workflow_id}` |
 | GET | `/api/workflows/{id}/runs` | `?limit=&offset=` → this workflow's run history (same row shape as `/api/runs`). Runs are matched by definition **name** — the only linkage that exists (each run snapshots its own `workflow_definitions` row, so there is no FK to `workflows`); the list digest uses the same rule. Renaming a workflow therefore starts a fresh history; `404` |
 | POST | `/api/workflows/{id}/sync-to-git` | open a PR with the spec → `{pr_url, branch, path}`; `501` until `GITHUB_TOKEN`+`GIT_REPO` are set; `502` on GitHub errors |
@@ -122,6 +134,27 @@ engine (S3 needs the api's `archive-s3` cargo feature).
 | GET | `/api/backfills` | `?schedule_id=&limit=` → job list (`{id, schedule_id, status, requested, fired, cursor, …}`) |
 | GET | `/api/backfills/{id}` | one job for monitoring (`fired`/`requested`/`status`); `404` |
 | POST | `/api/backfills/{id}/cancel` | stop pacing a running job → `{id, cancelled}`; `404` unknown, `409` already finished |
+
+### Artifacts (encrypted at rest — G-C2)
+
+Programmatic artifact channel; bytes are envelope-encrypted at rest when a KEK
+provider is configured (`DAGRON_ENV_KEK_PROVIDER`, see `CONFIG.md`). All routes
+require an authenticated session; `503` when `DAGRON_ARTIFACT_DIR` is unset.
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| PUT | `/api/runs/{run_id}/artifacts/{task}/{name}` | stream the request body into the store (encrypted per-chunk when a KEK is set) → `201` + backend locator. Size-capped by `DAGRON_ARTIFACT_MAX_BYTES`. |
+| GET | `/api/runs/{run_id}/artifacts/{task}/{name}` | stream the (decrypted) bytes → `200 application/octet-stream`; `404` if absent (a mid-stream decrypt/IO error aborts the connection) |
+| GET | `/api/runs/{run_id}/artifacts/{task}/{name}/exists` | → `{exists: bool}` |
+| POST | `/api/artifacts/rotate` | **admin group only.** Re-key every artifact from the previous KEK (`*_OLD` env) to the current one — rewraps the per-object data key, no payload re-encryption → `{rotated: N}`. `403` non-admin, `409` a rotation is already running, `400` no previous KEK configured, `503` artifacts off |
+
+> **Operational caveat — quiesce writes during rotation.** The single-flight lock
+> stops two rotations from overlapping, but it does **not** coordinate with normal
+> artifact PUTs. Rotation rewraps each object with a read-then-write (`get` → rewrap
+> → `put`); a PUT to the *same* key that lands between the `get` and the `put` is
+> overwritten by the rewrapped older value (a silent lost update). Pause artifact
+> writes (or rotate during a maintenance window) until a store-level compare-and-swap
+> closes the window.
 
 ## 2. Engine ops API (`--features ops`, bound at `API_ADDR`)
 
@@ -144,9 +177,13 @@ engine (S3 needs the api's `archive-s3` cargo feature).
 | POST | `/runs/{id}/rerun` | optional `{from?}` → `{run_id, rerun}`; `404`/`409`/`400` |
 | POST | `/runs/{id}/tasks/{task_id}/clear` | clear a completed task + its downstream cone → `{run_id, task_id, cleared}`; `404` unknown run/task, `409` task not completed |
 | POST | `/runs/{id}/tasks/{task_id}/approve` · `/reject` | resolve a `type: approval` gate → `{run_id, task_id, resolution}`; `404`, `409` not awaiting approval |
+| POST | `/runs/{id}/tasks/{task_id}/checkpoint` | a **running** task reports its committed checkpoint (`{uri, marker?}`, typically via its injected `DAGRON_RUN_ID`/`DAGRON_TASK_ID`); the pointer survives retries and the next attempt gets `DAGRON_RESUME_FROM` ([AI_WORKLOADS.md](AI_WORKLOADS.md)) → `{run_id, task_id, checkpoint_uri, marker}`; `400` empty uri, `404`, `409` task not running |
 | GET | `/dead-letters` | `{dead_letters: […]}` |
 | POST | `/dead-letters/{id}/redrive` | `{run_id, redriven_from}`; `404`/`400` |
 | DELETE | `/dead-letters/{id}` | `{id, deleted: true}`; `404` |
+| GET | `/datasets` | Dataset registry (data-aware scheduling, [DATASETS.md](DATASETS.md)): `?limit=` (default 100, clamp 1–1000) → `{datasets: [{uri, updated_at, last_run_id, last_task, updates}]}`, most recently updated first |
+| GET | `/datasets/events` | Lineage ledger — which run/task updated which dataset when: `?uri=` (narrow to one dataset) `&limit=` (default 100, clamp 1–1000) → `{events: [{id, uri, workflow, run_id, task_name, source, at}]}`, newest first. `source` is `task` (a `produces:` success) or `external`. `id` is the monotonic cursor sensors/triggers key off |
+| POST | `/datasets/events` | Record an **external** dataset update (a producer outside dagron — CDC, object-store notification): `{uri}` → `{recorded}`. Wakes dataset sensors and fires `on_datasets:` triggers. **dagron Enterprise**; the open build returns `403` with a signpost (its datasets update via `produces:` tasks). `400` invalid URI |
 
 ```bash
 # dagron dev (or compose engine) — submit straight YAML, then watch it:

@@ -31,6 +31,8 @@ tags:
     description: Workflow run lifecycle
   - name: dead-letters
     description: Poison submissions parked after repeated ingestion failure
+  - name: datasets
+    description: Data-aware scheduling — dataset registry + lineage ledger (docs/DATASETS.md)
   - name: ops
     description: Health, metrics, and API self-description
 
@@ -512,6 +514,52 @@ paths:
         "500":
           $ref: "#/components/responses/Error"
 
+  /runs/{id}/tasks/{task_id}/checkpoint:
+    post:
+      tags: [runs]
+      summary: Report a task checkpoint (checkpoint-aware resume)
+      description: >
+        A **running** task reports the checkpoint it just committed (typically
+        from inside the task, using its injected `DAGRON_RUN_ID` /
+        `DAGRON_TASK_ID` environment). dagron stores the pointer durably and
+        carries it across retries: the next attempt is dispatched with
+        `DAGRON_RESUME_FROM` (and `DAGRON_RESUME_MARKER`) so a long task —
+        a training epoch loop, a stream consumer — resumes from the checkpoint
+        instead of restarting from zero. What the checkpoint contains belongs
+        to the task; dagron owns only pointer durability.
+      operationId: checkpointTask
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+        - $ref: "#/components/parameters/TaskId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CheckpointReport" }
+      responses:
+        "200":
+          description: Checkpoint pointer recorded
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CheckpointRecorded" }
+        "400":
+          description: Empty checkpoint uri
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: Run or task not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: Task is not running (a parked attempt cannot report)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          $ref: "#/components/responses/Error"
+
   /dead-letters:
     get:
       tags: [dead-letters]
@@ -601,6 +649,112 @@ paths:
         "500":
           $ref: "#/components/responses/Error"
 
+  /datasets:
+    get:
+      tags: [datasets]
+      summary: List datasets
+      description: >
+        The dataset registry (data-aware scheduling, docs/DATASETS.md): every
+        dataset a `produces:` task (or, with dagron Enterprise, an external
+        event) ever updated, with its latest update, most recent first.
+      operationId: listDatasets
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, format: int64, default: 100, minimum: 1, maximum: 1000 }
+      responses:
+        "200":
+          description: Registered datasets
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [datasets]
+                properties:
+                  datasets:
+                    type: array
+                    maxItems: 1000
+                    items: { $ref: "#/components/schemas/Dataset" }
+        "500":
+          $ref: "#/components/responses/Error"
+
+  /datasets/events:
+    get:
+      tags: [datasets]
+      summary: List dataset update events (lineage)
+      description: >
+        The append-only lineage ledger: which workflow/run/task updated which
+        dataset when — the cross-workflow update trail dataset sensors and
+        `on_datasets:` triggers key off. Newest first; `?uri=` narrows to one
+        dataset.
+      operationId: listDatasetEvents
+      parameters:
+        - name: uri
+          in: query
+          required: false
+          schema: { type: string, maxLength: 512 }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, format: int64, default: 100, minimum: 1, maximum: 1000 }
+      responses:
+        "200":
+          description: Dataset update events
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [events]
+                properties:
+                  events:
+                    type: array
+                    maxItems: 1000
+                    items: { $ref: "#/components/schemas/DatasetEvent" }
+        "500":
+          $ref: "#/components/responses/Error"
+    post:
+      tags: [datasets]
+      summary: Record an external dataset event (Enterprise)
+      description: >
+        Declare that a dataset was updated by a producer outside dagron (CDC,
+        an object-store notification, another orchestrator), waking dataset
+        sensors and firing `on_datasets:` triggers. Ships with dagron
+        Enterprise; the open build answers `403` with a signpost — its datasets
+        update via `produces:` tasks (docs/DATASETS.md).
+      operationId: postDatasetEvent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [uri]
+              properties:
+                uri: { type: string, maxLength: 512, example: "s3://lake/orders" }
+      responses:
+        "200":
+          description: Event recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [recorded]
+                properties:
+                  recorded: { type: string }
+        "400":
+          description: Invalid dataset URI
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          description: External dataset events require dagron Enterprise (signposted)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          $ref: "#/components/responses/Error"
+
 components:
   parameters:
     RunId:
@@ -648,6 +802,30 @@ components:
         failures: { type: integer, format: int64, description: Times tried before giving up }
         first_seen_at: { type: string, format: date-time }
         last_error_at: { type: string, format: date-time }
+
+    Dataset:
+      type: object
+      description: A registry row — one dataset URI with its latest update.
+      required: [uri, updated_at, updates]
+      properties:
+        uri: { type: string, maxLength: 512, example: "s3://lake/orders" }
+        updated_at: { type: string, format: date-time }
+        last_run_id: { type: string, nullable: true, description: Run whose task last updated it (null for external events) }
+        last_task: { type: string, nullable: true, description: Task name that last updated it }
+        updates: { type: integer, format: int64, description: Total updates ever recorded }
+
+    DatasetEvent:
+      type: object
+      description: One lineage-ledger row — a single recorded dataset update.
+      required: [id, uri, source, at]
+      properties:
+        id: { type: integer, format: int64, description: Monotonic ledger id (sensor/trigger cursor domain) }
+        uri: { type: string, maxLength: 512 }
+        workflow: { type: string, nullable: true, description: Producing workflow (null for external events) }
+        run_id: { type: string, nullable: true }
+        task_name: { type: string, nullable: true }
+        source: { type: string, enum: [task, external], description: "`task` = a produces: success; `external` = posted via the API (Enterprise)" }
+        at: { type: string, format: date-time }
 
     RunStatus:
       type: string
@@ -710,6 +888,32 @@ components:
         task_id: { type: string, format: uuid }
         resolution: { type: string, enum: [approved, rejected] }
 
+    CheckpointReport:
+      type: object
+      description: A running task's committed-checkpoint report.
+      required: [uri]
+      properties:
+        uri:
+          type: string
+          description: >
+            Where the checkpoint was committed — any URI/path the next attempt
+            can read (a file under `DAGRON_CHECKPOINT_DIR`, an object-store
+            URI, …).
+        marker:
+          type: string
+          nullable: true
+          description: Optional progress marker (e.g. `epoch=7`, a stream offset).
+
+    CheckpointRecorded:
+      type: object
+      description: Acknowledgement of a recorded checkpoint pointer.
+      required: [run_id, task_id, checkpoint_uri]
+      properties:
+        run_id: { type: string, format: uuid }
+        task_id: { type: string, format: uuid }
+        checkpoint_uri: { type: string }
+        marker: { type: string, nullable: true }
+
     TaskRun:
       type: object
       description: One node within a run — the row that drives the state machine.
@@ -737,6 +941,32 @@ components:
           description: Monotonic CAS/fencing token guarding against double-claim
         scheduled_at: { type: string, format: date-time, nullable: true }
         finished_at: { type: string, format: date-time, nullable: true }
+        pool: { type: string, nullable: true, description: Named concurrency pool this task draws a slot from }
+        cache_hit:
+          type: boolean
+          description: True when the task was resolved from the memoization cache instead of executed
+        wake_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: >-
+            Park reason — a `type: wait` time sensor resumes at this instant.
+            A parked task stays `running` with a NULL lease, so these four
+            fields (at most one set) are what distinguishes "waiting on
+            something" from "hung".
+        wait_url:
+          type: string
+          nullable: true
+          description: Park reason — endpoint a `wait.url` sensor polls until it answers 2xx
+        wait_dataset:
+          type: string
+          nullable: true
+          description: Park reason — dataset URI a `wait.dataset` sensor waits to see updated
+        sub_run_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: "Park reason — child run a `type: workflow` trigger is blocked on"
 
     TaskSpec:
       type: object

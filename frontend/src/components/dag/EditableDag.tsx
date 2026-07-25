@@ -38,6 +38,7 @@ import {
   wouldCycle,
   TRIGGER_RULES,
   type Task,
+  type Template,
   type WorkflowModel,
 } from "@/lib/spec-model";
 
@@ -82,7 +83,7 @@ function EditableDagInner({ model, onChange }: EditableDagProps) {
       position: positions.current[t.name] ?? { x: 0, y: 0 },
       width: 190,
       height: 52,
-      data: { name: t.name, status: "pending", attempt: 0, workflowRef: t.workflow_ref, dockerImage: t.docker_image },
+      data: nodeData(t, model),
       selected: t.name === selected,
     }));
     const rawEdges: Edge[] = model.tasks.flatMap((t) =>
@@ -177,7 +178,7 @@ function EditableDagInner({ model, onChange }: EditableDagProps) {
         position: { x: 0, y: 0 },
         width: 190,
         height: 52,
-        data: { name: t.name, status: "pending", attempt: 0, workflowRef: t.workflow_ref, dockerImage: t.docker_image },
+        data: nodeData(t, model),
         selected: t.name === selected,
       }));
       const rawEdges: Edge[] = model.tasks.flatMap((t) =>
@@ -334,6 +335,7 @@ function EditableDagInner({ model, onChange }: EditableDagProps) {
       <TaskPanel
         task={sel}
         allTasks={model.tasks}
+        templates={model.templates}
         onChange={(updated, prevName) => {
           const next = applyTaskEdit(model, prevName, updated);
           onChange(next);
@@ -354,6 +356,21 @@ function EditableDagInner({ model, onChange }: EditableDagProps) {
   );
 }
 
+/// The canvas node payload for one task. A call task (`template:` /
+/// `workflow_ref`) renders as a sub-DAG node — one node standing for several —
+/// so the count of what it expands to comes along for the subtitle.
+function nodeData(t: Task, model: WorkflowModel) {
+  return {
+    name: t.name,
+    status: "pending",
+    attempt: 0,
+    workflowRef: t.workflow_ref,
+    templateRef: t.template,
+    templateTasks: model.templates.find((tpl) => tpl.name === t.template)?.tasks.length,
+    dockerImage: t.docker_image,
+  };
+}
+
 /// Apply an edited task back into the model, renaming dependency references when
 /// the task's name changed. Rejects a rename that collides with another task.
 function applyTaskEdit(model: WorkflowModel, prevName: string, updated: Task): WorkflowModel {
@@ -365,7 +382,7 @@ function applyTaskEdit(model: WorkflowModel, prevName: string, updated: Task): W
       updated = { ...updated, name: prevName };
     }
   }
-  return {
+  const next: WorkflowModel = {
     ...model,
     tasks: model.tasks.map((t) => {
       if (t.name === prevName) return updated;
@@ -375,17 +392,28 @@ function applyTaskEdit(model: WorkflowModel, prevName: string, updated: Task): W
       return t;
     }),
   };
+  // `result_from:` names a task, so a rename has to follow it — otherwise the
+  // spec saves with a dangling reference and the server rejects the run with
+  // "result_from names unknown task", pointing at a name the user just changed.
+  if (renamed && next._extra?.result_from === prevName) {
+    next._extra = { ...next._extra, result_from: updated.name };
+  }
+  return next;
 }
 
 function TaskPanel({
   task,
   allTasks,
+  templates,
   onChange,
   onDelete,
   onSelectName,
 }: {
   task: Task | null;
   allTasks: Task[];
+  /// Declared `templates:` — the choices for a template call, and where the
+  /// call's argument names come from.
+  templates: Template[];
   onChange: (updated: Task, prevName: string) => void;
   onDelete: (name: string) => void;
   onSelectName: (name: string) => void;
@@ -403,6 +431,10 @@ function TaskPanel({
   }
   const prev = task.name;
   const patch = (p: Partial<Task>) => onChange({ ...task, ...p }, prev);
+  // A call task (template / workflow_ref) runs no command of its own: its
+  // retries, timeout, image and trigger rule belong to the tasks it expands to,
+  // so offering those fields here would write knobs the engine never reads.
+  const isLeaf = task.template === undefined && !task.workflow_ref;
   // Empty clears the field; otherwise require an integer >= the field's minimum
   // (retry delay allows 0, counts/timeouts require 1).
   const intField = (v: string, min: number): number | undefined => {
@@ -423,7 +455,9 @@ function TaskPanel({
       <Label>Name</Label>
       <input style={inputStyle} value={task.name} onChange={(e) => patch({ name: e.target.value })} />
 
-      {task.workflow_ref ? (
+      {task.template !== undefined ? (
+        <TemplateCallFields task={task} templates={templates} patch={patch} />
+      ) : task.workflow_ref ? (
         <>
           <Label>Runs workflow</Label>
           <input style={{ ...inputStyle, marginBottom: 4 }} value={task.workflow_ref} readOnly />
@@ -452,7 +486,7 @@ function TaskPanel({
         </>
       )}
 
-      {!task.workflow_ref && (
+      {isLeaf && (
         <div style={{ display: "flex", gap: 8, alignItems: "stretch" }}>
           <div style={fieldCol}>
             <Label>Max attempts</Label>
@@ -487,7 +521,7 @@ function TaskPanel({
         </div>
       )}
 
-      {!task.workflow_ref && (
+      {isLeaf && (
         <>
           <Label>Run when</Label>
           <select
@@ -542,6 +576,102 @@ function TaskPanel({
           })}
       </div>
     </aside>
+  );
+}
+
+/// The panel for a **template call** — a task that runs a `templates:` sub-DAG
+/// instead of a command (the DAG-of-DAGs pattern). Two things are editable: the
+/// template it calls, and the arguments passed in. Argument rows come from the
+/// chosen template's declared `parameters`, so calling a template shows you what
+/// it takes rather than making you go read the YAML; anything the call already
+/// passes that the template doesn't declare is listed too, so switching template
+/// never hides a value silently.
+function TemplateCallFields({
+  task,
+  templates,
+  patch,
+}: {
+  task: Task;
+  templates: Template[];
+  patch: (p: Partial<Task>) => void;
+}) {
+  const called = templates.find((t) => t.name === task.template);
+  const args = task.arguments ?? {};
+  // Declared parameters first (in declaration order), then any extra keys the
+  // call carries — a leftover from a previous template, or a hand-written YAML
+  // argument. Both are editable; neither disappears.
+  const declared = Object.keys(called?.parameters ?? {});
+  const extra = Object.keys(args).filter((k) => !declared.includes(k));
+  const setArg = (key: string, value: string) => {
+    const next = { ...args, [key]: value };
+    // An argument matching the template's default is redundant — drop the empty
+    // ones so a call the user never touched stays out of the YAML.
+    if (value === "") delete next[key];
+    patch({ arguments: Object.keys(next).length ? next : undefined });
+  };
+
+  return (
+    <>
+      <Label>Calls template</Label>
+      <select
+        style={inputStyle}
+        value={task.template ?? ""}
+        onChange={(e) => patch({ template: e.target.value })}
+        title="The templates: sub-DAG this step expands into when the run starts"
+      >
+        {/* An unknown name (renamed or deleted template) stays selectable so the
+            call isn't silently rewritten to some other template on first render. */}
+        {!called && <option value={task.template ?? ""}>{task.template || "(none)"} — unknown</option>}
+        {templates.map((t) => (
+          <option key={t.name} value={t.name}>
+            {t.name} ({t.tasks.length} {t.tasks.length === 1 ? "task" : "tasks"})
+          </option>
+        ))}
+      </select>
+      <p style={{ color: "var(--muted)", fontSize: 11, marginTop: -6, marginBottom: 12 }}>
+        {called
+          ? `Expands into ${called.tasks.length} tasks (${called.tasks
+              .map((t) => `${task.name}.${t.name}`)
+              .join(", ")}) when the run starts.`
+          : templates.length
+            ? "No template by that name is declared — pick one, or fix `templates:` in the YAML view."
+            : "This spec declares no `templates:` — add one in the YAML view."}
+      </p>
+
+      {(declared.length > 0 || extra.length > 0) && <Label>Arguments</Label>}
+      {declared.map((key) => (
+        <div key={key} style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 8 }}>
+          <span
+            style={{ fontSize: 12, color: "var(--muted)", minWidth: 76, wordBreak: "break-all" }}
+            title={`Template default: ${called?.parameters?.[key] ?? ""}`}
+          >
+            {key}
+          </span>
+          <input
+            style={{ ...inputStyle, marginBottom: 0 }}
+            value={args[key] ?? ""}
+            placeholder={called?.parameters?.[key] ?? ""}
+            onChange={(e) => setArg(key, e.target.value)}
+          />
+        </div>
+      ))}
+      {extra.map((key) => (
+        <div key={key} style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 8 }}>
+          <span
+            style={{ fontSize: 12, color: "var(--amber)", minWidth: 76, wordBreak: "break-all" }}
+            title="This template doesn't declare a parameter by that name"
+          >
+            {key}
+          </span>
+          <input
+            style={{ ...inputStyle, marginBottom: 0 }}
+            value={args[key] ?? ""}
+            onChange={(e) => setArg(key, e.target.value)}
+          />
+        </div>
+      ))}
+      <div style={{ marginBottom: 12 }} />
+    </>
   );
 }
 

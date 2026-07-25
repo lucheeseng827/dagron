@@ -452,12 +452,11 @@ pub async fn backfill(
         ));
     }
 
-    // Validate + prepare the spec once (workflow_ref chains inlined,
-    // task_defaults, environment variables, submit-time conditionals), then
-    // create one run per *newly-claimed* fire-time.
-    let spec = crate::routes::control::parse_and_validate(&spec_yaml)?;
-    let spec = crate::expand::expand_workflow_refs(&state, spec).await?;
-    let spec = crate::routes::control::prepare_spec(&state, spec).await?;
+    // Validate the spec once up front, then create one run per *newly-claimed*
+    // fire-time — workflow_ref chains, task_defaults, environment variables, and
+    // submit-time conditionals are resolved per-fire inside submit_yaml below,
+    // since params/`when:` can vary by logical_date.
+    crate::routes::control::parse_and_validate(&spec_yaml)?;
     let now = Utc::now().to_rfc3339();
     let mut run_ids = Vec::new();
     let mut skipped = 0usize;
@@ -483,7 +482,8 @@ pub async fn backfill(
         // create_run is its own transaction, so the claim and the run can't share
         // one. If it fails, release the claim (DELETE) so the slot stays reclaimable
         // instead of being permanently counted as `skipped` on a later retry.
-        let run_id = match crate::routes::control::create_run(&state, &spec, &spec_yaml).await {
+        let run_id = match crate::routes::control::submit_yaml(&state, &spec_yaml, &spec_yaml).await
+        {
             Ok(run_id) => run_id,
             Err(e) => {
                 let _ = sqlx::query(
@@ -493,7 +493,9 @@ pub async fn backfill(
                 .bind(&logical_date)
                 .execute(&state.write_pool)
                 .await;
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")));
+                // Propagate the submit error verbatim — it already carries the
+                // right status (400 for a bad spec, 429 at max_active_runs).
+                return Err(e);
             }
         };
         // Record which run filled the slot (best-effort; the slot is already claimed).

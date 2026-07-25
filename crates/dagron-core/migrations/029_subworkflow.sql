@@ -1,0 +1,12 @@
+-- Sub-workflow trigger (spec fast-win #23 — Airflow TriggerDagRunOperator /
+-- Argo #6922 workflow-of-workflows). A `type: workflow` task submits a
+-- registered workflow as a child run, then *parks* until the child is terminal.
+--
+-- The parked task stays `running` but with `claimed_by`/`lease_expires_at` NULL
+-- and its child run id in `sub_run_id`: `claim_ready` (status = 'ready') never
+-- re-picks it and `recover_expired_leases` (needs a non-NULL lease) never
+-- reclaims it, so no new `status` value — and no status-CHECK rebuild — is
+-- needed. The reconcile loop's sub-workflow sweep finds these rows
+-- (`status = 'running' AND sub_run_id IS NOT NULL`) and resolves the parent when
+-- its child finishes. NULL = an ordinary task.
+ALTER TABLE task_runs ADD COLUMN sub_run_id TEXT;

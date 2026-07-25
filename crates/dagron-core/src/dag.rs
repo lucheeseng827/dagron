@@ -80,6 +80,18 @@ pub struct TaskSpec {
     /// auto-resolve it. `None`/`"task"` = an ordinary command task.
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
     pub task_type: Option<String>,
+    /// For a `type: workflow` task (#23): the name of the **registered workflow**
+    /// to trigger. The engine submits that workflow as a child run when this task
+    /// is reached and parks the task until the child run is terminal — succeeding
+    /// with it (child succeeded) or failing with it (child failed/cancelled).
+    /// Required for (and only valid on) a `type: workflow` task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    /// For a `type: wait` task (#27): a deferrable time sensor. The task parks
+    /// with **no worker slot held** until the deadline, then succeeds. See
+    /// [`WaitSpec`]. Required for (and only valid on) a `type: wait` task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<WaitSpec>,
     /// For a `type: approval` task: seconds to wait before the timeout default is
     /// applied. `None` = wait indefinitely for a human.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -102,6 +114,14 @@ pub struct TaskSpec {
     /// retry-backoff ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_max_delay_secs: Option<u64>,
+    /// Whether a task killed by its `timeout_secs` deadline is retried. Defaults
+    /// to `true` (a timeout is a failure like any other). Set `false` when a
+    /// deadline kill is unlikely to succeed on re-run (Airflow #9232) — the task
+    /// then fails immediately on timeout instead of burning the rest of its
+    /// `max_attempts`. Timeout-only: non-zero exits and backend errors still
+    /// retry. Falls back to [`TaskDefaults::retry_on_timeout`], then `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_on_timeout: Option<bool>,
     /// Per-task subprocess timeout in seconds. Falls back to the 25 s hard limit when absent.
     pub timeout_secs: Option<u64>,
     /// Docker image for this task. Used by DockerExecutor; ignored by LocalExecutor.
@@ -128,12 +148,80 @@ pub struct TaskSpec {
     /// `[a-z0-9_-]`, max 64 chars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_class: Option<String>,
+    /// Dispatch **priority** (Airflow `priority_weight` / Argo Kueue analog).
+    /// Among the tasks that are `ready` at the same moment, a scheduler claims
+    /// higher-priority tasks first (`ORDER BY priority DESC, scheduled_at`), so a
+    /// latency-sensitive branch jumps a deep backlog of low-priority work. Any
+    /// signed integer; `0` is the default. Falls back to the DAG-level
+    /// [`TaskDefaults::priority`] when a task leaves it at `0`. Priority breaks
+    /// ties only — it never lets a task run before its dependencies, and it
+    /// persists on the row so a retry / lease recovery keeps its place.
+    #[serde(default)]
+    pub priority: i64,
+    /// Named **concurrency pool** this task draws a slot from (parity fast-win
+    /// #21 — Airflow pools / Argo Kueue). A scheduler claims a pooled task only
+    /// while fewer than the pool's configured capacity are already running in it
+    /// (capacities come from the `POOLS` env, e.g. `POOLS=etl:4`); an over-budget
+    /// task simply waits in `ready` until a slot frees — no run is dropped. A
+    /// pool with no configured capacity is unlimited. Falls back to
+    /// [`TaskDefaults::pool`]. `None` = unpooled (unlimited). Lowercase
+    /// `[a-z0-9_-]`, max 64 chars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+    /// Result **memoization** (parity fast-win #22 — Argo memoization / Prefect
+    /// task caching). When set, a successful run stores its output keyed by
+    /// `(workflow, task, resolved cache key)`; a later task with the same key
+    /// reuses that output and skips execution entirely. The key templates
+    /// resolve at expansion, so `{{ scheduled_time }}` / `{{ params.* }}` make a
+    /// backfill reproducible. `None` = always run. See [`CacheSpec`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheSpec>,
     /// Loop operator: re-run this task until `until` evaluates true (the
     /// poll-until-done pattern). See [`RepeatSpec`]. Evaluated by the engine
     /// each time the task *succeeds*; failures still follow the normal
     /// retry/failure path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat: Option<RepeatSpec>,
+    /// **Datasets** this task updates when it succeeds (Airflow `outlets` /
+    /// Dagster asset materializations). Each URI is upserted into the `datasets`
+    /// registry and appended to the `dataset_events` lineage ledger with the
+    /// producing run/task — which is what dataset wait-sensors
+    /// (`wait: { dataset: … }`) and dataset-triggered workflows
+    /// ([`DagSpec::on_datasets`]) key off. URIs template at expansion
+    /// (`{{ params.* }}` / `{{ item }}`), so a fan-out can produce per-shard
+    /// datasets. Purely declarative — the engine records the update; moving the
+    /// actual bytes is the task's job. Empty = this task produces nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub produces: Vec<String>,
+    /// Gang / co-scheduling: expand this task into `size` member instances
+    /// (`<name>.0` … `<name>.N-1`) that a gang-aware scheduler claims
+    /// **all-or-nothing** (distributed training: N ranks together or none).
+    /// See [`GangSpec`]. Leaf command tasks only; incompatible with retries,
+    /// `repeat`, approval gates, and template calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gang: Option<GangSpec>,
+    /// Engine-internal (populated at run creation on each expanded member —
+    /// not for workflow authors): which gang this row belongs to, its rank,
+    /// and the gang size. Dispatch injects these as `DAGRON_GANG_ID` /
+    /// `DAGRON_GANG_RANK` / `DAGRON_GANG_SIZE` for rendezvous.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gang_member: Option<GangMember>,
+}
+
+/// `gang:` — all-or-nothing co-scheduling for one task (see [`TaskSpec::gang`]).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GangSpec {
+    /// Number of member instances (≥ 2); each runs the same command with its
+    /// rank in `DAGRON_GANG_RANK`.
+    pub size: u32,
+}
+
+/// Engine-stamped gang membership of one expanded member row.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GangMember {
+    pub id: String,
+    pub rank: u32,
+    pub size: u32,
 }
 
 /// `repeat:` — run a task repeatedly until a condition on its own output holds.
@@ -155,6 +243,52 @@ pub struct RepeatSpec {
     /// Seconds to wait between iterations (default 0 = immediate).
     #[serde(default)]
     pub delay_secs: u64,
+}
+
+/// `wait:` — a deferrable time sensor for a `type: wait` task (fast-win #27 —
+/// Airflow deferrable time sensors / Argo suspend-with-duration). Exactly one of
+/// `for` (a relative duration like `30s`/`5m`/`2h`, anchored when the task is
+/// reached) or `until` (an absolute RFC-3339 instant) must be set. The task
+/// holds no worker slot while it waits; the reconcile loop resolves it (success)
+/// once the deadline passes.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WaitSpec {
+    /// Relative duration to wait, anchored when the task is reached.
+    #[serde(default, rename = "for", skip_serializing_if = "Option::is_none")]
+    pub wait_for: Option<String>,
+    /// Absolute RFC-3339 instant to wait until.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
+    /// HTTP(S) endpoint to poll — an HTTP sensor. The task parks and the engine
+    /// GETs this URL on a fixed interval (`WAIT_POLL_SECS`, default 15 s),
+    /// succeeding when it returns a 2xx (Airflow HttpSensor). Bounded by the
+    /// run's `run_timeout_secs`. Exactly one of `for` / `until` / `url` /
+    /// `dataset` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Dataset to wait on — a **dataset sensor** (Dagster asset sensor /
+    /// Airflow dataset-condition). The task parks holding no worker slot and
+    /// succeeds when the named dataset records an update **after** the park
+    /// (a `produces:` task succeeded, or — Enterprise — an external dataset
+    /// event was posted). Updates already in the ledger at park time do not
+    /// count: the sensor waits for *fresh* data, not any data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<String>,
+}
+
+/// `cache:` — result memoization for a task (fast-win #22). A successful run
+/// records its output under `(workflow, task, key)`; a later task with the same
+/// resolved `key` reuses that output and does not execute. `key` is a template
+/// resolved at expansion (so it can reference `{{ params.* }}` /
+/// `{{ scheduled_time }}`), making repeated/backfilled runs hit the cache.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CacheSpec {
+    /// Cache key template. Two task runs whose resolved keys match share a result.
+    pub key: String,
+    /// Maximum age (seconds) of a cached entry; an older entry misses and the
+    /// task re-runs. `None` = the entry never expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age_secs: Option<u64>,
 }
 
 /// A single environment variable for a task container. Either a literal `value`
@@ -183,13 +317,57 @@ pub struct SecretRef {
 
 /// Kubernetes-style resource requests/limits (e.g. `cpu: "250m"`, `memory:
 /// "512Mi"`). Both maps are optional; whatever is present is copied verbatim onto
-/// the task pod container's `resources` block.
+/// the task pod container's `resources` block. `gpu:` is accelerator sugar —
+/// see [`GpuRequest`].
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ResourceRequirements {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub requests: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub limits: BTreeMap<String, String>,
+    /// GPU sugar: `resources: { gpu: { count: 1 } }` instead of hand-writing
+    /// the vendor's extended-resource key into `limits`. Expanded by
+    /// [`ResourceRequirements::effective_limits`]; an explicit `limits` entry
+    /// for the same key wins, so specs that already spell it out are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<GpuRequest>,
+}
+
+/// Accelerator request for a task (`resources.gpu`). Kubernetes schedules GPUs
+/// as *extended resources* — an opaque counted key in the container's `limits`
+/// (requests are implied equal for extended resources) — so this expands to
+/// `limits["<resource>"] = "<count>"`. Combine with `runner_class` (e.g.
+/// `spot-gpu` vs `ondemand-gpu` pools) to route the task to schedulers fronting
+/// the right accelerator capacity.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GpuRequest {
+    /// Number of devices (≥ 1). Fractional/MIG slicing is the device plugin's
+    /// concern, not dagron's — name the sliced resource via `resource` instead.
+    pub count: u32,
+    /// Extended-resource key advertising the accelerator. Default
+    /// `nvidia.com/gpu`; set e.g. `amd.com/gpu`, `google.com/tpu`, or a MIG
+    /// profile key like `nvidia.com/mig-1g.5gb`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+}
+
+/// The default accelerator extended-resource key (`resources.gpu.resource`).
+pub const DEFAULT_GPU_RESOURCE: &str = "nvidia.com/gpu";
+
+impl ResourceRequirements {
+    /// `limits` with the `gpu:` sugar folded in. An explicit `limits` entry for
+    /// the same key wins over the sugar (a spec that spells both is taken at
+    /// its word); with no `gpu:` this is exactly `limits`.
+    pub fn effective_limits(&self) -> BTreeMap<String, String> {
+        let mut limits = self.limits.clone();
+        if let Some(gpu) = &self.gpu {
+            let key = gpu.resource.as_deref().unwrap_or(DEFAULT_GPU_RESOURCE);
+            limits
+                .entry(key.to_string())
+                .or_insert_with(|| gpu.count.to_string());
+        }
+        limits
+    }
 }
 
 fn default_max_attempts() -> u32 {
@@ -205,8 +383,10 @@ fn is_false(b: &bool) -> bool {
 pub const HOOK_KINDS: &[&str] = &["on_exit", "on_failure"];
 
 /// Valid `type:` values. `task` (the default) is an ordinary command task;
-/// `approval` is a human approval gate (#19).
-pub const TASK_KINDS: &[&str] = &["task", "approval"];
+/// `approval` is a human approval gate (#19); `workflow` triggers a registered
+/// sub-workflow and waits for it (#23); `wait` is a deferrable time sensor that
+/// parks with no worker until a deadline (#27).
+pub const TASK_KINDS: &[&str] = &["task", "approval", "workflow", "wait"];
 
 /// Valid `approval_on_timeout:` values.
 pub const APPROVAL_TIMEOUT_ACTIONS: &[&str] = &["approve", "reject"];
@@ -215,6 +395,14 @@ impl TaskSpec {
     /// Whether this task is a `type: approval` human gate (#19).
     pub fn is_approval(&self) -> bool {
         self.task_type.as_deref() == Some("approval")
+    }
+    /// Whether this task is a `type: workflow` sub-workflow trigger (#23).
+    pub fn is_workflow(&self) -> bool {
+        self.task_type.as_deref() == Some("workflow")
+    }
+    /// Whether this task is a `type: wait` deferrable time sensor (#27).
+    pub fn is_wait(&self) -> bool {
+        self.task_type.as_deref() == Some("wait")
     }
 }
 
@@ -240,6 +428,65 @@ pub fn validate_runner_class(name: &str) -> Result<()> {
         bail!("runner_class 'other' is reserved (it is the metrics tail bucket)");
     }
     Ok(())
+}
+
+/// Validate a workflow `tag`: `[A-Za-z0-9_.-]`, 1–64 chars — URL-safe (it becomes
+/// a `?tag=` filter value) and label-friendly (mixed case + dots allowed).
+pub fn validate_tag(tag: &str) -> Result<()> {
+    if tag.is_empty() || tag.len() > 64 {
+        bail!("tag must be 1-64 characters, got {} ('{}')", tag.len(), tag);
+    }
+    if !tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        bail!("tag '{tag}' may only contain [A-Za-z0-9_.-]");
+    }
+    Ok(())
+}
+
+/// Validate a `pool` name: lowercase `[a-z0-9_-]`, 1–64 chars — the same
+/// conservative charset as [`validate_runner_class`]. Strict on purpose: the
+/// name becomes a claim-path SQL filter value and is matched against the
+/// comma-delimited "exhausted pools" set in the SQLite claim, so a comma (or
+/// other delimiter) in a name must be impossible.
+pub fn validate_pool(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 64 {
+        bail!("pool must be 1-64 characters, got {} ('{}')", name.len(), name);
+    }
+    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') {
+        bail!("pool '{name}' may only contain [a-z0-9_-]");
+    }
+    Ok(())
+}
+
+/// Validate a **dataset URI** (`produces:` / `on_datasets:` / `wait.dataset`):
+/// 1–512 chars, no whitespace or control characters. Deliberately loose beyond
+/// that — a dataset name is an opaque identity (`s3://lake/orders`,
+/// `postgres://warehouse/public.orders`, `dataset://daily-report`), matched by
+/// exact string equality like Airflow dataset URIs; dagron never dereferences
+/// it. Whitespace is banned so a URI can never be mistaken for two, and the
+/// length cap keeps the registry's key sane.
+pub fn validate_dataset_uri(uri: &str) -> Result<()> {
+    if uri.is_empty() || uri.len() > 512 {
+        bail!("dataset URI must be 1-512 characters, got {} ('{uri}')", uri.len());
+    }
+    if uri.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("dataset URI '{uri}' must not contain whitespace or control characters");
+    }
+    Ok(())
+}
+
+/// Extract a raw spec's dataset subscriptions — `(on_datasets, mode)` — without
+/// full template expansion or graph validation. The engine's dataset-trigger
+/// sweep calls this per registered workflow to keep `dataset_triggers` rows in
+/// sync cheaply; the full [`DagGraph::from_yaml_with_params`] pipeline (and its
+/// validation) still runs at fire time. `None` = the spec doesn't parse or
+/// subscribes to nothing. Mode defaults to `"any"`.
+pub fn dataset_subscriptions(yaml: &str) -> Option<(Vec<String>, String)> {
+    let spec: DagSpec = serde_yaml::from_str(yaml).ok()?;
+    if spec.on_datasets.is_empty() {
+        return None;
+    }
+    let mode = spec.datasets_mode.unwrap_or_else(|| "any".to_string());
+    Some((spec.on_datasets, mode))
 }
 
 /// A soft SLA deadline (`deadline:` block). See [`DagSpec::deadline`].
@@ -302,12 +549,29 @@ pub struct DagSpec {
     /// into the main `tasks` graph at run-creation time (see [`crate::expand`]).
     #[serde(default)]
     pub templates: Vec<TemplateSpec>,
+    /// Labels for organizing and filtering workflows (parity fast-win #26 —
+    /// Airflow #16432 colored tags / #24464 folder view, Dagster #14530). Purely
+    /// organizational — the engine ignores them; the workflow registry surfaces
+    /// them on `GET /api/workflows` and filters with `?tag=`. Each tag is
+    /// `[A-Za-z0-9_.-]`, ≤64 chars.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     /// Run-level wall-clock budget in seconds. When the run has been `running` longer than
     /// this, the engine's deadline sweep marks it `failed` and cancels its
     /// remaining tasks. `None` = no run-level deadline (per-task `timeout_secs`
     /// still applies). Must be ≥ 1 when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_timeout_secs: Option<u64>,
+    /// Maximum number of **concurrently active runs** of this workflow (matched
+    /// by name). When this many runs of the workflow are already `running`,
+    /// `create_run` refuses to start another with a `MaxActiveRunsReached` error
+    /// (parity fast-win #21 — Argo #12757 workflow concurrency control / Prefect
+    /// deployment concurrency limits): the API returns 429, a queue source
+    /// requeues the submission, and schedule/backfill fires are held back
+    /// (backfill retries when a slot frees). `None`/`0` = unlimited. Enforced at
+    /// run creation only — it caps concurrent runs, not per-task concurrency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_active_runs: Option<u32>,
     /// Soft SLA deadline. Unlike `run_timeout_secs`
     /// (which cancels), exceeding this only **emits an alert** — a
     /// `run.deadline_exceeded` outbox event + a metric — and leaves the run
@@ -347,6 +611,24 @@ pub struct DagSpec {
     /// for the exact merge rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_defaults: Option<TaskDefaults>,
+    /// **Dataset triggers** (Airflow dataset scheduling / Dagster asset
+    /// sensors): fire a run of this *registered* workflow when one of these
+    /// datasets records a new update (a task with a matching `produces:`
+    /// succeeded, or — Enterprise — an external event was posted). The open
+    /// build supports exactly **one** dataset here; subscribing to several
+    /// (fan-in composition, with [`DagSpec::datasets_mode`]) ships with dagron
+    /// Enterprise. Fires coalesce: updates that arrive while a fire is being
+    /// processed produce one run, not one per event. Empty = not
+    /// dataset-triggered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_datasets: Vec<String>,
+    /// How multiple [`DagSpec::on_datasets`] entries combine (**Enterprise**):
+    /// `"any"` — fire when any subscribed dataset updates (default); `"all"` —
+    /// fire only once *every* subscribed dataset has updated since the last
+    /// fire (the Airflow AND-of-datasets semantics, e.g. "refresh the join
+    /// once both upstream tables landed"). Meaningless with a single dataset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datasets_mode: Option<String>,
     pub tasks: Vec<TaskSpec>,
 }
 
@@ -369,12 +651,23 @@ pub struct TaskDefaults {
     pub retry_delay_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_max_delay_secs: Option<u64>,
+    /// DAG-wide default for [`TaskSpec::retry_on_timeout`]; applies to any task
+    /// that does not set its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_on_timeout: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docker_image: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_class: Option<String>,
+    /// DAG-wide dispatch priority default; applies to any task that leaves its
+    /// own [`TaskSpec::priority`] at the built-in `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i64>,
+    /// DAG-wide default concurrency [`TaskSpec::pool`] for tasks that set none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<EnvVar>,
 }
@@ -488,6 +781,56 @@ impl DagGraph {
             validate_runner_class(class)
                 .map_err(|e| anyhow::anyhow!("invalid runner_class in DAG '{}': {e}", spec.name))?;
         }
+        for tag in &spec.tags {
+            validate_tag(tag)
+                .map_err(|e| anyhow::anyhow!("invalid tag in DAG '{}': {e}", spec.name))?;
+        }
+
+        // Dataset triggers (`on_datasets:`): valid, deduplicated URIs. The open
+        // build fires on a single dataset; multi-dataset composition (and its
+        // `datasets_mode`) is the Enterprise data-aware scheduler — reject with
+        // a signpost, not a silent partial subscription (the SOURCE-connector
+        // funnel pattern).
+        {
+            let mut seen = std::collections::HashSet::new();
+            for uri in &spec.on_datasets {
+                validate_dataset_uri(uri).map_err(|e| {
+                    anyhow::anyhow!("invalid on_datasets entry in DAG '{}': {e}", spec.name)
+                })?;
+                if !seen.insert(uri.as_str()) {
+                    bail!("duplicate on_datasets entry '{uri}' in DAG '{}'", spec.name);
+                }
+            }
+            if let Some(mode) = spec.datasets_mode.as_deref() {
+                if !matches!(mode, "any" | "all") {
+                    bail!(
+                        "invalid datasets_mode '{mode}' in DAG '{}'; expected 'any' or 'all'",
+                        spec.name
+                    );
+                }
+                if spec.on_datasets.is_empty() {
+                    bail!(
+                        "datasets_mode set but on_datasets is empty in DAG '{}'",
+                        spec.name
+                    );
+                }
+            }
+            if !cfg!(feature = "enterprise")
+                && (spec.on_datasets.len() > 1 || spec.datasets_mode.is_some())
+            {
+                bail!(
+                    "DAG '{}' subscribes to {} datasets{}: multi-dataset triggers and \
+                     `datasets_mode` composition (any-of / all-of fan-in) ship with dagron \
+                     Enterprise — https://github.com/lucheeseng827/dagron#dagron-enterprise. \
+                     This build fires on a single dataset: keep exactly one `on_datasets` \
+                     entry (and omit `datasets_mode`), or split consumers into one \
+                     workflow per upstream dataset.",
+                    spec.name,
+                    spec.on_datasets.len(),
+                    if spec.datasets_mode.is_some() { " with datasets_mode" } else { "" },
+                );
+            }
+        }
 
         for task in &spec.tasks {
             if node_index.contains_key(&task.name) {
@@ -542,6 +885,100 @@ impl DagGraph {
             if task.is_approval() && task.hook.is_some() {
                 bail!("task '{}' cannot be both an approval gate and a hook in DAG '{}'", task.name, spec.name);
             }
+            // Sub-workflow trigger (#23): needs a target workflow name, has no
+            // command, and can't double as a hook. The `workflow:` field is only
+            // meaningful on a `type: workflow` task.
+            if task.is_workflow() {
+                match task.workflow.as_deref() {
+                    Some(w) if !w.trim().is_empty() => {}
+                    _ => bail!(
+                        "task '{}' is type: workflow but names no `workflow:` to trigger in DAG '{}'",
+                        task.name, spec.name
+                    ),
+                }
+                if !task.command.is_empty() {
+                    bail!("task '{}' (type: workflow) must not set a command in DAG '{}'", task.name, spec.name);
+                }
+                if task.hook.is_some() {
+                    bail!("task '{}' cannot be both a sub-workflow trigger and a hook in DAG '{}'", task.name, spec.name);
+                }
+            } else if task.workflow.is_some() {
+                bail!(
+                    "task '{}' sets `workflow:` but is not `type: workflow` in DAG '{}'",
+                    task.name, spec.name
+                );
+            }
+            // Deferrable wait sensor (#27): needs exactly one of wait.for /
+            // wait.until / wait.url / wait.dataset, no command, no hook.
+            // `wait:` is only for a type: wait task.
+            if task.is_wait() {
+                match &task.wait {
+                    Some(w) => {
+                        // Exactly one of for / until / url / dataset must be set.
+                        let set = w.wait_for.is_some() as u8
+                            + w.until.is_some() as u8
+                            + w.url.is_some() as u8
+                            + w.dataset.is_some() as u8;
+                        if set != 1 {
+                            bail!("task '{}' (type: wait) needs exactly one of wait.for / wait.until / wait.url / wait.dataset in DAG '{}'", task.name, spec.name);
+                        }
+                        if let Some(f) = &w.wait_for {
+                            parse_duration_secs(f).map_err(|e| {
+                                anyhow::anyhow!("invalid wait.for for task '{}' in DAG '{}': {e}", task.name, spec.name)
+                            })?;
+                        }
+                        if let Some(u) = &w.until {
+                            chrono::DateTime::parse_from_rfc3339(u).map_err(|e| {
+                                anyhow::anyhow!("invalid wait.until (expected RFC-3339) for task '{}' in DAG '{}': {e}", task.name, spec.name)
+                            })?;
+                        }
+                        if let Some(url) = &w.url {
+                            let url = url.trim();
+                            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                                bail!("invalid wait.url for task '{}' in DAG '{}': must be an http(s) URL", task.name, spec.name);
+                            }
+                        }
+                        if let Some(ds) = &w.dataset {
+                            validate_dataset_uri(ds).map_err(|e| {
+                                anyhow::anyhow!("invalid wait.dataset for task '{}' in DAG '{}': {e}", task.name, spec.name)
+                            })?;
+                        }
+                    }
+                    None => bail!("task '{}' is type: wait but has no `wait:` block in DAG '{}'", task.name, spec.name),
+                }
+                if !task.command.is_empty() {
+                    bail!("task '{}' (type: wait) must not set a command in DAG '{}'", task.name, spec.name);
+                }
+                if task.hook.is_some() {
+                    bail!("task '{}' cannot be both a wait sensor and a hook in DAG '{}'", task.name, spec.name);
+                }
+            } else if task.wait.is_some() {
+                bail!("task '{}' sets `wait:` but is not `type: wait` in DAG '{}'", task.name, spec.name);
+            }
+            // `produces:` — dataset updates are recorded on the worker-result
+            // success path, which approval gates, sub-workflow triggers, and
+            // wait sensors never take (they resolve via reconcile sweeps). Only
+            // command tasks may declare them, so a `produces:` is never
+            // silently dropped.
+            if !task.produces.is_empty() {
+                if task.is_approval() || task.is_workflow() || task.is_wait() {
+                    bail!(
+                        "task '{}' (type: {}) cannot declare `produces:` in DAG '{}' — only command tasks record dataset updates",
+                        task.name,
+                        task.task_type.as_deref().unwrap_or("task"),
+                        spec.name
+                    );
+                }
+                let mut seen = std::collections::HashSet::new();
+                for uri in &task.produces {
+                    validate_dataset_uri(uri).map_err(|e| {
+                        anyhow::anyhow!("invalid produces entry for task '{}' in DAG '{}': {e}", task.name, spec.name)
+                    })?;
+                    if !seen.insert(uri.as_str()) {
+                        bail!("duplicate produces entry '{uri}' for task '{}' in DAG '{}'", task.name, spec.name);
+                    }
+                }
+            }
             if let Some(class) = &task.runner_class {
                 validate_runner_class(class).map_err(|e| {
                     anyhow::anyhow!(
@@ -550,6 +987,80 @@ impl DagGraph {
                         spec.name
                     )
                 })?;
+            }
+            if let Some(p) = &task.pool {
+                validate_pool(p).map_err(|e| {
+                    anyhow::anyhow!("invalid pool for task '{}' in DAG '{}': {e}", task.name, spec.name)
+                })?;
+            }
+            if let Some(c) = &task.cache {
+                if c.key.trim().is_empty() {
+                    bail!("empty cache.key for task '{}' in DAG '{}'", task.name, spec.name);
+                }
+            }
+            // `resources.gpu` accelerator sugar: zero devices is a spec bug,
+            // not a request.
+            if let Some(gpu) = task.resources.as_ref().and_then(|r| r.gpu.as_ref()) {
+                if gpu.count == 0 {
+                    bail!(
+                        "invalid resources.gpu.count=0 for task '{}' in DAG '{}'; expected >= 1 (or omit gpu)",
+                        task.name,
+                        spec.name
+                    );
+                }
+                if gpu.resource.as_deref().is_some_and(|r| r.trim().is_empty()) {
+                    bail!(
+                        "empty resources.gpu.resource for task '{}' in DAG '{}'; omit it for the default ({})",
+                        task.name,
+                        spec.name,
+                        DEFAULT_GPU_RESOURCE
+                    );
+                }
+            }
+            // `gang:` co-scheduling validation — leaf command tasks with
+            // die-together (single-attempt) semantics only in v1.
+            if let Some(gang) = &task.gang {
+                if gang.size < 2 {
+                    bail!(
+                        "invalid gang.size={} for task '{}' in DAG '{}'; expected >= 2 (or omit gang)",
+                        gang.size,
+                        task.name,
+                        spec.name
+                    );
+                }
+                if task.max_attempts > 1 {
+                    bail!(
+                        "task '{}' cannot combine `gang` with retries (max_attempts > 1) in DAG '{}': a gang retries as a unit via run-level rerun, not per member",
+                        task.name,
+                        spec.name
+                    );
+                }
+                if task.repeat.is_some() || task.is_approval() || task.template.is_some() {
+                    bail!(
+                        "task '{}' cannot combine `gang` with repeat/approval/template in DAG '{}'",
+                        task.name,
+                        spec.name
+                    );
+                }
+                // A gang expands into member rows that each run a command; the
+                // commandless kinds (sub-workflow trigger, wait sensor) resolve
+                // through reconcile sweeps instead and have no meaning per-rank.
+                // They are exempt from the command check, so reject them here.
+                if task.is_workflow() || task.is_wait() {
+                    bail!(
+                        "task '{}' cannot combine `gang` with a sub-workflow trigger or wait sensor in DAG '{}'",
+                        task.name,
+                        spec.name
+                    );
+                }
+                if spec.result_from.as_deref() == Some(task.name.as_str()) {
+                    bail!(
+                        "result_from cannot name gang task '{}' in DAG '{}' (members are '{}.<rank>')",
+                        task.name,
+                        spec.name,
+                        task.name
+                    );
+                }
             }
             // `repeat:` loop-operator validation.
             if let Some(rep) = &task.repeat {
@@ -581,9 +1092,10 @@ impl DagGraph {
                     spec.name
                 );
             }
-            // A command is required for an ordinary task; an approval gate has no
-            // command (it waits for a human), so it is exempt.
-            if task.command.is_empty() && !task.is_approval() {
+            // A command is required for an ordinary task; an approval gate (waits
+            // for a human), a sub-workflow trigger (runs a child workflow, #23),
+            // and a wait sensor (defers on a timer, #27) have none, so they are exempt.
+            if task.command.is_empty() && !task.is_approval() && !task.is_workflow() && !task.is_wait() {
                 bail!(
                     "task '{}' has no command in DAG '{}' (a leaf task needs a command)",
                     task.name,
@@ -669,6 +1181,50 @@ mod tests {
     /// aggregated `runner_class="other"` series.
     #[test]
     fn runner_class_validation_rules() {
+        // `resources.gpu` sugar folds into effective limits; explicit keys win.
+        let gpu_yaml = r#"
+name: gpu_sugar
+tasks:
+  - name: train
+    command: ["python", "train.py"]
+    resources: { gpu: { count: 2 } }
+  - name: mig
+    command: ["python", "infer.py"]
+    resources:
+      limits: { "nvidia.com/mig-1g.5gb": "4" }
+      gpu: { count: 1, resource: "nvidia.com/mig-1g.5gb" }
+"#;
+        let g = DagGraph::from_yaml(gpu_yaml).expect("gpu sugar parses");
+        let train = g.task_spec("train").unwrap().resources.as_ref().unwrap();
+        assert_eq!(train.effective_limits().get("nvidia.com/gpu"), Some(&"2".to_string()));
+        let mig = g.task_spec("mig").unwrap().resources.as_ref().unwrap();
+        assert_eq!(
+            mig.effective_limits().get("nvidia.com/mig-1g.5gb"),
+            Some(&"4".to_string()),
+            "an explicit limits entry outranks the sugar"
+        );
+        assert!(
+            DagGraph::from_yaml(
+                "name: g0\ntasks:\n  - name: t\n    command: [\"true\"]\n    resources: { gpu: { count: 0 } }\n"
+            )
+            .is_err(),
+            "gpu.count=0 is rejected"
+        );
+
+        // `gang:` validation: size >= 2, leaf single-attempt tasks only.
+        assert!(DagGraph::from_yaml(
+            "name: g\ntasks:\n  - name: t\n    command: [\"true\"]\n    gang: { size: 4 }\n"
+        )
+        .is_ok());
+        for bad in [
+            "name: g\ntasks:\n  - name: t\n    command: [\"true\"]\n    gang: { size: 1 }\n",
+            "name: g\ntasks:\n  - name: t\n    command: [\"true\"]\n    gang: { size: 2 }\n    max_attempts: 3\n",
+            "name: g\ntasks:\n  - name: t\n    command: [\"true\"]\n    gang: { size: 2 }\n    repeat: { until: \"{{ output }} == done\", max_iterations: 3 }\n",
+            "name: g\nresult_from: t\ntasks:\n  - name: t\n    command: [\"true\"]\n    gang: { size: 2 }\n",
+        ] {
+            assert!(DagGraph::from_yaml(bad).is_err(), "must reject: {bad}");
+        }
+
         assert!(validate_runner_class("etl").is_ok());
         assert!(validate_runner_class("ml_training-2").is_ok());
         assert!(validate_runner_class("").is_err());
@@ -683,6 +1239,227 @@ mod tests {
         .expect("spec-level 'other' must be rejected")
         .to_string();
         assert!(err.contains("reserved"), "spec-level 'other' rejected: {err}");
+    }
+
+    #[test]
+    fn workflow_tags_parse_and_validate() {
+        // Valid tags round-trip onto the spec.
+        let dag = DagGraph::from_yaml(
+            "name: w\ntags: [etl, prod, team.data]\ntasks:\n  - { name: a, command: [\"true\"] }\n",
+        )
+        .unwrap();
+        assert_eq!(dag.spec.tags, vec!["etl", "prod", "team.data"]);
+
+        // Charset is enforced (a comma would break the URL/filter contract).
+        assert!(validate_tag("etl").is_ok());
+        assert!(validate_tag("team.data-1").is_ok());
+        assert!(validate_tag("").is_err());
+        assert!(validate_tag(&"x".repeat(65)).is_err());
+        assert!(validate_tag("a b").is_err());
+        assert!(validate_tag("a,b").is_err());
+
+        // An invalid tag fails validation at spec load.
+        let err = DagGraph::from_yaml(
+            "name: w\ntags: [\"bad tag\"]\ntasks:\n  - { name: a, command: [\"true\"] }\n",
+        )
+        .err()
+        .expect("invalid tag must be rejected")
+        .to_string();
+        assert!(err.contains("tag"), "invalid tag rejected: {err}");
+    }
+
+    #[test]
+    fn subworkflow_trigger_validation() {
+        // A valid trigger: type: workflow with a target and no command.
+        let dag = DagGraph::from_yaml(
+            "name: p\ntasks:\n  - { name: t, type: workflow, workflow: child }\n",
+        )
+        .unwrap();
+        let t = dag.spec.tasks.iter().find(|t| t.name == "t").unwrap();
+        assert!(t.is_workflow());
+        assert_eq!(t.workflow.as_deref(), Some("child"));
+
+        // type: workflow without a target is rejected.
+        let err = DagGraph::from_yaml("name: p\ntasks:\n  - { name: t, type: workflow }\n")
+            .err()
+            .expect("missing workflow target must be rejected")
+            .to_string();
+        assert!(err.contains("workflow"), "target required: {err}");
+
+        // `workflow:` on a non-workflow task is rejected.
+        let err = DagGraph::from_yaml(
+            "name: p\ntasks:\n  - { name: t, command: [\"true\"], workflow: child }\n",
+        )
+        .err()
+        .expect("workflow field on an ordinary task must be rejected")
+        .to_string();
+        assert!(err.contains("workflow"), "misplaced workflow field: {err}");
+
+        // A trigger must not also carry a command.
+        let err = DagGraph::from_yaml(
+            "name: p\ntasks:\n  - { name: t, type: workflow, workflow: c, command: [\"true\"] }\n",
+        )
+        .err()
+        .expect("a trigger with a command must be rejected")
+        .to_string();
+        assert!(err.contains("command"), "trigger command rejected: {err}");
+    }
+
+    #[test]
+    fn wait_sensor_validation() {
+        // Valid: `for` and `until`.
+        let dag = DagGraph::from_yaml(
+            "name: p\ntasks:\n  - { name: w, type: wait, wait: { for: 30s } }\n",
+        )
+        .unwrap();
+        assert!(dag.spec.tasks[0].is_wait());
+        DagGraph::from_yaml(
+            "name: p\ntasks:\n  - { name: w, type: wait, wait: { until: \"2030-01-01T00:00:00Z\" } }\n",
+        )
+        .unwrap();
+
+        // Neither / both / missing block are rejected.
+        assert!(DagGraph::from_yaml("name: p\ntasks:\n  - { name: w, type: wait, wait: {} }\n").is_err());
+        assert!(DagGraph::from_yaml(
+            "name: p\ntasks:\n  - { name: w, type: wait, wait: { for: 1s, until: \"2030-01-01T00:00:00Z\" } }\n"
+        )
+        .is_err());
+        assert!(DagGraph::from_yaml("name: p\ntasks:\n  - { name: w, type: wait }\n").is_err());
+
+        // Valid: `url` HTTP sensor (#27 follow-on).
+        let dag = DagGraph::from_yaml(
+            "name: p\ntasks:\n  - { name: w, type: wait, wait: { url: \"https://example.com/ready\" } }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            dag.spec.tasks[0].wait.as_ref().unwrap().url.as_deref(),
+            Some("https://example.com/ready")
+        );
+
+        // A non-http(s) `url` is rejected.
+        let err = DagGraph::from_yaml(
+            "name: p\ntasks:\n  - { name: w, type: wait, wait: { url: \"ftp://example.com\" } }\n",
+        )
+        .err()
+        .expect("non-http url must be rejected")
+        .to_string();
+        assert!(err.contains("http"), "url scheme rejected: {err}");
+
+        // `url` combined with `for`/`until` violates exactly-one.
+        assert!(DagGraph::from_yaml(
+            "name: p\ntasks:\n  - { name: w, type: wait, wait: { url: \"https://x/y\", for: 1s } }\n"
+        )
+        .is_err());
+
+        // `wait:` on a non-wait task, and a wait task with a command, are rejected.
+        assert!(DagGraph::from_yaml(
+            "name: p\ntasks:\n  - { name: w, command: [\"true\"], wait: { for: 1s } }\n"
+        )
+        .is_err());
+        assert!(DagGraph::from_yaml(
+            "name: p\ntasks:\n  - { name: w, type: wait, wait: { for: 1s }, command: [\"true\"] }\n"
+        )
+        .is_err());
+    }
+
+    /// Dataset spec surface: `produces:` on tasks, the `wait.dataset` sensor,
+    /// and `on_datasets:` triggers — plus the OSS/Enterprise composition gate.
+    #[test]
+    fn dataset_spec_validation() {
+        // Valid: produces on a command task; templates at expansion elsewhere.
+        let dag = DagGraph::from_yaml(
+            "name: p\ntasks:\n  - { name: t, command: [\"true\"], produces: [\"s3://lake/orders\"] }\n",
+        )
+        .unwrap();
+        assert_eq!(dag.spec.tasks[0].produces, vec!["s3://lake/orders"]);
+
+        // Invalid URIs and duplicates are rejected.
+        assert!(DagGraph::from_yaml(
+            "name: p\ntasks:\n  - { name: t, command: [\"true\"], produces: [\"has space\"] }\n"
+        )
+        .is_err());
+        assert!(DagGraph::from_yaml(
+            "name: p\ntasks:\n  - { name: t, command: [\"true\"], produces: [\"a://b\", \"a://b\"] }\n"
+        )
+        .is_err());
+
+        // produces on a non-command task (its success bypasses the worker
+        // result path) is rejected rather than silently dropped.
+        assert!(DagGraph::from_yaml(
+            "name: p\ntasks:\n  - { name: w, type: wait, wait: { for: 1s }, produces: [\"a://b\"] }\n"
+        )
+        .is_err());
+
+        // Dataset sensor: valid alone, counted in the exactly-one-of rule.
+        let dag = DagGraph::from_yaml(
+            "name: p\ntasks:\n  - { name: w, type: wait, wait: { dataset: \"s3://lake/orders\" } }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            dag.spec.tasks[0].wait.as_ref().unwrap().dataset.as_deref(),
+            Some("s3://lake/orders")
+        );
+        assert!(DagGraph::from_yaml(
+            "name: p\ntasks:\n  - { name: w, type: wait, wait: { dataset: \"a://b\", for: 1s } }\n"
+        )
+        .is_err());
+
+        // Single-dataset trigger: fine in every edition.
+        let dag = DagGraph::from_yaml(
+            "name: p\non_datasets: [\"s3://lake/orders\"]\ntasks:\n  - { name: t, command: [\"true\"] }\n",
+        )
+        .unwrap();
+        assert_eq!(dag.spec.on_datasets, vec!["s3://lake/orders"]);
+
+        // Duplicate subscriptions and a bad mode are rejected everywhere.
+        assert!(DagGraph::from_yaml(
+            "name: p\non_datasets: [\"a://b\", \"a://b\"]\ntasks:\n  - { name: t, command: [\"true\"] }\n"
+        )
+        .is_err());
+        assert!(DagGraph::from_yaml(
+            "name: p\non_datasets: [\"a://b\"]\ndatasets_mode: sometimes\ntasks:\n  - { name: t, command: [\"true\"] }\n"
+        )
+        .is_err());
+        // datasets_mode without subscriptions is meaningless.
+        assert!(DagGraph::from_yaml(
+            "name: p\ndatasets_mode: any\ntasks:\n  - { name: t, command: [\"true\"] }\n"
+        )
+        .is_err());
+
+        // Composition (multi-dataset / datasets_mode) is the Enterprise line:
+        // the open build rejects it with a signpost naming the edition; an
+        // enterprise build accepts it.
+        let multi = "name: p\non_datasets: [\"a://b\", \"a://c\"]\ndatasets_mode: all\ntasks:\n  - { name: t, command: [\"true\"] }\n";
+        #[cfg(not(feature = "enterprise"))]
+        {
+            let err =
+                DagGraph::from_yaml(multi).err().expect("multi-dataset is Enterprise").to_string();
+            assert!(err.contains("dagron Enterprise"), "signpost names the edition: {err}");
+        }
+        #[cfg(feature = "enterprise")]
+        {
+            let dag = DagGraph::from_yaml(multi).unwrap();
+            assert_eq!(dag.spec.on_datasets.len(), 2);
+            assert_eq!(dag.spec.datasets_mode.as_deref(), Some("all"));
+        }
+    }
+
+    /// The sweep-side subscription extraction reads raw specs without expansion.
+    #[test]
+    fn dataset_subscriptions_extraction() {
+        assert_eq!(
+            dataset_subscriptions("name: p\non_datasets: [\"a://b\"]\ntasks: []\n"),
+            Some((vec!["a://b".to_string()], "any".to_string()))
+        );
+        assert_eq!(
+            dataset_subscriptions(
+                "name: p\non_datasets: [\"a://b\", \"a://c\"]\ndatasets_mode: all\ntasks: []\n"
+            ),
+            Some((vec!["a://b".to_string(), "a://c".to_string()], "all".to_string()))
+        );
+        // No subscriptions, or an unparseable spec → None.
+        assert_eq!(dataset_subscriptions("name: p\ntasks: []\n"), None);
+        assert_eq!(dataset_subscriptions("{{ not yaml"), None);
     }
 
     #[test]

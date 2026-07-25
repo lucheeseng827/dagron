@@ -1,7 +1,7 @@
 //! Audit trail for control-plane mutations, plus viewer read-only enforcement.
 //!
 //! **Enterprise-gated** (`--features enterprise`): per
-//! `docs/COMMERCIALIZATION.md` §3, the audit log (compliance surface) and the
+//! the open-core split: the audit log (compliance surface) and the
 //! `viewer` RBAC role are paid-tier — OSS builds compile this module to a
 //! passthrough middleware, no `audit_log` table, and no `/api/audit` route.
 //! The source stays in the open tree, feature-off, like the other

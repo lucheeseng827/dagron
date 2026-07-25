@@ -8,7 +8,7 @@ use std::sync::Arc;
 use dagron_identity::IdentityProvider;
 use serde::Serialize;
 use sqlx::postgres::PgPool;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex};
 
 /// A task-state-change event, carrying the affected run_id from the
 /// `task_events` NOTIFY payload (see engine `db::postgres::notify`).
@@ -40,4 +40,16 @@ pub struct AppState {
     /// `LocalIdentityProvider` (argon2 against the `users` table); an alternate
     /// provider can plug an SSO backend in here behind the same trait.
     pub identity: Arc<dyn IdentityProvider>,
+    /// Programmatic artifact store (`put`/`get` by key). `Some` when
+    /// `DAGRON_ARTIFACT_DIR` is set — transparently envelope-encrypted at rest when
+    /// a KEK provider is configured (`dagron_artifact::store_from_env`). `None`
+    /// disables the artifact endpoints (503).
+    pub artifact_store: Option<Arc<dyn dagron_artifact::ArtifactStore>>,
+    /// Single-flight guard for the store-wide key-rotation admin endpoint: only one
+    /// rotation may run at a time (a second concurrent request gets `409`), so
+    /// overlapping sweeps can't widen the write-vs-rotate window or double the work.
+    pub rotation_lock: Arc<Mutex<()>>,
+    /// Per-client budget for `POST /api/login` — the one unauthenticated route
+    /// that costs an Argon2 verify per call. See [`crate::ratelimit`].
+    pub login_limiter: Arc<crate::ratelimit::RateLimiter>,
 }

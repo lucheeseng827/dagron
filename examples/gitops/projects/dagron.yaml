@@ -17,8 +17,8 @@ spec:
 
   sourceRepos:
     # The repo holding this chart + these manifests. Replace with your fork/mirror.
-    - https://github.com/lucheeseng827/nick-rust-project.git
-    - https://github.com/lucheeseng827/nick-rust-project
+    - https://github.com/lucheeseng827/dagron.git
+    - https://github.com/lucheeseng827/dagron
 
   # Where apps in this project may deploy. Same (in-cluster) API server; only the
   # namespaces the platform and the per-team workflows land in. The AppProject,

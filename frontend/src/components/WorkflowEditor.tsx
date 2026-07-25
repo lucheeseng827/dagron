@@ -7,6 +7,7 @@ import "@/lib/monaco"; // self-host the Monaco runtime (air-gap; no CDN)
 import ScheduleDrawer from "@/components/ScheduleDrawer";
 import EditableDag from "@/components/dag/EditableDag";
 import { modelToYaml, parseModel } from "@/lib/spec-model";
+import { visualSupport } from "@/lib/spec-support";
 import { STARTERS } from "@/lib/starters";
 import {
   createWorkflow,
@@ -43,6 +44,17 @@ export default function WorkflowEditor({ id }: { id?: string }) {
 
   // Live parse for the visual editor; the model is derived from the YAML spec.
   const parsed = useMemo(() => parseModel(spec), [spec]);
+  // …and a separate question: would the canvas be telling the truth? A spec
+  // using features the visual model can't represent (fan-out, sensors, hooks)
+  // locks Visual mode rather than letting an edit quietly corrupt it.
+  const support = useMemo(() => visualSupport(spec), [spec]);
+  const locked = !support.ok;
+
+  // Loading a workflow that uses those features while sitting on the Visual tab
+  // must move the user, not present a graph they can edit into nonsense.
+  useEffect(() => {
+    if (locked) setView("yaml");
+  }, [locked]);
 
   useEffect(() => {
     if (!id) return;
@@ -157,16 +169,29 @@ export default function WorkflowEditor({ id }: { id?: string }) {
           </select>
         )}
         <div className="dy-seg" style={{ display: "flex", gap: 4, background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: 3 }}>
-          {(["visual", "yaml"] as const).map((v) => (
-            <button
-              key={v}
-              onClick={() => setView(v)}
-              className={`dy-pill ${view === v ? "dy-pill-active" : ""}`}
-              style={{ cursor: "pointer", textTransform: "capitalize" }}
-            >
-              {v}
-            </button>
-          ))}
+          {(["visual", "yaml"] as const).map((v) => {
+            const disabled = v === "visual" && locked;
+            return (
+              <button
+                key={v}
+                onClick={() => !disabled && setView(v)}
+                disabled={disabled}
+                className={`dy-pill ${view === v ? "dy-pill-active" : ""}`}
+                style={{
+                  cursor: disabled ? "not-allowed" : "pointer",
+                  textTransform: "capitalize",
+                  opacity: disabled ? 0.5 : 1,
+                }}
+                title={
+                  disabled
+                    ? "This workflow uses features the visual editor can't edit — use the YAML tab."
+                    : undefined
+                }
+              >
+                {v}
+              </button>
+            );
+          })}
         </div>
         <div style={{ flex: 1 }} />
         {!isNew && (
@@ -188,6 +213,7 @@ export default function WorkflowEditor({ id }: { id?: string }) {
       </div>
 
       {error && <p style={{ color: "var(--red)", marginBottom: 8 }}>{error}</p>}
+      {locked && <VisualLockedNotice reasons={support.reasons} />}
       {prUrl && (
         <p style={{ marginBottom: 8 }}>
           Pull request opened:{" "}
@@ -217,6 +243,37 @@ export default function WorkflowEditor({ id }: { id?: string }) {
       </div>
 
       {!isNew && id && <ScheduleDrawer workflowId={id} />}
+    </div>
+  );
+}
+
+/// Why Visual mode is off. The headline is the whole message for most people;
+/// the field list is there for the one who wants to know which line to change,
+/// capped so a fan-out over twenty tasks doesn't push the editor off screen.
+function VisualLockedNotice({ reasons }: { reasons: string[] }) {
+  const SHOWN = 4;
+  return (
+    <div
+      style={{
+        marginBottom: 8,
+        padding: "9px 12px",
+        borderRadius: 8,
+        border: "1px solid rgba(210,153,34,0.45)",
+        background: "rgba(210,153,34,0.10)",
+        fontSize: 13,
+      }}
+    >
+      <span style={{ color: "var(--amber)" }}>
+        This workflow uses features the visual editor can&apos;t edit — use the YAML tab.
+      </span>
+      {reasons.length > 0 && (
+        <ul style={{ margin: "6px 0 0", paddingLeft: 20, color: "var(--muted)", fontSize: 12 }}>
+          {reasons.slice(0, SHOWN).map((r) => (
+            <li key={r}>{r}</li>
+          ))}
+          {reasons.length > SHOWN && <li>…and {reasons.length - SHOWN} more</li>}
+        </ul>
+      )}
     </div>
   );
 }

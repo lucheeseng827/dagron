@@ -1,0 +1,31 @@
+# Pattern 03 — fetch the script when the run starts (container executor)
+#
+# The container companion to `03_fetch_at_runtime.yaml`. No executor mounts the
+# host's per-run `DAGRON_ARTIFACTS` directory into a container, so a container
+# task can't read a file a *different* task fetched. The fix is to make each task
+# self-contained: fetch and execute in the same task, so nothing has to cross a
+# container boundary. Repeat this shape per task that needs the script — there is
+# no `depends_on` on a host chain, because there is no shared directory to wait on.
+#
+# Same trade as the host variant: pin an immutable URL (commit sha, versioned
+# key) — a moving target is a run you cannot reproduce.
+name: etl-fetched-script-container
+
+parameters:
+  # Pin this. A moving target here is a run you cannot reproduce.
+  script_url: "https://raw.githubusercontent.com/example/ops/9f2c1ab/etl/transform.sh"
+
+tasks:
+  - name: fetch-and-run-in-container
+    docker_image: alpine:3.20
+    command:
+      - "sh"
+      - "-c"
+      - >-
+        set -eu;
+        wget -qO /tmp/transform.sh "{{ script_url }}";
+        chmod +x /tmp/transform.sh;
+        /tmp/transform.sh --shard 4
+    max_attempts: 3
+    retry_delay_secs: 5
+    timeout_secs: 900

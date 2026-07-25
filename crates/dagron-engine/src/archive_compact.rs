@@ -1,6 +1,6 @@
 //! `dagron archive-compact` — fold archived run documents into Parquet.
 //!
-//! The third tier of the hot/cold story (ee/STATE_STORE.md): hot Postgres
+//! The third tier of the hot/cold story: hot Postgres
 //! (days) → per-run `run-<id>.json` documents in the archive sink (months,
 //! individually retrievable via dagron-api's `/api/archive` endpoints) →
 //! **date-partitioned Parquet** (analytics, forever). This subcommand walks

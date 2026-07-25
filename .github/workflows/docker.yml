@@ -6,11 +6,10 @@
 # stamped `v*.*.*` tag this fires on).
 #
 # This is the dagron twin of mergestro-gate's mirror-native publish
-# (module_55/.github/workflows/docker.yml): the OSS release path builds the images
-# IN the open repo, from the open source, instead of pushing them from the private
-# monorepo. Only the three OSS images are ever built here — the closed add-on
-# images (operator / cloud / mcp / step-llm) live in a separate private pipeline
-# and their sources never enter the mirror at all.
+# the release path builds the images IN this repo, from this source, rather than
+# pushing them in from elsewhere. Only the OSS images are built here; commercial
+# add-on images are published separately and their sources are not part of this
+# repository.
 #
 # Requires two secrets in the mirror's `cicd` environment (same names as the
 # monorepo release):
@@ -71,6 +70,13 @@ jobs:
             context: "."
             file: "./crates/dagron-mcp/Dockerfile"
             build_args: ""
+          # The GitOps worker (#721). The one image that intentionally carries a
+          # `git` binary — which is why it is a separate deployable and why
+          # dagron-api stays distroless. Deploy it only if you connect repos.
+          - name: dagron-gitops
+            context: "."
+            file: "./crates/dagron-gitops/Dockerfile"
+            build_args: ""
         arch: [amd64, arm64]
         # `arch` is a real matrix axis, so these includes attach the platform +
         # runner to each (image × arch) combination rather than adding new legs.
@@ -130,7 +136,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [dagron-engine, dagron-api, dagron-frontend, dagron-mcp]
+        image: [dagron-engine, dagron-api, dagron-frontend, dagron-mcp, dagron-gitops]
     steps:
       - name: Collect this image's per-arch digests
         uses: actions/download-artifact@v4

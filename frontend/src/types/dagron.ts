@@ -32,6 +32,16 @@ export interface RunSummary {
 
 export type GitRepoState = "Synced" | "OutOfSync" | "Syncing";
 
+/// `GET /api/git-repos` — repos plus whether a GitOps worker is alive.
+///
+/// Syncing runs in the separate `dagron-gitops` container, so a deployment can
+/// have repositories configured and nothing to act on them. Surfacing that is
+/// the point: the page used to promise "Auto-sync ON" while every sync failed.
+export interface GitRepoList {
+  repos: GitRepo[];
+  worker_online: boolean;
+}
+
 export interface GitRepo {
   id: string;
   name: string;
@@ -55,6 +65,42 @@ export interface TaskRow {
   output: string | null;
   scheduled_at: string | null;
   finished_at: string | null;
+  /// Why a parked task is parked — at most one is set. Every park form (time /
+  /// HTTP / dataset sensor, sub-workflow trigger) keeps the row `running` with
+  /// no lease, so without these a parked task and a hung one look identical.
+  wake_at: string | null;
+  wait_url: string | null;
+  wait_dataset: string | null;
+  sub_run_id: string | null;
+  /// Scheduling metadata: the named pool the task drew a slot from (#21), its
+  /// dispatch priority (#25), and whether it was served from the memoization
+  /// store rather than executed (#22) — which explains a 0s success.
+  pool: string | null;
+  priority: number;
+  cache_hit: boolean;
+}
+
+/// A dataset in the registry: current state plus who consumes it.
+export interface Dataset {
+  uri: string;
+  updated_at: string;
+  last_run_id: string | null;
+  last_task: string | null;
+  updates: number;
+  /// Workflows subscribed via `on_datasets:` — the runs this dataset wakes.
+  consumers: string[];
+}
+
+/// One entry of the append-only lineage ledger.
+export interface DatasetEvent {
+  id: number;
+  uri: string;
+  workflow: string | null;
+  run_id: string | null;
+  task_id: string | null;
+  task_name: string | null;
+  source: string;
+  at: string;
 }
 
 export interface RunDetail {
@@ -78,6 +124,14 @@ export interface GraphNode {
   attempt: number;
   scheduled_at: string | null;
   finished_at: string | null;
+  /// Park reason, if any — a parked node is `running` forever until the thing it
+  /// waits on happens, which on a graph is indistinguishable from a stuck task.
+  wake_at: string | null;
+  wait_url: string | null;
+  wait_dataset: string | null;
+  sub_run_id: string | null;
+  /// Resolved from the memoization store instead of executed (#22).
+  cache_hit: boolean;
 }
 
 export interface GraphEdge {
@@ -161,6 +215,8 @@ export interface WorkflowRow {
   history: TaskStatus[];
   success_rate: number | null;
   run_count: number;
+  /** Organizational labels declared in the spec (#26). */
+  tags: string[];
 }
 
 export interface Schedule {

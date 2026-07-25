@@ -1,4 +1,4 @@
--- Archive index (ee/STATE_STORE.md hot/cold split): one small row per run the
+-- Archive index (the hot/cold split): one small row per run the
 -- archive-before-purge GC exported, written just before the hot rows are
 -- purged. This is what keeps archived history LISTABLE without scanning the
 -- archive sink: dagron-api's /api/archive endpoints read this table and fetch

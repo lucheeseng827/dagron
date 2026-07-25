@@ -84,21 +84,25 @@ pub fn expand(mut spec: DagSpec) -> Result<DagSpec> {
         name: spec.name,
         parameters: BTreeMap::new(),
         templates: vec![],
+        tags: spec.tags,
         run_timeout_secs: spec.run_timeout_secs,
+        max_active_runs: spec.max_active_runs,
         deadline: spec.deadline,
         notify: spec.notify,
         result_from: spec.result_from,
         runner_class: spec.runner_class,
         environment: spec.environment,
         task_defaults: None,
+        on_datasets: spec.on_datasets,
+        datasets_mode: spec.datasets_mode,
         tasks: e.tasks,
     })
 }
 
 /// Merge [`TaskDefaults`] into each task. Optional fields fill only when the
-/// task left them unset; `max_attempts`/`retry_delay_secs` fill only when the
-/// task carries the built-in default (1 / 0); default `env` vars are prepended
-/// so a same-named task var shadows them (last write wins at the executor).
+/// task left them unset; `max_attempts`/`retry_delay_secs`/`priority` fill only
+/// when the task carries the built-in default (1 / 0 / 0); default `env` vars are
+/// prepended so a same-named task var shadows them (last write wins at the executor).
 fn apply_task_defaults(tasks: &mut [TaskSpec], d: &crate::dag::TaskDefaults) {
     for t in tasks.iter_mut() {
         if t.max_attempts == 1 {
@@ -114,6 +118,9 @@ fn apply_task_defaults(tasks: &mut [TaskSpec], d: &crate::dag::TaskDefaults) {
         if t.retry_max_delay_secs.is_none() {
             t.retry_max_delay_secs = d.retry_max_delay_secs;
         }
+        if t.retry_on_timeout.is_none() {
+            t.retry_on_timeout = d.retry_on_timeout;
+        }
         if t.timeout_secs.is_none() {
             t.timeout_secs = d.timeout_secs;
         }
@@ -122,6 +129,14 @@ fn apply_task_defaults(tasks: &mut [TaskSpec], d: &crate::dag::TaskDefaults) {
         }
         if t.runner_class.is_none() {
             t.runner_class = d.runner_class.clone();
+        }
+        if t.priority == 0 {
+            if let Some(v) = d.priority {
+                t.priority = v;
+            }
+        }
+        if t.pool.is_none() {
+            t.pool = d.pool.clone();
         }
         if !d.env.is_empty() {
             let mut env = d.env.clone();
@@ -238,6 +253,23 @@ fn expand_one(
         }
         if !task.command.is_empty() {
             bail!("approval task '{}' cannot set a `command` (it waits for a human)", task.name);
+        }
+    } else if task.is_workflow() {
+        // A sub-workflow trigger (#23) is a leaf that carries no command — it runs
+        // a child workflow — so it is likewise exempt from the command/template rule.
+        if is_call {
+            bail!("sub-workflow task '{}' cannot also be a `template` call", task.name);
+        }
+        if !task.command.is_empty() {
+            bail!("sub-workflow task '{}' cannot set a `command` (it triggers a workflow)", task.name);
+        }
+    } else if task.is_wait() {
+        // A wait sensor (#27) is a commandless leaf that defers on a timer.
+        if is_call {
+            bail!("wait task '{}' cannot also be a `template` call", task.name);
+        }
+        if !task.command.is_empty() {
+            bail!("wait task '{}' cannot set a `command` (it defers on a timer)", task.name);
         }
     } else if is_call == !task.command.is_empty() {
         bail!(
@@ -401,11 +433,23 @@ fn build_leaf(
         hook: task.hook.clone(),
         allow_failure: task.allow_failure,
         task_type: task.task_type.clone(),
+        // Sub-workflow trigger target (#23) survives onto the leaf.
+        workflow: task.workflow.clone(),
+        // Wait-sensor config (#27) survives onto the leaf; every field may
+        // template, so a sensor can reference `{{ params.* }}` uniformly —
+        // a `for:` that only resolved on some fields would be a nasty surprise.
+        wait: task.wait.as_ref().map(|w| crate::dag::WaitSpec {
+            wait_for: w.wait_for.as_ref().map(|f| substitute(f, ctx)),
+            until: w.until.as_ref().map(|u| substitute(u, ctx)),
+            url: w.url.as_ref().map(|u| substitute(u, ctx)),
+            dataset: w.dataset.as_ref().map(|d| substitute(d, ctx)),
+        }),
         approval_timeout_secs: task.approval_timeout_secs,
         approval_on_timeout: task.approval_on_timeout.clone(),
         max_attempts: task.max_attempts,
         retry_delay_secs: task.retry_delay_secs,
         retry_max_delay_secs: task.retry_max_delay_secs,
+        retry_on_timeout: task.retry_on_timeout,
         timeout_secs: task.timeout_secs,
         docker_image: task.docker_image.as_ref().map(|s| substitute(s, ctx)),
         env: task
@@ -422,6 +466,16 @@ fn build_leaf(
         // Substituted like docker_image so a template can parameterize its
         // class; validated post-expansion in DagGraph::from_spec.
         runner_class: task.runner_class.as_ref().map(|s| substitute(s, ctx)),
+        // Fan-out instances inherit the parent task's dispatch priority.
+        priority: task.priority,
+        // …and its concurrency pool.
+        pool: task.pool.clone(),
+        // Memoization key is a template resolved now (so `{{ params.* }}` /
+        // `{{ scheduled_time }}` bind per fire, making backfills reproducible).
+        cache: task.cache.as_ref().map(|c| crate::dag::CacheSpec {
+            key: substitute(&c.key, ctx),
+            max_age_secs: c.max_age_secs,
+        }),
         // `until` may reference workflow parameters ({{ threshold }} <= {{ output }});
         // resolve them now — only {{ output }}/{{ attempt }} are runtime keys.
         repeat: task.repeat.as_ref().map(|r| {
@@ -429,6 +483,13 @@ fn build_leaf(
             r.until = substitute(&r.until, ctx);
             r
         }),
+        // Gang membership survives expansion (a template's leaf may gang);
+        // gang_member is engine-stamped at run creation, never authored.
+        gang: task.gang.clone(),
+        gang_member: None,
+        // Produced datasets template per instance (`{{ item }}` / `{{ params.* }}`),
+        // so a fan-out can record per-shard dataset updates.
+        produces: task.produces.iter().map(|u| substitute(u, ctx)).collect(),
         // call-only fields never survive on a leaf; a runtime `when` (task
         // output refs) is the one gate that does — the engine consumes it.
         template: None,
@@ -1009,6 +1070,9 @@ task_defaults:
   retry_delay_secs: 5
   timeout_secs: 120
   docker_image: base:1
+  priority: 8
+  retry_on_timeout: false
+  pool: shared
   env:
     - { name: REGION, value: us-east-1 }
 tasks:
@@ -1017,6 +1081,9 @@ tasks:
     command: [\"true\"]
     max_attempts: 7
     docker_image: special:2
+    priority: 2
+    retry_on_timeout: true
+    pool: special
     env:
       - { name: REGION, value: eu-west-1 }
 ";
@@ -1026,13 +1093,38 @@ tasks:
         assert_eq!(a.retry_delay_secs, 5);
         assert_eq!(a.timeout_secs, Some(120));
         assert_eq!(a.docker_image.as_deref(), Some("base:1"));
+        assert_eq!(a.priority, 8, "task at default 0 inherits the DAG-level priority");
+        assert_eq!(a.retry_on_timeout, Some(false), "unset task inherits the retry_on_timeout default");
+        assert_eq!(a.pool.as_deref(), Some("shared"), "unset task inherits the pool default");
         assert_eq!(a.env.len(), 1);
         let b = dag.spec.tasks.iter().find(|t| t.name == "b").unwrap();
         assert_eq!(b.max_attempts, 7, "explicit task value must win");
         assert_eq!(b.docker_image.as_deref(), Some("special:2"));
+        assert_eq!(b.priority, 2, "explicit task priority must win over the default");
+        assert_eq!(b.retry_on_timeout, Some(true), "explicit retry_on_timeout must win over the default");
+        assert_eq!(b.pool.as_deref(), Some("special"), "explicit task pool must win over the default");
         // Default env prepended, task's shadowing var last (last write wins).
         assert_eq!(b.env.len(), 2);
         assert_eq!(b.env[1].value, "eu-west-1");
+    }
+
+    #[test]
+    fn cache_key_is_substituted_at_expansion() {
+        // The cache key templates against workflow params so repeated/backfilled
+        // runs with the same logical inputs hit the same memo (#22).
+        let yaml = "name: w
+parameters:
+  ds: 2026-07-24
+tasks:
+  - name: extract
+    command: [\"run\"]
+    cache: { key: \"extract-{{ ds }}\", max_age_secs: 3600 }
+";
+        let dag = crate::dag::DagGraph::from_yaml(yaml).unwrap();
+        let t = dag.spec.tasks.iter().find(|t| t.name == "extract").unwrap();
+        let cache = t.cache.as_ref().expect("cache spec present");
+        assert_eq!(cache.key, "extract-2026-07-24", "cache key resolved against params");
+        assert_eq!(cache.max_age_secs, Some(3600));
     }
 
     #[test]

@@ -13,7 +13,7 @@ keywords = ["dagron", "workflow", "dag", "scheduler", "orchestration"]
 dependencies = []
 
 [project.urls]
-Roadmap = "https://github.com/lucheeseng827/nick-rust-project"
+Roadmap = "https://github.com/lucheeseng827/dagron"
 
 [tool.setuptools]
 py-modules = ["dagron"]

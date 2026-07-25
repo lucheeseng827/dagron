@@ -29,7 +29,6 @@ auto-rerun, but without the gateway's workflow/schedule/backfill/`params` HTTP A
 ## One-time setup
 
 ```bash
-cd rust_modules/lab/module_54
 
 # 1) Postgres
 docker run -d --name dagron-pg -e POSTGRES_PASSWORD=dagron -e POSTGRES_DB=dagron \

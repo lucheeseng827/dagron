@@ -1,0 +1,6 @@
+# Cron config for the sensor-window case study (04): fire the windower at the
+# top of every minute. Point the engine at it with CRON_CONFIG=04_cron.yaml.
+schedules:
+  - name: sensor-window-1m
+    cron: "0 * * * * *"
+    dag: 04_sensor_window.yaml

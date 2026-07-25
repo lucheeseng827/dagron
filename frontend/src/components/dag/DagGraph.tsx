@@ -18,7 +18,7 @@ import { buildSentinels, isSentinel } from "./sentinels";
 import { layout } from "./layout";
 import { useDagDirection, type LayoutDirection } from "./direction";
 import DirectionControl from "./DirectionControl";
-import { statusColor } from "@/lib/adapter";
+import { statusColor, waitingOn } from "@/lib/adapter";
 import type { GraphResponse, RunStatus, TaskStatus } from "@/types/dagron";
 
 const nodeTypes = { status: StatusNode, sentinel: SentinelNode };
@@ -60,6 +60,10 @@ export default function DagGraph({ graph, runStatus, onNodeClick, direction, onD
         attempt: n.attempt,
         scheduledAt: n.scheduled_at,
         finishedAt: n.finished_at,
+        // A parked node would otherwise render as "running" with an elapsed
+        // clock that never stops — the node most likely to be misread as stuck.
+        waiting: waitingOn(n),
+        cacheHit: n.cache_hit,
       },
     }));
     const rawEdges: Edge[] = graph.edges.map((e) => ({

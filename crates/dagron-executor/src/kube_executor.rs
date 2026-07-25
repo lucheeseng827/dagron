@@ -108,7 +108,8 @@ impl Executor for KubeExecutor {
             }
             Err(_) => {
                 Self::cleanup(&pods, &name).await;
-                bail!("pod '{name}' timed out after {secs}s");
+                // Typed TimeoutError so the worker can gate retry-on-timeout (#24).
+                return Err(anyhow::Error::new(crate::executor::TimeoutError { secs }));
             }
         };
 
@@ -150,10 +151,12 @@ fn build_pod(name: &str, image: &str, command: &[String], ctx: &ExecContext) -> 
         .map(|e| serde_json::json!({ "name": e.name, "value": e.value }))
         .collect();
 
+    // `effective_limits` folds the `resources.gpu` accelerator sugar into the
+    // limits map (extended resources are limits-only; k8s implies the request).
     let resources = ctx.resources.as_ref().map(|r| {
         serde_json::json!({
             "requests": r.requests,
-            "limits": r.limits,
+            "limits": r.effective_limits(),
         })
     });
 

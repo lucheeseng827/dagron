@@ -95,9 +95,10 @@ impl Executor for DockerExecutor {
                 return Err(e.into());
             }
             Err(_) => {
-                // Timed out — force-remove stops and deletes in one call.
+                // Timed out — force-remove stops and deletes in one call. Return
+                // the typed TimeoutError so the worker can gate retry-on-timeout (#24).
                 self.force_remove(&name).await;
-                anyhow::bail!("container timed out after {secs}s");
+                return Err(anyhow::Error::new(crate::executor::TimeoutError { secs }));
             }
         };
 

@@ -8,6 +8,33 @@ description = "Shared, environment-tunable tracing/observability bootstrap for t
 name = "dagron_logging"
 path = "src/lib.rs"
 
+[features]
+# OTLP span delivery (#28 follow-on). Off by default — a default build has no
+# opentelemetry dependency and unchanged logging behavior. When enabled AND
+# `OTEL_EXPORTER_OTLP_ENDPOINT` is set at runtime, `init` also installs an OTLP
+# (HTTP/protobuf) span exporter + a tracing-opentelemetry bridge layer, so the
+# stack's tracing spans are delivered to a collector.
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
+
 [dependencies]
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry"] }
+
+# OTLP exporter stack (optional, `otel` feature). HTTP/protobuf over a blocking
+# reqwest client with rustls — deliberately avoids the gRPC/tonic transport so no
+# extra async-runtime or C toolchain is pulled in. `default-features = false`
+# drops the default grpc-tonic transport.
+opentelemetry = { version = "0.32", optional = true }
+opentelemetry_sdk = { version = "0.32", optional = true }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "trace",
+    "http-proto",
+    "reqwest-blocking-client",
+    "reqwest-rustls",
+], optional = true }
+tracing-opentelemetry = { version = "0.33", optional = true }

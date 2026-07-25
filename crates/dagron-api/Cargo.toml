@@ -11,13 +11,20 @@ path = "src/main.rs"
 [features]
 # Optional feature: parameterized rerun (`params` deep-merge). No extra
 # crate dependencies — purely a code-gate on the rerun endpoint.
-enterprise = []
+enterprise = [
+    "dagron-core/enterprise",
+    "dagron-artifact/enterprise",
+    "dagron-crypto/enterprise",
+]
 # Fetch archived run documents from cloud object storage (`GC_ARCHIVE_URL`) for
 # the /api/archive endpoints — same env contract and feature names as the
 # engine. One feature per backend; S3-compatible MinIO/Ceph rides `archive-s3`.
-archive-s3 = ["archive-cloud", "object_store/aws"]
-archive-gcs = ["archive-cloud", "object_store/gcp"]
-archive-azure = ["archive-cloud", "object_store/azure"]
+# Each cloud feature turns on that provider across this binary: archived-run
+# fetch AND the artifact-store backend (DAGRON_ARTIFACT_URL) speak to the same
+# cloud with one flag.
+archive-s3 = ["archive-cloud", "object_store/aws", "dagron-artifact/s3"]
+archive-gcs = ["archive-cloud", "object_store/gcp", "dagron-artifact/gcs"]
+archive-azure = ["archive-cloud", "object_store/azure", "dagron-artifact/azure"]
 # Internal: shared object-store dep enabled by the cloud backends above.
 archive-cloud = ["dep:object_store"]
 
@@ -43,6 +50,14 @@ dagron-logging = { path = "../dagron-logging" }
 dagron-identity = { path = "../dagron-identity" }
 # Encrypting environment secrets on write (the engine decrypts at dispatch).
 dagron-crypto = { path = "../dagron-crypto" }
+dagron-artifact = { path = "../dagron-artifact" }
+# The DAG model + the run writer, shared with the engine rather than mirrored.
+# This crate used to re-declare the spec types and re-implement submit, which
+# silently dropped every task field the mirror had not learned about (fan-out,
+# resources, wait, cache, pool, priority, produces, …). `postgres` only — this
+# binary is Postgres-only and the two backends are mutually exclusive.
+dagron-core = { path = "../dagron-core", default-features = false, features = ["postgres", "ops"] }
+tokio-util = { version = "0.7", features = ["io"] }
 async-trait = "0.1"
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }

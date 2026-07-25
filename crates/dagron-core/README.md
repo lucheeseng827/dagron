@@ -27,9 +27,19 @@ and the process metrics registry. It knows nothing about *how* a task runs (see
 | `ops` | Management/UI datastore queries (run listings, dead-letters, DB schedules, status counts) + metrics fields backing the ops HTTP API. |
 | `enterprise` | Auto-backfill sweep, `run_reruns` ledger, parameterized rerun metrics, outbox eventing. Implies `ops`. |
 
-Exactly one datastore backend must be active. `default = ["sqlite"]` so
-`cargo build --workspace` resolves a backend; dependents that pick a different
-backend depend on this crate with `default-features = false` and forward their choice.
+Exactly one datastore backend must be active. `default = ["sqlite"]` so a plain
+build resolves one; dependents that pick a different backend depend on this crate
+with `default-features = false` and forward their choice.
+
+Because of that, the workspace cannot be built as a single unit: the engine
+resolves `sqlite` while `dagron-api`/`dagron-gitops` resolve `postgres`, and
+`--workspace` would unify them into the `compile_error!`. Build the two halves
+separately (this is what the release gate does, and how the images are built):
+
+```console
+cargo build --workspace --exclude dagron-api --exclude dagron-gitops
+cargo build -p dagron-api -p dagron-gitops
+```
 
 ## Quickstart
 

@@ -10,7 +10,7 @@ Python: [`sdks/python/README.md`](../../sdks/python/README.md), TypeScript:
 
 ## 1. Start a dagron to talk to
 
-From the module root (`module_54/`):
+From the repository root:
 
 ```bash
 podman compose up --build      # or: docker compose up --build

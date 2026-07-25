@@ -19,6 +19,18 @@ pub struct GraphNode {
     pub attempt: i64,
     pub scheduled_at: Option<String>,
     pub finished_at: Option<String>,
+    /// Why this node is parked, if it is. A parked task (wait sensor or
+    /// sub-workflow trigger) is `running` with a NULL lease, so on the graph it
+    /// is a node that looks busy forever. At most one of these is set; the graph
+    /// only needs to know *that* it is parked, so the values are carried for the
+    /// tooltip rather than re-fetched per node.
+    pub wake_at: Option<String>,
+    pub wait_url: Option<String>,
+    pub wait_dataset: Option<String>,
+    pub sub_run_id: Option<String>,
+    /// Resolved from the memoization store rather than executed (#22) — the
+    /// reason a node can be green with no runtime.
+    pub cache_hit: bool,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -75,7 +87,8 @@ pub async fn get_graph(
     Path(id): Path<String>,
 ) -> Result<Json<GraphResponse>, StatusCode> {
     let nodes = sqlx::query_as::<_, GraphNode>(
-        "SELECT id, name, status, attempt, scheduled_at, finished_at
+        "SELECT id, name, status, attempt, scheduled_at, finished_at,
+                wake_at, wait_url, wait_dataset, sub_run_id, cache_hit
          FROM task_runs WHERE run_id = $1",
     )
     .bind(&id)

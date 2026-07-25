@@ -1,0 +1,38 @@
+# Pattern 02 — run a script already on the engine host (EXECUTOR=local only)
+#
+# The local executor spawns the command as a subprocess of the engine, so any
+# path it can see works. Two things to know:
+#
+#   * **Use absolute paths.** The executor sets no working directory
+#     (`Command::new(command[0])`, no `current_dir`), so a relative path resolves
+#     against the *engine process's* cwd — which is whatever the engine was
+#     started with, not the workflow's location.
+#   * **Every engine replica needs the file.** Any replica may claim any task, so
+#     a script present on only one box makes the task fail whenever another
+#     replica wins the claim. Ship it with config management, bake it into the
+#     engine image, or mount it into the engine container — and if you're already
+#     building an image for it, pattern 01 is the better answer.
+#
+# This is NOT how a container executor works: neither the Docker nor the
+# Kubernetes backend mounts host paths (no binds, no volumes), so a host path is
+# invisible to a `docker_image:` task.
+name: etl-host-script
+
+tasks:
+  - name: preflight
+    command: ["bash", "/opt/dagron/scripts/preflight.sh"]
+
+  # Arguments are ordinary argv entries — no shell quoting to get wrong.
+  - name: transform
+    command: ["bash", "/opt/dagron/scripts/transform.sh", "--shard", "3", "--strict"]
+    depends_on: [preflight]
+    timeout_secs: 900
+
+  # Workflow parameters template into the command, so one script serves many
+  # runs: submit with `parameters` overridden per run/schedule.
+  - name: load
+    command: ["bash", "/opt/dagron/scripts/load.sh", "--date", "{{ run_date }}"]
+    depends_on: [transform]
+
+parameters:
+  run_date: "2026-07-25"

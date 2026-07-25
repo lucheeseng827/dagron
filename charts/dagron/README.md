@@ -13,13 +13,13 @@ in-cluster Postgres for testing. Runs on kind / k3d / k3s / EKS.
 The chart is published to Docker Hub as an OCI artifact (Helm ≥ 3.8):
 
 ```console
-helm install dagron oci://registry-1.docker.io/mancube/dagron --version 0.4.0
+helm install dagron oci://registry-1.docker.io/mancube/dagron --version 0.5.0
 ```
 
 Inspect values first:
 
 ```console
-helm show values oci://registry-1.docker.io/mancube/dagron --version 0.4.0
+helm show values oci://registry-1.docker.io/mancube/dagron --version 0.5.0
 ```
 
 ## Values
