@@ -3,7 +3,7 @@
 # (lucheeseng827/dagron); inert in the monorepo, which never carries the stamped
 # `v*.*.*` tag this fires on.
 #
-# Why this exists: before it, a release shipped five container images and an OCI
+# Why this exists: before it, a release shipped six container images and an OCI
 # chart and nothing you could run directly. "Install dagron" meant "install
 # Docker", or "install a Rust toolchain and wait for a compile" — which is a
 # poor first impression and, for the single-binary/edge story the project makes,
@@ -49,9 +49,16 @@ jobs:
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm # native arm64; cross-linking musl is avoidable pain
             archive: tar.gz
-          - target: x86_64-apple-darwin
-            runner: macos-13 # last Intel image; macos-latest is arm64
-            archive: tar.gz
+          # No x86_64-apple-darwin. It was built on `macos-13`, which GitHub has
+          # retired — and a `runs-on` label matching no runner does not fail, it
+          # sits in `queued` until the 24h ceiling. On v0.5.1 that stranded the
+          # four builds below, because `publish` needs the whole matrix, so the
+          # release got zero assets instead of four.
+          #
+          # Dropped rather than repointed at an Intel image: Apple stopped
+          # selling Intel Macs in 2023 and the runners are on their way out, so
+          # repointing buys a target that breaks again on someone else's
+          # schedule. Intel Mac users can `cargo install dagron`.
           - target: aarch64-apple-darwin
             runner: macos-latest
             archive: tar.gz

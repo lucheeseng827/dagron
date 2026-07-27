@@ -6,6 +6,48 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-07-28
+
+### Fixed
+- **`dagron-gitops` no longer carries perl, and with it 17 CRITICAL CVEs.** The
+  image scanned with CVE-2026-57433, CVE-2026-8376, CVE-2026-13221 and
+  CVE-2026-42496 across `perl`, `perl-base`, `libperl5.36` and
+  `perl-modules-5.36`, plus CVE-2023-45853 in `zlib1g` 1.2.13.
+
+  None of them had a fix. Every one reported an empty "fixed in" column, so no
+  base-image bump and no `apt-get upgrade` would have cleared a single one —
+  there was no patched Debian package to move to.
+
+  perl was never installed deliberately. Debian's `git` hard-`Depends` on `perl`
+  and `liberror-perl`, so `--no-install-recommends` could not exclude it, and
+  `debian:bookworm-slim` ships `perl-base` before anything is installed at all.
+  When a package you do not need has an unpatched critical, the fix is to not
+  have the package: the runtime moves to Alpine, whose `git` depends only on
+  musl, libcurl, libexpat, libpcre2 and libz. Verified in the built image —
+  zero perl packages, no perl binary, zlib 1.3.2, and git 2.47.3 still cloning
+  and committing as the non-root user. The image is 26.7 MB.
+
+  Cheap to do here only because this crate pulls no OpenSSL: sqlx is
+  `default-features = false` with no TLS feature. **`dagron-engine-localdev` is
+  still `debian:bookworm-slim` and still carries the `perl-base` and `zlib1g`
+  CVEs** — left alone because Alpine would swap its GNU userland for busybox,
+  and that image exists so user-authored task commands resolve.
+
+- **Release binaries actually publish.** 0.5.1 announced them and shipped none.
+  The `x86_64-apple-darwin` leg targeted `macos-13`, which GitHub has retired,
+  and a `runs-on` label matching no runner does not fail — it sits in `queued`
+  until the 24-hour ceiling. Because `publish` waits on the whole matrix, four
+  successful builds were stranded behind it and the release got zero assets
+  rather than four.
+
+### Removed
+- **The `x86_64-apple-darwin` binary.** Dropped rather than repointed at another
+  Intel image: Apple stopped selling Intel Macs in 2023 and those runners are
+  being retired, so repointing buys a target that breaks again on someone
+  else's schedule. Remaining: `x86_64`/`aarch64-unknown-linux-musl`,
+  `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`. Intel Mac users can build
+  from source.
+
 ## [0.5.1] - 2026-07-28
 
 ### Added
