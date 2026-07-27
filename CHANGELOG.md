@@ -6,7 +6,201 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-28
+
+### Added
+
+- **Personal access tokens.** Automation had no credential of its own:
+  `/api/login` mints a short-lived session token meant for a browser, so a CI
+  job had to store a *password* and log in to get one — a secret that cannot be
+  revoked without locking the human out and cannot be told apart from that
+  human's own traffic.
+
+  `POST /api/tokens` mints a named, optionally-expiring token, `GET` lists them,
+  `DELETE` revokes. It goes anywhere the session bearer goes, recognised by its
+  `dgp_` prefix, and the console grows an **API tokens** screen. Only
+  `sha256(token)` is stored — the plaintext exists once, in the creation
+  response, and no endpoint can show it again because nothing is kept that
+  could. Two rules worth knowing: a token **cannot manage tokens** (that needs a
+  password session, so one leaked credential cannot mint replacements faster
+  than you revoke them), and a token carries its owner's permissions read
+  *live*, so demoting a user takes effect on their existing tokens at once.
+  There is no per-token scoping yet — give automation its own user.
+  See [`docs/HOWTO.md`](docs/HOWTO.md).
+
+- **Per-line log timestamps.** Every log line now carries a time. Where a line
+  printed its own RFC3339 stamp — a task that logs structured output, or
+  Docker/Kubernetes with their `timestamps` option — it is parsed into `ts` and
+  removed from the text. Where it did not, which is most output, the console
+  falls back to the owning task's start and shows the task's duration alongside,
+  so the estimate is judged rather than trusted: a 200 ms task makes it
+  millisecond-accurate, a four-hour task makes it nearly useless, and you can
+  see which you are looking at.
+
+  Deliberately *not* interpolated across the task's window by line position —
+  that would spread lines evenly over a duration they were never evenly spread
+  across, inventing precision that reads as recorded fact.
+
+  Splitting the stamp off is also what keeps the filters honest: every predicate
+  now runs on the message, so an anchored `regex=^ERROR` still matches once a
+  runtime starts prefixing times. The trade is that a term appearing only in the
+  timestamp no longer matches, so `exclude=2026-07-26` no longer removes stamped
+  lines; time-range filtering belongs on the parsed `ts` and is not built yet.
+
+- **Failure triage.** `status` says what the engine did; nothing said what a
+  person then decided, so a failed run stayed failed forever and the overview's
+  "needs attention" list could only drain by the failure ageing out — which is
+  not triage, it is forgetting.
+
+  `POST /api/runs/{id}/triage` records `acknowledged` (someone is on it),
+  `resolved` (dealt with) or `ignored` (a real failure we accept, with a note
+  explaining why); `DELETE` puts it back in the queue. Three states rather than
+  one flag because they are different answers, and the run page grows a control
+  shown only on a failed run. The overview now counts *untriaged* failures, so
+  the queue drains because someone acted.
+
+- **Workflow versioning and lifecycle.** Editing a workflow overwrote its spec
+  in place — there was no version column and no history, so the previous
+  definition was simply gone. `workflow_versions` is now append-only, written on
+  create *and* every update, and the console shows the history with a read-only
+  view of any stored spec. (Past *runs* were never at risk; `task_runs`
+  snapshots its TaskSpec at dispatch.)
+
+  Workflows also gain a state: `active` / `paused` / `retired`. Both non-active
+  states refuse to run — enforced in the scheduler *and* on the run endpoint, so
+  "paused" stops cron and the button alike — and **neither touches the
+  workflow's schedules**. That is the whole point: the only stop button used to
+  be `DELETE`, and `schedules.workflow_id` is `ON DELETE CASCADE`, so deleting a
+  workflow silently took its cron schedules with it.
+
+- **Dead-letter retry policy from the console.** `DEAD_LETTER_MAX_ATTEMPTS` was
+  environment-only and read once at engine start, so changing it meant a
+  restart. It is now a stored setting the engine reads on the failure path —
+  no restart, and no window where the console shows a number the running
+  process is not using. Unset keeps the environment value, so existing
+  deployments are unchanged. `STREAM_DLQ_PATH` stays deployment config on
+  purpose: it is a filesystem path on the engine's host.
+  New guide: [`docs/DEAD_LETTERS.md`](docs/DEAD_LETTERS.md).
+
+- **Release binaries.** A release shipped container images and an OCI chart and
+  nothing you could run. `dagron` is now published for
+  `x86_64`/`aarch64-unknown-linux-musl`, `x86_64`/`aarch64-apple-darwin` and
+  `x86_64-pc-windows-msvc`, with `SHA256SUMS`. musl rather than glibc so a
+  static binary runs on any distro rather than inheriting the builder's glibc
+  floor. Each is smoke-tested on the runner that built it.
+
+- **`compose.quickstart.yaml`** — pulls published images instead of compiling
+  four Rust crates before you have seen anything. Paired with a new
+  **`dagron-engine-localdev`** image: the production engine is distroless, and
+  with `EXECUTOR=local` a task's command runs *inside* that container, so
+  `command: ["echo", "hello"]` cannot resolve there. The localdev image is the
+  same binary on debian-slim.
+
+- **`scripts/examples_check.py`** — validates every example spec and runs the
+  ones a laptop can run, classifying the rest with a reason so "skipped" never
+  quietly means "broken". Currently 35 specs valid, 27 running.
+
+- **`scripts/logfilter_e2e.py`** — end-to-end check of the log filter grammar,
+  including parity between the engine's ops API and `dagron-api`. The two
+  handlers implement one grammar and nothing compared them to each other.
+
+- **Workflow log views with an explicit, adjustable filter.** Logs were readable
+  one task at a time, unfiltered: to find out why a run failed you clicked
+  through every task panel looking for the one that printed the stack trace, and
+  a task that logged 200k lines gave you all 200k. Both halves are now fixed.
+
+  A new **`GET /api/runs/{id}/logs`** (and `GET /runs/{id}/logs` on the engine
+  ops API) returns *every* task's output in a run as one attributed stream —
+  which task, which attempt, which line number — so a failure is one call away
+  instead of N guesses. Both log endpoints, old and new, accept the same
+  server-side filter: `q` / `exclude` / `regex` / `level` / `case` / `context` /
+  `limit` / `tail`. Filtering happens on the server because a run's output can
+  be hundreds of megabytes, and "download it all, then grep in the browser" is
+  not a filter.
+
+  The console gains a **Logs** view on the run page (next to Graph and Timeline)
+  with the filter controls, level toggles, and a per-task scope picker; the task
+  drawer gets the same controls, and a filter survives navigation and is carried
+  in the URL, so "here's the link with the error filter" works. The filter also
+  composes with live tailing: it applies *within* each `?offset=` slice while
+  `next_offset` keeps counting the raw text, so a filtered tail neither loses nor
+  repeats output.
+
+  Three properties the implementation is deliberate about, because a log view
+  that quietly hides things is worse than none: `total`/`matched` are counted
+  **before** the line cap, so a truncated view always says how much it hid; line
+  numbers are positions in the *unfiltered* output, so a filtered line can still
+  be found in the raw log; and an invalid filter (uncompilable regex, unknown
+  level) is a `400` naming the reason rather than a silently unfiltered response
+  the caller would read as "nothing matched was hidden".
+
+  Levels are **inferred** from the head of each line — task output carries no
+  structured level — and only the head, so `echo "no errors found"` isn't an
+  error line. The grammar lives in one place
+  (`crates/dagron-logging/src/logfilter.rs`, feature `logfilter`) so a filter
+  typed in the console, sent by an SDK, or written into a runbook all mean the
+  same thing. It's off by default: the engine binary only writes logs and
+  shouldn't link a regex engine.
+
+  Also reachable from the MCP server (`dagron_get_run_logs`, plus filter
+  arguments on `dagron_get_task_logs` — an agent triaging a failure now makes one
+  call, not one per task) and both SDKs (`get_run_logs`/`getRunLogs`, filter
+  kwargs on the task-log calls). Reference:
+  [docs/API.md §Log filter](docs/API.md#log-filter).
+- **`scripts/ossync-dryrun.py`** — run the OSS mirror sync locally before tagging.
+  Stages exactly what would publish and runs four checks: the two fail-closed
+  scans CI already enforces, plus **provenance** (private repo URL, monorepo
+  paths, internal doc names) and **link closure**, which the CI scan cannot see
+  because it matches tokens rather than meaning. All three of the problems it
+  now catches were found by hand during 0.5.0: Argo CD examples pointing at the
+  private monorepo, READMEs telling readers to `cd` into a directory the mirror
+  does not have, and mirrored docs linking docs that were never included.
+
+  It stages from `git ls-files`, not the working tree, because the real sync
+  rsyncs from a CI checkout with no untracked or gitignored files — staging
+  differently invents leaks that could never ship. Wired into
+  [docs/OSS_AUDIT.md](docs/OSS_AUDIT.md) §5's pre-publish checklist and §6.
+
+### Changed
+
+- **The console shell.** One accent instead of two competing ones (primary
+  actions were blue while the brand and navigation were orange), a steel chrome
+  layer around a dark content ground, and a density pass: page width 1180 →
+  1560 so run and task tables stop being squeezed, sticky table headers, and a
+  sticky sidebar. The overview now leads with **what needs attention** — failed
+  runs, approvals waiting, dead letters, repos out of sync — and when that list
+  is empty it names what it checked, so a quiet panel reads as verified rather
+  than broken.
+
+- **The dev `compose.yaml` configures the artifact store** (`DAGRON_ARTIFACT_DIR`)
+  with a volume shared between the engine and `dagron-api`. Without it the
+  checkpoint/resume and batch-inference examples failed immediately — correct
+  behaviour, and a poor first meeting with the feature those examples exist to
+  demonstrate.
+
 ### Fixed
+
+- **Fonts are self-hosted.** The console `@import`ed a font family from
+  `fonts.googleapis.com` at runtime — a render-blocking request it cannot make
+  at all in an air-gapped install.
+- **Keyboard focus is visible.** The console had no `:focus-visible` style
+  anywhere, so every button, link and form control across all 21 routes was
+  invisible to a keyboard user.
+- **`--dim` failed AA.** The secondary text colour measured 4.0:1 on the page
+  ground; it is now 5.1:1.
+- **The sidebar version is the real one.** It read `v0.1.0` on every build,
+  including released images: the version fell back to `frontend/package.json`,
+  which nobody bumps, and the release workflow never passed `APP_VERSION`.
+  Unstamped builds now say `dev` rather than inventing a number.
+- **Sub-DAG nodes no longer overflow their box.** Graph nodes declared a fixed
+  height that was right for a plain task and wrong for one carrying a middle
+  row, so the bottom handle sat partway up the node. Layout also now reads
+  React Flow's measured sizes rather than the pre-measurement declaration.
+- **The log filter no longer queries mid-word.** Text filters commit on Enter or
+  on leaving the box, with the edited field outlined until applied; a regex that
+  does not parse yet is held back instead of spending a round trip that can only
+  return 400.
+
 - **The OSS release gate can build the mirror cut again.** It ran
   `cargo build --workspace`, which this workspace cannot satisfy *by design*:
   `dagron-core` compiles exactly one sqlx backend, the engine resolves `sqlite`,

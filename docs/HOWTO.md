@@ -170,6 +170,11 @@ curl -sS -b cookies.txt http://localhost:8080/api/runs/$RUN_ID/graph
 # one task's logs (poll ?offset=next_offset until "eof": true)
 curl -sS -b cookies.txt "http://localhost:8080/api/runs/$RUN_ID/tasks/$TASK_ID/logs?offset=0"
 
+# the WHOLE run's logs, merged and attributed — the call for "it failed and I
+# don't know which task did it". Add a filter to narrow it (docs/API.md#log-filter):
+curl -sS -b cookies.txt "http://localhost:8080/api/runs/$RUN_ID/logs?level=error&context=1" \
+  | jq -r '.lines[] | "\(.task)  \(.text)"'
+
 # block until the run finishes (?timeout_secs=, default 30, max 600)
 curl -sS -b cookies.txt "http://localhost:8080/api/runs/$RUN_ID/wait?timeout_secs=120"
 ```
@@ -201,7 +206,59 @@ dagron-api. The engine API also serves Swagger UI at `/docs`.
 
 ---
 
-## 5. Secrets & environment variables
+## 5. API tokens for CI and scripts
+
+`/api/login` mints a **session** token: short-lived, and meant for a browser.
+Anything automated that used it had to keep a user's password around to get a
+fresh one — a secret that cannot be revoked without locking the human out, and
+that looks exactly like the human in the logs.
+
+A personal access token is the credential for that job. It is named, revocable
+on its own, and optionally expiring.
+
+```bash
+# Create one (needs a password login — see below for why).
+curl -s -X POST localhost:8080/api/tokens -b cookies.txt \
+  -H 'content-type: application/json' \
+  -d '{"name":"nightly-ci","expires_in_days":90}'
+# -> 201 {"id":"…","name":"nightly-ci","prefix":"dgp_D-5E8bxXpY",
+#         "token":"dgp_D-5E8bxXpY…","expires_at":"2026-10-24T…"}
+```
+
+**Copy the `token` now.** Only its SHA-256 is stored, so there is no endpoint
+that can show it again — a database dump yields no working credential, and
+neither does a support request.
+
+Use it anywhere the session bearer would go, with no cookie jar and no password:
+
+```bash
+curl -s localhost:8080/api/runs \
+  -H "Authorization: Bearer $DAGRON_TOKEN"
+```
+
+```bash
+# List your tokens — prefix, last use, expiry. Never the secret.
+curl -s localhost:8080/api/tokens -b cookies.txt
+
+# Revoke one. Effective immediately; the row is kept so an audit can still see
+# that the token existed and when it was stopped.
+curl -s -X DELETE localhost:8080/api/tokens/<id> -b cookies.txt
+```
+
+`last_used_at` (to the minute) is how you tell whether a token is still wired
+into something before revoking it.
+
+**Creating and revoking tokens requires a password session, not a token.** A
+token that could mint tokens would replace itself faster than you could revoke
+it, and revocation would stop being a control. Requests to `/api/tokens`
+carrying a `dgp_` bearer get `403` saying so.
+
+**A token carries its owner's permissions**, read live — there is no per-token
+scoping yet. Demoting a user to `viewer` takes effect on their existing tokens
+at once rather than whenever the token is next replaced, but a token belonging
+to an admin *is* an admin. Give automation its own user.
+
+## 6. Secrets & environment variables
 
 Two layers: plain **variables** (substituted into the spec) and encrypted
 **secrets** (decrypted only at task dispatch). Both live in a named
@@ -265,7 +322,7 @@ on the engine host. For knobs the chart doesn't model, `engine.extraEnv` /
 
 ---
 
-## 6. Long scripts: where the code lives
+## 7. Long scripts: where the code lives
 
 A task's `command:` is argv. There is **no `script:` field and no file-include
 directive** — a spec never pulls in another file. So "my script is 400 lines"

@@ -26,11 +26,20 @@ pub struct RunSummary {
     /// `schedule_backfills` row claims it as a backfill, a stamped
     /// `schedule_id` marks a cron fire, anything else was human-initiated.
     pub trigger_kind: String,
+    /// What a human decided about this run: acknowledged / resolved / ignored,
+    /// or absent for one nobody has looked at. `status` is what the engine did;
+    /// this is what was done about it, and it is the difference between an
+    /// attention queue that drains and one that only ages out.
+    pub triage_state: Option<String>,
+    pub triage_note: Option<String>,
+    pub triaged_at: Option<String>,
+    pub triaged_by: Option<String>,
 }
 
 /// SELECT list + joins shared by the run list and per-workflow runs: summary
 /// columns, the definition name, and the derived trigger kind.
 pub(crate) const SUMMARY_SELECT: &str = "SELECT wr.id, wr.definition_id, wr.status, wr.created_at, wr.finished_at, d.name,
+        wr.triage_state, wr.triage_note, wr.triaged_at, wr.triaged_by,
         CASE WHEN sb.run_id IS NOT NULL THEN 'backfill'
              WHEN wr.schedule_id IS NOT NULL THEN 'schedule'
              ELSE 'manual' END AS trigger_kind
@@ -78,6 +87,12 @@ pub struct RunDetail {
     pub name: Option<String>,
     /// Derived trigger kind: manual | schedule | backfill.
     pub trigger_kind: String,
+    /// What a human decided about this run. `status` is what the engine did;
+    /// this is what was done about it.
+    pub triage_state: Option<String>,
+    pub triage_note: Option<String>,
+    pub triaged_at: Option<String>,
+    pub triaged_by: Option<String>,
     pub tasks: Vec<TaskRow>,
 }
 
@@ -136,6 +151,7 @@ pub async fn get_run(
     let run = sqlx::query_as::<_, RunSummaryFull>(
         "SELECT wr.id, wr.definition_id, wr.status, wr.input, wr.output,
                 wr.created_at, wr.finished_at, d.name,
+                wr.triage_state, wr.triage_note, wr.triaged_at, wr.triaged_by,
                 CASE WHEN sb.run_id IS NOT NULL THEN 'backfill'
                      WHEN wr.schedule_id IS NOT NULL THEN 'schedule'
                      ELSE 'manual' END AS trigger_kind
@@ -171,6 +187,10 @@ pub async fn get_run(
         finished_at: run.finished_at,
         name: run.name,
         trigger_kind: run.trigger_kind,
+        triage_state: run.triage_state,
+        triage_note: run.triage_note,
+        triaged_at: run.triaged_at,
+        triaged_by: run.triaged_by,
         tasks,
     }))
 }
@@ -215,6 +235,10 @@ struct RunSummaryFull {
     finished_at: Option<String>,
     name: Option<String>,
     trigger_kind: String,
+    triage_state: Option<String>,
+    triage_note: Option<String>,
+    triaged_at: Option<String>,
+    triaged_by: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -2386,7 +2386,12 @@ pub async fn claim_due_schedules(pool: &Pool, now: &str) -> Result<Vec<crate::mo
                 s.when_expr AS when_expr, s.stop_expr AS stop_expr
          FROM schedules s
          JOIN workflows w ON w.id = s.workflow_id
-         WHERE s.enabled = 1
+         -- A paused or retired workflow does not fire, and this is the only
+         -- place that can enforce it: a state the scheduler ignores is a label,
+         -- not a control. Deliberately separate from s.enabled, which disables
+         -- one schedule; this stops the workflow however many schedules it has.
+         WHERE w.state = 'active'
+           AND s.enabled = 1
            AND s.next_fire_at IS NOT NULL
            AND s.next_fire_at <= $1",
     )
@@ -2489,7 +2494,10 @@ pub async fn list_catchup_schedules(pool: &Pool) -> Result<Vec<crate::models::Ca
                 s.catchup_window_secs AS catchup_window_secs,
                 s.catchup_max_runs AS catchup_max_runs
          FROM schedules s JOIN workflows w ON w.id = s.workflow_id
-         WHERE s.enabled = 1 AND s.catchup = 1",
+         -- Same gate as claim_due_schedules: a paused workflow must not catch
+         -- up either, or pausing would merely defer the backlog rather than
+         -- stop it.
+         WHERE w.state = 'active' AND s.enabled = 1 AND s.catchup = 1",
     )
     .fetch_all(pool)
     .await?;

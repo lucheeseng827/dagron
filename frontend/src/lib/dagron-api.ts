@@ -2,12 +2,14 @@
 // base "/api" (Next rewrite → dagron-api), bearer from localStorage, generic fetch.
 
 import type {
+  ApiToken,
   ArchivedRunDoc,
   ArchivedRunSummary,
   AuditEntry,
   BackfillView,
   Dataset,
   DatasetEvent,
+  CreatedToken,
   DayBucket,
   DeadLetter,
   EnvironmentView,
@@ -20,6 +22,7 @@ import type {
   NotifyTestResult,
   PendingApproval,
   RunDetail,
+  RunLogs,
   SearchResponse,
   RunSummary,
   Schedule,
@@ -27,9 +30,12 @@ import type {
   TaskLogs,
   TaskResolution,
   UserView,
+  WorkflowState,
+  WorkflowVersion,
   Workflow,
   WorkflowRow,
 } from "@/types/dagron";
+import { toParams, type LogFilterState } from "@/lib/log-filter";
 
 const BASE = "/api";
 
@@ -139,12 +145,39 @@ export const getRunSpec = (id: string): Promise<{ yaml: string; name: string | n
 
 /// Task logs. Pass `offset` (a prior response's `next_offset`) to tail: only
 /// output past that char offset comes back, until `eof`.
-export const getTaskLogs = (id: string, tid: string, offset?: number): Promise<TaskLogs> =>
-  apiFetch(
-    `/runs/${encodeURIComponent(id)}/tasks/${encodeURIComponent(tid)}/logs${
-      offset != null ? `?offset=${offset}` : ""
-    }`,
+///
+/// `filter` is the shared log filter grammar (see `@/lib/log-filter`), applied
+/// *within* the tailed slice — so a tailing client with a filter set appends
+/// only the new matching lines, while `next_offset` keeps advancing over the raw
+/// text and toggling the filter mid-tail never loses or repeats output.
+export const getTaskLogs = (
+  id: string,
+  tid: string,
+  offset?: number,
+  filter?: LogFilterState,
+): Promise<TaskLogs> => {
+  const p = filter ? toParams(filter) : new URLSearchParams();
+  if (offset != null) p.set("offset", String(offset));
+  const q = p.toString();
+  return apiFetch(
+    `/runs/${encodeURIComponent(id)}/tasks/${encodeURIComponent(tid)}/logs${q ? `?${q}` : ""}`,
   );
+};
+
+/// Workflow logs: every task's output in one run, merged and attributed, with
+/// the same filter grammar applied server-side. `tasks`/`statuses` narrow which
+/// tasks are read at all (the filter then narrows which of their lines survive).
+export const getRunLogs = (
+  id: string,
+  filter?: LogFilterState,
+  scope?: { tasks?: string[]; statuses?: string[] },
+): Promise<RunLogs> => {
+  const p = filter ? toParams(filter) : new URLSearchParams();
+  if (scope?.tasks?.length) p.set("task", scope.tasks.join(","));
+  if (scope?.statuses?.length) p.set("status", scope.statuses.join(","));
+  const q = p.toString();
+  return apiFetch(`/runs/${encodeURIComponent(id)}/logs${q ? `?${q}` : ""}`);
+};
 
 // ── control ──────────────────────────────────────────────────────────────────
 export const submitRun = (yaml: string): Promise<{ run_id: string }> =>
@@ -350,6 +383,70 @@ export const cancelBackfill = (id: string): Promise<{ id: string; cancelled: boo
   apiFetch(`/backfills/${encodeURIComponent(id)}/cancel`, { method: "POST" });
 
 // ── admin: users + audit trail ───────────────────────────────────────────────
+/// Dead-letter policy. Only the retry count is settable: STREAM_DLQ_PATH is a
+/// path on the engine own host and stays deployment configuration, because a
+/// form that picks where a server process writes files is a footgun.
+/// `null` means unset — the engine keeps using DEAD_LETTER_MAX_ATTEMPTS.
+export const getDeadLetterSettings = (): Promise<{ max_attempts: number } | null> =>
+  apiFetch(`/settings/dead-letters`);
+
+export const putDeadLetterSettings = (
+  maxAttempts: number,
+): Promise<{ max_attempts: number }> =>
+  apiFetch(`/settings/dead-letters`, {
+    method: "PUT",
+    body: JSON.stringify({ max_attempts: maxAttempts }),
+  });
+
+export const listTokens = (): Promise<ApiToken[]> => apiFetch(`/tokens`);
+
+/// Mint a token. The response is the only time the plaintext exists — the
+/// caller must show it immediately, because nothing can retrieve it later.
+export const createToken = (
+  name: string,
+  expiresInDays: number | null,
+): Promise<CreatedToken> =>
+  apiFetch(`/tokens`, {
+    method: "POST",
+    body: JSON.stringify({ name, expires_in_days: expiresInDays }),
+  });
+
+export const revokeToken = (id: string): Promise<void> =>
+  apiFetch(`/tokens/${id}`, { method: "DELETE" });
+
+/// Record what a human decided about a run. `status` is what the engine did;
+/// this is what was done about it, and it is what lets the attention queue
+/// drain instead of merely ageing out.
+export const setTriage = (
+  runId: string,
+  state: "acknowledged" | "resolved" | "ignored",
+  note?: string,
+): Promise<unknown> =>
+  apiFetch(`/runs/${runId}/triage`, {
+    method: "POST",
+    body: JSON.stringify({ state, note: note || null }),
+  });
+
+/// Undo a triage decision, putting the run back in the queue. Humans mis-click,
+/// and without this the only way back would be to fail the run again.
+export const clearTriage = (runId: string): Promise<unknown> =>
+  apiFetch(`/runs/${runId}/triage`, { method: "DELETE" });
+
+/// A workflow's definition history, newest first.
+export const listWorkflowVersions = (id: string): Promise<WorkflowVersion[]> =>
+  apiFetch(`/workflows/${id}/versions`);
+
+/// Pause, retire or reactivate. Leaves the workflow's schedules alone — a
+/// paused workflow resumes on exactly the schedule it had.
+export const setWorkflowState = (
+  id: string,
+  state: WorkflowState,
+): Promise<{ id: string; state: WorkflowState }> =>
+  apiFetch(`/workflows/${id}/state`, {
+    method: "POST",
+    body: JSON.stringify({ state }),
+  });
+
 export const listUsers = (): Promise<UserView[]> => apiFetch(`/users`);
 
 export const createUser = (

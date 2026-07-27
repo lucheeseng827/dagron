@@ -41,8 +41,16 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Union
 
-__all__ = ["Dag", "Client", "DagronError", "SpecLike", "__version__"]
-__version__ = "0.3.0"
+__all__ = [
+    "Dag",
+    "Client",
+    "DagronError",
+    "SpecLike",
+    "LOG_FILTER_PARAMS",
+    "log_filter_params",
+    "__version__",
+]
+__version__ = "0.4.0"
 
 #: Run statuses the engine treats as terminal (no further transitions).
 TERMINAL_RUN_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
@@ -327,9 +335,59 @@ class Client:
         """Fetch the run's task nodes + dependency edges (for graph rendering)."""
         return self._request("GET", f"/api/runs/{_seg(run_id)}/graph")
 
-    def get_task_logs(self, run_id: str, task_id: str) -> Dict[str, Any]:
-        """Fetch one task's captured output, scoped to its run."""
-        return self._request("GET", f"/api/runs/{_seg(run_id)}/tasks/{_seg(task_id)}/logs")
+    def get_task_logs(
+        self,
+        run_id: str,
+        task_id: str,
+        *,
+        offset: Optional[int] = None,
+        **log_filter: Any,
+    ) -> Dict[str, Any]:
+        """Fetch one task's captured output, scoped to its run.
+
+        ``offset`` (a prior response's ``next_offset``) tails: only output past
+        that character offset comes back, until ``eof``.
+
+        ``log_filter`` accepts the log filter grammar — see :func:`log_filter`
+        — and is applied server-side *within* the tailed slice, so a filtered
+        tail appends only matching new lines while ``next_offset`` keeps
+        advancing over the raw text.
+        """
+        params = log_filter_params(**log_filter)
+        if offset is not None:
+            params["offset"] = offset
+        return self._request(
+            "GET", f"/api/runs/{_seg(run_id)}/tasks/{_seg(task_id)}/logs", params=params
+        )
+
+    def get_run_logs(
+        self,
+        run_id: str,
+        *,
+        tasks: Optional[Sequence[str]] = None,
+        statuses: Optional[Sequence[str]] = None,
+        **log_filter: Any,
+    ) -> Dict[str, Any]:
+        """Fetch the whole run's output as one attributed, filtered stream.
+
+        This is the call for "something in this run failed and I don't know
+        which task" — one request instead of one per task. ``tasks``/``statuses``
+        choose which task output is read at all; the filter then chooses which of
+        their lines survive.
+
+        Returns ``{"tasks": [...], "lines": [...], "total", "matched",
+        "truncated", "eof", "filtered", "limit"}`` — ``total`` and ``matched``
+        are counted before the line cap, so a truncated view always says so.
+
+            api.get_run_logs(run_id, level="error", context=2)
+            api.get_run_logs(run_id, tasks=["extract"], regex=r"rows=\\d+")
+        """
+        params = log_filter_params(**log_filter)
+        if tasks:
+            params["task"] = ",".join(tasks)
+        if statuses:
+            params["status"] = ",".join(statuses)
+        return self._request("GET", f"/api/runs/{_seg(run_id)}/logs", params=params)
 
     def cancel_run(self, run_id: str) -> int:
         """Cancel a run; returns the number of tasks flipped to ``cancelled``."""
@@ -664,6 +722,65 @@ def _normalize_env(
 def _seg(value: str) -> str:
     """Percent-encode a single path segment (ids are UUIDs, but never trust input)."""
     return urllib.parse.quote(str(value), safe="")
+
+
+#: The log filter grammar, as accepted by both log endpoints. Mirrors
+#: ``dagron_logging::logfilter`` — the server owns the semantics; this is only
+#: the list of names, so a typo becomes a ``TypeError`` here instead of a
+#: silently-ignored parameter that makes an unfiltered response look filtered.
+LOG_FILTER_PARAMS = frozenset(
+    {"q", "exclude", "regex", "level", "case", "context", "limit", "tail"}
+)
+
+
+def log_filter_params(**kwargs: Any) -> Dict[str, Any]:
+    """Normalise log filter keyword arguments into query parameters.
+
+    Recognised keys (all optional):
+
+    ``q``
+        keep only lines containing this text
+    ``exclude``
+        drop lines containing this text
+    ``regex``
+        keep only lines matching this regular expression
+    ``level``
+        keep only these inferred levels — a string or a sequence of
+        ``error``/``warn``/``info``/``debug``/``trace``/``plain``
+    ``case``
+        match case-sensitively (default: insensitive)
+    ``context``
+        also keep this many lines either side of each match
+    ``limit``
+        maximum lines to return
+    ``tail``
+        when capped, keep the last lines instead of the first
+
+    Levels may be passed as a list; booleans become ``1``/``0``. An unknown key
+    raises :class:`TypeError`.
+    """
+    unknown = set(kwargs) - LOG_FILTER_PARAMS
+    if unknown:
+        raise TypeError(
+            f"unknown log filter parameter(s): {', '.join(sorted(unknown))}; "
+            f"expected any of {', '.join(sorted(LOG_FILTER_PARAMS))}"
+        )
+    out: Dict[str, Any] = {}
+    for key, value in kwargs.items():
+        if value is None or value == "":
+            continue
+        if isinstance(value, bool):
+            # Only emit the flag when it's on: an explicit `case=0` would still
+            # count as "the caller filtered", which changes server behaviour.
+            if value:
+                out[key] = "1"
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            joined = ",".join(str(v) for v in value)
+            if joined:
+                out[key] = joined
+        else:
+            out[key] = value
+    return out
 
 
 def _parse_sse(lines: Iterable[bytes]) -> Iterator[Dict[str, Any]]:

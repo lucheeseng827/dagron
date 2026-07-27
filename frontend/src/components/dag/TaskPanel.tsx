@@ -1,11 +1,20 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
+import LogFilterBar from "@/components/logview/LogFilterBar";
+import LogLines, { type RenderedLine } from "@/components/logview/LogLines";
 import { getTaskLogs } from "@/lib/dagron-api";
 import { statusColor, statusLabel, type WaitingOn } from "@/lib/adapter";
+import {
+  DEFAULT_LOG_LIMIT,
+  isEmptyFilter,
+  lineTime,
+  taskDuration,
+  type LogFilterState,
+} from "@/lib/log-filter";
 import { absTime, fromNow } from "@/lib/time";
-import type { TaskLogs } from "@/types/dagron";
+import type { LogLine, TaskLogs } from "@/types/dagron";
 
 export interface TaskPanelProps {
   runId: string;
@@ -23,6 +32,10 @@ export interface TaskPanelProps {
   pool?: string | null;
   priority?: number;
   cacheHit?: boolean;
+  /// The log filter, shared with the run's workflow log view so switching
+  /// between them doesn't silently change what you're looking at.
+  filter: LogFilterState;
+  onFilterChange: (next: LogFilterState) => void;
 }
 
 const TAIL_INTERVAL_MS = 2000;
@@ -30,6 +43,13 @@ const TAIL_INTERVAL_MS = 2000;
 /// Right-side drawer: task detail + logs for the clicked node. Logs tail live:
 /// after the initial full fetch, output past `next_offset` is polled and
 /// appended until the task is terminal (`eof`) — no full-refetch flicker.
+///
+/// With a filter set, the server applies it *inside* each tailed slice, so the
+/// tail keeps working: only matching new lines are appended, while `next_offset`
+/// still advances over the raw text. Changing the filter restarts from offset 0
+/// — the earlier slices were filtered under the old predicate, and re-deriving
+/// them client-side would need the raw output the filter exists to avoid
+/// fetching.
 export default function TaskPanel({
   runId,
   taskId,
@@ -39,13 +59,26 @@ export default function TaskPanel({
   pool,
   priority,
   cacheHit,
+  filter,
+  onFilterChange,
 }: TaskPanelProps) {
   const [logs, setLogs] = useState<TaskLogs | null>(null);
   const [output, setOutput] = useState("");
+  const [lines, setLines] = useState<LogLine[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const paneRef = useRef<HTMLDivElement | null>(null);
   const preRef = useRef<HTMLPreElement | null>(null);
   // Tail cursor lives in a ref so the poll interval reads the latest value.
   const offsetRef = useRef(0);
+  // Running totals over every slice fetched so far. The server reports these per
+  // slice; a tailing pane needs them for the whole task, or the summary would
+  // reset to "0 of 12 lines" on each poll.
+  const [seen, setSeen] = useState({ total: 0, matched: 0, truncated: false });
+
+  const filtering = isEmptyFilter(filter) ? false : true;
+  // Re-key the fetch effect on the filter's serialized form: a new object with
+  // the same fields must not restart the tail.
+  const filterKey = useMemo(() => JSON.stringify(filter), [filter]);
 
   useEffect(() => {
     if (!taskId) {
@@ -62,6 +95,8 @@ export default function TaskPanel({
     // (and a misdirected retry) can't show while the new fetch is in flight.
     setLogs(null);
     setOutput("");
+    setLines([]);
+    setSeen({ total: 0, matched: 0, truncated: false });
     setError(null);
     offsetRef.current = 0;
 
@@ -73,6 +108,8 @@ export default function TaskPanel({
     const applyFull = (l: TaskLogs) => {
       setLogs(l);
       setOutput(l.output ?? "");
+      setLines(l.lines ?? []);
+      setSeen({ total: l.total, matched: l.matched, truncated: l.truncated });
       offsetRef.current = l.next_offset;
     };
 
@@ -80,17 +117,23 @@ export default function TaskPanel({
       if (inFlight) return;
       inFlight = true;
       try {
-        const l = await getTaskLogs(runId, taskId, offsetRef.current);
+        const l = await getTaskLogs(runId, taskId, offsetRef.current, filter);
         if (!live) return;
         if (l.next_offset < offsetRef.current) {
           // Output shrank — the task was retried/cleared and restarted from
           // scratch. Resync with a full fetch instead of appending garbage.
-          const fresh = await getTaskLogs(runId, taskId);
+          const fresh = await getTaskLogs(runId, taskId, undefined, filter);
           if (!live) return;
           applyFull(fresh);
         } else {
           setLogs((prev) => (prev ? { ...prev, ...l, output: prev.output } : l));
           if (l.output) setOutput((o) => o + l.output);
+          if (l.lines?.length) setLines((prev) => [...prev, ...l.lines!]);
+          setSeen((s) => ({
+            total: s.total + l.total,
+            matched: s.matched + l.matched,
+            truncated: s.truncated || l.truncated,
+          }));
           offsetRef.current = l.next_offset;
         }
         if (l.eof) stop();
@@ -102,7 +145,7 @@ export default function TaskPanel({
       }
     };
 
-    getTaskLogs(runId, taskId)
+    getTaskLogs(runId, taskId, undefined, filter)
       .then((l) => {
         if (!live) return;
         applyFull(l);
@@ -114,16 +157,35 @@ export default function TaskPanel({
       live = false;
       stop();
     };
-  }, [runId, taskId]);
+    // `filter` is covered by `filterKey`.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runId, taskId, filterKey]);
 
   // Follow-scroll: stick to the bottom while new output streams in, but only
   // when the user is already near the bottom — don't fight an upward scroll.
   useEffect(() => {
-    const el = preRef.current;
+    const el = filtering ? paneRef.current : preRef.current;
     if (!el) return;
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
     if (nearBottom) el.scrollTop = el.scrollHeight;
-  }, [output]);
+  }, [output, lines, filtering]);
+
+  const rendered: RenderedLine[] = useMemo(
+    () =>
+      lines.map((l, i) => ({
+        key: `${l.n}:${i}`,
+        n: l.n,
+        level: l.level,
+        text: l.text,
+        matched: l.matched,
+        // One task in this pane, so every fallback time is its start.
+        time: lineTime(l.ts, {
+          started: logs?.started_at,
+          within: taskDuration(logs?.started_at, logs?.finished_at),
+        }),
+      })),
+    [lines, logs?.started_at, logs?.finished_at],
+  );
 
   if (!taskId) return null;
 
@@ -148,7 +210,10 @@ export default function TaskPanel({
           ✕
         </button>
       </div>
-      {error && <p style={{ color: "#f85149" }}>{error}</p>}
+      {/* Once the logs load, the filter bar owns error display — a rejected
+          filter belongs next to the box that caused it. This only covers the
+          case where there's no pane to attach it to. */}
+      {error && !logs && <p style={{ color: "var(--red)" }}>{error}</p>}
       {logs && (
         <>
           <div style={{ display: "flex", gap: "1rem", fontSize: 13, alignItems: "center" }}>
@@ -217,22 +282,42 @@ export default function TaskPanel({
             </div>
           )}
           {actions && <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>{actions(logs)}</div>}
-          <pre
-            ref={preRef}
-            style={{
-              background: "var(--bg)",
-              padding: "0.75rem",
-              borderRadius: 6,
-              fontSize: 12,
-              whiteSpace: "pre-wrap",
-              wordBreak: "break-word",
-              minHeight: 80,
-              maxHeight: "60vh",
-              overflow: "auto",
-            }}
-          >
-            {output || "(no output)"}
-          </pre>
+          <LogFilterBar
+            value={filter}
+            onChange={onFilterChange}
+            compact
+            error={error}
+            summary={{ ...seen, limit: filter.limit || DEFAULT_LOG_LIMIT }}
+          />
+          {/* Two panes on purpose. Unfiltered output stays a plain `<pre>` — the
+              raw text, copyable in one selection, exactly as before. A filtered
+              view needs per-line structure (source line number, level colour,
+              dimmed context), which a single text blob can't carry. */}
+          {filtering ? (
+            <LogLines
+              ref={paneRef}
+              lines={rendered}
+              style={{ minHeight: 80, maxHeight: "60vh" }}
+              empty="No lines match this filter."
+            />
+          ) : (
+            <pre
+              ref={preRef}
+              style={{
+                background: "var(--bg)",
+                padding: "0.75rem",
+                borderRadius: 6,
+                fontSize: 12,
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+                minHeight: 80,
+                maxHeight: "60vh",
+                overflow: "auto",
+              }}
+            >
+              {output || "(no output)"}
+            </pre>
+          )}
         </>
       )}
     </aside>

@@ -124,6 +124,75 @@ async fn body_or_status(r: reqwest::Response) -> Result<String> {
     }
 }
 
+/// Query params of the shared log filter grammar
+/// (`dagron_logging::logfilter`), as MCP tool arguments. Listed once so the
+/// per-task and whole-run log tools can't drift into offering different filters
+/// over the same data — and so an agent that learns one has learned both.
+const LOG_FILTER_ARGS: &[(&str, &str)] = &[
+    ("q", "keep only lines containing this text"),
+    ("exclude", "drop lines containing this text"),
+    ("regex", "keep only lines matching this regular expression"),
+    ("level", "keep only these inferred levels, comma-separated (error,warn,info,debug,trace,plain)"),
+    ("case", "match case-sensitively ('1' to enable; default is insensitive)"),
+    ("context", "also keep this many lines either side of each match"),
+    ("limit", "maximum lines to return"),
+    ("tail", "when capped, keep the last lines instead of the first ('1' to enable)"),
+];
+
+/// Build a log tool's `properties` map: `run_id`, the filter args, plus whatever
+/// is specific to that tool.
+fn log_tool_props(extra: &[(&str, Value)]) -> Value {
+    let mut props = serde_json::Map::new();
+    props.insert("run_id".into(), json!({ "type": "string" }));
+    for (name, value) in extra {
+        props.insert((*name).into(), value.clone());
+    }
+    for (name, description) in LOG_FILTER_ARGS {
+        props.insert((*name).into(), json!({ "type": "string", "description": description }));
+    }
+    Value::Object(props)
+}
+
+/// Collect the log filter args present in a tool call into a query string.
+///
+/// Values are passed through as strings and validated by the engine, which owns
+/// the grammar — re-implementing the parse here would give an agent two places
+/// to be told a regex is invalid, with two different messages.
+fn log_filter_query(args: &Value) -> Result<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut push = |key: &str| -> Result<()> {
+        match args.get(key) {
+            None | Some(Value::Null) => Ok(()),
+            Some(Value::String(s)) if s.is_empty() => Ok(()),
+            Some(Value::String(s)) => {
+                parts.push(format!("{key}={}", urlencode(s)));
+                Ok(())
+            }
+            Some(other) => anyhow::bail!("`{key}` must be a string, got {other}"),
+        }
+    };
+    for (name, _) in LOG_FILTER_ARGS {
+        push(name)?;
+    }
+    push("task")?;
+    Ok(if parts.is_empty() { String::new() } else { format!("?{}", parts.join("&")) })
+}
+
+/// Percent-encode a query value. Only unreserved characters pass through, so a
+/// regex containing `&`, `+` or `[` reaches the engine as one intact value.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// The MCP tool catalogue (name, description, JSON-Schema input).
 pub fn tool_defs() -> Vec<Value> {
     vec![
@@ -161,11 +230,28 @@ pub fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "dagron_get_task_logs",
-            "description": "Read a task's captured logs/output within a run.",
+            "description": "Read a task's captured logs/output within a run. Accepts the same log filter as dagron_get_run_logs.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "run_id": { "type": "string" }, "task_id": { "type": "string" } },
+                "properties": log_tool_props(&[("task_id", json!({ "type": "string" }))]),
                 "required": ["run_id", "task_id"], "additionalProperties": false
+            }
+        }),
+        json!({
+            // The tool an agent should reach for first when a run failed: one
+            // call returns every task's output, attributed and filtered, instead
+            // of N calls to guess which task printed the error.
+            "name": "dagron_get_run_logs",
+            "description": "Read the whole run's logs as one attributed stream, filtered server-side. \
+Use `level`/`q`/`regex`/`exclude` to narrow, `task` to restrict to specific tasks, and `context` \
+to keep surrounding lines. Prefer this over per-task reads when diagnosing a failure.",
+            "inputSchema": {
+                "type": "object",
+                "properties": log_tool_props(&[(
+                    "task",
+                    json!({ "type": "string", "description": "restrict to these task names or ids (comma-separated)" }),
+                )]),
+                "required": ["run_id"], "additionalProperties": false
             }
         }),
         json!({
@@ -231,9 +317,19 @@ pub async fn call_tool(client: &DagronClient, name: &str, args: &Value) -> Resul
         "dagron_get_task_logs" => {
             client
                 .get(&format!(
-                    "/api/runs/{}/tasks/{}/logs",
+                    "/api/runs/{}/tasks/{}/logs{}",
                     safe_id("run_id")?,
-                    safe_id("task_id")?
+                    safe_id("task_id")?,
+                    log_filter_query(args)?
+                ))
+                .await
+        }
+        "dagron_get_run_logs" => {
+            client
+                .get(&format!(
+                    "/api/runs/{}/logs{}",
+                    safe_id("run_id")?,
+                    log_filter_query(args)?
                 ))
                 .await
         }
@@ -417,6 +513,7 @@ mod tests {
             "dagron_submit_run",
             "dagron_cancel_run",
             "dagron_get_task_logs",
+            "dagron_get_run_logs",
             "dagron_get_metrics",
             "dagron_list_dead_letters",
             "dagron_get_run_events",
@@ -428,6 +525,46 @@ mod tests {
             assert!(t["description"].is_string());
             assert_eq!(t["inputSchema"]["type"], "object");
         }
+    }
+
+    #[test]
+    fn log_filter_query_encodes_only_what_was_passed() {
+        assert_eq!(log_filter_query(&json!({ "run_id": "r1" })).unwrap(), "");
+        assert_eq!(
+            log_filter_query(&json!({ "run_id": "r1", "level": "error", "context": "2" })).unwrap(),
+            "?level=error&context=2",
+        );
+        // An empty string is "not set", not "match the empty string" — an agent
+        // filling in a blank argument must not accidentally filter.
+        assert_eq!(log_filter_query(&json!({ "q": "" })).unwrap(), "");
+        // A regex with query-significant characters must survive as one value.
+        assert_eq!(
+            log_filter_query(&json!({ "regex": "a&b[0-9]+" })).unwrap(),
+            "?regex=a%26b%5B0-9%5D%2B",
+        );
+        // Wrong types fail locally with a clear message rather than as an
+        // opaque HTTP 400 from dagron-api.
+        assert!(log_filter_query(&json!({ "limit": 100 })).is_err());
+    }
+
+    #[test]
+    fn both_log_tools_offer_the_same_filter() {
+        let defs = tool_defs();
+        let props = |name: &str| -> Vec<String> {
+            let t = defs.iter().find(|t| t["name"] == name).expect("tool present");
+            let mut k: Vec<String> =
+                t["inputSchema"]["properties"].as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let task = props("dagron_get_task_logs");
+        let run = props("dagron_get_run_logs");
+        for (key, _) in LOG_FILTER_ARGS {
+            assert!(task.contains(&key.to_string()), "task tool missing {key}");
+            assert!(run.contains(&key.to_string()), "run tool missing {key}");
+        }
+        assert!(task.contains(&"task_id".to_string()));
+        assert!(run.contains(&"task".to_string()));
     }
 
     #[tokio::test]

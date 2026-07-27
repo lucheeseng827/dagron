@@ -115,6 +115,47 @@ function seg(value) {
   return encodeURIComponent(String(value));
 }
 
+/**
+ * The log filter grammar accepted by both log endpoints. Mirrors
+ * `dagron_logging::logfilter` — the server owns the semantics; this is only the
+ * list of names, so a typo throws here instead of becoming a silently-ignored
+ * parameter that makes an unfiltered response look filtered.
+ */
+export const LOG_FILTER_PARAMS = Object.freeze([
+  "q",
+  "exclude",
+  "regex",
+  "level",
+  "case",
+  "context",
+  "limit",
+  "tail",
+]);
+
+/**
+ * Normalise log filter options into query parameters. Arrays are joined with
+ * commas (`level: ["error", "warn"]`); `true` becomes `1` and `false` is
+ * dropped, because an explicit `case=0` would still count as "the caller
+ * filtered" and change server behaviour. An unknown key throws.
+ */
+export function logFilterParams(filter = {}) {
+  const params = {};
+  for (const [key, value] of Object.entries(filter)) {
+    if (!LOG_FILTER_PARAMS.includes(key)) {
+      throw new TypeError(
+        `unknown log filter parameter "${key}"; expected one of ${LOG_FILTER_PARAMS.join(", ")}`,
+      );
+    }
+    if (value === undefined || value === null || value === "" || value === false) continue;
+    if (value === true) params[key] = "1";
+    else if (Array.isArray(value)) {
+      const joined = value.join(",");
+      if (joined) params[key] = joined;
+    } else params[key] = value;
+  }
+  return params;
+}
+
 /** Coerce a Dag / object / string into the spec string the API wants. */
 function specToStr(spec) {
   if (spec instanceof Dag) return spec.toJSON();
@@ -235,8 +276,37 @@ export class Client {
     return this._request("GET", `/api/runs/${seg(runId)}/graph`);
   }
 
-  async getTaskLogs(runId, taskId) {
-    return this._request("GET", `/api/runs/${seg(runId)}/tasks/${seg(taskId)}/logs`);
+  /**
+   * One task's captured output, scoped to its run.
+   *
+   * `offset` (a prior response's `next_offset`) tails: only output past that
+   * character offset comes back, until `eof`. The log filter is applied
+   * server-side *within* that slice, so a filtered tail appends only matching
+   * new lines while `next_offset` keeps advancing over the raw text.
+   */
+  async getTaskLogs(runId, taskId, { offset, ...filter } = {}) {
+    const params = logFilterParams(filter);
+    if (offset !== undefined && offset !== null) params.offset = offset;
+    return this._request("GET", `/api/runs/${seg(runId)}/tasks/${seg(taskId)}/logs`, { params });
+  }
+
+  /**
+   * The whole run's output as one attributed, filtered stream — the call for
+   * "something in this run failed and I don't know which task", instead of one
+   * request per task.
+   *
+   * `tasks`/`statuses` choose which task output is read at all; the filter then
+   * chooses which of their lines survive. `total`/`matched` in the response are
+   * counted before the line cap, so a truncated view always says so.
+   *
+   *   await api.getRunLogs(runId, { level: "error", context: 2 });
+   *   await api.getRunLogs(runId, { tasks: ["extract"], regex: "rows=\\d+" });
+   */
+  async getRunLogs(runId, { tasks, statuses, ...filter } = {}) {
+    const params = logFilterParams(filter);
+    if (tasks?.length) params.task = tasks.join(",");
+    if (statuses?.length) params.status = statuses.join(",");
+    return this._request("GET", `/api/runs/${seg(runId)}/logs`, { params });
   }
 
   async cancelRun(runId) {

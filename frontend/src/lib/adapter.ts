@@ -34,25 +34,29 @@ export function toStep(task: TaskRow, index: number): Step {
 /// CSS color for each task/run status — used by the timeline, DAG nodes, and
 /// status dots. Accepts a plain string (any status the API may return) and falls
 /// back to grey for unknown values, so callers don't need unsafe `as` casts.
+/// Status hues come from the CSS tokens in globals.css rather than being
+/// duplicated as hex here — the two copies had already drifted. The MAPPING is
+/// deliberately unchanged: operators read these colours daily, and rotating a
+/// familiar vocabulary buys nothing but re-learning.
 export function statusColor(status: string): string {
   switch (status) {
     case "succeeded":
-      return "#2ea043"; // green
+      return "var(--green)";
     case "failed":
-      return "#f85149"; // red
+      return "var(--red)";
     case "running":
-      return "#2f81f7"; // blue
+      return "var(--blue)";
     case "ready":
-      return "#d29922"; // amber
+      return "var(--amber)";
     case "pending":
-      return "#6e7681"; // grey
+      return "var(--dim)";
     case "cancelled":
     case "skipped":
-      return "#484f58"; // muted
+      return "var(--muted-status)";
     case "awaiting_approval":
-      return "#a371f7"; // purple — a human gate, distinct from machine states
+      return "var(--purple)"; // a human gate, distinct from machine states
     default:
-      return "#6e7681";
+      return "var(--dim)";
   }
 }
 

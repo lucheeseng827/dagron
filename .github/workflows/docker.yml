@@ -58,6 +58,23 @@ jobs:
             context: "."
             file: "./Dockerfile"
             build_args: "FEATURES=postgres,ops,kubernetes"
+          # The same engine, built from the `localdev` stage (debian-slim)
+          # instead of distroless.
+          #
+          # With EXECUTOR=local a task's command runs as a subprocess *inside
+          # this container*, so the distroless image above — which has no shell
+          # and no coreutils — can run no local task at all. It is correct for
+          # docker/kubernetes execution, where the command runs in the task's
+          # own image, and unusable for the single-box quickstart where a first
+          # workflow is `echo`.
+          #
+          # Publishing both is what lets compose.quickstart.yaml pull rather
+          # than build. NOT for production: it exists to make `echo` resolve.
+          - name: dagron-engine-localdev
+            context: "."
+            file: "./Dockerfile"
+            target: "localdev"
+            build_args: "FEATURES=postgres,ops,kubernetes"
           - name: dagron-api
             context: "."
             file: "./crates/dagron-api/Dockerfile"
@@ -102,6 +119,18 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
+      # The frontend bakes the version into its bundle at build time (the
+      # standalone server can't read it at runtime), so the build job needs it
+      # too — the `ver` step in the merge job below runs too late for this.
+      - name: Resolve version
+        id: appver
+        env:
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then V="$DISPATCH_TAG"; else V="$GITHUB_REF_NAME"; fi
+          echo "version=${V#v}" >> "$GITHUB_OUTPUT"
+
       # Push by digest only — the merge job below owns the human-readable tags.
       - name: Build + push ${{ matrix.image.name }} (${{ matrix.platform }}, native)
         id: build
@@ -109,7 +138,14 @@ jobs:
         with:
           context: ${{ matrix.image.context }}
           file: ${{ matrix.image.file }}
-          build-args: ${{ matrix.image.build_args }}
+          # Empty for every image but the localdev engine, which means "build
+          # the final stage" — the existing behaviour.
+          target: ${{ matrix.image.target }}
+          # Only the frontend declares ARG APP_VERSION; passing it to the other
+          # images would just emit an unused-build-arg warning on every leg.
+          build-args: |
+            ${{ matrix.image.build_args }}
+            ${{ matrix.image.name == 'dagron-frontend' && format('APP_VERSION={0}', steps.appver.outputs.version) || '' }}
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=docker.io/mancube/${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=true
           provenance: false
@@ -124,7 +160,11 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: digest-${{ matrix.image.name }}-${{ matrix.arch }}
+          # `__` separates image from arch: with a single dash,
+          # `digest-dagron-engine-*` also matches
+          # `digest-dagron-engine-localdev-amd64`, and the plain engine
+          # manifest would be built from the wrong digests.
+          name: digest-${{ matrix.image.name }}__${{ matrix.arch }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
@@ -136,13 +176,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [dagron-engine, dagron-api, dagron-frontend, dagron-mcp, dagron-gitops]
+        image: [dagron-engine, dagron-engine-localdev, dagron-api, dagron-frontend, dagron-mcp, dagron-gitops]
     steps:
       - name: Collect this image's per-arch digests
         uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
-          pattern: digest-${{ matrix.image }}-*
+          pattern: digest-${{ matrix.image }}__*
           merge-multiple: true
 
       - name: Set up Buildx

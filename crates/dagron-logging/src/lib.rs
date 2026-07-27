@@ -25,6 +25,17 @@
 //! | `LOG_ANSI`         | `1`/`0`                                              | auto    | Force ANSI colors on/off (auto-disabled for `json`). |
 //!
 //! Verbosity precedence: `RUST_LOG` (if set and parseable) → `LOG_LEVEL` → `info`.
+//!
+//! ## Reading logs back
+//!
+//! Everything above is the **emit** side. The [`logfilter`] module (feature
+//! `logfilter`) is the **read** side: the filter grammar applied when a human
+//! opens a workflow's stored task output. It is the single parser for that
+//! grammar, and feature-gated so the engine binary — which only ever writes
+//! logs — doesn't link a regex engine.
+
+#[cfg(feature = "logfilter")]
+pub mod logfilter;
 
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::layer::SubscriberExt;

@@ -338,6 +338,26 @@ curl -s "localhost:8787/runs/$RUN/tasks/$TASK/logs?offset=0"
 
 Secrets are masked in the live stream just like the final output.
 
+### Read a whole run's logs, filtered
+
+When a run fails and you don't yet know *which* task failed, clicking through
+task panels one at a time is the actual problem. One call returns every task's
+output as a single attributed stream, filtered server-side:
+
+```bash
+curl -s "localhost:8787/runs/$RUN/logs?level=error&context=1" \
+  | jq -r '.lines[] | "\(.task)  \(.text)"'
+# extract  2026-07-26T10:00:02Z WARN  retrying page 3
+# extract  2026-07-26T10:00:03Z ERROR upstream timeout
+```
+
+The filter — `q`, `exclude`, `regex`, `level`, `case`, `context`, `limit`, `tail`
+— works on both log endpoints and in the console's **Logs** view on the run page.
+It runs on the server: a run's output can be hundreds of megabytes, and
+downloading it all to grep in a browser is not a filter. Responses report
+`matched` against `total`, so a view that hides most of a run always says so.
+Full reference: [docs/API.md §Log filter](docs/API.md#log-filter).
+
 ### Streaming: events in, workflows out
 
 `SOURCE=stream` follows an append-only NDJSON file or named pipe — one workflow

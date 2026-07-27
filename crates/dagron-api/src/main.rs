@@ -183,13 +183,22 @@ async fn main() -> Result<()> {
         .route("/api/runs/{id}/spec", get(routes::runs::get_run_spec))
         .route("/api/runs/{id}/wait", get(routes::runs::wait_run))
         .route("/api/runs/{id}/graph", get(routes::graph::get_graph))
-        .route("/api/runs/{id}/tasks/{tid}/logs", get(routes::graph::get_task_logs))
+        // Log views: the whole run's output as one filtered stream, and one
+        // task's output (live-tailable) under the same filter grammar.
+        .route("/api/runs/{id}/logs", get(routes::logs::get_run_logs))
+        .route("/api/runs/{id}/tasks/{tid}/logs", get(routes::logs::get_task_logs))
         .route("/api/runs/{id}/stream", get(routes::stream::stream_run))
         // Account-wide activity stream: feeds the list pages' live-updates mode.
         .route("/api/events/stream", get(routes::stream::stream_events))
         .route("/api/runs", post(routes::control::submit_run))
         .route("/api/runs/{id}/cancel", post(routes::control::cancel_run))
         .route("/api/runs/{id}/rerun", post(routes::control::rerun_run))
+        // Failure triage: what a *human* decided about a failed run, which
+        // `status` (what the engine did) cannot express.
+        .route(
+            "/api/runs/{id}/triage",
+            post(routes::triage::set_triage).delete(routes::triage::clear_triage),
+        )
         .route("/api/runs/{id}/resubmit", post(routes::control::resubmit_run))
         .route("/api/runs/{id}/tasks/{tid}/retry", post(routes::control::retry_task))
         .route("/api/runs/{id}/tasks/{tid}/clear", post(routes::control::clear_task))
@@ -210,6 +219,20 @@ async fn main() -> Result<()> {
         .route("/api/dead-letters", get(routes::ops::list_dead_letters))
         .route("/api/dead-letters/{id}/redrive", post(routes::ops::redrive_dead_letter))
         .route("/api/dead-letters/{id}", axum::routing::delete(routes::ops::delete_dead_letter))
+        // Dead-letter policy. Only the retry count: STREAM_DLQ_PATH is a path
+        // on the engine's host and belongs in deployment config, not a form.
+        .route(
+            "/api/settings/dead-letters",
+            get(routes::settings::get_dead_letters).put(routes::settings::put_dead_letters),
+        )
+        // Personal access tokens: long-lived credentials for CI and the SDKs,
+        // so automation never has to store a password. Managing them requires a
+        // password session (see auth::SessionAuth).
+        .route(
+            "/api/tokens",
+            get(routes::tokens::list_tokens).post(routes::tokens::create_token),
+        )
+        .route("/api/tokens/{id}", axum::routing::delete(routes::tokens::revoke_token))
         // First-class workflows (named, reusable DAG definitions).
         .route(
             "/api/workflows",
@@ -222,6 +245,11 @@ async fn main() -> Result<()> {
                 .delete(routes::workflows::delete_workflow),
         )
         .route("/api/workflows/{id}/run", post(routes::workflows::run_workflow))
+        // Lifecycle: version history, and a state that is not deletion. Pausing
+        // leaves the workflow's schedules intact — that is the whole difference
+        // from DELETE, which cascades them away.
+        .route("/api/workflows/{id}/versions", get(routes::lifecycle::list_versions))
+        .route("/api/workflows/{id}/state", post(routes::lifecycle::set_state))
         .route("/api/workflows/{id}/runs", get(routes::workflows::workflow_runs))
         .route("/api/workflows/{id}/sync-to-git", post(routes::gitsync::sync_to_git))
         // Public run-status badge (embeds in READMEs; status label only, no auth).

@@ -22,7 +22,16 @@ and the [system-context diagram](ARCHITECTURE.md#1-system-context) in
 | `dagron_get_run` | `run_id` | `GET /api/runs/{id}` |
 | `dagron_submit_run` | `yaml` | `POST /api/runs` |
 | `dagron_cancel_run` | `run_id` | `POST /api/runs/{id}/cancel` |
-| `dagron_get_task_logs` | `run_id`, `task_id` | `GET /api/runs/{id}/tasks/{tid}/logs` |
+| `dagron_get_task_logs` | `run_id`, `task_id`, + [log filter](API.md#log-filter) | `GET /api/runs/{id}/tasks/{tid}/logs` |
+| `dagron_get_run_logs` | `run_id`, `task`, + [log filter](API.md#log-filter) | `GET /api/runs/{id}/logs` |
+
+`dagron_get_run_logs` is the one to reach for when a run failed: it returns
+**every** task's output as one attributed, server-filtered stream, so the agent
+makes one call instead of N guesses at which task printed the error. Both log
+tools take the same filter arguments — `q`, `exclude`, `regex`, `level`, `case`,
+`context`, `limit`, `tail` — all passed as strings and validated by the engine,
+which owns the grammar. A typical triage call is
+`{"run_id": "...", "level": "error", "context": "2"}`.
 
 ### Observe cluster internals
 
@@ -135,8 +144,8 @@ on how you deploy it.
 ### Defend against prompt-injection escalation
 
 - Any text the agent reads — workflow YAML, task logs, dead-letter payloads —
-  can carry instructions aimed at the LLM. Tools like `dagron_get_task_logs`
-  and `dagron_list_dead_letters` return that text verbatim. If the agent will
+  can carry instructions aimed at the LLM. Tools like `dagron_get_task_logs`,
+  `dagron_get_run_logs` and `dagron_list_dead_letters` return that text verbatim. If the agent will
   act on it, treat results as data, not directives.
 - The MCP server validates path-segment ids (`run_id`, `task_id`) against
   `[A-Za-z0-9_-]+` before any HTTP call so a crafted id can't reshape the

@@ -28,6 +28,13 @@ export interface RunSummary {
   /// Workflow/DAG name (from the run's definition); may be null for legacy rows.
   name: string | null;
   trigger_kind: TriggerKind;
+  /// What a human decided about this run — acknowledged / resolved / ignored,
+  /// or absent for one nobody has looked at yet. `status` is what the engine
+  /// did; this is what was done about it.
+  triage_state?: "acknowledged" | "resolved" | "ignored";
+  triage_note?: string;
+  triaged_at?: string;
+  triaged_by?: string;
 }
 
 export type GitRepoState = "Synced" | "OutOfSync" | "Syncing";
@@ -104,6 +111,11 @@ export interface DatasetEvent {
 }
 
 export interface RunDetail {
+  /// What a human decided about this run — see RunSummary.triage_state.
+  triage_state?: "acknowledged" | "resolved" | "ignored";
+  triage_note?: string;
+  triaged_at?: string;
+  triaged_by?: string;
   id: string;
   definition_id: string;
   status: RunStatus;
@@ -144,18 +156,96 @@ export interface GraphResponse {
   edges: GraphEdge[];
 }
 
+/// Level the API inferred from a log line's head. Best-effort — task output is
+/// whatever the command printed, so `plain` is the common case.
+export type LogLevel = "error" | "warn" | "info" | "debug" | "trace" | "plain";
+
+/// One line of a filtered log view (see crates/dagron-api/src/routes/logs.rs).
+export interface LogLine {
+  /// 1-based line number in the task's *unfiltered* output, so a filtered line
+  /// can still be located in the raw log.
+  n: number;
+  level: LogLevel;
+  /// The RFC3339 stamp the line itself carried, parsed off the front and
+  /// removed from `text` (so filters match the message). Absent for ordinary
+  /// output — fall back to the owning task's `started_at`.
+  ts?: string;
+  text: string;
+  /// False for a neighbour kept only by `context=N` — rendered dimmed.
+  matched: boolean;
+}
+
+/// A merged workflow-log line, attributed to the task that printed it.
+export interface RunLogLine extends LogLine {
+  task_id: string;
+  task: string;
+  attempt: number;
+}
+
+/// Per-task rollup returned with the workflow log view: every task in the run,
+/// selected or not, so the task picker needs no second request.
+export interface RunLogTask {
+  id: string;
+  name: string;
+  status: TaskStatus;
+  attempt: number;
+  /// Inside the request's task/status scope.
+  selected: boolean;
+  /// Raw line count (0 for an unselected task — its output isn't read).
+  total: number;
+  /// Lines the filter matched in this task.
+  matched: number;
+  /// When the task started/finished (RFC3339). Most output carries no time of
+  /// its own, so this window bounds every line the task printed — and is as
+  /// tight as the task was short.
+  started_at?: string;
+  finished_at?: string;
+}
+
+/// GET /api/runs/:id/logs — the whole run's output as one filtered stream.
+export interface RunLogs {
+  run_id: string;
+  tasks: RunLogTask[];
+  lines: RunLogLine[];
+  /// Raw lines across the selected tasks.
+  total: number;
+  /// Lines matched across the selected tasks, *before* the line cap.
+  matched: number;
+  /// True when the line cap dropped lines that matched.
+  truncated: boolean;
+  /// True once every selected task is terminal: the view is final.
+  eof: boolean;
+  /// Whether any filter was in effect (an unfiltered view still caps).
+  filtered: boolean;
+  /// Effective line cap, echoed so the UI can offer "raise the limit".
+  limit: number;
+}
+
 export interface TaskLogs {
   task_id: string;
   name: string;
   status: TaskStatus;
+  /// When the task started/finished (RFC3339). A line with no `ts` of its own
+  /// was printed somewhere inside this window.
+  started_at?: string;
+  finished_at?: string;
   attempt: number;
   output: string | null;
-  /// Char offset this response starts at (tail metadata, see graph.rs).
+  /// Char offset this response starts at (tail metadata, see routes/logs.rs).
   offset: number;
   /// Resume point for the next tail poll — the full output's char length.
+  /// Always counted on the *raw* text, so a filter can't desync tailing.
   next_offset: number;
   /// True once the task is terminal: no more output will arrive.
   eof: boolean;
+  /// Filtered lines; absent when no filter was requested.
+  lines?: LogLine[];
+  /// Raw lines in the slice this response covers.
+  total: number;
+  /// Lines the filter matched in that slice, before the line cap.
+  matched: number;
+  truncated: boolean;
+  filtered: boolean;
 }
 
 /// SSE event payload from GET /api/runs/:id/stream (one run) and
@@ -195,10 +285,33 @@ export interface WorkflowSummary {
 export interface Workflow extends WorkflowSummary {
   spec: string;
   description: string | null;
+  /// Lifecycle: active / paused / retired.
+  state?: WorkflowState;
+  /// Current definition version; the history is /workflows/{id}/versions.
+  version?: number;
 }
+
+/// One entry in a workflow's definition history. Append-only: an edit adds a
+/// version, it never rewrites one.
+export interface WorkflowVersion {
+  id: string;
+  version: number;
+  name: string;
+  spec: string;
+  created_at: string;
+  created_by?: string;
+}
+
+/// Workflow lifecycle. `paused` and `retired` both refuse to run and neither
+/// touches the workflow's schedules — that is the difference from deleting,
+/// which cascades them away.
+export type WorkflowState = "active" | "paused" | "retired";
 
 /// Enriched Workflows-list row (definition + schedule + recent-run digest).
 export interface WorkflowRow {
+  /// Lifecycle state of the workflow itself — not `paused`, which is about a
+  /// single schedule being disabled.
+  state?: WorkflowState;
   id: string;
   name: string;
   description: string | null;
@@ -337,6 +450,30 @@ export interface DayBucket {
   active: number;
   avg_duration_secs: number | null;
   max_duration_secs: number | null;
+}
+
+/// A personal access token as the API returns it — prefix only, never the
+/// secret. The plaintext exists exactly once, in the CreatedToken below.
+export interface ApiToken {
+  id: string;
+  name: string;
+  /// The cleartext head, e.g. `dgp_D-5E8bxXpY` — enough to match a token
+  /// against the one you copied, useless as a credential.
+  prefix: string;
+  created_at: string;
+  expires_at?: string;
+  last_used_at?: string;
+  revoked_at?: string;
+}
+
+/// The one response that carries the secret. Shown once and never retrievable:
+/// only its hash is stored.
+export interface CreatedToken {
+  id: string;
+  name: string;
+  prefix: string;
+  token: string;
+  expires_at?: string;
 }
 
 export interface UserView {

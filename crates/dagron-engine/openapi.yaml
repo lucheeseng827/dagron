@@ -282,16 +282,116 @@ paths:
         "500":
           $ref: "#/components/responses/Error"
 
+  /runs/{id}/logs:
+    get:
+      tags: [runs]
+      summary: Read the whole run's logs, filtered
+      description: >
+        Every task's output in the run, merged into one attributed stream and
+        filtered server-side. This is the view for "the run failed and I don't
+        know which task did it" — one call instead of one per task.
+
+
+        `task=`/`status=` choose which task output is read at all; the filter
+        params then choose which of those lines survive. `total` and `matched`
+        are counted **before** the line cap, so a truncated view always says how
+        much it hid.
+      operationId: runLogs
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+        - name: task
+          in: query
+          required: false
+          description: Restrict to these task names or ids (repeatable, or comma-separated).
+          schema: { type: string }
+        - name: status
+          in: query
+          required: false
+          description: Restrict to tasks in these statuses (repeatable, or comma-separated).
+          schema: { type: string }
+        - $ref: "#/components/parameters/LogFilterQ"
+        - $ref: "#/components/parameters/LogFilterExclude"
+        - $ref: "#/components/parameters/LogFilterRegex"
+        - $ref: "#/components/parameters/LogFilterLevel"
+        - $ref: "#/components/parameters/LogFilterCase"
+        - $ref: "#/components/parameters/LogFilterContext"
+        - $ref: "#/components/parameters/LogFilterLimit"
+        - $ref: "#/components/parameters/LogFilterTail"
+      responses:
+        "200":
+          description: The run's merged, filtered log lines plus a per-task rollup
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, tasks, lines, total, matched, truncated, eof, filtered, limit]
+                properties:
+                  run_id: { type: string, format: uuid }
+                  tasks:
+                    type: array
+                    description: >
+                      Every task in the run, selected or not, so a client can render
+                      a task picker without a second call.
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string, format: uuid }
+                        name: { type: string }
+                        status: { $ref: "#/components/schemas/TaskStatus" }
+                        attempt: { type: integer, format: int64 }
+                        selected: { type: boolean, description: inside the request's task/status scope }
+                        total: { type: integer, description: raw lines (0 for an unselected task) }
+                        matched: { type: integer, description: lines the filter matched in this task }
+                        started_at:
+                          type: string
+                          description: >
+                            When the task started (RFC3339, as stored). Most output
+                            carries no time of its own, so this bounds every line the
+                            task printed: a line was emitted somewhere in
+                            [started_at, finished_at], and that window is as tight as
+                            the task was short. Use it as the per-line time when a
+                            line has no `ts` of its own, and show the window so the
+                            uncertainty stays visible.
+                        finished_at:
+                          type: string
+                          description: When the task finished (RFC3339, as stored).
+                  lines:
+                    type: array
+                    items: { $ref: "#/components/schemas/RunLogLine" }
+                  total: { type: integer, description: raw lines across the selected tasks }
+                  matched: { type: integer, description: matched lines, before the line cap }
+                  truncated: { type: boolean, description: the cap dropped lines that matched }
+                  eof: { type: boolean, description: every selected task is terminal }
+                  filtered: { type: boolean, description: any filter grammar was in effect }
+                  limit: { type: integer, description: the effective line cap }
+        "400":
+          description: An invalid filter (uncompilable regex, unknown level, non-numeric bound)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: Run not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          $ref: "#/components/responses/Error"
+
   /runs/{id}/tasks/{task_id}/logs:
     get:
       tags: [runs]
-      summary: Tail a task's output
+      summary: Tail a task's output, optionally filtered
       description: >
         One task's output for live tailing (fast-win #17). With `?offset=`
         returns only the output past that character offset, plus `next_offset`
         (resume point) and `eof` (the task is terminal); poll with
         `?offset=next_offset` until `eof`. Offsets are Unicode-scalar counts, so
         they never split a multibyte character.
+
+
+        The filter params apply **within** the returned slice, while
+        `next_offset` keeps counting the raw text — so filtering and tailing
+        compose, and toggling a filter mid-tail neither loses nor repeats output.
       operationId: taskLogs
       parameters:
         - $ref: "#/components/parameters/RunId"
@@ -301,6 +401,14 @@ paths:
           required: false
           description: Resume tailing from this character offset. Omit for the full output.
           schema: { type: integer, minimum: 0 }
+        - $ref: "#/components/parameters/LogFilterQ"
+        - $ref: "#/components/parameters/LogFilterExclude"
+        - $ref: "#/components/parameters/LogFilterRegex"
+        - $ref: "#/components/parameters/LogFilterLevel"
+        - $ref: "#/components/parameters/LogFilterCase"
+        - $ref: "#/components/parameters/LogFilterContext"
+        - $ref: "#/components/parameters/LogFilterLimit"
+        - $ref: "#/components/parameters/LogFilterTail"
       responses:
         "200":
           description: The task's output (or the slice past `offset`) with tail metadata
@@ -308,16 +416,29 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [task_id, name, status, attempt, output, offset, next_offset, eof]
+                required: [task_id, name, status, attempt, output, offset, next_offset, eof, total, matched, truncated, filtered]
                 properties:
                   task_id: { type: string, format: uuid }
                   name: { type: string }
                   status: { $ref: "#/components/schemas/TaskStatus" }
                   attempt: { type: integer, format: int64 }
-                  output: { type: string }
+                  output: { type: string, description: the slice, or the filtered text when a filter is active }
                   offset: { type: integer, description: char offset this slice starts at }
-                  next_offset: { type: integer, description: resume point for the next poll }
+                  next_offset: { type: integer, description: resume point for the next poll (counted on the raw text) }
                   eof: { type: boolean, description: true once the task is terminal }
+                  lines:
+                    type: array
+                    description: Present only when a filter was requested.
+                    items: { $ref: "#/components/schemas/LogLine" }
+                  total: { type: integer, description: raw lines in this slice }
+                  matched: { type: integer, description: matched lines, before the line cap }
+                  truncated: { type: boolean }
+                  filtered: { type: boolean }
+        "400":
+          description: An invalid filter (uncompilable regex, unknown level, non-numeric bound)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "404":
           description: Run or task not found
           content:
@@ -776,6 +897,70 @@ components:
       description: Dead-letter UUID.
       schema: { type: string, format: uuid }
 
+    # ── log filter grammar ────────────────────────────────────────────────────
+    # Shared by both log endpoints (and by dagron-api). Declared once so the
+    # two endpoints can never drift into offering
+    # different filters over the same stored output. Every predicate must hold
+    # for a line to be kept; sending none of them returns unfiltered output,
+    # still subject to the line cap.
+    LogFilterQ:
+      name: q
+      in: query
+      required: false
+      description: Keep only lines containing this text (repeatable — all must match).
+      schema: { type: string }
+    LogFilterExclude:
+      name: exclude
+      in: query
+      required: false
+      description: Drop lines containing this text (repeatable — none may match).
+      schema: { type: string }
+    LogFilterRegex:
+      name: regex
+      in: query
+      required: false
+      description: >
+        Keep only lines matching this regular expression. An uncompilable or
+        over-long pattern is a `400` naming the reason, never a silent pass.
+      schema: { type: string, maxLength: 512 }
+    LogFilterLevel:
+      name: level
+      in: query
+      required: false
+      description: >
+        Keep only these levels (repeatable, or comma-separated). Level is
+        *inferred* from the head of each line — task output carries no structured
+        level — so this is a best-effort convenience, not a guarantee.
+      schema:
+        type: string
+        example: error,warn
+    LogFilterCase:
+      name: case
+      in: query
+      required: false
+      description: Match terms and the regex case-sensitively. Default is insensitive.
+      schema: { type: string, enum: ["0", "1"] }
+    LogFilterContext:
+      name: context
+      in: query
+      required: false
+      description: >
+        Also keep this many unmatched lines either side of each match (grep -C).
+        Context lines come back with `matched: false` so a client can dim them.
+      schema: { type: integer, minimum: 0 }
+    LogFilterLimit:
+      name: limit
+      in: query
+      required: false
+      description: Maximum lines returned. Omit for the server default (2000); hard cap 50000.
+      schema: { type: integer, minimum: 0, maximum: 50000 }
+    LogFilterTail:
+      name: tail
+      in: query
+      required: false
+      description: When the cap applies, keep the last lines rather than the first.
+      schema: { type: string, enum: ["0", "1"] }
+
   responses:
     Error:
       description: Unexpected server/datastore error
@@ -789,6 +974,51 @@ components:
       required: [error]
       properties:
         error: { type: string, description: Human-readable failure message }
+
+    LogLevel:
+      type: string
+      description: >
+        Severity inferred from a log line's head. `plain` — no recognizable level
+        token — is the common case for ordinary command output.
+      enum: [error, warn, info, debug, trace, plain]
+
+    LogLine:
+      type: object
+      required: [n, level, text, matched]
+      properties:
+        n:
+          type: integer
+          description: >
+            1-based line number in the **unfiltered** output, so a filtered line
+            can still be located in the raw log.
+        level: { $ref: "#/components/schemas/LogLevel" }
+        ts:
+          type: string
+          description: >
+            The RFC3339 stamp the line itself carried, parsed off the front and
+            removed from `text` so filters match the message (an anchored
+            `regex=^ERROR` keeps working when a stamp appears). Absent for
+            ordinary output, which is most output — a client wanting a time for
+            every line falls back to the owning task's `started_at`.
+        text:
+          type: string
+          description: >
+            The line without its trailing newline, and without any leading
+            timestamp (that is reported separately as `ts`).
+        matched:
+          type: boolean
+          description: False for a neighbour kept only by `context=N`.
+
+    RunLogLine:
+      allOf:
+        - $ref: "#/components/schemas/LogLine"
+        - type: object
+          required: [task_id, task, attempt]
+          description: A merged workflow-log line, attributed to the task that printed it.
+          properties:
+            task_id: { type: string, format: uuid }
+            task: { type: string, description: Task name (ids are opaque to humans) }
+            attempt: { type: integer, format: int64 }
 
     DeadLetter:
       type: object

@@ -9,6 +9,12 @@ name = "dagron_logging"
 path = "src/lib.rs"
 
 [features]
+# The stored-log filter grammar (`logfilter` module) used by the read side:
+# dagron-api and the engine's `ops` API apply it to stored task output. Off by
+# default so the engine binary — which only ever *writes* logs — doesn't link
+# the regex engine.
+logfilter = ["dep:regex"]
+
 # OTLP span delivery (#28 follow-on). Off by default — a default build has no
 # opentelemetry dependency and unchanged logging behavior. When enabled AND
 # `OTEL_EXPORTER_OTLP_ENDPOINT` is set at runtime, `init` also installs an OTLP
@@ -24,6 +30,11 @@ otel = [
 [dependencies]
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry"] }
+
+# Regex matching for the `logfilter` read-side grammar (optional). Already in the
+# workspace tree via tracing-subscriber's env-filter, so this adds no new
+# third-party code — only a direct edge.
+regex = { version = "1", optional = true }
 
 # OTLP exporter stack (optional, `otel` feature). HTTP/protobuf over a blocking
 # reqwest client with rustls — deliberately avoids the gRPC/tonic transport so no

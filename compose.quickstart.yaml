@@ -1,0 +1,127 @@
+# dagron quickstart — pulls published images, builds nothing.
+#
+#   podman compose -f compose.quickstart.yaml up -d
+#   docker compose -f compose.quickstart.yaml up -d
+#
+# Then open http://localhost:3000 and sign in with admin@local / dagron-admin.
+#
+# Use this to *try* dagron. `compose.yaml` next to it builds every service from
+# source, which is right when you are changing dagron and wrong when you are
+# meeting it: a first run should not begin with compiling four Rust crates.
+#
+# Pin a version with DAGRON_VERSION=0.5.1 (defaults below). Floating :latest is
+# deliberately not the default — a quickstart that silently changes under you is
+# worse than one you have to bump.
+#
+# NOT a production deployment. The credentials are in this file, Postgres has no
+# volume tuning, nothing is TLS. See docs/OPERATIONS.md and the Helm chart for a
+# real one.
+
+services:
+  postgres:
+    image: docker.io/library/postgres:16-alpine
+    environment:
+      POSTGRES_USER: dagron
+      POSTGRES_PASSWORD: dagron
+      POSTGRES_DB: workflow
+    # Not published to the host: nothing outside this stack needs it, and an
+    # open 5432 with these credentials is a bad default to hand someone.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dagron -d workflow"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - dagron-pg:/var/lib/postgresql/data
+
+  engine:
+    # -localdev, not the plain engine image, and the difference matters here.
+    #
+    # With EXECUTOR=local a task's command runs as a subprocess *inside this
+    # container*. The production engine image is distroless: no shell, no
+    # coreutils, so `command: ["echo", "hello"]` — the first thing anyone
+    # writes — cannot resolve. The localdev image is the same binary on
+    # debian-slim so that first workflow actually runs.
+    #
+    # For docker/kubernetes execution the task runs in its own image and the
+    # distroless engine is the right one. See docs/OPERATIONS.md.
+    image: docker.io/mancube/dagron-engine-localdev:${DAGRON_VERSION:-0.5.1}
+    environment:
+      DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
+      API_ADDR: 0.0.0.0:8787
+      EXECUTOR: local
+      RUST_LOG: info
+      # Where the engine watches for workflow files. The named volume below is
+      # shared with nothing else; drop a YAML in it to submit by file.
+      SOURCE: file
+      DAG_PATH: /workflows
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - dagron-workflows:/workflows
+
+  dagron-api:
+    image: docker.io/mancube/dagron-api:${DAGRON_VERSION:-0.5.1}
+    environment:
+      DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
+      # Dev credentials, seeded on first start. Change them for anything that
+      # outlives the afternoon; docs/OPERATIONS.md covers doing it properly.
+      DAGRON_ADMIN_EMAIL: admin@local
+      DAGRON_ADMIN_PASSWORD: dagron-admin
+      DAGRON_ADMIN_NAME: Administrator
+      # dagron-api refuses to start on anything shorter than 32 characters,
+      # which is the right call and worth not working around with a shorter
+      # string. Fixed so sessions survive a restart of this stack; override it,
+      # and generate a real one for anything that outlives the afternoon.
+      DAGRON_JWT_SECRET: ${DAGRON_JWT_SECRET:-quickstart-only-not-a-real-secret-change-me}
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:8080:8080"
+      # The console's port is published here, not on the frontend service —
+      # see the note under `frontend`, which shares this container's network.
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    image: docker.io/mancube/dagron-frontend:${DAGRON_VERSION:-0.5.1}
+    # Shares dagron-api's network namespace, which is what makes the published
+    # image usable here at all.
+    #
+    # The frontend proxies /api to a target baked in at build time (Next
+    # `rewrites()` are resolved when the standalone bundle is built, not read
+    # from the environment at boot). The published image carries the default,
+    # `http://localhost:8080` — so out of the box it can only reach an API on
+    # its own localhost.
+    #
+    # That is not a bug in the image: the Helm chart never uses this proxy,
+    # because its ingress routes /api straight to the API service and / to the
+    # frontend. compose.yaml gets it right by passing DAGRON_API_URL as a
+    # *build* arg, which a pull-don't-build quickstart cannot do.
+    #
+    # Sharing the namespace makes `localhost:8080` true, with no second image
+    # and no reverse proxy in front. The cost is that `ports:` must live on the
+    # service that owns the namespace, above.
+    network_mode: "service:dagron-api"
+    depends_on:
+      - dagron-api
+
+  # Opt in with `--profile gitops`. Off by default because it is only useful
+  # once you have connected a repository, and a worker idling against nothing
+  # is noise in the logs of someone still finding their way around.
+  gitops:
+    profiles: ["gitops"]
+    image: docker.io/mancube/dagron-gitops:${DAGRON_VERSION:-0.5.1}
+    environment:
+      DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
+      GITOPS_POLL_SECS: "60"
+      RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  dagron-pg:
+  dagron-workflows:

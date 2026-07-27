@@ -25,6 +25,14 @@ pub struct Workflow {
     pub description: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Lifecycle: active / paused / retired. Distinct from a *schedule* being
+    /// disabled — this stops the workflow however many schedules it has, and
+    /// leaves them all intact.
+    #[sqlx(default)]
+    pub state: String,
+    /// Current definition version; `workflow_versions` holds the history.
+    #[sqlx(default)]
+    pub version: i64,
     /// Organizational labels parsed from the spec (#26). `#[sqlx(default)]` so the
     /// row query (which doesn't select a `tags` column) maps; set from the spec.
     #[sqlx(default)]
@@ -54,8 +62,12 @@ pub struct WorkflowRow {
     pub schedule_id: Option<String>,
     pub cron_expr: Option<String>,
     pub next_fire_at: Option<String>,
+    /// The *schedule* is disabled. Not the same as the workflow being paused:
+    /// this one is per-schedule, `state` below is the whole workflow.
     pub paused: bool,
     pub has_schedule: bool,
+    /// Workflow lifecycle: active / paused / retired.
+    pub state: String,
     pub last_status: Option<String>,
     pub last_at: Option<String>,
     /// Up to 14 recent run statuses, oldest → newest (for the sparkline).
@@ -81,6 +93,7 @@ struct WfBase {
     description: Option<String>,
     created_at: String,
     updated_at: String,
+    state: String,
 }
 #[derive(sqlx::FromRow)]
 struct SchedRow {
@@ -116,7 +129,8 @@ pub async fn list_workflows(
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Vec<WorkflowRow>>, StatusCode> {
     let wfs = sqlx::query_as::<_, WfBase>(
-        "SELECT id, name, spec, description, created_at, updated_at FROM workflows ORDER BY name",
+        "SELECT id, name, spec, description, created_at, updated_at, state
+         FROM workflows ORDER BY name",
     )
     .fetch_all(&state.read_pool)
     .await
@@ -191,6 +205,7 @@ pub async fn list_workflows(
             description: w.description,
             created_at: w.created_at,
             updated_at: w.updated_at,
+            state: w.state,
         });
     }
     // Optional tag filter (#26): keep only workflows carrying the requested tag.
@@ -207,7 +222,8 @@ pub async fn get_workflow(
     Path(id): Path<String>,
 ) -> Result<Json<Workflow>, StatusCode> {
     let mut wf = sqlx::query_as::<_, Workflow>(
-        "SELECT id, name, spec, description, created_at, updated_at FROM workflows WHERE id = $1",
+        "SELECT id, name, spec, description, created_at, updated_at, state, version
+         FROM workflows WHERE id = $1",
     )
     .bind(&id)
     .fetch_optional(&state.read_pool)
@@ -231,6 +247,15 @@ pub async fn create_workflow(
     let now = chrono::Utc::now().to_rfc3339();
     let id = Uuid::new_v4().to_string();
 
+    // One transaction: a workflow row must never exist without its version-1
+    // history row backing it, so a client is never told "version 1" when
+    // `workflow_versions` has nothing to show for it.
+    let mut tx = state
+        .write_pool
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+
     sqlx::query(
         "INSERT INTO workflows (id, name, spec, description, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$5)",
     )
@@ -239,9 +264,31 @@ pub async fn create_workflow(
     .bind(&body.spec)
     .bind(&description)
     .bind(&now)
-    .execute(&state.write_pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| dup_or_internal(e, &name))?;
+
+    // Version 1, so history starts at creation rather than at the first edit —
+    // otherwise the original definition is the one version nobody can recover.
+    let version = crate::routes::lifecycle::record_version(
+        &mut tx,
+        &id,
+        &name,
+        &body.spec,
+        Some(&_auth.0.email),
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(workflow_id = %id, error = %e, "failed to record initial workflow version");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to record initial workflow version".to_string(),
+        )
+    })?;
+
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     Ok((
         StatusCode::CREATED,
@@ -253,6 +300,8 @@ pub async fn create_workflow(
             description,
             created_at: now.clone(),
             updated_at: now,
+            state: "active".to_string(),
+            version,
         }),
     ))
 }
@@ -269,7 +318,29 @@ pub async fn update_workflow(
     let description = body.description.filter(|d| !d.trim().is_empty());
     let now = chrono::Utc::now().to_rfc3339();
 
-    let res = sqlx::query(
+    let mut tx = state
+        .write_pool
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+
+    // Lock the row before touching it. Without this, two concurrent edits to
+    // the *same* workflow can both read the same `MAX(version)` inside
+    // record_version and race: one history insert then loses to the other's
+    // UNIQUE (workflow_id, version) and silently drops (best-effort below), and
+    // `workflows.version` can end up pointing at a history row that isn't the
+    // spec this request just wrote. Locking here makes the second request wait
+    // for the first to commit rather than interleave with it.
+    let locked: Option<i64> = sqlx::query_scalar("SELECT version FROM workflows WHERE id = $1 FOR UPDATE")
+        .bind(&id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    if locked.is_none() {
+        return Err((StatusCode::NOT_FOUND, format!("workflow '{id}' not found")));
+    }
+
+    sqlx::query(
         "UPDATE workflows SET name = $1, spec = $2, description = $3, updated_at = $4 WHERE id = $5",
     )
     .bind(&name)
@@ -277,17 +348,46 @@ pub async fn update_workflow(
     .bind(&description)
     .bind(&now)
     .bind(&id)
-    .execute(&state.write_pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| dup_or_internal(e, &name))?;
 
-    if res.rows_affected() == 0 {
-        return Err((StatusCode::NOT_FOUND, format!("workflow '{id}' not found")));
+    // History, written after the update succeeds, in a savepoint rather than
+    // the outer transaction directly: best-effort still applies here — losing
+    // a history row must not fail an edit the user already made and can see —
+    // but a plain swallowed error would otherwise leave the outer transaction
+    // aborted (Postgres poisons a transaction on any failed statement), taking
+    // the update above down with it. The savepoint contains the damage to just
+    // this step. Sharing the row lock from above is what makes the write here
+    // race-free, not the savepoint.
+    let mut sp = sqlx::Acquire::begin(&mut tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    match crate::routes::lifecycle::record_version(&mut sp, &id, &name, &body.spec, Some(&_auth.0.email)).await {
+        Ok(_) => {
+            sp.commit()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+        }
+        Err(e) => {
+            tracing::error!(workflow_id = %id, error = %e, "failed to record workflow version");
+            sp.rollback()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+        }
     }
 
-    let created_at: String = sqlx::query_scalar("SELECT created_at FROM workflows WHERE id = $1")
-        .bind(&id)
-        .fetch_one(&state.read_pool)
+    // Read back state and version rather than assuming: record_version above
+    // has just bumped version, and an edit must not silently reactivate a
+    // workflow someone paused.
+    let (created_at, wf_state, version): (String, String, i64) =
+        sqlx::query_as("SELECT created_at, state, version FROM workflows WHERE id = $1")
+            .bind(&id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+
+    tx.commit()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
@@ -299,6 +399,8 @@ pub async fn update_workflow(
         description,
         created_at,
         updated_at: now,
+        state: wf_state,
+        version,
     }))
 }
 
@@ -327,12 +429,26 @@ pub async fn run_workflow(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let spec_yaml: Option<String> = sqlx::query_scalar("SELECT spec FROM workflows WHERE id = $1")
-        .bind(&id)
-        .fetch_optional(&state.read_pool)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-    let spec_yaml = spec_yaml.ok_or((StatusCode::NOT_FOUND, format!("workflow '{id}' not found")))?;
+    // A paused or retired workflow refuses to run here as well as in the
+    // scheduler. Enforcing it in only one of the two would mean "paused" stops
+    // cron but not a button, which is not what anyone reads it to mean.
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT spec, state FROM workflows WHERE id = $1")
+            .bind(&id)
+            .fetch_optional(&state.read_pool)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    if let Some((_, wf_state)) = &row {
+        if !crate::routes::lifecycle::is_runnable(wf_state) {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("workflow '{id}' is {wf_state} — set it active before running it"),
+            ));
+        }
+    }
+    let spec_yaml = row
+        .map(|(spec, _)| spec)
+        .ok_or((StatusCode::NOT_FOUND, format!("workflow '{id}' not found")))?;
 
     control::parse_and_validate(&spec_yaml)?;
     // Same pipeline as `POST /api/runs`: `workflow_ref` chains inlined, then the

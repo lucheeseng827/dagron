@@ -44,8 +44,19 @@ services:
       DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
       API_ADDR: 0.0.0.0:8787   # keeps the process resident + serves the internal ops API
       EXECUTOR: local
+      # Turns on the artifact store, which the checkpoint/resume and batch
+      # examples require: the engine injects DAGRON_ARTIFACTS per run and
+      # DAGRON_CHECKPOINT_DIR per task. Without it those examples fail at once
+      # with ":? set DAGRON_ARTIFACT_DIR on the engine" — correct, but a poor
+      # first meeting with the feature the AI examples exist to show.
+      DAGRON_ARTIFACT_DIR: /artifacts
       DAGRON_ENV_SECRET_KEY: *env_secret_key
       RUST_LOG: info
+    volumes:
+      # Shared with dagron-api, which serves these back over /api/artifacts —
+      # the engine writing to its own container filesystem would leave the API
+      # reading an empty directory.
+      - dagron-artifacts:/artifacts
     depends_on:
       postgres:
         condition: service_healthy
@@ -85,6 +96,11 @@ services:
       # this port is bound to 127.0.0.1 and the proxy sets the header. Leave unset
       # anywhere dagron-api is reachable directly (a caller can forge it).
       DAGRON_TRUST_PROXY_HEADERS: "true"
+      # Same store the engine writes to, so /api/artifacts can serve what a run
+      # produced.
+      DAGRON_ARTIFACT_DIR: /artifacts
+    volumes:
+      - dagron-artifacts:/artifacts
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:
@@ -127,8 +143,15 @@ services:
         # Baked into the Next /api rewrite at build time; the standalone server
         # can't change it at runtime, so it is intentionally only a build arg.
         DAGRON_API_URL: http://dagron-api:8080
+        # Same deal for the version in the sidebar brand. Release images get the
+        # image tag here (see .github/workflows/docker.yml); a local stack has no
+        # tag, so it shows "dev" rather than inventing a number.
+        APP_VERSION: ${APP_VERSION:-dev}
     ports:
       - "127.0.0.1:3000:3000"
     depends_on:
       dagron-api:
         condition: service_started
+
+volumes:
+  dagron-artifacts:

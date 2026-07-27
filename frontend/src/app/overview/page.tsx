@@ -75,6 +75,67 @@ export default function OverviewPage() {
     .slice(0, 6);
   const recent = runs.slice(0, 6);
 
+  // ── what needs a human ────────────────────────────────────────────────────
+  // The page leads with this. Everything here is something someone has to act
+  // on; if the list is empty there is genuinely nothing to do, and the empty
+  // state says so rather than showing a blank panel.
+  const dayAgo = Date.now() - 86400_000;
+  // Untriaged failures only. A failure someone has already acknowledged,
+  // resolved or deliberately ignored is not "needs attention" any more — and
+  // before triage existed this list could only drain by ageing out, which meant
+  // it emptied whether or not anyone had looked.
+  const failed24 = runs.filter(
+    (r) =>
+      r.status === "failed" &&
+      !r.triage_state &&
+      new Date(r.created_at).getTime() >= dayAgo,
+  );
+  const ok24 = runs.filter(
+    (r) => r.status === "succeeded" && new Date(r.created_at).getTime() >= dayAgo,
+  ).length;
+
+  const attention: {
+    key: string;
+    count: number;
+    color: string;
+    label: string;
+    hint: string;
+    href: string;
+  }[] = [
+    {
+      key: "failed",
+      count: failed24.length,
+      color: "var(--red)",
+      label: `failed run${failed24.length === 1 ? "" : "s"} in the last 24h`,
+      hint: "inspect the failed task, then rerun or redrive",
+      href: "/runs?status=failed",
+    },
+    {
+      key: "approvals",
+      count: health?.awaiting_approvals ?? 0,
+      color: "var(--purple)",
+      label: `run${(health?.awaiting_approvals ?? 0) === 1 ? "" : "s"} awaiting approval`,
+      hint: "parked, holding no worker slot, until someone decides",
+      href: "/approvals",
+    },
+    {
+      key: "dead",
+      count: health?.dead_letters ?? 0,
+      color: "var(--red)",
+      label: `dead letter${(health?.dead_letters ?? 0) === 1 ? "" : "s"} parked`,
+      hint: "fix the cause, then redrive them",
+      href: "/dead-letters",
+    },
+    {
+      key: "drift",
+      count: outOfSync,
+      color: "var(--amber)",
+      label: `repo${outOfSync === 1 ? "" : "s"} out of sync`,
+      hint: "the cluster is not running what Git says",
+      href: "/gitops",
+    },
+  ].filter((a) => a.count > 0);
+
   return (
     <div className="dy-page">
       <div className="dy-pagehead">
@@ -93,25 +154,51 @@ export default function OverviewPage() {
       </div>
       {error && <p style={{ color: "var(--red)" }}>{error}</p>}
 
-      {/* Attention strip: things a human should act on, one click away. */}
-      {health && (health.awaiting_approvals > 0 || health.dead_letters > 0) && (
-        <div style={{ display: "flex", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
-          {health.awaiting_approvals > 0 && (
-            <Link href="/approvals" className="dy-card" style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 16px", borderColor: "rgba(163,113,247,0.5)", color: "var(--fg)" }}>
-              <span className="dy-dot" style={{ background: "#a371f7" }} />
-              <strong>{health.awaiting_approvals}</strong> run{health.awaiting_approvals === 1 ? "" : "s"} awaiting approval
-              <span style={{ color: "var(--dim)" }}>→</span>
-            </Link>
-          )}
-          {health.dead_letters > 0 && (
-            <Link href="/dead-letters" className="dy-card" style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 16px", borderColor: "rgba(248,81,73,0.5)", color: "var(--fg)" }}>
-              <span className="dy-dot" style={{ background: "var(--red)" }} />
-              <strong>{health.dead_letters}</strong> dead letter{health.dead_letters === 1 ? "" : "s"} parked
-              <span style={{ color: "var(--dim)" }}>→</span>
-            </Link>
+      {/* ── needs attention — the page leads with this ────────────────────── */}
+      <section className="dy-attn" aria-labelledby="attn-h">
+        <div className="dy-attn-head">
+          <h2 id="attn-h">Needs attention</h2>
+          {attention.length > 0 && (
+            <span className="dy-attn-count">
+              {attention.reduce((n, a) => n + a.count, 0)}
+            </span>
           )}
         </div>
-      )}
+
+        {attention.length === 0 ? (
+          /* Teaches rather than saying "nothing here": names what was checked,
+             so an empty panel reads as verified-quiet, not as broken. */
+          <div className="dy-attn-clear">
+            <span className="dy-dot" style={{ background: "var(--green)" }} />
+            <div>
+              <strong>Nothing needs attention.</strong>
+              <p>
+                No failed runs, approvals or dead letters in the last 24 hours, and every
+                connected repo is in sync.
+                {ok24 > 0 && ` ${ok24} run${ok24 === 1 ? "" : "s"} succeeded.`}
+              </p>
+            </div>
+          </div>
+        ) : (
+          <ul className="dy-attn-list">
+            {attention.map((a) => (
+              <li key={a.key}>
+                <Link href={a.href} className="dy-attn-item">
+                  <span className="dy-dot" style={{ background: a.color }} />
+                  <span className="dy-attn-n">{a.count}</span>
+                  <span className="dy-attn-label">
+                    {a.label}
+                    <span className="dy-attn-hint">{a.hint}</span>
+                  </span>
+                  <span className="dy-attn-go" aria-hidden="true">
+                    →
+                  </span>
+                </Link>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
 
       {/* KPI row — each card links to the screen that answers its question. */}
       <div className="dy-kpis">
@@ -147,8 +234,10 @@ export default function OverviewPage() {
         </Link>
       </div>
 
-      {/* two columns */}
-      <div style={{ display: "grid", gridTemplateColumns: "1.55fr 1fr", gap: 18, alignItems: "start" }}>
+      {/* Three equal columns. The old 1.55fr/1fr split put one short card beside
+          a tall stacked pair, which left most of the lower-left of the page as
+          void whenever the schedule was empty. */}
+      <div className="dy-cols3">
         {/* Next scheduled runs */}
         <div className="dy-card">
           <div className="dy-cardhead">
@@ -177,13 +266,11 @@ export default function OverviewPage() {
           {nextRuns.length === 0 && <p className="dy-empty">No scheduled runs.</p>}
         </div>
 
-        {/* right column */}
-        <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
-          <div className="dy-card">
-            <div className="dy-cardhead">
-              <strong>Recent runs</strong>
-              <Link href="/runs">View all →</Link>
-            </div>
+        <div className="dy-card">
+          <div className="dy-cardhead">
+            <strong>Recent runs</strong>
+            <Link href="/runs">View all →</Link>
+          </div>
             {recent.map((r) => (
               <Link key={r.id} href={`/runs/${r.id}`} className="dy-row">
                 <span className="dy-dot" style={{ background: statusColor(r.status as TaskStatus) }} />
@@ -195,23 +282,22 @@ export default function OverviewPage() {
                 </span>
               </Link>
             ))}
-            {recent.length === 0 && <p className="dy-empty">No runs yet.</p>}
-          </div>
+          {recent.length === 0 && <p className="dy-empty">No runs yet.</p>}
+        </div>
 
-          <div className="dy-card">
-            <div className="dy-cardhead">
-              <strong>GitOps repos</strong>
-              <Link href="/gitops">View all →</Link>
-            </div>
-            {repos.map((r) => (
-              <Link key={r.id} href="/gitops" className="dy-row">
-                <span className="dy-dot" style={{ background: REPO_COLOR[r.state] }} />
-                <span className="mono" style={{ fontSize: 13 }}>{r.name}</span>
-                <span style={{ marginLeft: "auto", fontSize: 12.5, color: REPO_COLOR[r.state] }}>{r.state}</span>
-              </Link>
-            ))}
-            {repos.length === 0 && <p className="dy-empty">No repos connected.</p>}
+        <div className="dy-card">
+          <div className="dy-cardhead">
+            <strong>GitOps repos</strong>
+            <Link href="/gitops">View all →</Link>
           </div>
+          {repos.map((r) => (
+            <Link key={r.id} href="/gitops" className="dy-row">
+              <span className="dy-dot" style={{ background: REPO_COLOR[r.state] }} />
+              <span className="mono" style={{ fontSize: 13 }}>{r.name}</span>
+              <span style={{ marginLeft: "auto", fontSize: 12.5, color: REPO_COLOR[r.state] }}>{r.state}</span>
+            </Link>
+          ))}
+          {repos.length === 0 && <p className="dy-empty">No repos connected.</p>}
         </div>
       </div>
     </div>

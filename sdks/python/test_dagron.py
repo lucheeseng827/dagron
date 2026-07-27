@@ -292,6 +292,49 @@ class ClientRunTests(GatewayTestCase):
         self.client.list_runs()
         self.assertEqual(self.last_request()["query"], {})
 
+    def test_get_run_logs_encodes_the_filter(self):
+        self.respond("GET", "/api/runs/r-1/logs", 200, {"lines": []})
+        self.client.get_run_logs(
+            "r-1", level=["error", "warn"], context=2, tail=True, case=False,
+            regex=r"rows=\d+", tasks=["extract", "load"],
+        )
+        req = self.last_request()
+        self.assertEqual(req["path"], "/api/runs/r-1/logs")
+        self.assertEqual(
+            req["query"],
+            {
+                "level": ["error,warn"],
+                "context": ["2"],
+                "tail": ["1"],
+                "regex": [r"rows=\d+"],
+                "task": ["extract,load"],
+            },
+        )
+        # `case=False` is dropped, not sent as 0: an explicit `case=0` would
+        # still count as "the caller filtered" and change server behaviour.
+        self.assertNotIn("case", req["query"])
+
+    def test_get_run_logs_without_a_filter_sends_no_params(self):
+        # An unfiltered read must stay byte-identical to what it was before
+        # filters existed — a stray `q=` would push the server onto its filter
+        # path for nothing.
+        self.respond("GET", "/api/runs/r-1/logs", 200, {"lines": []})
+        self.client.get_run_logs("r-1")
+        self.assertEqual(self.last_request()["query"], {})
+
+    def test_get_task_logs_combines_offset_and_filter(self):
+        self.respond("GET", "/api/runs/r-1/tasks/t-1/logs", 200, {"output": ""})
+        self.client.get_task_logs("r-1", "t-1", offset=120, level="error")
+        self.assertEqual(
+            self.last_request()["query"], {"offset": ["120"], "level": ["error"]}
+        )
+
+    def test_unknown_log_filter_parameter_raises(self):
+        # A typo'd filter name must fail loudly here: silently dropping it would
+        # return an unfiltered response the caller reads as filtered.
+        with self.assertRaises(TypeError):
+            self.client.get_run_logs("r-1", levl="error")
+
     def test_get_run_encodes_path_segment(self):
         # A '/' in the id must be percent-encoded into one segment, not split into
         # path structure (no traversal / wrong-endpoint hits).

@@ -15,7 +15,12 @@ Postgres-only, stateless, listens on `PORT` (default `8080`).
 **Auth:** every route below except `/healthz`, `POST /api/login` and
 `POST /api/logout` requires a valid HS256 session JWT, accepted either as the
 HttpOnly `dagron_session` cookie (browsers) or `Authorization: Bearer <jwt>`
-(API clients). Missing/invalid/expired → `401` (`src/auth.rs`).
+(API clients). Automation may instead present a personal access token (`dgp_`
+prefix) in the same `Authorization: Bearer` header; it resolves to its owner's
+live permissions. Token *management* (`/api/tokens*`) is the one exception — it
+requires a password session and refuses a `dgp_` bearer with `403`, so a leaked
+token cannot mint its own replacements. Missing/invalid/expired → `401`
+(`src/auth.rs`).
 `POST /api/users`, `GET /api/users`, `GET /api/audit`, and all three
 `/api/settings/notifications*` routes additionally require the `admin` group
 (`403` otherwise) — notification defaults hold secret webhook URLs and reroute
@@ -36,6 +41,9 @@ CORS is currently permissive (dev posture — see
 | GET | `/api/me` | — → the session claims `{sub, email, name, groups, exp}` | `401` |
 | POST | `/api/users` | `{email, password, name, groups[]}` → `201 {id}` | `403` non-admin, `400` password < 8, `409` duplicate |
 | GET | `/api/users` | → `[{id, email, name, groups[], created_at}]` (no hashes) | `403` non-admin |
+| POST | `/api/tokens` | mint a personal access token `{name, expires_in_days?}` → `201 {id, name, prefix, token, expires_at}`; the `token` plaintext is returned **only here** (storage keeps `sha256` only) | `403` presented an API token, `400` empty name / `expires_in_days` ≤ 0 or out of range |
+| GET | `/api/tokens` | → the caller's own tokens `[{id, name, prefix, created_at, expires_at, last_used_at, revoked_at}]` (no hashes, no plaintext) | `403` presented an API token |
+| DELETE | `/api/tokens/{id}` | revoke → `204` (idempotent — revoking twice is not an error) | `403` presented an API token, `404` unknown / not the caller's |
 | GET | `/api/health` | rich health for the UI status widget: `{api, edition, db, scheduler_leader, leader_holder, active_runs, awaiting_approvals, dead_letters}`. Never 500s — a DB outage answers `db: "error"` | `401` |
 | GET | `/api/search` | `?q=&limit=` (limit per category, default 8, max 20) → `{query, workflows[], runs[], schedules[]}`. Capped + parameterized (run ids match by prefix, names by substring; LIKE wildcards escaped) — the ⌘K palette backend | `401` |
 | GET/POST | `/api/environments` | list / create `{name, description?, variables{}}` → environments with `variables` + `secret_names` (values are **write-only**, never returned) | `409` duplicate, `400` bad name |
@@ -64,7 +72,8 @@ curl -s http://localhost:8080/api/me -H "Authorization: Bearer $TOKEN"
 | GET | `/api/runs/{id}` | run detail (`{…, name, trigger_kind}`) + `tasks[]` (`{id, name, status, attempt, output, scheduled_at, finished_at}`); `404` |
 | GET | `/api/runs/{id}/wait` | `?timeout_secs=` (default 30, clamp 1–600) long-poll to terminal → `{run_id, status, finished, result}` (`result` = the `result_from` task's output on success); `404`; a timed-out wait is `200` with `finished: false` |
 | GET | `/api/runs/{id}/graph` | DAG as `{nodes[], edges[]}` for the UI graph view |
-| GET | `/api/runs/{id}/tasks/{tid}/logs` | `{task_id, name, status, attempt, output, offset, next_offset, eof}`; `404`. **`?offset=`** returns only the output past that char offset for live tailing — poll with `?offset=next_offset` until `eof` |
+| GET | `/api/runs/{id}/logs` | **Workflow logs** — every task's output merged into one attributed stream, filtered server-side → `{run_id, tasks[], lines[], total, matched, truncated, eof, filtered, limit}`; `404` unknown run, `400` invalid filter. `?task=`/`?status=` narrow which tasks are read (name or id, repeatable or CSV); the [log filter](#log-filter) then narrows which lines survive. `total`/`matched` are counted **before** the line cap, so a truncated view always says how much it hid |
+| GET | `/api/runs/{id}/tasks/{tid}/logs` | `{task_id, name, status, attempt, output, offset, next_offset, eof, total, matched, truncated, filtered, lines?}`; `404`, `400` invalid filter. **`?offset=`** returns only the output past that char offset for live tailing — poll with `?offset=next_offset` until `eof`. The [log filter](#log-filter) applies *within* that slice while `next_offset` keeps counting the raw text, so filtering and tailing compose; `lines` is present only when a filter was asked for |
 | GET | `/api/runs/{id}/stream` | **SSE**: one shared Postgres `LISTEN task_events` fans out to per-run streams; each event is JSON; on broadcast lag the client receives `event: resync` / `data: lagged` and should refetch |
 | GET | `/api/events/stream` | **SSE**: account-wide activity — every run's task events (`{run_id}`), unfiltered, off the same shared listener; feeds the UI list pages' live-updates mode; same `resync` contract on lag |
 | POST | `/api/runs/{id}/cancel` | → `{cancelled: n}`; `404` |
@@ -77,6 +86,58 @@ curl -s http://localhost:8080/api/me -H "Authorization: Bearer $TOKEN"
 
 Control mutations fire `pg_notify('task_events', run_id)` in-transaction, so
 the engine wakes immediately (`src/routes/control.rs`).
+
+<a id="log-filter"></a>
+
+### Log filter
+
+Both log endpoints — on `dagron-api` and on the engine ops API — accept the same
+filter grammar, applied **server-side**. A run's captured output can be hundreds
+of megabytes; shipping all of it so the client can grep is not a filter, it's a
+download.
+
+The filter is a set of predicates, **all** of which must hold for a line to be
+kept. Sending none of them returns unfiltered output (still subject to the line
+cap), byte-for-byte as before filtering existed.
+
+| Param | Meaning |
+| --- | --- |
+| `q` | keep only lines containing this text (repeatable — all terms must match) |
+| `exclude` | drop lines containing this text (repeatable — none may match) |
+| `regex` | keep only lines matching this regular expression (max 512 bytes) |
+| `level` | keep only these levels (repeatable or CSV): `error`/`warn`/`info`/`debug`/`trace`/`plain` |
+| `case` | `1` to match case-sensitively; the default is insensitive |
+| `context` | also keep N unmatched lines either side of each match (`grep -C`) |
+| `limit` | max lines returned (default 2000, hard cap 50000; `0` = default) |
+| `tail` | `1` to keep the **last** lines when the cap applies, rather than the first |
+
+```sh
+# Every error line in the run, with a line of context either side.
+curl -s "$API/api/runs/$RUN/logs?level=error&context=1" | jq -r '.lines[].text'
+
+# Just the extract task, minus healthcheck noise, last 200 lines.
+curl -s "$API/api/runs/$RUN/logs?task=extract&exclude=healthz&limit=200&tail=1"
+```
+
+Notes that matter when reading a response:
+
+- **Levels are inferred**, not recorded. Task output is whatever the command
+  printed, so the level comes from scanning the head of each line. A line that
+  never says "error" cannot be found by asking for errors, and `plain` (no
+  recognizable level token) is the common case.
+- **Line numbers (`n`) are positions in the unfiltered output**, so a filtered
+  line can still be located in the raw log.
+- **`total` and `matched` are counted before the line cap.** A view that hides
+  most of a run always says so, via `matched` vs `total` and `truncated`.
+- **Context lines come back with `matched: false`** so a client can dim them —
+  context you can't tell apart from a hit overstates what the filter found.
+- **An invalid filter is a `400` naming the reason** (uncompilable regex, unknown
+  level, non-numeric bound). Ignoring it would return an unfiltered wall of text
+  the caller would read as "nothing was filtered out".
+
+The grammar lives in `crates/dagron-logging/src/logfilter.rs` — one parser, so a
+filter typed in the console, sent by an SDK, or written into a runbook all mean
+the same thing.
 
 ### Archived runs (history past the hot window)
 
@@ -120,8 +181,10 @@ unauthenticated); a dataset is updated by a task's `produces:`, never here.
 | Method | Path | Notes |
 | --- | --- | --- |
 | GET/POST | `/api/workflows` | list (enriched with schedule + recent-run digest) / create `{name?, spec, description?}` → `201`; `409` duplicate name. Each row carries `tags: []` — the spec's `tags:` labels, **parsed from the stored spec on read** so they always reflect the current definition. **`?tag=<t>`** returns only workflows carrying that tag |
-| GET/PUT/DELETE | `/api/workflows/{id}` | read / update / delete; `404`, `409`. The read also returns the spec's `tags: []` |
-| POST | `/api/workflows/{id}/run` | → `{run_id, workflow_id}` |
+| GET/PUT/DELETE | `/api/workflows/{id}` | read / update / delete; `404`, `409`. The read also returns the spec's `tags: []`. **PUT** first records the prior definition as a `workflow_versions` row, then overwrites the head. **DELETE** cascades to this workflow's schedules — prefer `state: retired` to stop it without losing them |
+| POST | `/api/workflows/{id}/run` | → `{run_id, workflow_id}`; `409` if the workflow is `paused` or `retired` (only `active` starts a run) |
+| GET | `/api/workflows/{id}/versions` | append-only definition history, newest first → `[{id, version, name, spec, created_at, created_by}]`. A version is recorded on create and on every `PUT`, so v1 is the original definition; `workflows.spec` remains the current head; `404` |
+| POST | `/api/workflows/{id}/state` | `{state}`, one of `active` / `paused` / `retired` → `{id, state}`. Both non-active states refuse to run (enforced in the scheduler **and** `/run`) and **leave the schedules untouched** — the difference from delete; `retired` also hides from the default listing; `400` unknown state, `404` |
 | GET | `/api/workflows/{id}/runs` | `?limit=&offset=` → this workflow's run history (same row shape as `/api/runs`). Runs are matched by definition **name** — the only linkage that exists (each run snapshots its own `workflow_definitions` row, so there is no FK to `workflows`); the list digest uses the same rule. Renaming a workflow therefore starts a fresh history; `404` |
 | POST | `/api/workflows/{id}/sync-to-git` | open a PR with the spec → `{pr_url, branch, path}`; `501` until `GITHUB_TOKEN`+`GIT_REPO` are set; `502` on GitHub errors |
 | GET/POST | `/api/git-repos` | list / connect `{url, branch?, auto_sync}` → `201`; `400` empty URL, `409` duplicate |
@@ -172,7 +235,8 @@ require an authenticated session; `503` when `DAGRON_ARTIFACT_DIR` is unset.
 | POST | `/runs` | **raw YAML body** (not JSON-wrapped) → `201 {run_id}`; `400` invalid DAG; **`429` + `Retry-After`** when `MAX_INFLIGHT_RUNS` is exceeded — the admission backpressure documented in [`ARCHITECTURE.md` §5.6](ARCHITECTURE.md#56-v4-queue-driven-ingestion--admission-backpressure). **`?wait=true`** (with `?timeout_secs=`) makes it a synchronous invocation: `200 {run_id, status, finished, result}` instead of `201` |
 | GET | `/runs/{id}` | `{run, tasks}`; `404` |
 | GET | `/runs/{id}/wait` | `?timeout_secs=` (default 30, clamp 1–600) long-poll to terminal → `{run_id, status, finished, result}`; `404`; timed-out wait is `200` with `finished: false` |
-| GET | `/runs/{id}/tasks/{task_id}/logs` | one task's output for tailing → `{task_id, name, status, attempt, output, offset, next_offset, eof}`; `404`. **`?offset=`** returns only the output past that char offset — poll with `?offset=next_offset` until `eof` |
+| GET | `/runs/{id}/logs` | **Workflow logs** — the whole run's output merged, attributed and filtered → `{run_id, tasks[], lines[], total, matched, truncated, eof, filtered, limit}`; `404`, `400` invalid filter. `?task=`/`?status=` scope which tasks are read; the [log filter](#log-filter) scopes which lines survive |
+| GET | `/runs/{id}/tasks/{task_id}/logs` | one task's output for tailing → `{task_id, name, status, attempt, output, offset, next_offset, eof, total, matched, truncated, filtered, lines?}`; `404`, `400` invalid filter. **`?offset=`** returns only the output past that char offset — poll with `?offset=next_offset` until `eof`. The [log filter](#log-filter) applies within that slice |
 | POST | `/runs/{id}/cancel` | `{run_id, cancelled: true}`; `409` if not cancellable |
 | POST | `/runs/{id}/rerun` | optional `{from?}` → `{run_id, rerun}`; `404`/`409`/`400` |
 | POST | `/runs/{id}/tasks/{task_id}/clear` | clear a completed task + its downstream cone → `{run_id, task_id, cleared}`; `404` unknown run/task, `409` task not completed |

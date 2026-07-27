@@ -1,12 +1,16 @@
-//! DAG graph + task-log read endpoints.
+//! DAG graph read endpoint.
 //!
 //! `graph` returns nodes (task_runs) and edges (task_dependencies) shaped so the
 //! React Flow client consumes edges as `source`/`target` directly.
+//!
+//! Log reads used to live here too; they moved to [`super::logs`] when they grew
+//! a filter grammar, so the graph endpoint and the log views don't share a file
+//! just because they both read `task_runs`.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::auth::AuthUser;
 use crate::state::AppState;
@@ -45,40 +49,6 @@ pub struct GraphResponse {
     pub edges: Vec<GraphEdge>,
 }
 
-#[derive(Debug, sqlx::FromRow)]
-struct TaskLogRow {
-    task_id: String,
-    name: String,
-    status: String,
-    attempt: i64,
-    output: Option<String>,
-}
-
-/// Task log response with tail metadata (#17). `output` is the full output when
-/// no `offset` is given (back-compat), or the slice from `offset` when tailing.
-/// A client polls with `?offset=next_offset` until `eof` (the task is terminal).
-/// Offsets are Unicode-scalar counts, so they never split a multibyte character.
-#[derive(Debug, Serialize)]
-pub struct TaskLogs {
-    pub task_id: String,
-    pub name: String,
-    pub status: String,
-    pub attempt: i64,
-    pub output: Option<String>,
-    /// Offset (char count) this response starts at.
-    pub offset: usize,
-    /// Resume point for the next poll — the char length of the full output.
-    pub next_offset: usize,
-    /// True once the task is terminal: no more output will arrive.
-    pub eof: bool,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct LogParams {
-    /// Resume tailing from this char offset. Omit for the full output.
-    pub offset: Option<usize>,
-}
-
 /// `GET /api/runs/:id/graph` — task nodes + dependency edges for one run.
 /// Returns empty arrays (not 404) for a real run with no tasks.
 pub async fn get_graph(
@@ -109,49 +79,6 @@ pub async fn get_graph(
     .map_err(internal)?;
 
     Ok(Json(GraphResponse { nodes, edges }))
-}
-
-/// `GET /api/runs/:id/tasks/:tid/logs[?offset=N]` — one task's output, scoped to
-/// the run (so a task id can't be probed against the wrong run). 404 if not found.
-/// With `?offset=` it returns only the output past that char offset for live
-/// tailing (#17): poll with `?offset=next_offset` until `eof`.
-pub async fn get_task_logs(
-    _auth: AuthUser,
-    State(state): State<AppState>,
-    Path((id, tid)): Path<(String, String)>,
-    Query(params): Query<LogParams>,
-) -> Result<Json<TaskLogs>, StatusCode> {
-    let row = sqlx::query_as::<_, TaskLogRow>(
-        "SELECT id AS task_id, name, status, attempt, output
-         FROM task_runs WHERE id = $1 AND run_id = $2",
-    )
-    .bind(&tid)
-    .bind(&id)
-    .fetch_optional(&state.read_pool)
-    .await
-    .map_err(internal)?
-    .ok_or(StatusCode::NOT_FOUND)?;
-
-    let full = row.output.unwrap_or_default();
-    let total = full.chars().count();
-    let eof = matches!(row.status.as_str(), "succeeded" | "failed" | "skipped" | "cancelled");
-    // Slice on a char boundary by skipping whole scalars — never panics on UTF-8.
-    let output = match params.offset {
-        Some(off) if off < total => Some(full.chars().skip(off).collect::<String>()),
-        Some(_) => Some(String::new()), // caller is caught up
-        None => Some(full),
-    };
-    let offset = params.offset.unwrap_or(0).min(total);
-    Ok(Json(TaskLogs {
-        task_id: row.task_id,
-        name: row.name,
-        status: row.status,
-        attempt: row.attempt,
-        output,
-        offset,
-        next_offset: total,
-        eof,
-    }))
 }
 
 fn internal(err: sqlx::Error) -> StatusCode {

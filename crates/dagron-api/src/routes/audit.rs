@@ -151,8 +151,12 @@ pub async fn audit_mutations(
     let path = req.uri().path().to_string();
     let method = req.method().to_string();
 
-    // Decode the session (if any) before the handler consumes the request.
-    let claims = crate::auth::claims_from_request(req.headers(), &state.jwt_secret);
+    // Resolve the caller (if any) before the handler consumes the request.
+    // This must go through `authenticate`, not the JWT-only decoder: the block
+    // below is an authorization decision, and a personal access token that read
+    // as "unauthenticated" here would skip it entirely — a viewer's token doing
+    // what a viewer's session cannot.
+    let claims = crate::auth::authenticate(req.headers(), &state).await;
 
     if mutating && !skip_audit(&path) {
         if let Some(c) = &claims {

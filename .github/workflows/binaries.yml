@@ -1,0 +1,172 @@
+# Build the `dagron` binary for every supported platform and attach it to the
+# release the sync already created. Active in the PUBLIC MIRROR
+# (lucheeseng827/dagron); inert in the monorepo, which never carries the stamped
+# `v*.*.*` tag this fires on.
+#
+# Why this exists: before it, a release shipped five container images and an OCI
+# chart and nothing you could run directly. "Install dagron" meant "install
+# Docker", or "install a Rust toolchain and wait for a compile" — which is a
+# poor first impression and, for the single-binary/edge story the project makes,
+# an odd gap.
+#
+# Only the root `dagron` binary is published. It is the one a person runs
+# (`dagron dev`, `dagron validate`, a one-shot run); dagron-api, the GitOps
+# worker and the MCP server are services and ship as images.
+name: Publish release binaries
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach binaries to (e.g. v0.5.0)"
+        required: true
+
+permissions:
+  contents: write # uploading release assets
+
+concurrency:
+  group: binaries-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl, not gnu: a statically linked binary runs on any distro,
+          # including the minimal images an edge box tends to have. A glibc
+          # build would inherit the builder's glibc floor and fail on anything
+          # older, which is exactly the box least likely to be updatable.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm # native arm64; cross-linking musl is avoidable pain
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            runner: macos-13 # last Intel image; macos-latest is arm64
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      # `cc` for the musl target, and nothing else: the binary links no OpenSSL
+      # (rustls throughout) and bundles SQLite, so there is no system library to
+      # find. Verified with `cargo tree --bin dagron`.
+      - name: musl toolchain
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # --locked so a release binary is built from the committed lockfile and
+      # not from whatever resolved that morning. Default features = sqlite +
+      # ops: the embedded datastore and the management API, which is what
+      # `dagron dev` needs and what a single-binary deployment means.
+      - name: Build
+        run: cargo build --release --locked --bin dagron --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ github.event.inputs.tag || github.ref_name }}"
+          name="dagron-${version}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/dagron" "dist/$name/"
+          # Licence travels with the binary; someone who downloads only this
+          # tarball should still have it.
+          cp LICENSE "dist/$name/" 2>/dev/null || true
+          tar -C dist -czf "dist/${name}.tar.gz" "$name"
+          echo "ASSET=dist/${name}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (windows)
+        if: matrix.archive == 'zip'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ github.event.inputs.tag || github.ref_name }}"
+          name="dagron-${version}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/dagron.exe" "dist/$name/"
+          cp LICENSE "dist/$name/" 2>/dev/null || true
+          (cd dist && 7z a "${name}.zip" "$name" >/dev/null)
+          echo "ASSET=dist/${name}.zip" >> "$GITHUB_ENV"
+
+      # Runs the binary that is about to be published, on the machine that built
+      # it. Catches the failure that matters most and is easiest to ship: an
+      # archive containing something that does not start.
+      # Every leg builds natively — macos-13 is x86_64, macos-latest is arm64,
+      # ubuntu-24.04-arm is arm64 — so each runner can execute what it just
+      # built. No cross-compilation, so no reason to skip this anywhere.
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/dagron"
+          # Note: not `[ -f "$bin.exe" ] && bin=...` — under `set -e` a false
+          # test would end the step, which is every non-Windows target.
+          if [ -f "$bin.exe" ]; then bin="$bin.exe"; fi
+          # `validate` parses, expands and graph-checks a spec with no server
+          # and no network — the cheapest end-to-end proof the binary runs.
+          "$bin" validate examples/simple_dag.yaml
+          echo "smoke test passed for ${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  publish:
+    name: Attach to the release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # One checksum file over every archive, so a download can be verified
+      # without trusting the transport. Generated here rather than per-job so
+      # the file covers the whole set.
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          # Written outside the directory first: `sha256sum * > SHA256SUMS`
+          # creates the empty target before the glob expands, so the file ends
+          # up hashing itself.
+          sha256sum dagron-* > ../SHA256SUMS
+          mv ../SHA256SUMS .
+          cat SHA256SUMS
+
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${{ github.event.inputs.tag || github.ref_name }}"
+          # --clobber so re-running a dispatch replaces assets rather than
+          # failing halfway and leaving a release with a partial set.
+          gh release upload "$version" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          echo "Attached $(ls dist | wc -l) assets to $version"

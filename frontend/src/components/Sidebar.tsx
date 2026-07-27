@@ -20,6 +20,7 @@ type IconName =
   | "users"
   | "audit"
   | "bell"
+  | "key"
   | "search"
   | "envs";
 
@@ -53,6 +54,12 @@ const OPS: NavItem[] = [
 const ADMIN: NavItem[] = [
   { href: "/settings/notifications", label: "Notifications", icon: "bell" },
   { href: "/settings/users", label: "Users", icon: "users" },
+];
+// Not admin-gated. A token is a credential for the signed-in user, and an
+// operator wiring up CI needs one exactly as much as an admin does — putting it
+// behind the admin gate would leave them back on storing a password.
+const ACCOUNT: NavItem[] = [
+  { href: "/settings/tokens", label: "API tokens", icon: "key" },
 ];
 // Enterprise-build screens (health.edition === "enterprise"): the audit trail.
 const ADMIN_EE: NavItem[] = [{ href: "/settings/audit", label: "Audit log", icon: "audit" }];
@@ -164,7 +171,12 @@ export default function Sidebar() {
           <div className="dy-brand-sub">
             WORKFLOWS
             {process.env.NEXT_PUBLIC_APP_VERSION ? (
-              <span className="dy-brand-ver">v{process.env.NEXT_PUBLIC_APP_VERSION}</span>
+              <span className="dy-brand-ver">
+                {/* Prefix "v" only for a real version, so an unstamped local
+                    build reads "dev" rather than "vdev". */}
+                {/^\d/.test(process.env.NEXT_PUBLIC_APP_VERSION) ? "v" : ""}
+                {process.env.NEXT_PUBLIC_APP_VERSION}
+              </span>
             ) : null}
           </div>
         </div>
@@ -185,6 +197,9 @@ export default function Sidebar() {
 
       <div className="dy-navsection">OPERATIONS</div>
       {OPS.map(renderItem)}
+
+      <div className="dy-navsection">ACCOUNT</div>
+      {ACCOUNT.map(renderItem)}
 
       {isAdmin && (
         <>
@@ -315,6 +330,13 @@ function NavIcon({ name }: { name: IconName }) {
           <ellipse cx="12" cy="5" rx="9" ry="3" />
           <path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5" />
           <path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3" />
+        </svg>
+      );
+    case "key":
+      return (
+        <svg className="dy-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+          <circle cx="8" cy="12" r="4" />
+          <path d="M12 12h9M18 12v3M21 12v2" strokeLinecap="round" />
         </svg>
       );
     case "users":

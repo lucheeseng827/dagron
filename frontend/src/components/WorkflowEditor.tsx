@@ -1,6 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import WorkflowLifecycle from "@/components/WorkflowLifecycle";
+import type { WorkflowState } from "@/types/dagron";
 import { useRouter } from "next/navigation";
 import Editor from "@monaco-editor/react";
 import "@/lib/monaco"; // self-host the Monaco runtime (air-gap; no CDN)
@@ -41,6 +43,10 @@ export default function WorkflowEditor({ id }: { id?: string }) {
   const [loading, setLoading] = useState(!isNew);
   const [view, setView] = useState<"yaml" | "visual">("visual");
   const [prUrl, setPrUrl] = useState<string | null>(null);
+  // Lifecycle state + current version, read back from the API rather than
+  // assumed: an edit must not silently reactivate a workflow someone paused.
+  const [wfState, setWfState] = useState<WorkflowState | undefined>();
+  const [wfVersion, setWfVersion] = useState<number | undefined>();
 
   // Live parse for the visual editor; the model is derived from the YAML spec.
   const parsed = useMemo(() => parseModel(spec), [spec]);
@@ -56,17 +62,24 @@ export default function WorkflowEditor({ id }: { id?: string }) {
     if (locked) setView("yaml");
   }, [locked]);
 
-  useEffect(() => {
+  const load = useCallback(() => {
     if (!id) return;
     getWorkflow(id)
       .then((w) => {
         setName(w.name);
         setSpec(w.spec);
         setDescription(w.description ?? "");
+        setWfState(w.state);
+        setWfVersion(w.version);
       })
       .catch((e) => setError(errMsg(e)))
       .finally(() => setLoading(false));
   }, [id]);
+
+  useEffect(() => {
+    if (!id) return;
+    load();
+  }, [id, load]);
 
   const onSave = async () => {
     setBusy(true);
@@ -77,6 +90,10 @@ export default function WorkflowEditor({ id }: { id?: string }) {
         router.push(`/workflows/${w.id}`);
       } else {
         await updateWorkflow(id!, spec, name || undefined, description || undefined);
+        // Re-read state/version rather than assume: the save just bumped the
+        // version, and the lifecycle panel (and any open history) must not
+        // keep showing the pre-save numbers.
+        load();
       }
     } catch (e) {
       setError(errMsg(e));
@@ -117,6 +134,7 @@ export default function WorkflowEditor({ id }: { id?: string }) {
     setPrUrl(null);
     try {
       await updateWorkflow(id, spec, name || undefined, description || undefined);
+      load();
       const { pr_url } = await syncWorkflowToGit(id);
       setPrUrl(pr_url);
     } catch (e) {
@@ -214,6 +232,16 @@ export default function WorkflowEditor({ id }: { id?: string }) {
 
       {error && <p style={{ color: "var(--red)", marginBottom: 8 }}>{error}</p>}
       {locked && <VisualLockedNotice reasons={support.reasons} />}
+      {/* Saved workflows only: a workflow that does not exist yet has no state
+          to change and no history to show. */}
+      {!isNew && (
+        <WorkflowLifecycle
+          id={id!}
+          state={wfState}
+          version={wfVersion}
+          onChanged={load}
+        />
+      )}
       {prUrl && (
         <p style={{ marginBottom: 8 }}>
           Pull request opened:{" "}

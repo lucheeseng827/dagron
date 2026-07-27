@@ -1,29 +1,67 @@
-@import "https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap";
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-/* ── dagron design system (from the phase-2 prototype) ─────────────────────── */
+/* ── dagron design system ──────────────────────────────────────────────────
+   The console shares dagron.dev's material (see site/ + DESIGN.md): a steel
+   chrome layer around a dark content ground, paint-white text, one amber
+   accent. It does NOT share the marketing page's display type or its flap
+   ornament — this is an operator's tool, and a display face in a data table
+   is a costume. One workhorse sans carries the whole UI.
+
+   Two colour rules that the previous palette broke:
+     1. ONE accent. It was orange #e8833a for brand and blue #2f81f7 for
+        primary buttons, so two colours competed for "act here".
+     2. The accent is not a status. --accent (#f5a623) means "act here / you
+        are here"; --amber (#d9a441, duller) is the ready/waiting run state.
+        Close enough to belong together, separate enough that a primary button
+        never reads as a run state.                                            */
 :root {
-  --bg: #0d1014;
-  --panel: #15191f;
-  --panel-2: #1b2027;
-  --side: #11151b;
-  --card: #15191f;
+  /* content ground and panels — the dark face the data sits on */
+  --bg: #101317;
+  --panel: #171b21;
+  --panel-2: #1e232a;
+  --card: #171b21;
+  /* the second neutral layer: sidebar, toolbars, table headers. Steel, and
+     cooler than the content ground so chrome reads as chrome. */
+  --side: #1b1f25;
+  --steel: #22272e;
+  --steel-hi: #333a43;
+
   --border: rgba(255, 255, 255, 0.07);
-  --border-strong: rgba(255, 255, 255, 0.12);
+  --border-strong: rgba(255, 255, 255, 0.13);
 
-  --fg: #e6edf3;
-  --muted: #8b949e;
-  --dim: #6e7681;
+  --fg: #eceae3; /* paint */
+  --muted: #9aa3ad; /* 6.9:1 on --bg */
+  --dim: #7d8792; /* 5.1:1 on --bg — the old #6e7681 was 4.0:1 and failed AA */
 
-  --accent: #e8833a; /* rust ember */
-  --accent-hover: #f0a35e;
-  --blue: #2f81f7;
-  --green: #2ea043;
-  --amber: #d29922;
-  --red: #f85149;
-  --muted-status: #484f58;
+  /* one accent: primary actions, current selection, focus. Never decoration. */
+  --accent: #f5a623;
+  --accent-hover: #ffc766;
+  --accent-ink: #1b1204; /* text on an amber fill — 8.9:1 */
+  --accent-soft: rgba(245, 166, 35, 0.13);
+
+  /* Status vocabulary. The mapping is the one operators already read (see
+     statusColor() in lib/adapter.ts, which now points at these instead of
+     keeping a second, drifting set of hex literals). */
+  --green: #3fb950; /* succeeded */
+  --red: #f0645a; /* failed */
+  --blue: #58a6ff; /* running */
+  --amber: #d9a441; /* ready / waiting — duller than --accent, on purpose */
+  --purple: #a371f7; /* awaiting approval — a human gate */
+  --muted-status: #545c66; /* cancelled / skipped */
+
+  /* type: one family for the UI, a system mono for code, data and times */
+  --font-sans-stack: var(--font-sans), system-ui, -apple-system, "Segoe UI", roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", sfmono-regular, menlo, consolas, monospace;
+
+  /* one spacing/step scale, so density is a decision and not an accident */
+  --gap-1: 4px;
+  --gap-2: 8px;
+  --gap-3: 12px;
+  --gap-4: 16px;
+  --gap-5: 24px;
+  --radius: 7px;
 }
 
 * {
@@ -36,7 +74,7 @@ body {
   height: 100%;
   background: var(--bg);
   color: var(--fg);
-  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  font-family: var(--font-sans-stack);
   font-size: 14px;
   -webkit-font-smoothing: antialiased;
 }
@@ -44,7 +82,7 @@ body {
 code,
 pre,
 .mono {
-  font-family: "IBM Plex Mono", monospace;
+  font-family: var(--font-mono);
 }
 
 /* Minimal pill scrollbars — thin, transparent track, muted rounded thumb (no
@@ -82,15 +120,23 @@ pre,
   min-height: 100vh;
 }
 
+/* The chrome layer. Steel, lit from the top edge, and it does not scroll with
+   the content — on a console left open all day the nav must stay put while a
+   long run list moves underneath it. */
 .dy-side {
   width: 232px;
   flex-shrink: 0;
-  background: var(--side);
-  border-right: 1px solid var(--border);
+  background: linear-gradient(180deg, var(--steel) 0, var(--side) 120px);
+  border-right: 1px solid #0c0f12;
+  box-shadow: inset -1px 0 0 rgba(255, 255, 255, 0.03);
   display: flex;
   flex-direction: column;
-  padding: 16px 12px;
-  gap: 4px;
+  padding: 14px 10px;
+  gap: 2px;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
 }
 
 .dy-brand {
@@ -102,7 +148,7 @@ pre,
   letter-spacing: -0.02em;
 }
 .dy-brand-sub {
-  font-family: "IBM Plex Mono", monospace;
+  font-family: var(--font-mono);
   font-size: 10px;
   color: var(--dim);
   margin-top: 3px;
@@ -123,8 +169,8 @@ pre,
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 9px 11px;
-  border-radius: 8px;
+  padding: 7px 10px;
+  border-radius: 6px;
   font-size: 13.5px;
   font-weight: 500;
   color: var(--muted);
@@ -133,13 +179,18 @@ pre,
   transition: background 0.12s, color 0.12s;
 }
 .dy-navitem:hover {
-  background: rgba(255, 255, 255, 0.04);
+  background: rgba(255, 255, 255, 0.05);
   color: var(--fg);
   text-decoration: none;
 }
-.dy-navitem-active {
+/* "You are here" is carried by the bar and the weight, not by colour alone —
+   the accent is also a status hue elsewhere, so selection must survive being
+   read as one. */
+.dy-navitem-active,
+.dy-navitem-active:hover {
   color: var(--fg);
-  background: rgba(232, 131, 58, 0.12);
+  font-weight: 600;
+  background: var(--accent-soft);
   box-shadow: inset 2px 0 0 var(--accent);
 }
 
@@ -165,8 +216,8 @@ pre,
   width: 34px;
   height: 34px;
   border-radius: 9px;
-  background: linear-gradient(150deg, #f0a35e, #e8833a 55%, #c25a1e);
-  box-shadow: 0 2px 10px rgba(232, 131, 58, 0.35);
+  background: linear-gradient(150deg, #ffc766, #f5a623 55%, #c9820f);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.22) inset;
   flex-shrink: 0;
   overflow: hidden;
 }
@@ -180,11 +231,13 @@ pre,
 }
 
 .dy-navsection {
-  font-family: "IBM Plex Mono", monospace;
-  font-size: 9.5px;
-  color: #56606b;
-  letter-spacing: 0.08em;
-  padding: 16px 11px 6px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--dim);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  padding: 18px 10px 6px;
 }
 
 .dy-icon {
@@ -194,7 +247,7 @@ pre,
 }
 .dy-navcount {
   margin-left: auto;
-  font-family: "IBM Plex Mono", monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
   color: var(--dim);
 }
@@ -231,7 +284,6 @@ pre,
   height: 8px;
   border-radius: 50%;
   background: var(--green);
-  box-shadow: 0 0 8px var(--green);
   flex-shrink: 0;
 }
 .dy-user {
@@ -256,22 +308,40 @@ pre,
   width: 26px;
   height: 26px;
   border-radius: 50%;
-  background: linear-gradient(135deg, #2f81f7, #1f5fc0);
+  /* Neutral, not the old blue: identity is not a status and not an action, so
+     it takes the chrome layer rather than a colour with a meaning attached. */
+  background: var(--steel-hi);
+  border: 1px solid var(--border-strong);
   display: flex;
   align-items: center;
   justify-content: center;
   font-size: 11px;
   font-weight: 700;
-  color: #fff;
+  color: var(--fg);
   flex-shrink: 0;
+}
+
+/* ── keyboard focus ───────────────────────────────────────────────────────
+   The console shipped with no focus style at all: every button, link, nav
+   item and form control on all 21 routes was invisible to a keyboard user.
+   One ring, one place. :focus-visible so a mouse click does not draw it. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+.dy-navitem:focus-visible,
+.dy-row:focus-visible,
+.dy-card:focus-visible {
+  outline-offset: -2px;
 }
 
 /* ── primitives ───────────────────────────────────────────────────────────── */
 .dy-card {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 16px;
+  border-radius: var(--radius);
+  padding: var(--gap-4);
 }
 
 .dy-pill {
@@ -287,8 +357,8 @@ pre,
 }
 .dy-pill-active {
   color: var(--fg);
-  background: rgba(232, 131, 58, 0.14);
-  border-color: rgba(232, 131, 58, 0.4);
+  background: var(--accent-soft);
+  border-color: rgba(245, 166, 35, 0.4);
 }
 
 .dy-btn {
@@ -306,15 +376,17 @@ pre,
   border-color: var(--accent);
 }
 .dy-btn-primary {
-  /* Primary CTAs are blue in the design comp; rust is reserved for brand + nav. */
-  background: var(--blue);
-  border-color: var(--blue);
-  color: #fff;
+  /* One accent. This was blue while the brand and nav were orange, so two
+     different colours both said "act here" on the same screen. */
+  background: var(--accent);
+  border-color: #c9820f;
+  color: var(--accent-ink);
   font-weight: 600;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.28) inset;
 }
 .dy-btn-primary:hover {
-  background: #4a93ff;
-  border-color: #4a93ff;
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
 }
 .dy-btn-danger:hover {
   border-color: var(--red);
@@ -331,12 +403,18 @@ pre,
 }
 .dy-table th {
   text-align: left;
-  color: var(--muted);
-  font-weight: 500;
-  font-size: 12px;
+  color: var(--dim);
+  font-weight: 600;
+  font-size: 11px;
   text-transform: uppercase;
-  letter-spacing: 0.04em;
-  padding: 8px 12px;
+  letter-spacing: 0.07em;
+  padding: 9px 12px;
+  /* Header is chrome, so it takes the steel layer and stays put while a long
+     run list scrolls under it. */
+  background: var(--steel);
+  position: sticky;
+  top: 0;
+  z-index: 1;
 }
 .dy-table td {
   padding: 10px 12px;
@@ -345,8 +423,10 @@ pre,
 }
 
 .dy-page {
-  padding: 26px 32px 40px;
-  max-width: 1180px;
+  padding: 22px 28px 40px;
+  /* Was 1180px. Run and task tables have six-plus columns and were being
+     squeezed on screens with room to spare; wide data is the point here. */
+  max-width: 1560px;
 }
 .dy-h1 {
   font-size: 23px;
@@ -384,16 +464,17 @@ pre,
 .dy-kpi {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 16px 17px;
+  border-radius: var(--radius);
+  padding: 13px 15px;
 }
 .dy-kpi-label {
   font-size: 12px;
   color: var(--muted);
   margin-bottom: 9px;
 }
+/* 27px was brochure scale for a number that is usually a single digit. */
 .dy-kpi-value {
-  font-size: 27px;
+  font-size: 21px;
   font-weight: 700;
   letter-spacing: -0.02em;
 }
@@ -441,8 +522,8 @@ pre,
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 10px 8px;
-  border-radius: 8px;
+  padding: 8px;
+  border-radius: 6px;
   text-decoration: none;
   color: var(--fg);
 }
@@ -557,7 +638,7 @@ pre,
   padding: 6px;
 }
 .dy-cmdk-group {
-  font-family: "IBM Plex Mono", monospace;
+  font-family: var(--font-mono);
   font-size: 9.5px;
   color: #56606b;
   letter-spacing: 0.08em;
@@ -589,7 +670,7 @@ pre,
 }
 .dy-kbd,
 .dy-cmdk-empty kbd {
-  font-family: "IBM Plex Mono", monospace;
+  font-family: var(--font-mono);
   font-size: 10px;
   color: var(--dim);
   background: var(--panel-2);
@@ -648,4 +729,124 @@ a {
    Components convey hover via color/background instead. */
 a:hover {
   text-decoration: none;
+}
+
+/* ── overview: needs-attention panel ───────────────────────────────────────
+   The page leads with this, so it is a panel and not a card in a grid: full
+   width, steel header, and one row per thing a human has to act on. */
+.dy-attn {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--panel);
+  margin-bottom: var(--gap-4);
+  overflow: hidden;
+}
+.dy-attn-head {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  padding: 9px 14px;
+  background: var(--steel);
+  border-bottom: 1px solid var(--border);
+}
+.dy-attn-head h2 {
+  margin: 0;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.dy-attn-count {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent-ink);
+  background: var(--accent);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
+.dy-attn-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.dy-attn-list li + li {
+  border-top: 1px solid var(--border);
+}
+.dy-attn-item {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-3);
+  padding: 11px 14px;
+  color: var(--fg);
+  text-decoration: none;
+  transition: background 0.12s;
+}
+.dy-attn-item:hover {
+  background: rgba(255, 255, 255, 0.03);
+  text-decoration: none;
+}
+.dy-attn-n {
+  font-family: var(--font-mono);
+  font-size: 15px;
+  font-weight: 600;
+  min-width: 2ch;
+  text-align: right;
+}
+.dy-attn-label {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-size: 13.5px;
+  min-width: 0;
+}
+.dy-attn-hint {
+  font-size: 12px;
+  color: var(--dim);
+}
+.dy-attn-go {
+  margin-left: auto;
+  color: var(--dim);
+  flex-shrink: 0;
+}
+.dy-attn-item:hover .dy-attn-go {
+  color: var(--accent);
+}
+
+/* Empty is the good case here, so it gets a real state rather than a blank
+   panel: it names what was checked so the quiet reads as verified. */
+.dy-attn-clear {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--gap-3);
+  padding: 14px;
+}
+.dy-attn-clear .dy-dot {
+  margin-top: 5px;
+}
+.dy-attn-clear p {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  max-width: 70ch;
+}
+
+/* ── overview: three equal columns ───────────────────────────────────────── */
+.dy-cols3 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--gap-4);
+  align-items: start;
+}
+@media (max-width: 1180px) {
+  .dy-cols3 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 760px) {
+  .dy-cols3 {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }

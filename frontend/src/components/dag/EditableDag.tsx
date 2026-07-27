@@ -22,7 +22,7 @@ import SnippetPalette from "./SnippetPalette";
 import DirectionControl from "./DirectionControl";
 import { useDagDirection, type LayoutDirection } from "./direction";
 import { isSentinel, positionedSentinels } from "./sentinels";
-import { layout, NODE_H, NODE_W } from "./layout";
+import { layout, NODE_W, statusNodeHeight } from "./layout";
 import {
   buildPaletteTask,
   leafNames,
@@ -81,8 +81,11 @@ function EditableDagInner({ model, onChange }: EditableDagProps) {
       id: t.name,
       type: "status",
       position: positions.current[t.name] ?? { x: 0, y: 0 },
-      width: 190,
-      height: 52,
+      width: NODE_W,
+      // Height must match what StatusNode actually renders — a sub-DAG call or
+      // a step with an image carries a third row and is taller. React Flow
+      // applies this to the wrapper, so a wrong value clips the node.
+      height: statusNodeHeight(nodeData(t, model)),
       data: nodeData(t, model),
       selected: t.name === selected,
     }));
@@ -176,8 +179,8 @@ function EditableDagInner({ model, onChange }: EditableDagProps) {
         id: t.name,
         type: "status",
         position: { x: 0, y: 0 },
-        width: 190,
-        height: 52,
+        width: NODE_W,
+        height: statusNodeHeight(nodeData(t, model)),
         data: nodeData(t, model),
         selected: t.name === selected,
       }));
@@ -275,7 +278,11 @@ function EditableDagInner({ model, onChange }: EditableDagProps) {
       setDropEdgeId(null);
       const p = screenToFlowPosition({ x: e.clientX, y: e.clientY });
       const task = buildPaletteTask(s, model.tasks, []);
-      positions.current[task.name] = { x: p.x - NODE_W / 2, y: p.y - NODE_H / 2 };
+      // Center the drop on the cursor using the height the node will actually
+      // render at — a sub-DAG/image task carries a third row and is taller, so
+      // a flat NODE_H would drop it low, off-centre by the row's height.
+      const h = statusNodeHeight(nodeData(task, model));
+      positions.current[task.name] = { x: p.x - NODE_W / 2, y: p.y - h / 2 };
       const hit = edgeUnderDrag(e);
       onChange({
         ...model,
@@ -487,33 +494,43 @@ function TaskPanel({
       )}
 
       {isLeaf && (
+        // Labels are short enough to hold one line in a third of the panel —
+        // "Max attempts" / "Retry delay s" / "Timeout s" each wrapped, which
+        // doubled the row's height. Units and the engine's default live in the
+        // placeholder, so an empty field shows what you actually get.
         <div style={{ display: "flex", gap: 8, alignItems: "stretch" }}>
           <div style={fieldCol}>
-            <Label>Max attempts</Label>
+            <Label>Attempts</Label>
             <input
               style={fieldInput}
               type="number"
               min={1}
+              placeholder="1"
+              title="Total attempts before the task is marked failed. Default 1 — no retries."
               value={task.max_attempts ?? ""}
               onChange={(e) => patch({ max_attempts: intField(e.target.value, 1) })}
             />
           </div>
           <div style={fieldCol}>
-            <Label>Retry delay s</Label>
+            <Label>Retry delay</Label>
             <input
               style={fieldInput}
               type="number"
               min={0}
+              placeholder="0 s"
+              title="Base seconds between retries; the actual wait doubles each attempt. Default 0 — retry immediately."
               value={task.retry_delay_secs ?? ""}
               onChange={(e) => patch({ retry_delay_secs: intField(e.target.value, 0) })}
             />
           </div>
           <div style={fieldCol}>
-            <Label>Timeout s</Label>
+            <Label>Timeout</Label>
             <input
               style={fieldInput}
               type="number"
               min={1}
+              placeholder="25 s"
+              title="Seconds before the task is killed. Left empty it falls back to the 25 s hard limit."
               value={task.timeout_secs ?? ""}
               onChange={(e) => patch({ timeout_secs: intField(e.target.value, 1) })}
             />

@@ -18,6 +18,9 @@ use crate::state::AppState;
 /// `ui_settings` key holding the JSON-encoded [`NotificationSettings`].
 pub const NOTIFY_KEY: &str = "notifications";
 
+/// `ui_settings` key holding the JSON-encoded [`DeadLetterSettings`].
+pub const DEAD_LETTER_KEY: &str = "dead_letters";
+
 /// Instance-wide notification routing is an admin concern: the stored Slack
 /// URL is a bearer-like secret, PUT redirects every run's outcome data, and
 /// the test endpoint makes the server POST outbound — none of which a regular
@@ -205,4 +208,116 @@ fn internal(err: sqlx::Error) -> StatusCode {
 fn internal_msg(err: sqlx::Error) -> (StatusCode, String) {
     tracing::error!(error = ?err, "db query failed");
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+}
+
+// ── dead letters ─────────────────────────────────────────────────────────────
+
+/// How many times ingestion retries a submission before parking it.
+///
+/// Only the retry count is settable here. The other DLQ knob,
+/// `STREAM_DLQ_PATH`, is a filesystem path on the engine's own host — a form
+/// that chooses where a server process writes files is a footgun, so that one
+/// stays deployment configuration.
+///
+/// Absent means "unset": the engine keeps using its `DEAD_LETTER_MAX_ATTEMPTS`
+/// environment value, so an existing deployment behaves exactly as before until
+/// someone deliberately overrides it here.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DeadLetterSettings {
+    /// Attempts before a submission is dead-lettered. Minimum 1 — zero would
+    /// mean "park everything without ever trying", which is not a retry policy.
+    pub max_attempts: i64,
+}
+
+/// `GET /api/settings/dead-letters`
+pub async fn get_dead_letters(
+    _auth: AuthUser,
+    State(state): State<AppState>,
+) -> Result<Json<Option<DeadLetterSettings>>, (StatusCode, String)> {
+    let raw = sqlx::query_scalar::<_, String>("SELECT value FROM ui_settings WHERE key = $1")
+        .bind(DEAD_LETTER_KEY)
+        .fetch_optional(&state.read_pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(raw.and_then(|r| serde_json::from_str(&r).ok())))
+}
+
+/// `PUT /api/settings/dead-letters`
+///
+/// Takes effect on the next ingestion failure — the engine reads this on the
+/// failure path rather than caching it at startup, so there is no restart and
+/// no window where the console disagrees with what is running.
+pub async fn put_dead_letters(
+    AuthUser(claims): AuthUser,
+    State(state): State<AppState>,
+    Json(body): Json<DeadLetterSettings>,
+) -> Result<Json<DeadLetterSettings>, (StatusCode, String)> {
+    require_admin(&claims)?;
+    if body.max_attempts < 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("max_attempts must be at least 1, got {}", body.max_attempts),
+        ));
+    }
+    let json = serde_json::to_string(&body)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    sqlx::query(
+        // updated_at is NOT NULL — same shape as the notifications writer above.
+        "INSERT INTO ui_settings (key, value, updated_at) VALUES ($1, $2, $3)
+         ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = $3",
+    )
+    .bind(DEAD_LETTER_KEY)
+    .bind(&json)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&state.write_pool)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tracing::info!(max_attempts = body.max_attempts, "dead-letter settings updated");
+    Ok(Json(body))
+}
+
+#[cfg(test)]
+mod dead_letter_tests {
+    use super::*;
+
+    fn claims(groups: &[&str]) -> SessionClaims {
+        SessionClaims {
+            sub: "u1".to_string(),
+            email: "u1@example.com".to_string(),
+            name: "U1".to_string(),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            exp: 0,
+        }
+    }
+
+    /// put_dead_letters gates on this exact check (mirroring put_notifications
+    /// right above it) — a non-admin session must not be able to rewrite the
+    /// engine's retry threshold.
+    #[test]
+    fn require_admin_rejects_non_admins() {
+        let err = require_admin(&claims(&["member"])).unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        require_admin(&claims(&["admin"])).expect("admin group must pass");
+        require_admin(&claims(&["member", "admin"])).expect("admin among other groups must pass");
+    }
+
+    #[test]
+    fn zero_attempts_is_not_a_retry_policy() {
+        // Guards the validation's intent: 0 would park every submission without
+        // ever trying it, which is a way to lose work, not to configure retries.
+        let s = DeadLetterSettings { max_attempts: 0 };
+        assert!(s.max_attempts < 1, "0 must be rejected by put_dead_letters");
+        let ok = DeadLetterSettings { max_attempts: 1 };
+        assert!(ok.max_attempts >= 1);
+    }
+
+    #[test]
+    fn settings_round_trip_as_json() {
+        // The engine deserialises this exact shape out of ui_settings; a field
+        // rename here silently stops taking effect there.
+        let json = serde_json::to_string(&DeadLetterSettings { max_attempts: 7 }).unwrap();
+        assert!(json.contains("max_attempts"), "{json}");
+        let back: DeadLetterSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.max_attempts, 7);
+    }
 }

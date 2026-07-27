@@ -12,6 +12,35 @@ export interface TaskOptions {
   runnerClass?: string;
 }
 
+/** Inferred severity of a stored log line — best-effort, from the line's head. */
+export type LogLevel = "error" | "warn" | "info" | "debug" | "trace" | "plain";
+
+/**
+ * The server-side log filter accepted by both log endpoints. All fields
+ * optional; omitting everything returns unfiltered output (still line-capped).
+ */
+export interface LogFilter {
+  /** Keep only lines containing this text. */
+  q?: string;
+  /** Drop lines containing this text. */
+  exclude?: string;
+  /** Keep only lines matching this regular expression. */
+  regex?: string;
+  /** Keep only these inferred levels. */
+  level?: LogLevel | LogLevel[];
+  /** Match case-sensitively (default: insensitive). */
+  case?: boolean;
+  /** Also keep this many lines either side of each match. */
+  context?: number;
+  /** Maximum lines to return (0/omitted = the server default). */
+  limit?: number;
+  /** When capped, keep the last lines instead of the first. */
+  tail?: boolean;
+}
+
+export declare const LOG_FILTER_PARAMS: readonly string[];
+export declare function logFilterParams(filter?: LogFilter): Record<string, unknown>;
+
 export interface DagSpec {
   name: string;
   runner_class?: string;
@@ -83,7 +112,15 @@ export declare class Client {
   }): Promise<Array<Record<string, unknown>>>;
   getRun(runId: string): Promise<Record<string, unknown>>;
   getRunGraph(runId: string): Promise<Record<string, unknown>>;
-  getTaskLogs(runId: string, taskId: string): Promise<Record<string, unknown>>;
+  getTaskLogs(
+    runId: string,
+    taskId: string,
+    opts?: LogFilter & { offset?: number },
+  ): Promise<Record<string, unknown>>;
+  getRunLogs(
+    runId: string,
+    opts?: LogFilter & { tasks?: string[]; statuses?: string[] },
+  ): Promise<Record<string, unknown>>;
   cancelRun(runId: string): Promise<number>;
   rerunRun(
     runId: string,

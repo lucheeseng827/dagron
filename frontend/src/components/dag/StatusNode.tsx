@@ -71,7 +71,15 @@ export default function StatusNode({ data, sourcePosition, targetPosition }: Nod
   return (
     <div
       style={{
-        width: 190,
+        width: "100%",
+        // Fill the wrapper React Flow sized from the declared height, so the
+        // border is the node's real edge and the bottom handle lands on it
+        // rather than partway up the content.
+        height: "100%",
+        boxSizing: "border-box",
+        display: "flex",
+        flexDirection: "column",
+        justifyContent: "center",
         background: "var(--card)",
         border: `1px solid ${color}`,
         borderLeft: `4px solid ${color}`,

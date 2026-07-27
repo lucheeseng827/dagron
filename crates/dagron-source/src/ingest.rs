@@ -210,11 +210,26 @@ impl Actor for IngestActor {
                                 // otherwise spin recv→refuse→nack until a slot frees.
                                 tokio::time::sleep(THROTTLE).await;
                             } else {
-                                let count =
-                                    state.failures.entry(message.payload.clone()).or_insert(0);
-                                *count += 1;
-                                if *count >= state.max_validation_attempts {
-                                    let failures = *count;
+                                // Copy the count out before the await below: the
+                                // map entry is a live borrow of `state`, and
+                                // holding it across a suspension point both
+                                // conflicts with reading the setting and makes
+                                // the future non-Send.
+                                let count = {
+                                    let c = state
+                                        .failures
+                                        .entry(message.payload.clone())
+                                        .or_insert(0);
+                                    *c += 1;
+                                    *c
+                                };
+                                let max_attempts = effective_max_attempts(
+                                    state.pool.clone(),
+                                    state.max_validation_attempts,
+                                )
+                                .await;
+                                if count >= max_attempts {
+                                    let failures = count;
                                     state.failures.remove(&message.payload);
                                     dead_letter(
                                         state,
@@ -225,7 +240,7 @@ impl Actor for IngestActor {
                                     )
                                     .await;
                                 } else {
-                                    warn!(error = %e, attempt = *count, "create_run failed — nacking for redelivery");
+                                    warn!(error = %e, attempt = count, "create_run failed — nacking for redelivery");
                                     if let Err(e) = state.source.nack(&message.handle).await {
                                         warn!(error = %e, "nack failed — message redelivers after timeout");
                                     }
@@ -281,6 +296,36 @@ async fn create_run_at(
     match position {
         Some((key, pos)) => db::create_run_with_offset(pool, dag, payload, key, pos).await,
         None => db::create_run(pool, dag, payload).await,
+    }
+}
+
+/// Attempts before a submission is parked, as configured *now*.
+///
+/// Read on the failure path rather than cached at startup, so changing the
+/// policy in the console takes effect without restarting the engine. That costs
+/// one indexed row read per ingestion failure — and ingestion failures are, by
+/// construction, the uncommon case. Caching it would mean the console showing a
+/// number the running process is not actually using, which is worse than the
+/// read.
+///
+/// Falls back to the value the process started with (`DEAD_LETTER_MAX_ATTEMPTS`)
+/// whenever the setting is unset, malformed, or the table is absent — a
+/// standalone SQLite engine with no dagron-api alongside it has no `ui_settings`
+/// table at all, and has to keep working exactly as before.
+/// Takes the pool by value rather than `&IngestState`: the state owns a
+/// `Box<dyn WorkflowSource>`, which is not `Sync`, so borrowing any part of it
+/// across an await would make the actor's whole future non-`Send`. The pool is
+/// an `Arc` internally, so cloning it costs a refcount.
+async fn effective_max_attempts(pool: db::Pool, fallback: i64) -> i64 {
+    #[derive(serde::Deserialize)]
+    struct Stored {
+        max_attempts: i64,
+    }
+    match db::ui_setting(&pool, "dead_letters").await {
+        Ok(Some(raw)) => serde_json::from_str::<Stored>(&raw)
+            .map(|s| s.max_attempts.max(1))
+            .unwrap_or(fallback),
+        _ => fallback,
     }
 }
 

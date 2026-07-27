@@ -30,12 +30,15 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, RawQuery, State},
     http::{header, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+// The log filter grammar, shared with dagron-api so a filter typed against one
+// HTTP surface means the same thing on the other.
+use dagron_logging::logfilter::{self, LogFilter};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::{error, info};
@@ -87,6 +90,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/runs", get(list_runs).post(submit_run))
         .route("/runs/{id}", get(get_run))
         .route("/runs/{id}/wait", get(wait_run))
+        // Log views: the whole run's output as one filtered stream, and one
+        // task's output (live-tailable) under the same filter grammar.
+        .route("/runs/{id}/logs", get(run_logs))
         .route("/runs/{id}/tasks/{task_id}/logs", get(task_logs))
         .route("/runs/{id}/cancel", post(cancel_run))
         .route("/runs/{id}/rerun", post(rerun_run))
@@ -361,22 +367,74 @@ async fn wait_run(
     Ok(Json(run_result_json(&run)))
 }
 
-/// Query for `GET /runs/{id}/tasks/{task_id}/logs` — resume a tail from a char
-/// offset (#17).
-#[derive(Debug, Deserialize)]
-struct LogQuery {
-    offset: Option<usize>,
+/// Is this task status terminal (no further output will arrive)?
+fn task_is_terminal(status: &str) -> bool {
+    matches!(status, "succeeded" | "failed" | "skipped" | "cancelled")
 }
 
-/// `GET /runs/{id}/tasks/{task_id}/logs[?offset=N]` — one task's output for live
-/// tailing. With `?offset=` returns only the output past that char offset plus a
-/// `next_offset` to resume from and `eof` (the task is terminal); poll until
-/// `eof`. 404 if the run or task is unknown.
+/// Parse the shared log filter out of a raw query string, mapping a parse
+/// failure to a 400 that names the reason. A bad regex is the caller's typo, and
+/// silently ignoring it would hand them an unfiltered wall of text they'd read
+/// as "nothing was filtered out".
+///
+/// Uses the same parser as `dagron-api` ([`dagron_logging::logfilter`]) so a
+/// filter means one thing across both HTTP surfaces.
+type ParsedLogQuery = (LogFilter, bool, Vec<(String, String)>);
+
+fn parse_log_filter(raw: Option<&str>) -> Result<ParsedLogQuery, ApiError> {
+    let raw = raw.unwrap_or("");
+    let pairs = logfilter::parse_pairs(raw);
+    let filter = LogFilter::from_pairs(&pairs)
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let filtering = logfilter::pairs_have_filter(&pairs);
+    // Hand the split pairs back so the caller reads its own params out of the
+    // same pass — parsing the query a second time is both wasted work and a
+    // chance for the two passes to disagree.
+    Ok((filter, filtering, pairs))
+}
+
+/// Read `offset=` (the tail cursor) out of an already-split query.
+fn log_offset(pairs: &[(String, String)]) -> Result<Option<usize>, ApiError> {
+    // Last wins on a repeated `offset=`, matching dagron-api's `Scope::from_pairs`
+    // — one grammar must not give two answers depending on which surface you ask.
+    match pairs.iter().rev().find(|(k, _)| k == "offset") {
+        None => Ok(None),
+        Some((_, v)) => v
+            .trim()
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|_| ApiError(StatusCode::BAD_REQUEST, format!("offset must be a number, got {v:?}"))),
+    }
+}
+
+/// Render a [`FilterResult`]'s lines as JSON.
+fn filter_lines_json(res: &dagron_logging::logfilter::FilterResult) -> serde_json::Value {
+    json!(res
+        .lines
+        .iter()
+        .map(|l| json!({
+            "n": l.n, "level": l.level.as_str(), "ts": l.ts,
+            "text": l.text, "matched": l.matched,
+        }))
+        .collect::<Vec<_>>())
+}
+
+/// `GET /runs/{id}/tasks/{task_id}/logs[?offset=N][&<filter>]` — one task's
+/// output for live tailing. With `?offset=` returns only the output past that
+/// char offset plus a `next_offset` to resume from and `eof` (the task is
+/// terminal); poll until `eof`. 404 if the run or task is unknown.
+///
+/// The filter grammar (`q`/`exclude`/`regex`/`level`/`case`/`context`/`limit`/
+/// `tail`) applies *within* the returned slice, while `next_offset` keeps
+/// counting the raw text — so tailing and filtering compose.
 async fn task_logs(
     State(st): State<ApiState>,
     Path((id, task_id)): Path<(String, String)>,
-    Query(q): Query<LogQuery>,
+    RawQuery(raw): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let (filter, filtering, pairs) = parse_log_filter(raw.as_deref())?;
+    let offset = log_offset(&pairs)?;
+
     if db::get_run(&st.pool, &id).await?.is_none() {
         return Err(ApiError(StatusCode::NOT_FOUND, format!("run '{id}' not found")));
     }
@@ -390,22 +448,138 @@ async fn task_logs(
 
     let full = task.output.unwrap_or_default();
     let total = full.chars().count();
-    let eof = matches!(task.status.to_string().as_str(), "succeeded" | "failed" | "skipped" | "cancelled");
+    let eof = task_is_terminal(&task.status.to_string());
     // Char-boundary slice — never splits a multibyte scalar.
-    let output = match q.offset {
+    let slice = match offset {
         Some(off) if off < total => full.chars().skip(off).collect::<String>(),
         Some(_) => String::new(),
         None => full,
     };
-    Ok(Json(json!({
+    let mut body = json!({
         "task_id": task.id,
         "name": task.name,
         "status": task.status.to_string(),
         "attempt": task.attempt,
-        "output": output,
-        "offset": q.offset.unwrap_or(0).min(total),
+        "offset": offset.unwrap_or(0).min(total),
         "next_offset": total,
         "eof": eof,
+        "filtered": filtering,
+        // A line with no stamp of its own was printed somewhere in this window.
+        "started_at": task.scheduled_at,
+        "finished_at": task.finished_at,
+    });
+    let obj = body.as_object_mut().expect("json! built an object");
+    if filtering {
+        let res = filter.apply(&slice);
+        obj.insert("output".into(), json!(res.to_text()));
+        obj.insert("lines".into(), filter_lines_json(&res));
+        obj.insert("total".into(), json!(res.total));
+        obj.insert("matched".into(), json!(res.matched));
+        obj.insert("truncated".into(), json!(res.truncated));
+    } else {
+        // No filter asked for: the slice goes back untouched, byte for byte.
+        let lines = slice.lines().count();
+        obj.insert("output".into(), json!(slice));
+        obj.insert("total".into(), json!(lines));
+        obj.insert("matched".into(), json!(lines));
+        obj.insert("truncated".into(), json!(false));
+    }
+    Ok(Json(body))
+}
+
+/// `GET /runs/{id}/logs[?<filter>][&task=&status=]` — the **whole run's** output
+/// as one attributed stream, filtered server-side.
+///
+/// The view for "this run failed and I don't know which task did it": one call
+/// instead of one per task. `task=`/`status=` choose which task output is read;
+/// the filter then chooses which of those lines survive.
+async fn run_logs(
+    State(st): State<ApiState>,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let raw = raw.unwrap_or_default();
+    let (filter, filtering, pairs) = parse_log_filter(Some(&raw))?;
+    let csv = |key: &str, alt: &str| -> Vec<String> {
+        pairs
+            .iter()
+            .filter(|(k, _)| k == key || k == alt)
+            .flat_map(|(_, v)| v.split(','))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let want_tasks = csv("task", "tasks");
+    let want_statuses = csv("status", "statuses");
+
+    if db::get_run(&st.pool, &id).await?.is_none() {
+        return Err(ApiError(StatusCode::NOT_FOUND, format!("run '{id}' not found")));
+    }
+    let limit = filter.effective_limit();
+    let mut task_rollup = Vec::new();
+    let mut lines: Vec<serde_json::Value> = Vec::new();
+    let (mut total, mut matched, mut truncated, mut eof) = (0usize, 0usize, false, true);
+
+    for task in db::list_tasks(&st.pool, &id).await? {
+        let status = task.status.to_string();
+        let selected = (want_tasks.is_empty()
+            || want_tasks.iter().any(|t| *t == task.id || t.eq_ignore_ascii_case(&task.name)))
+            && (want_statuses.is_empty()
+                || want_statuses.iter().any(|s| s.eq_ignore_ascii_case(&status)));
+        if !selected {
+            task_rollup.push(json!({
+                "id": task.id, "name": task.name, "status": status,
+                "attempt": task.attempt, "selected": false, "total": 0, "matched": 0,
+                // Reported even when unselected: the picker shows when each
+                // task ran, which is half of choosing one.
+                "started_at": task.scheduled_at, "finished_at": task.finished_at,
+            }));
+            continue;
+        }
+        if !task_is_terminal(&status) {
+            eof = false;
+        }
+        let res = filter.apply(task.output.as_deref().unwrap_or_default());
+        total += res.total;
+        matched += res.matched;
+        truncated |= res.truncated;
+        task_rollup.push(json!({
+            "id": task.id, "name": task.name, "status": status,
+            "attempt": task.attempt, "selected": true,
+            "total": res.total, "matched": res.matched,
+            // Most output carries no time of its own, so this window bounds
+            // every line the task printed — as tight as the task was short.
+            "started_at": task.scheduled_at, "finished_at": task.finished_at,
+        }));
+        for l in &res.lines {
+            lines.push(json!({
+                "task_id": task.id, "task": task.name, "attempt": task.attempt,
+                "n": l.n, "level": l.level.as_str(), "ts": l.ts,
+                "text": l.text, "matched": l.matched,
+            }));
+        }
+    }
+
+    // Merge-level cap. `tail` keeps the end of the run — where a failure is.
+    if lines.len() > limit {
+        truncated = true;
+        if filter.is_tail() {
+            lines.drain(..lines.len() - limit);
+        } else {
+            lines.truncate(limit);
+        }
+    }
+
+    Ok(Json(json!({
+        "run_id": id,
+        "tasks": task_rollup,
+        "lines": lines,
+        "total": total,
+        "matched": matched,
+        "truncated": truncated,
+        "eof": eof,
+        "filtered": filtering,
+        "limit": limit,
     })))
 }
 
@@ -793,6 +967,7 @@ mod tests {
             "/runs",
             "/runs/{id}",
             "/runs/{id}/wait",
+            "/runs/{id}/logs",
             "/runs/{id}/tasks/{task_id}/logs",
             "/runs/{id}/cancel",
             "/runs/{id}/rerun",
@@ -1012,7 +1187,7 @@ mod tests {
         let e = task_logs(
             State(state.clone()),
             Path(("nope".into(), "x".into())),
-            Query(LogQuery { offset: None }),
+            RawQuery(None),
         )
         .await
         .unwrap_err();
@@ -1030,7 +1205,7 @@ mod tests {
         let e = task_logs(
             State(state.clone()),
             Path((run_id.clone(), "nope".into())),
-            Query(LogQuery { offset: None }),
+            RawQuery(None),
         )
         .await
         .unwrap_err();
@@ -1040,7 +1215,7 @@ mod tests {
         let full = task_logs(
             State(state.clone()),
             Path((run_id.clone(), a.id.clone())),
-            Query(LogQuery { offset: None }),
+            RawQuery(None),
         )
         .await
         .unwrap();
@@ -1053,7 +1228,7 @@ mod tests {
         let tail = task_logs(
             State(state.clone()),
             Path((run_id.clone(), a.id.clone())),
-            Query(LogQuery { offset: Some(6) }),
+            RawQuery(Some("offset=6".into())),
         )
         .await
         .unwrap();
@@ -1067,11 +1242,147 @@ mod tests {
         let done = task_logs(
             State(state.clone()),
             Path((run_id.clone(), a.id.clone())),
-            Query(LogQuery { offset: None }),
+            RawQuery(None),
         )
         .await
         .unwrap();
         assert_eq!(done.0["eof"], true);
+
+        state.pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The **workflow** log view: `GET /runs/{id}/logs` merges every task's
+    /// output into one attributed stream, and the shared filter grammar narrows
+    /// it. This is the end-to-end check that the filter, the per-task rollup and
+    /// the merge-level cap agree with each other over real datastore rows.
+    #[tokio::test]
+    async fn run_logs_merges_and_filters_every_task() {
+        let (state, path) = temp_state(0).await;
+        let yaml = "name: t\ntasks:\n  - name: a\n    command: [\"true\"]\n  - name: b\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let run_id = db::create_run(&state.pool, &dag, yaml).await.unwrap();
+
+        // Unknown run → 404 (not an empty stream, which would read as "quiet run").
+        let e = run_logs(State(state.clone()), Path("nope".into()), RawQuery(None))
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
+
+        // Give both tasks output: one clean, one with an error line.
+        db::advance_ready_tasks(&state.pool).await.unwrap();
+        let claimed = db::claim_ready(&state.pool, "w", 10).await.unwrap();
+        assert_eq!(claimed.len(), 2, "both tasks are independent and ready");
+        for t in &claimed {
+            let fence = t.version + 1;
+            let body = if t.name == "a" {
+                "starting a\nrows=10\n"
+            } else {
+                "starting b\nERROR upstream timeout\n"
+            };
+            db::append_task_output(&state.pool, &t.id, fence, body, true).await.unwrap();
+        }
+
+        // Unfiltered: every line from every task, attributed, and `filtered` false.
+        let all = run_logs(State(state.clone()), Path(run_id.clone()), RawQuery(None))
+            .await
+            .unwrap();
+        assert_eq!(all.0["total"], 4);
+        assert_eq!(all.0["lines"].as_array().unwrap().len(), 4);
+        assert_eq!(all.0["filtered"], false);
+        assert_eq!(all.0["eof"], false, "both tasks are still running");
+        assert_eq!(all.0["tasks"].as_array().unwrap().len(), 2);
+        let names: Vec<&str> =
+            all.0["lines"].as_array().unwrap().iter().map(|l| l["task"].as_str().unwrap()).collect();
+        assert!(names.contains(&"a") && names.contains(&"b"), "both tasks contribute lines");
+
+        // Filtered by inferred level: only the error line survives, and `total`
+        // still reports every raw line so the view can say what it hid.
+        let errs = run_logs(
+            State(state.clone()),
+            Path(run_id.clone()),
+            RawQuery(Some("level=error".into())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(errs.0["filtered"], true);
+        assert_eq!(errs.0["matched"], 1);
+        assert_eq!(errs.0["total"], 4);
+        let lines = errs.0["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["task"], "b");
+        assert_eq!(lines[0]["level"], "error");
+
+        // Scoping to a task excludes the other entirely — its output isn't even
+        // read, which is why its rollup reports zero rather than its real count.
+        let only_a =
+            run_logs(State(state.clone()), Path(run_id.clone()), RawQuery(Some("task=a".into())))
+                .await
+                .unwrap();
+        assert_eq!(only_a.0["total"], 2);
+        let rollup = only_a.0["tasks"].as_array().unwrap();
+        let b = rollup.iter().find(|t| t["name"] == "b").unwrap();
+        assert_eq!(b["selected"], false);
+        assert_eq!(b["total"], 0);
+
+        // A bad regex is the caller's typo → 400 naming the reason, never a
+        // silently-unfiltered response.
+        let e = run_logs(State(state.clone()), Path(run_id.clone()), RawQuery(Some("regex=%5B".into())))
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST);
+
+        state.pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Tailing and filtering compose: the filter applies *within* the `?offset=`
+    /// slice while `next_offset` keeps counting the raw text, so a filtered tail
+    /// neither loses nor repeats output.
+    #[tokio::test]
+    async fn task_logs_filter_applies_within_the_tailed_slice() {
+        let (state, path) = temp_state(0).await;
+        let yaml = "name: t\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let run_id = db::create_run(&state.pool, &dag, yaml).await.unwrap();
+        db::advance_ready_tasks(&state.pool).await.unwrap();
+        let claimed = db::claim_ready(&state.pool, "w", 10).await.unwrap();
+        let a = &claimed[0];
+        let fence = a.version + 1;
+        db::append_task_output(&state.pool, &a.id, fence, "line one\nERROR first\n", true)
+            .await
+            .unwrap();
+
+        let first = task_logs(
+            State(state.clone()),
+            Path((run_id.clone(), a.id.clone())),
+            RawQuery(Some("level=error".into())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.0["output"], "ERROR first\n");
+        assert_eq!(first.0["matched"], 1);
+        assert_eq!(first.0["total"], 2, "total counts the raw slice, not the matches");
+        // The cursor advances over the RAW text — all 21 chars, not the 12 kept.
+        let cursor = first.0["next_offset"].as_u64().unwrap();
+        assert_eq!(cursor, 21);
+
+        // More output arrives; tailing from the cursor with the filter still set
+        // returns only the new matching line.
+        db::append_task_output(&state.pool, &a.id, fence, "line three\nERROR second\n", false)
+            .await
+            .unwrap();
+        let tail = task_logs(
+            State(state.clone()),
+            Path((run_id.clone(), a.id.clone())),
+            RawQuery(Some(format!("offset={cursor}&level=error"))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tail.0["output"], "ERROR second\n");
+        assert_eq!(tail.0["lines"].as_array().unwrap().len(), 1);
+        // Line numbers are positions in the slice, and the cursor keeps climbing.
+        assert!(tail.0["next_offset"].as_u64().unwrap() > cursor);
 
         state.pool.close().await;
         let _ = std::fs::remove_file(&path);

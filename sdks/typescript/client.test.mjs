@@ -107,6 +107,47 @@ test("list query omits unset params, encodes set ones", async () => {
   assert.deepEqual(last().query, { status: ["failed"], limit: ["10"], offset: ["20"] });
 });
 
+test("run logs encode the filter and task scope", async () => {
+  respond("GET", "/api/runs/r-1/logs", 200, { lines: [] });
+  await client().getRunLogs("r-1", {
+    level: ["error", "warn"],
+    context: 2,
+    tail: true,
+    case: false,
+    regex: "rows=\\d+",
+    tasks: ["extract", "load"],
+  });
+  const req = last();
+  assert.equal(req.path, "/api/runs/r-1/logs");
+  assert.deepEqual(req.query.level, ["error,warn"]);
+  assert.deepEqual(req.query.context, ["2"]);
+  assert.deepEqual(req.query.tail, ["1"]);
+  assert.deepEqual(req.query.regex, ["rows=\\d+"]);
+  assert.deepEqual(req.query.task, ["extract,load"]);
+  // `case: false` is dropped, not sent as 0 — an explicit `case=0` would still
+  // count as "the caller filtered" and change server behaviour.
+  assert.equal(req.query.case, undefined);
+});
+
+test("an unfiltered log read sends no query at all", async () => {
+  respond("GET", "/api/runs/r-1/logs", 200, { lines: [] });
+  await client().getRunLogs("r-1");
+  assert.deepEqual(last().query, {});
+});
+
+test("task logs combine offset with the filter", async () => {
+  respond("GET", "/api/runs/r-1/tasks/t-1/logs", 200, { output: "" });
+  await client().getTaskLogs("r-1", "t-1", { offset: 120, level: "error" });
+  assert.deepEqual(last().query.offset, ["120"]);
+  assert.deepEqual(last().query.level, ["error"]);
+});
+
+test("an unknown log filter parameter throws", async () => {
+  // Silently dropping a typo'd filter would return an unfiltered response the
+  // caller reads as filtered.
+  await assert.rejects(() => client().getRunLogs("r-1", { levl: "error" }), TypeError);
+});
+
 test("path segments are percent-encoded (no traversal / wrong endpoint)", async () => {
   respond("GET", "/api/runs/a%2Fb", 200, { id: "a/b" });
   const run = await client().getRun("a/b");
