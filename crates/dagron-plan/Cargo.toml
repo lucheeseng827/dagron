@@ -18,8 +18,7 @@ path = "src/lib.rs"
 # a datastore, so which backend feature is active doesn't matter functionally.
 # core still requires exactly one to compile at all; take its sqlite default so
 # `cargo build`/`test -p dagron-plan` work standalone with no extra flags.
-# dagron-api's postgres-only dagron-core dependency is built in its own
-# separate CI step (dagron-ee-guard.yml) specifically so it never has to unify
-# features with this crate's choice.
+# dagron-api's postgres-only dagron-core dependency is built in its own separate
+# CI step specifically so it never has to unify features with this crate's choice.
 dagron-core = { path = "../dagron-core" }
 anyhow = "1"

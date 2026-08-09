@@ -21,7 +21,7 @@ live permissions. Token *management* (`/api/tokens*`) is the one exception — i
 requires a password session and refuses a `dgp_` bearer with `403`, so a leaked
 token cannot mint its own replacements. Missing/invalid/expired → `401`
 (`src/auth.rs`).
-`POST /api/users`, `GET /api/users`, `GET /api/audit`, and all three
+`POST /api/users`, `GET /api/users` and all three
 `/api/settings/notifications*` routes additionally require the `admin` group
 (`403` otherwise) — notification defaults hold secret webhook URLs and reroute
 every run's notifications, and the test route makes the server POST outbound.
@@ -187,9 +187,10 @@ unauthenticated); a dataset is updated by a task's `produces:`, never here.
 | POST | `/api/workflows/{id}/state` | `{state}`, one of `active` / `paused` / `retired` → `{id, state}`. Both non-active states refuse to run (enforced in the scheduler **and** `/run`) and **leave the schedules untouched** — the difference from delete; `retired` also hides from the default listing; `400` unknown state, `404` |
 | GET | `/api/workflows/{id}/runs` | `?limit=&offset=` → this workflow's run history (same row shape as `/api/runs`). Runs are matched by definition **name** — the only linkage that exists (each run snapshots its own `workflow_definitions` row, so there is no FK to `workflows`); the list digest uses the same rule. Renaming a workflow therefore starts a fresh history; `404` |
 | POST | `/api/workflows/{id}/sync-to-git` | open a PR with the spec → `{pr_url, branch, path}`; `501` until `GITHUB_TOKEN`+`GIT_REPO` are set; `502` on GitHub errors |
-| GET/POST | `/api/git-repos` | list / connect `{url, branch?, auto_sync}` → `201`; `400` empty URL, `409` duplicate |
+| GET/POST | `/api/git-repos` | list / connect `{url, branch?, path?, auto_sync, auth?}` → `201`; `400` empty or unusable URL, `409` duplicate. `url` may be `https://`, `ssh://[user@]host/…` or scp-style `git@host:owner/repo` (an https URL still may not embed credentials). The list also returns `worker_online` and `credentials_configured`. |
 | DELETE | `/api/git-repos/{id}` | `204`; `404` |
 | POST | `/api/git-repos/{id}/sync` | sync now → updated repo row |
+| PUT/DELETE | `/api/git-repos/{id}/auth` | set/rotate or remove this repo's Git credential → updated repo row; `404`; `503` when secret encryption is unconfigured. Body: `{kind: "none"\|"token"\|"ssh", username?, token?, ssh_private_key?, known_hosts?}`. `token` requires an HTTPS URL, `ssh` an SSH one — the mismatch is a `400` rather than a credential that could never be used. **Write-only:** the secret is stored AES-256-GCM encrypted and is never returned; reads get `auth_kind`, `auth_username`, `auth_known_hosts` and a non-secret `auth_hint` (`••••cdef`, or `ssh-ed25519 SHA256:…` — the same fingerprint the forge shows). Passphrase-protected keys are rejected: the worker has no terminal to be prompted at. |
 | GET/POST | `/api/schedules` | `?workflow_id=` / create `{workflow_id, cron_expr, enabled?, catchup?, catchup_window_secs?, catchup_max_runs?}`; `400` bad cron |
 | PUT/DELETE | `/api/schedules/{id}` | update / delete; `404` |
 | POST | `/api/schedules/{id}/backfill` | **synchronous** backfill: `{from, to, max_runs?}` → `{scheduled, skipped, from, to, run_ids}` (materialized in one call, hard cap 1000) |

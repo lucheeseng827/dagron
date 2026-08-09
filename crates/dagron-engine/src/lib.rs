@@ -187,6 +187,24 @@ fn redact_conn(target: &str) -> String {
     scrubbed
 }
 
+/// Resolve the `MAX_INFLIGHT_RUNS` admission cap, defaulting to 64.
+///
+/// **`0` disables the cap** — the contract the Helm chart and its `values.yaml`
+/// have always documented. Both admission sites read it that way: `api.rs` gates
+/// its `POST /runs` check on `max_inflight_runs > 0`, and the ingest actor's
+/// throttle is gated the same way. Anything below zero is a nonsense cap rather
+/// than a distinct mode, so it normalizes to `0` (disabled) instead of silently
+/// meaning something else.
+///
+/// This used to clamp with `.max(1)`, which made the documented `0` unreachable
+/// and turned "disable the cap" into "cap at one active run" — a near-total
+/// stall for a deployment that set it.
+fn parse_max_inflight_runs(raw: Option<String>) -> i64 {
+    raw.and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(64)
+        .max(0)
+}
+
 /// Seed the GitOps workflow directory with the image's bundled examples on first
 /// start (when the dir is empty). Ported from the old `docker-entrypoint.sh` so
 /// the container can run on a shell-less, lightweight base (distroless). Best
@@ -457,11 +475,7 @@ pub async fn run(seams: Seams) -> Result<()> {
     // may be active at once — the admission valve that lets the scheduler absorb
     // a large influx by leaving the overflow buffered in the queue.
     let source_kind = std::env::var("SOURCE").unwrap_or_else(|_| "file".to_string());
-    let max_inflight_runs: i64 = std::env::var("MAX_INFLIGHT_RUNS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(64)
-        .max(1);
+    let max_inflight_runs: i64 = parse_max_inflight_runs(std::env::var("MAX_INFLIGHT_RUNS").ok());
     // How many times a transient create_run failure is retried (nacked) before a
     // submission is dead-lettered. Parse failures dead-letter immediately.
     let dead_letter_max_attempts: i64 = std::env::var("DEAD_LETTER_MAX_ATTEMPTS")
@@ -865,7 +879,7 @@ pub async fn run(seams: Seams) -> Result<()> {
 
     loop {
         // Tick timer — the recover→advance→dispatch→collect→reap span. A tick
-        // pegging the CPU (the LOADTEST.md finding) shows up as this histogram's
+        // pegging the CPU (a load-test finding) shows up as this histogram's
         // upper buckets filling. Excludes the wait below (idle, not work).
         let tick_start = std::time::Instant::now();
 
@@ -2003,7 +2017,23 @@ pub async fn run(seams: Seams) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::new_traceparent;
+    use super::{new_traceparent, parse_max_inflight_runs};
+
+    /// `MAX_INFLIGHT_RUNS` contract, as the Helm chart and `values.yaml`
+    /// document it: default 64, an explicit number is honoured verbatim, and
+    /// `0` **disables** the cap rather than clamping to a cap of one.
+    #[test]
+    fn max_inflight_runs_zero_disables_the_cap() {
+        let cap = |s: &str| parse_max_inflight_runs(Some(s.to_string()));
+        assert_eq!(parse_max_inflight_runs(None), 64, "unset → default");
+        assert_eq!(cap("200"), 200);
+        assert_eq!(cap(" 200 "), 200, "whitespace tolerated");
+        assert_eq!(cap("1"), 1, "a cap of one is still a cap");
+        assert_eq!(cap("0"), 0, "0 disables — never clamped to 1");
+        assert_eq!(cap("-5"), 0, "negative normalizes to disabled");
+        assert_eq!(cap("banana"), 64, "unparseable → default");
+        assert_eq!(cap(""), 64, "empty → default");
+    }
 
     /// A generated traceparent is a valid W3C header: version 00, 32-hex trace
     /// id, 16-hex span id, sampled flag — and the trace id is never all-zero.

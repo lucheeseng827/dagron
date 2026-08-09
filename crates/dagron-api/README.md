@@ -56,6 +56,13 @@ Control (auth required):
 
 `GET /healthz` is unauthenticated (liveness).
 
+Not served by the open build: `GET /api/audit` and the read-only `viewer` role
+are gated behind `--features enterprise`. With the feature off the mutation
+middleware is a pure passthrough — nothing is recorded, no role is enforced, and
+the route 404s (`src/routes/audit.rs`). Auth itself is unaffected: every handler
+still runs its own `AuthUser` extractor, so an unauthenticated mutation `401`s in
+either build.
+
 ## Event flow
 
 A password login mints the session JWT; live run updates ride an SSE stream fed by

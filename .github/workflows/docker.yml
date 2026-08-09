@@ -218,8 +218,8 @@ jobs:
 
   # Package + push the OSS Helm chart (OCI) after the images exist, so a single v*
   # tag publishes the whole stack from the mirror. The mirror's charts/dagron is
-  # already the OSS cut — the .ossync sync strips the closed operator.yaml + crds —
-  # but the seatbelt below re-checks before pushing.
+  # already the OSS cut — it carries no operator.yaml or crds — but the seatbelt
+  # below re-checks before pushing.
   chart:
     needs: merge
     runs-on: ubuntu-latest

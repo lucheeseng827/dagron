@@ -378,11 +378,125 @@ Worked examples for all four, plus what to validate:
 
 ---
 
+## 8. Tasks that run longer than 25 seconds
+
+**A task with no `timeout_secs` is killed after 25 seconds.** This is the first
+thing most people hit, because the default is short and nothing about the spec
+hints at it — a `sleep 60`, a slow query, a model download, all die identically:
+
+```text
+run:  failed
+task: failed   attempt 1
+      command timed out after 25s
+```
+
+Fix it on the task:
+
+```yaml
+tasks:
+  - name: slow
+    command: ["sh", "-c", "sleep 60; echo done"]
+    timeout_secs: 120        # default 25
+```
+
+or once for the whole spec:
+
+```yaml
+task_defaults:
+  timeout_secs: 3600
+```
+
+**Read the failure carefully — it says `timed out`, not a non-zero exit.** A
+task killed by its deadline reports `command timed out after Ns`; a task whose
+command failed reports its own output. They are different problems and the
+second one is not fixed by a bigger number.
+
+### Why it fails on attempt 1
+
+`max_attempts` defaults to **1**, which is one total attempt and therefore no
+retries, for any failure. So a timeout shows a single attempt even though a
+retry looks like it should have happened. The field counts attempts, not
+retries: set it to `2` for one retry, `3` for two, and so on.
+
+Separately, `retry_on_timeout` (default **`true`**) decides whether a *deadline
+kill specifically* consumes retries. Set it `false` when a timeout is unlikely
+to succeed on re-run — that fails at once instead of burning the remaining
+budget (Airflow #9232). It is timeout-only: a non-zero exit always follows the
+normal attempts rule.
+
+### Is there a maximum?
+
+**Not one you will hit.** `timeout_secs` and `run_timeout_secs` are both `u64`
+seconds — `86400` (a day) and `604800` (a week) are legal. The only validation
+is the lower end: `timeout_secs must be >= 1 when provided`. `run_timeout_secs`
+is clamped to `i64::MAX` seconds (~292 billion years) when it is persisted, so
+there is a ceiling in principle but none that constrains any real schedule.
+
+The task lease is not a ceiling either. It is 30 s
+(`TASK_LEASE_EXTEND_SECS`), but a running task's worker heartbeats it every 10 s,
+so an hours-long task is never reclaimed out from under itself. A task outliving
+its lease period is normal and expected. (Heartbeats can be turned off with
+`TASK_LEASE_HEARTBEAT=false`; that trades this for a hard rule that every task
+must finish inside one lease window, which only suits a fleet of genuinely short
+tasks.)
+
+### The three budgets, and which one to reach for
+
+| Field | Scope | On expiry |
+| --- | --- | --- |
+| `timeout_secs` | one task | task killed → `failed` (retries per above) |
+| `run_timeout_secs` | whole run | run `failed`, remaining tasks cancelled |
+| `deadline: { in: 45m }` | whole run | **alert only** — the run keeps going |
+
+Per-task timeouts do not bound a run: a long DAG of individually-bounded tasks
+can still exceed the total duration you had in mind, so `run_timeout_secs` is
+the actual safety net.
+Reach for `deadline:` when "this is late" should page someone rather than
+destroy three hours of work.
+
+```yaml
+name: nightly-train
+run_timeout_secs: 90000        # whole-run budget
+deadline: { in: 6h }           # soft SLA — alerts, does not cancel
+task_defaults:
+  timeout_secs: 3600
+tasks:
+  - name: extract
+    command: ["extract"]
+    timeout_secs: 1800
+  - name: train
+    command: ["python", "train.py"]
+    timeout_secs: 14400        # 4 h
+    max_attempts: 5            # preemption = a retry that resumes
+```
+
+Pair a long timeout with checkpointing rather than relying on it alone: a
+four-hour task that retries from zero is worse than one that fails fast.
+`DAGRON_RESUME_FROM` hands the last checkpoint back on retry — see
+[`AI_WORKLOADS.md`](AI_WORKLOADS.md).
+
+### A different `timeout_secs` that *is* capped
+
+The synchronous-wait query parameter shares the name and is unrelated to how
+long a task may run:
+
+```console
+curl -X POST 'localhost:8787/runs?wait=true&timeout_secs=30'   # capped at 600
+curl 'localhost:8787/runs/$RUN/wait?timeout_secs=600'          # capped at 600
+```
+
+It is **clamped to 1–600 s** and controls only how long the HTTP call blocks.
+Against a workflow longer than ten minutes the call returns `finished: false`
+with the live status so you re-poll — that is the documented contract, not an
+error, and not a sign the run died.
+
+---
+
 ## See also
 
 - [`../examples/`](../examples/) — runnable workflow specs.
 - [`../examples/scripts/`](../examples/scripts/README.md) — the four places a
-  long script can live, and which reach which executor (§6).
+  long script can live, and which reach which executor (§7).
 - [`STREAMING.md`](STREAMING.md) — events → workflows: the built-in stream
   source, delivery semantics, and five case studies
   ([`../examples/streaming/`](../examples/streaming/)).

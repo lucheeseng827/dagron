@@ -45,24 +45,44 @@ services:
     #
     # For docker/kubernetes execution the task runs in its own image and the
     # distroless engine is the right one. See docs/OPERATIONS.md.
-    image: docker.io/mancube/dagron-engine-localdev:${DAGRON_VERSION:-0.5.2}
+    image: docker.io/mancube/dagron-engine-localdev:${DAGRON_VERSION:-0.6.0}
     environment:
       DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
       API_ADDR: 0.0.0.0:8787
       EXECUTOR: local
       RUST_LOG: info
-      # Where the engine watches for workflow files. The named volume below is
-      # shared with nothing else; drop a YAML in it to submit by file.
-      SOURCE: file
-      DAG_PATH: /workflows
+    # The DAG path is a *positional argument*, not an environment variable —
+    # `dagron [dev] [DAG_PATH] [DB_TARGET]`, see docs/CONFIG.md §Invocation.
+    # Setting DAG_PATH in `environment:` does nothing: the binary never reads it,
+    # falls back to its built-in default `examples/simple_dag.yaml`, and since
+    # that path does not exist in the image you get
+    #   WARN cannot read DAG file 'examples/simple_dag.yaml': No such file
+    #   INFO workflow source exhausted — ingestion stopping
+    # on every boot. The ENTRYPOINT is the bare binary, so `command:` is the
+    # positional.
+    #
+    # It must be a *file*: the default `file` source (SOURCE, unset = "file") is
+    # `FileSource`, which emits one YAML **once** at startup and then drains.
+    # It is not a directory reader and not a watcher — pointing it at /workflows
+    # gives "Is a directory", and a YAML dropped in later is never picked up.
+    # Submit further workflows through the UI or POST /api/runs (docs/HOWTO.md
+    # §2); that is the path this quickstart is built around.
+    #
+    # Naming one bundled example here means the dashboard has a finished run in
+    # it the first time you open it, instead of being empty.
+    command: ["/workflows/simple_dag.yaml"]
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
+      # /workflows is WORKFLOW_DIR (docs/CONFIG.md), the seed target the engine
+      # fills with the bundled examples on first start when empty. Shared, not
+      # an inbox — the gitops worker below does not write here; it reconciles a
+      # connected repo into the workflows table in Postgres (DATABASE_URL).
       - dagron-workflows:/workflows
 
   dagron-api:
-    image: docker.io/mancube/dagron-api:${DAGRON_VERSION:-0.5.2}
+    image: docker.io/mancube/dagron-api:${DAGRON_VERSION:-0.6.0}
     environment:
       DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
       # Dev credentials, seeded on first start. Change them for anything that
@@ -86,7 +106,7 @@ services:
         condition: service_healthy
 
   frontend:
-    image: docker.io/mancube/dagron-frontend:${DAGRON_VERSION:-0.5.2}
+    image: docker.io/mancube/dagron-frontend:${DAGRON_VERSION:-0.6.0}
     # Shares dagron-api's network namespace, which is what makes the published
     # image usable here at all.
     #
@@ -113,7 +133,7 @@ services:
   # is noise in the logs of someone still finding their way around.
   gitops:
     profiles: ["gitops"]
-    image: docker.io/mancube/dagron-gitops:${DAGRON_VERSION:-0.5.2}
+    image: docker.io/mancube/dagron-gitops:${DAGRON_VERSION:-0.6.0}
     environment:
       DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
       GITOPS_POLL_SECS: "60"

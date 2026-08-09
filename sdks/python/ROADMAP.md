@@ -145,8 +145,8 @@ SSE streaming, and a `wait_for_run` poll helper. Real-socket test suite.
 
 ### M5 — Deeper dagron internals *(v0.6+, gated on server exposure)*
 These reach beyond the current HTTP surface; each needs a server-side endpoint or a
-documented protocol before the SDK can wrap it. Tracked here so the SDK roadmap and
-the platform roadmap stay aligned (`docs/ROADMAP.md`).
+documented protocol before the SDK can wrap it. Tracked here so the SDK roadmap
+and the platform roadmap stay aligned.
 
 | Internal | Where it lives today | SDK plan |
 |---|---|---|

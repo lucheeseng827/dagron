@@ -159,10 +159,10 @@ that survives a mid-run kill via checkpoint resume, spot/on-demand pool
 routing, sharded batch inference with a gather step, an LLM content pipeline
 with a human approval gate, and a train→eval→deploy quality gate.
 
-## The complete suite (dagron Enterprise)
+## dagron Enterprise
 
-The primitives above are open source deliberately — they are the programming
-model. **dagron Enterprise** layers the managed fleet on top:
+The primitives above are the programming model and are complete on their own.
+**dagron Enterprise** adds the managed fleet around them:
 
 - **Workflow generation** — describe a pipeline in natural language, get a
   schema-validated dagron spec (generation is validated against the same

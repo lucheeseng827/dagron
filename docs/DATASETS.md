@@ -117,40 +117,36 @@ subscribed dataset records a new update. The triggering URI is injected as
 | External dataset events (`POST /datasets/events`) — CDC, S3 notifications, other orchestrators | — `403` with signpost | ✅ (pairs with the managed CloudEvents ingest gateway) |
 | Freshness SLAs (fire/alert when a dataset goes stale), lineage graph UI, dataset partitions | — | on the Enterprise roadmap |
 
-The line follows the §3 honesty test the way the SOURCE connectors drew it:
-the **single-team loop is complete and free** — one workflow produces, another
-senses or fires on it, lineage fully queryable, HA included. What's paid is
-*composition and integration at org scale*: fan-in across many teams' datasets,
-events from systems outside dagron, and the org-level lineage/freshness layer —
-value that only materializes once many teams share the data platform.
+The **single-team loop is complete on its own** — one workflow produces, another
+senses or fires on it, lineage fully queryable, HA included. What Enterprise adds
+is composition and integration at org scale: fan-in across many teams' datasets,
+events from systems outside dagron, and the org-level lineage/freshness layer.
 
-## The OSS → paid funnel, concretely
+## Limits of the open build
 
 Every gate is a **signpost, not a dead end** — it names what was attempted,
-where it ships, and what the open build does instead (the pattern
+where it ships, and what to do instead in this build (the pattern
 `dagron-source`'s connector errors established):
 
-1. **Adoption hook (free).** A single-team user wires `produces:` +
-   `on_datasets:` in minutes and gets Airflow-Datasets behavior out of a single
-   binary. This is top-of-funnel; gating it would poison adoption.
-2. **First friction = first touchpoint.** The natural next step — "fire the
-   join once *both* tables refresh" — is a one-line spec change
-   (`on_datasets: [a, b]`). Validation answers with the Enterprise signpost and
-   the exact workaround (split consumers, one workflow per dataset). The user
-   learns the edition line at the moment they feel the need, in their own
-   terminal, with a working fallback in hand.
-3. **Integration pull.** The moment data lands from outside dagron (CDC,
-   S3 events), `POST /datasets/events` answers `403` with the same signpost —
-   and the workaround (a tiny `produces:` task) works but visibly scales
-   poorly, which is honest: the paid feature is the *managed integration*
-   (a hosted events gateway and CDC connectors), not an artificial lock.
-4. **Org gravity.** Lineage across dozens of teams' workflows, freshness SLAs,
-   and the graph UI are org-level surfaces (the same shelf as SSO/RBAC/audit) —
-   they only matter at exactly the scale where there's a budget.
-
-Sales-signal side: the signposts make intent measurable — a support question or
-GitHub issue quoting the multi-dataset error *is* a qualified lead, the same
-way SOURCE-connector signpost questions are.
+- **Multi-dataset composition.** `on_datasets: [a, b]` with
+  `datasets_mode: any|all` is rejected at validation, so a *trigger* cannot wait
+  for *both* upstream tables to refresh. Express the join inside the workflow
+  instead: trigger on one dataset and put a `wait: { dataset: … }` sensor (§2 —
+  full in this build) on the other, which parks mid-DAG holding no worker slot
+  until that dataset updates. One semantic difference to know: the sensor
+  resolves on the next update *after* it parks, so a partner dataset that
+  already refreshed before the run started does not satisfy it, where
+  `datasets_mode: all` would have. Where that distinction matters, do the fan-in
+  outside dagron and submit the joined run yourself.
+- **External dataset events.** `POST /datasets/events` answers `403`, so data
+  landing from outside dagron (CDC, S3 notifications, another orchestrator)
+  cannot announce itself directly. Work around it with a small `produces:` task
+  that records the dataset once the external load finishes; it works, but it
+  scales poorly as more systems feed the platform, which is why the managed
+  events gateway and CDC connectors exist.
+- **Freshness SLAs, the lineage graph UI, and dataset partitions** are not in
+  this build and have no workaround — they are org-level surfaces on the same
+  shelf as SSO, RBAC and audit.
 
 ## Operations
 

@@ -65,9 +65,26 @@ spec:
             # writable scratch so it never probes an unwritable $HOME.
             - name: HOME
               value: /tmp
+            {{- if eq (include "dagron.envSecretsEnabled" .) "true" }}
+            # Decrypts the per-repository Git credentials (HTTPS token / SSH
+            # key) stored from the console. The same key dagron-api encrypts
+            # them with — this worker is the only thing that reads them back.
+            - name: {{ include "dagron.envSecretKeyName" . }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "dagron.envSecretName" . }}
+                  key: {{ include "dagron.envSecretKeyName" . }}
+            {{- end }}
+            {{- if .Values.gitops.sshStrictHostKeyChecking }}
+            # Refuse an SSH sync for a repo with no pinned known_hosts rather
+            # than trusting whatever host answers.
+            - name: DAGRON_GIT_SSH_STRICT
+              value: "1"
+            {{- end }}
             {{- if .Values.gitops.tokenSecret.name }}
-            # Forge token for private repositories. Sent only to trusted forge
-            # hosts over HTTPS; leave unset for public repos.
+            # Fallback token for repositories with no credential of their own.
+            # Sent only to trusted forge hosts over HTTPS; leave unset for
+            # public repos.
             - name: DAGRON_GIT_TOKEN
               valueFrom:
                 secretKeyRef:

@@ -6,6 +6,34 @@ ingest actor, the ops surface, and the multi-run reconcile loop. The `dagron` bi
 is a thin shell over `run()`; alternate builds differ only in the [`Seams`] they pass
 (built-in vs. extra sources; no-op vs. active run-lifecycle hooks).
 
+## Architecture
+
+```mermaid
+flowchart LR
+  bin["dagron binary"] -->|"run(seams)"| engine
+
+  subgraph engine["dagron-engine"]
+    rl["reconcile loop — recover → advance → dispatch → collect → reap"]
+    ingest["IngestActor (ractor)"]
+    workers["WorkerPool (WORKER_COUNT)"]
+    ops["ops surface (feature ops) — api · cron · gc · schedule · backfill"]
+    lead["leadership lease"]
+    ops --- lead
+    ingest --> rl
+    rl --> workers
+  end
+
+  src["dagron-source (SOURCE=file|stream)"] --> ingest
+  workers -->|"spawn task"| exec["dagron-executor (EXECUTOR=local|docker|kubernetes)"]
+  rl <-->|"dagron-core db facade (Pool · Waker)"| store[("datastore — SQLite or Postgres")]
+  ops --> store
+  rl -. "Seams: RunSink · Meter · SourceFactory" .-> hooks["host-supplied hooks (no-op by default)"]
+  rl -. "notify.git · OpenLineage · artifacts" .-> integ["dagron-forge · dagron-lineage · dagron-artifact"]
+```
+
+Only the leadership holder runs the time-driven ops loops, so cron, GC, DB
+schedules and backfill fire exactly once across N replicas.
+
 ## What it does
 
 - **`run(seams)`** — boots the scheduler: initializes logging, builds the executor
@@ -23,6 +51,39 @@ is a thin shell over `run()`; alternate builds differ only in the [`Seams`] they
 - **Integrations** — offline `dagron validate` spec linting, `DAGRON_ARTIFACTS`
   injection via `dagron-artifact`, OpenLineage emit via `dagron-lineage`, and
   `notify.git` forge commit statuses via `dagron-forge`.
+
+## Event flow
+
+One tick of the reconcile loop, in source order (`src/lib.rs`, steps 1–6). Every
+step is idempotent, so all replicas may sweep concurrently; the loop then parks
+on `Waker::wait`, which returns on a datastore `NOTIFY` or the tick timer,
+whichever comes first.
+
+```mermaid
+sequenceDiagram
+  participant L as reconcile loop
+  participant DB as dagron-core db
+  participant W as WorkerPool
+  participant X as executor
+
+  L->>DB: 1 recover_expired_leases (crash recovery)
+  L->>DB: 1b–1d run deadlines · SLA alerts · approval-gate expiry
+  L->>DB: 2 advance_ready_tasks (deps satisfied → ready)
+  L->>DB: 3 claim_ready_gang / claim_ready_classes (capacity = pool − in-flight)
+  DB-->>L: leased tasks (priority- and pool-ordered)
+  L->>W: dispatch payloads
+  W->>X: spawn (local / docker / kubernetes)
+  X-->>W: output chunks
+  W-->>L: 3b live-log chunks → append_task_output
+  X-->>W: exit status
+  W-->>L: 4 result → mark_task_succeeded / mark_task_failed (backoff retry)
+  L->>DB: 5 reap_completed_runs
+  DB-->>L: finalized (run_id, status) → RunSink / notify.git / lineage
+  L->>DB: Waker::wait — NOTIFY or tick timer
+```
+
+Step 6 is drain-mode shutdown: the loop stops claiming, lets in-flight tasks
+finish, and exits.
 
 ## Feature flags
 
@@ -59,9 +120,9 @@ Selected environment variables read by `run()`:
 |-----|---------|
 | `DATABASE_URL` | Postgres connection string (postgres builds). |
 | `EXECUTOR` | Executor backend: `local` (default) / `docker` / `kubernetes`. |
-| `SOURCE` | Ingestion source: `file` (default) / `redis` / `sqs` / `kafka`. |
+| `SOURCE` | Ingestion source: `file` (default) / `stream`. Managed broker connectors are part of dagron Enterprise and error at startup here with a pointer (`dagron-source/src/source.rs`). |
 | `WORKER_COUNT` | Worker pool size (default 16). |
-| `MAX_INFLIGHT_RUNS` | Admission cap on concurrently active runs (default 64). |
+| `MAX_INFLIGHT_RUNS` | Admission cap on concurrently active runs (default 64; `0` disables the cap). |
 | `DEAD_LETTER_MAX_ATTEMPTS` | Transient create-run retries before dead-lettering (default 3). |
 | `API_ADDR` | Management API listen address (enables the ops server). |
 | `CRON_CONFIG` | Path to the cron config file (enables the cron loop). |

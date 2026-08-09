@@ -142,7 +142,7 @@ pub struct Metrics {
     /// Task wall-time (claim→finish), the headroom-dominating signal real ETL
     /// tasks have but the no-op load test never exercised.
     pub task_duration: Histogram,
-    /// Reconcile-loop tick duration — the CPU-pegging signal from LOADTEST.md.
+    /// Reconcile-loop tick duration — the CPU-pegging signal load testing surfaced.
     pub reconcile_tick: Histogram,
     // ── QW3 auto-catchup self-healing state gauges ──────────────────────────────────
     // Unlike the counters above (monotonic, bumped on the hot path) these are
@@ -360,7 +360,7 @@ impl Metrics {
         }
 
         // Queue depth as a first-class gauge: the backlog whose growth rate the
-        // LOADTEST.md alert rules watch.
+        // recommended alert rules watch.
         let _ = writeln!(out, "# HELP scheduler_queue_depth Ready tasks awaiting dispatch (backlog).");
         let _ = writeln!(out, "# TYPE scheduler_queue_depth gauge");
         let _ = writeln!(out, "scheduler_queue_depth {queue_depth}");

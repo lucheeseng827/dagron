@@ -5,14 +5,11 @@ Kubernetes cluster with Argo CD, where `git push` is the only mutation. Workflow
 fan out through a single **ApplicationSet** — one Argo CD Application per team
 folder, each syncing that team's `Workflow` / `CronWorkflow` CRs.
 
-The narrative walkthrough (architecture, the rolling rollout, multi-cluster,
-secrets, troubleshooting) is in [`../../docs/GITOPS_ARGOCD.md`](../../docs/GITOPS_ARGOCD.md).
 This file is the copy-paste runbook.
 
 > Grounded in the **as-built** chart (`terraform/charts/dagron`, v0.3.0) and the
-> **as-built** CRDs (`dagron.io/v1`: `Workflow`, `CronWorkflow`). The design/roadmap
-> doc [`../../docs/GITOPS.md`](../../docs/GITOPS.md) describes a richer future schema —
-> what runs here is what ships today.
+> **as-built** CRDs (`dagron.io/v1`: `Workflow`, `CronWorkflow`). A richer schema
+> is planned — what runs here is what ships today.
 
 ## Layout
 
@@ -153,5 +150,5 @@ kind delete cluster --name dagron-gitops
   for testing only. Point at a managed DB for anything real (see the chart
   `values.yaml` `externalDatabaseUrl`).
 - **Secrets in Git.** This demo uses chart-managed defaults. For real use, keep
-  the DB/JWT secrets out of Git with Sealed Secrets / External Secrets / SOPS —
-  see [`../../docs/GITOPS_ARGOCD.md`](../../docs/GITOPS_ARGOCD.md) §Secrets.
+  the DB/JWT secrets out of Git with Sealed Secrets, External Secrets or SOPS,
+  and point the chart at the resulting Secret rather than committing values.

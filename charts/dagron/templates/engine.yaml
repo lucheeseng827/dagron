@@ -95,7 +95,7 @@ spec:
               value: {{ ternary "1" "0" .Values.engine.dbSchedules | quote }}
             # Admission cap for POST /runs: the engine returns 429 + Retry-After
             # once this many runs are active, instead of growing an unbounded
-            # backlog (the LOADTEST.md finding). 0 disables the cap.
+            # backlog (a load-test finding). 0 disables the cap.
             - name: MAX_INFLIGHT_RUNS
               value: {{ .Values.engine.maxInflightRuns | quote }}
             - name: RUST_LOG

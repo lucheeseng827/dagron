@@ -2,8 +2,7 @@
 
 > Status: **implemented** (Feature 2) — broker-native DLQ for SQS / Kafka / Redis
 > + a new NATS JetStream source.
-> Companion to [`ARCHITECTURE.md`](ARCHITECTURE.md) (the `WorkflowSource` seam) and
-> [`SCALE_ROADMAP.md`](SCALE_ROADMAP.md).
+> Companion to [`ARCHITECTURE.md`](ARCHITECTURE.md) (the `WorkflowSource` seam).
 > Last updated: 2026-06-15
 
 ## 0. Goal

@@ -292,8 +292,8 @@ async fn submit_run(
 
     // Admission control: shed load before it becomes an unbounded backlog. This
     // is the API-path counterpart to the ingest source's MAX_INFLIGHT_RUNS valve
-    // — without it, `POST /runs` accepts faster than the engine can drain (the
-    // LOADTEST.md finding). A 429 + Retry-After tells clients to back off.
+    // — without it, `POST /runs` accepts faster than the engine can drain (a
+    // load-test finding). A 429 + Retry-After tells clients to back off.
     if st.max_inflight_runs > 0 {
         let active = db::count_active_runs(&st.pool).await?;
         if active >= st.max_inflight_runs {

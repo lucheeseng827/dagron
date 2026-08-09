@@ -317,8 +317,8 @@ pub async fn get_run_logs(
         // pulled this task's entire `output` into memory and the filter scans all
         // of it, so a 500MB task costs 500MB per request — and the run page polls
         // this. Bounding the read itself (scope pushed into the WHERE clause,
-        // SQL-side slicing, per-task streaming) is tracked as item 1 of
-        // docs/LOG_PIPELINE.md §8.4.
+        // SQL-side slicing, per-task streaming) is tracked as known follow-up
+        // work.
         let res = filter.apply(row.output.as_deref().unwrap_or_default());
         total += res.total;
         matched += res.matched;

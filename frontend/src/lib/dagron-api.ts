@@ -13,6 +13,7 @@ import type {
   DayBucket,
   DeadLetter,
   EnvironmentView,
+  GitAuthInput,
   GitRepo,
   GitRepoList,
   GraphResponse,
@@ -511,12 +512,26 @@ export const globalSearch = (q: string, limit = 8): Promise<SearchResponse> =>
 // ── GitOps repository registry ───────────────────────────────────────────────
 export const listGitRepos = (): Promise<GitRepoList> => apiFetch(`/git-repos`);
 
-export const connectGitRepo = (
-  url: string,
-  branch?: string,
-  auto_sync = false,
-): Promise<GitRepo> =>
-  apiFetch(`/git-repos`, { method: "POST", body: JSON.stringify({ url, branch, auto_sync }) });
+export const connectGitRepo = (body: {
+  url: string;
+  branch?: string;
+  path?: string;
+  auto_sync?: boolean;
+  /// Optional credential stored with the repo. Omit for a public repository.
+  auth?: GitAuthInput;
+}): Promise<GitRepo> => apiFetch(`/git-repos`, { method: "POST", body: JSON.stringify(body) });
+
+/// Set or rotate a repository's credential. Write-only: the API stores it
+/// encrypted and never returns it, so the response carries only the hint.
+export const setGitRepoAuth = (id: string, auth: GitAuthInput): Promise<GitRepo> =>
+  apiFetch(`/git-repos/${encodeURIComponent(id)}/auth`, {
+    method: "PUT",
+    body: JSON.stringify(auth),
+  });
+
+/// Remove a repository's credential — it falls back to public / worker-wide token access.
+export const clearGitRepoAuth = (id: string): Promise<GitRepo> =>
+  apiFetch(`/git-repos/${encodeURIComponent(id)}/auth`, { method: "DELETE" });
 
 export const syncGitRepo = (id: string): Promise<GitRepo> =>
   apiFetch(`/git-repos/${encodeURIComponent(id)}/sync`, { method: "POST" });

@@ -261,6 +261,13 @@ async fn main() -> Result<()> {
         )
         .route("/api/git-repos/{id}", axum::routing::delete(routes::gitrepos::delete_repo))
         .route("/api/git-repos/{id}/sync", post(routes::gitrepos::sync_repo))
+        // Per-repository credential (HTTPS token or SSH key), write-only: set or
+        // rotate it here, clear it with DELETE. It is never readable back.
+        .route(
+            "/api/git-repos/{id}/auth",
+            axum::routing::put(routes::gitrepos::put_auth)
+                .delete(routes::gitrepos::delete_auth),
+        )
         // Workflow schedules (UI schedule drawer; engine fires them).
         .route(
             "/api/schedules",

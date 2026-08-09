@@ -51,7 +51,8 @@ pub struct IngestArgs {
     pub pool: db::Pool,
     pub source: Box<dyn WorkflowSource>,
     /// Admission cap — the actor will not create a new run while
-    /// `count_active_runs() >= max_inflight_runs`.
+    /// `count_active_runs() >= max_inflight_runs`. `0` (or less) disables the
+    /// cap entirely; see [`at_inflight_cap`].
     pub max_inflight_runs: i64,
     /// Set true once the source is permanently exhausted (one-shot file). The
     /// reconcile loop reads this to decide when draining is complete.
@@ -65,6 +66,13 @@ pub struct IngestArgs {
     /// (nacked) before the submission is dead-lettered. `1` = dead-letter on the
     /// first transient failure. Parse failures dead-letter immediately regardless.
     pub max_validation_attempts: i64,
+}
+
+/// Whether the admission valve is closed: `active` runs against a `cap` of which
+/// **`0` (or less) means "no cap"**, the contract the chart documents and the
+/// engine's `POST /runs` gate already implements.
+fn at_inflight_cap(active: i64, cap: i64) -> bool {
+    cap > 0 && active >= cap
 }
 
 pub struct IngestState {
@@ -151,7 +159,11 @@ impl Actor for IngestActor {
                 return Ok(());
             }
         };
-        if active >= state.max_inflight_runs {
+        // `max_inflight_runs <= 0` disables the cap, matching the chart docs and
+        // the `POST /runs` gate in the engine's api.rs. Without this guard a
+        // configured `0` compares `active >= 0` — always true — and the actor
+        // throttles forever, admitting nothing at all.
+        if at_inflight_cap(active, state.max_inflight_runs) {
             // SAFETY: ractor runs actors on tokio tasks; this sleep yields.
             tokio::time::sleep(THROTTLE).await;
             myself.cast(IngestMsg::Poll)?;
@@ -382,6 +394,22 @@ async fn dead_letter(
 mod tests {
     use super::*;
     use crate::source::ChannelSource;
+
+    /// The admission valve's contract. A positive cap closes at or above itself;
+    /// `0` disables it, so the actor keeps admitting no matter how many runs are
+    /// active — the case that used to throttle forever because `active >= 0`
+    /// always holds.
+    #[test]
+    fn zero_cap_never_closes_the_valve() {
+        assert!(!at_inflight_cap(0, 64), "empty, well under the cap");
+        assert!(!at_inflight_cap(63, 64), "one slot left");
+        assert!(at_inflight_cap(64, 64), "at the cap");
+        assert!(at_inflight_cap(65, 64), "over the cap");
+        assert!(at_inflight_cap(1, 1), "a cap of one still caps");
+        assert!(!at_inflight_cap(0, 0), "0 disables — not 'admit nothing'");
+        assert!(!at_inflight_cap(10_000, 0), "0 disables at any depth");
+        assert!(!at_inflight_cap(10_000, -1), "a negative cap is off too");
+    }
 
     /// End-to-end ingest routing: an unparseable submission is dead-lettered (and
     /// acked off the source), while a valid one alongside it still becomes a run.

@@ -20,3 +20,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# An in-crate one-shot HTTP server, so the wire shape of a tool call (method,
+# content-type, body) is asserted rather than assumed.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net"] }

@@ -16,11 +16,10 @@
     "plugins": [{ "name": "next" }],
     "paths": {
       "@/*": ["./src/*"],
-      // Open-core seam for proprietary screens (docs/OPEN_SOURCE.md §2):
-      // `@ee/X` resolves to src/ee (the closed implementation) when present,
-      // else to src/ee-stub (the OSS-shipped upsell fallback). The OSS mirror
-      // strips src/ee (.ossync exclude), so mirrored builds resolve the stubs
-      // and still compile.
+      // Seam for the enterprise screens: `@ee/X` resolves to src/ee (the
+      // enterprise implementation) when present, else to src/ee-stub, which
+      // ships in this repo. A build without src/ee resolves the stubs and
+      // still compiles.
       "@ee/*": ["./src/ee/*", "./src/ee-stub/*"]
     }
   },

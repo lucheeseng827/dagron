@@ -6,26 +6,199 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-09
+
+Minor, not patch: `DagronClient::from_env` now returns `Result<Self>`, and
+pre-1.0 this project treats a breaking change as a minor bump (see the header
+above).
+
+### Added
+- **GitOps repositories can authenticate — with a token *or* an SSH key, set from
+  the console.** Until now the only credential the sync had was the worker-wide
+  `DAGRON_GIT_TOKEN`: one token for every repository, changeable only by
+  redeploying the container, sent only to three hard-coded forge hosts, and
+  HTTPS-only. Two repos on two accounts could not both be connected, a
+  self-managed forge could not be reached at all (`DAGRON_GIT_TRUSTED_HOSTS` was
+  documented but read by nothing), and a forge that offers SSH but not HTTPS
+  clone was simply out of reach. The console offered no way to enter a credential
+  of any kind.
+
+  Each repository now carries its own optional credential — an **HTTPS token** or
+  an **SSH private key** — set on the GitOps page or through
+  `PUT /api/git-repos/{id}/auth`, and removed with `DELETE`. It is stored
+  AES-256-GCM encrypted by the same `DAGRON_ENV_SECRET_KEY` / KEK machinery as
+  environment secrets, decrypted only by the `dagron-gitops` worker, and is never
+  readable back: the API returns a kind, a username and a hint (`••••cdef`, or
+  `ssh-ed25519 SHA256:…` — the same fingerprint the forge prints beside the
+  deploy key), never the value.
+
+  Consequences worth knowing:
+
+  - **SSH URLs are accepted now.** `ssh://git@host/owner/repo` and the scp-style
+    `git@host:owner/repo` both connect; the `git@` that made them fail validation
+    was being read as an embedded credential, which on SSH it is not. An `https://`
+    URL still may not carry userinfo — there it *is* the credential, and storing
+    it would write a token into `git_repos.url` in cleartext.
+  - **Neither secret reaches the worker's command line.** The token goes to a
+    0600 `credential.helper` file and the key to a 0600 file named by
+    `GIT_SSH_COMMAND`, both in a scratch directory removed when the sync ends.
+    The previous `https://x-access-token:TOKEN@host/…` clone URL put the token in
+    argv, which `/proc/<pid>/cmdline` hands to anything in the container.
+  - **The mismatch is refused at write time.** A token against an SSH repo, or a
+    key against HTTPS, is a `400` — not a credential the console reports as
+    installed while every sync fails "permission denied". Public keys pasted into
+    the private-key box and passphrase-protected keys are rejected for the same
+    reason: the worker has no terminal to be prompted at.
+  - **`DAGRON_GIT_SSH_STRICT=1`** refuses an SSH sync for a repo with no pinned
+    `known_hosts` rather than trusting whatever host answers. Off by default; the
+    console says "host key unverified" on repos in that state either way.
+  - **`DAGRON_GIT_TRUSTED_HOSTS` now works.** It has been in `docs/CONFIG.md`
+    since the feature shipped and was read by nothing, so a token for a
+    self-managed forge was silently dropped and the clone failed as "repository
+    not found". It still applies only to the worker-wide token: a per-repo
+    credential is not host-filtered, because attaching it to that repository is
+    the operator saying where it may go.
+
+  The `dagron-gitops` image gains `openssh-client` (git execs `ssh`; without it
+  every SSH repo fails with "ssh: not found") and needs `DAGRON_ENV_SECRET_KEY`
+  set to dagron-api's value — compose and the Helm chart wire it through. A repo
+  with no credential behaves exactly as before.
+
+- **`DAGRON_MCP_TOKEN` will no longer cross the network in the clear.** A token
+  sent to a remote `DAGRON_API_URL` over plaintext `http://` is readable by
+  anything on the path, so the server now **refuses to start** instead. The error
+  names the three ways out — use `https://`, point at loopback, or set
+  `DAGRON_MCP_ALLOW_PLAINTEXT_TOKEN=1` — and names the host, and *only* the host,
+  since a base URL may carry `user:password@` and reporting a leaked credential
+  by printing another one would be its own disclosure.
+
+  This started as a warning, which was the wrong call: a process cannot verify
+  that a mesh is protecting the connection, and a log line nobody reads doesn't
+  stop a misconfigured deployment from shipping the token in cleartext. The
+  opt-out keeps the legitimate case — plaintext to an in-cluster Service,
+  transport secured below us — fully supported while making that exception
+  explicit and auditable rather than silent.
+
+  Loopback is decided by parsing the host as an `IpAddr` and asking
+  `is_loopback()`, so the whole `127/8` block and `::1` need no opt-out, while an
+  ordinary remote name like `127.0.0.1.example.com` gets no free pass.
+
+  **Breaking:** `DagronClient::from_env` now returns `Result<Self>`.
+
+### Changed
+- **The enterprise audit trail is no longer published.** `routes/audit.rs` shipped
+  the whole feature — the `audit_log` DDL, the recording middleware, the `viewer`
+  read-only denial and the `/api/audit` read — into the public mirror behind
+  `#[cfg(feature = "enterprise")]`, compiled off but fully readable. The 230 gated
+  lines move to `routes/audit_ee.rs`, which the sync manifest excludes the way it
+  already excludes `migrations_ee`; the open tree keeps the passthrough middleware
+  and every call site in `main.rs` is spelled the same in both builds.
+
+  It is `include!`d rather than declared as a `mod`, and that is the whole trick:
+  rustfmt resolves every `mod` declaration regardless of `cfg`, so the module form
+  makes `cargo fmt` fail outright in a checkout where the file is absent — exactly
+  the mirror. An inactive `include!` it leaves alone, and `cargo build` / `cargo
+  test` are happy either way.
+
+- **The mirror stops naming the repository it was cut from.** A sweep of all 457
+  staged files found the private monorepo's layout and vocabulary spread through
+  it: the CI job name in `dagron-plan/Cargo.toml`, the closed crate path in
+  `dagron-mcp/README.md`, an internal load-test note cited from five code
+  comments, the sync manifest named in `docker.yml`, and 25 references to
+  documents that are not published — every one a dead link or a private filename
+  in a public repo. All reworded.
+
+  Two of those documents were the walkthrough a *published* example pointed at, so
+  the example shipped without the page explaining it: `BACKFILL_USECASES.md` and
+  `WORKFLOW_UI_GUIDE.md` are now mirrored (the latter after dropping the monorepo
+  path from its header and its quickstart). The Argo CD walkthrough is not, and
+  cannot be as written — every example in it points `repoURL` at the private
+  clone URL, the same reason the AWS backup runbook stays unpublished.
+
+  Two guards were added for the class of mistake that nearly shipped it: the marker
+  set had nothing matching the private repository's own name, or a path inside it.
+  Both now fail the pre-publish scan. (The patterns are spelled out in the sync
+  manifest, not here — a changelog that quotes them would trip them.)
+
+- **Marketing framing out of the published docs.** `DATASETS.md` carried a section
+  of go-to-market reasoning written for us, not the reader — "top-of-funnel",
+  "the user learns the edition line at the moment they feel the need", and a
+  closing note that a GitHub issue quoting an error "*is* a qualified lead". It is
+  replaced by "Limits of the open build", which keeps every gate and the workaround
+  for it and drops the funnel. `audit.rs` no longer calls the feature "paid-tier",
+  and `README.md` says "managed fleet" where it said "commercial fleet". The
+  capability tables all stay: the engine's own signpost errors point at them.
+
+- **The private-key tripwire stopped firing on source that merely names one.** The
+  pre-publish scan matched a bare `BEGIN … PRIVATE KEY`, which the new GitOps
+  credential form trips legitimately — the textarea placeholder and the key
+  validation tests both contain the literal header an operator has to recognise.
+  It is now two rules that match key *material*: the header alone on a line (any
+  real `.pem`, including an indented YAML block scalar) and the base64 of the
+  `openssh-key-v1` container header, which is context-free and so still catches a
+  key pasted into a source literal — the one shape the first rule gives up.
+
+### Fixed
+- **`MAX_INFLIGHT_RUNS=0` disables the admission cap, as the chart has always
+  said it does.** The chart, its `values.yaml` and `docs/CONFIG.md` all documented
+  `0` as "no cap", and `POST /runs` implemented exactly that (`max_inflight_runs
+  > 0` before it checks). The env parse in between clamped with `.max(1)`, so `0`
+  never reached either consumer: an operator who disabled the cap got a cap of
+  **one active run** instead — a near-total stall, and the opposite of what they
+  asked for.
+
+  The clamp is now `.max(0)`, and the ingest actor's throttle grew the same
+  `> 0` guard the API path already had — without it a `0` that finally reaches it
+  compares `active >= 0`, which is always true, and the actor would throttle
+  forever while admitting nothing. Negative values normalize to `0` rather than
+  meaning some third thing. Both sites are pinned by unit tests
+  (`max_inflight_runs_zero_disables_the_cap`, `zero_cap_never_closes_the_valve`),
+  because the previous contract was documented in three places and enforced in
+  none.
+
+- **The MCP `dagron_submit_run` tool now actually submits.** It posted the spec
+  as a raw body with `content-type: application/yaml`. `POST /api/runs` binds
+  `Json<SubmitBody>` — an envelope, `{"yaml": "…"}` — and axum's `Json` extractor
+  refuses any request that isn't `application/json` with **415 before the handler
+  runs**. So the one tool an agent needs most, hand dagron a workflow, could not
+  have worked against `dagron-api` in any deployment: every submit came back as an
+  unsupported-media-type error the model then reported as a tool failure.
+
+  It sends the JSON envelope now. Worth noting *why* it survived: the crate's
+  tests covered the tool catalogue and the argument validation thoroughly, and
+  nothing asserted what went on the wire — a shape only visible at the HTTP
+  boundary. `submit_posts_the_spec_as_json` closes that by serving one request
+  from an in-crate listener and asserting the method, the content type and the
+  body, so the next drift of this kind fails a test rather than a demo.
+
+  `DagronClient::get`/`post` are also public now, so a composing server can add
+  tools without re-implementing base-URL and auth handling.
+
 ## [0.5.2] - 2026-07-28
 
 ### Fixed
-- **`dagron-gitops` no longer carries perl, and with it 17 CRITICAL CVEs.** The
-  image scanned with CVE-2026-57433, CVE-2026-8376, CVE-2026-13221 and
-  CVE-2026-42496 across `perl`, `perl-base`, `libperl5.36` and
-  `perl-modules-5.36`, plus CVE-2023-45853 in `zlib1g` 1.2.13.
+- **`dagron-gitops` no longer carries perl.** The image scanned with five open
+  advisories — CVE-2026-57433, CVE-2026-8376, CVE-2026-13221 and CVE-2026-42496
+  against perl, plus CVE-2023-45853 against `zlib1g` — reported as 17 rows
+  because each perl advisory appears once per installed package (`perl`,
+  `perl-base`, `libperl5.36`, `perl-modules-5.36`).
 
-  None of them had a fix. Every one reported an empty "fixed in" column, so no
-  base-image bump and no `apt-get upgrade` would have cleared a single one —
-  there was no patched Debian package to move to.
+  Read them more carefully than the scanner's colour, and two things matter.
+  Debian triages several as `no-dsa` — "Minor issue; can be fixed in point
+  release" — which is *why* the "fixed in" column is empty: a deliberate
+  deprioritisation rather than an impossibility. And CVE-2026-8376 affects only
+  32-bit builds, so it never applied to the amd64 and arm64 images published
+  here.
 
-  perl was never installed deliberately. Debian's `git` hard-`Depends` on `perl`
-  and `liberror-perl`, so `--no-install-recommends` could not exclude it, and
-  `debian:bookworm-slim` ships `perl-base` before anything is installed at all.
-  When a package you do not need has an unpatched critical, the fix is to not
-  have the package: the runtime moves to Alpine, whose `git` depends only on
-  musl, libcurl, libexpat, libpcre2 and libz. Verified in the built image —
-  zero perl packages, no perl binary, zlib 1.3.2, and git 2.47.3 still cloning
-  and committing as the non-root user. The image is 26.7 MB.
+  So the case is not "the image was critically vulnerable". It is that perl was
+  never wanted in the first place — Debian's `git` hard-`Depends` on it, so
+  `--no-install-recommends` could not exclude it, and `debian:bookworm-slim`
+  ships `perl-base` before anything is installed at all — and an unneeded
+  dependency carrying open unfixed advisories is worth removing when the cost is
+  a base-image change. The runtime moves to Alpine, whose `git` depends only on
+  musl, libcurl, libexpat, libpcre2 and libz. Verified in the built image: zero
+  perl packages, no perl binary, zlib 1.3.2, and git 2.47.3 still cloning and
+  committing as the non-root user. The image is 26.7 MB.
 
   Cheap to do here only because this crate pulls no OpenSSL: sqlx is
   `default-features = false` with no TLS feature. **`dagron-engine-localdev` is
@@ -200,8 +373,8 @@ All notable changes to this project are documented here. The format is based on
 
   It stages from `git ls-files`, not the working tree, because the real sync
   rsyncs from a CI checkout with no untracked or gitignored files — staging
-  differently invents leaks that could never ship. Wired into
-  [docs/OSS_AUDIT.md](docs/OSS_AUDIT.md) §5's pre-publish checklist and §6.
+  differently invents leaks that could never ship. Wired into the pre-publish
+  checklist the release process runs.
 
 ### Changed
 

@@ -25,7 +25,7 @@ imagePullSecrets: []
 # `kubernetes` cargo features. The module Dockerfile defaults to a sqlite-only
 # build — see terraform/README.md §"Building the images".
 engine:
-  image: mancube/dagron-engine:0.5.2
+  image: mancube/dagron-engine:0.6.0
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 8080
@@ -109,17 +109,28 @@ gitops:
   enabled: false
   # First published in 0.5.0. Release packaging rewrites this tag to the release
   # version (docker.yml), so the pin here only matters to a repo checkout.
-  image: mancube/dagron-gitops:0.5.2
+  image: mancube/dagron-gitops:0.6.0
   imagePullPolicy: IfNotPresent
   # Seconds between auto-sync reconciles per repo. A manual Sync is immediate.
   pollSecs: 60
   rustLog: info
-  # Token for private repositories, read from a Secret you create. Sent only to
-  # trusted forge hosts over HTTPS; leave name empty for public repos.
-  #   kubectl create secret generic dagron-git   #     --from-literal=DAGRON_GIT_TOKEN=ghp_xxx
+  # Fallback token for private repositories, read from a Secret you create. Sent
+  # only to trusted forge hosts over HTTPS; leave name empty for public repos.
+  #   kubectl create secret generic dagron-git \
+  #     --from-literal=DAGRON_GIT_TOKEN=ghp_xxx
+  #
+  # Per-repository credentials — an HTTPS token or an SSH deploy key, set from
+  # the console's GitOps page — are the other way to reach a private repo, and
+  # the one to prefer: they are scoped to one repository, rotatable without a
+  # redeploy, and work with SSH-only forges. They are stored encrypted, so they
+  # need `envSecrets` below configured; this worker gets the same key.
   tokenSecret:
     name: ""
     key: DAGRON_GIT_TOKEN
+  # Refuse to sync an SSH repository that has no known_hosts pinned on its
+  # credential, instead of trusting whatever host answers. Off by default so
+  # repositories connected without host keys keep syncing.
+  sshStrictHostKeyChecking: false
   # Disposable clone scratch (the root filesystem is read-only). Raise it if you
   # sync a large monorepo.
   scratchSizeLimit: 1Gi
@@ -130,7 +141,7 @@ gitops:
 
 dagronApi:
   enabled: true
-  image: mancube/dagron-api:0.5.2
+  image: mancube/dagron-api:0.6.0
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 8080
@@ -187,7 +198,7 @@ envSecrets:
 # ── Frontend (Next.js UI) ────────────────────────────────────────────────────
 frontend:
   enabled: true
-  image: mancube/dagron-frontend:0.5.2
+  image: mancube/dagron-frontend:0.6.0
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 3000

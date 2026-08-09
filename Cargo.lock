@@ -1481,6 +1481,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "dagron-core",
+ "dagron-crypto",
  "dagron-logging",
  "serde_yaml",
  "sqlx",

@@ -132,6 +132,106 @@ struct Due {
     /// Value read in the sweep — the CAS target, so a peer that syncs this repo
     /// between the SELECT and the claim wins and we skip.
     last_synced_at: Option<String>,
+    /// `none` | `token` | `ssh` — see `dagron-api::routes::gitrepos`.
+    auth_kind: String,
+    auth_username: Option<String>,
+    /// Ciphertext of the token / private key, decrypted here and nowhere else.
+    auth_secret: Option<String>,
+    auth_known_hosts: Option<String>,
+}
+
+/// Decrypt a repo's stored credential into the form the clone needs.
+///
+/// `Ok(None)` is "this repo has no credential" — the worker then falls back to
+/// the process-wide token, as it always did. An `Err` is a *configured*
+/// credential that could not be read (missing or mismatched
+/// `DAGRON_ENV_SECRET_KEY`, a KEK provider that will not build), and it fails
+/// the sync on purpose: cloning unauthenticated instead would report the repo as
+/// "not found" and send the operator looking at the wrong thing.
+fn decrypt_auth(repo: &Due) -> Result<Option<sync::GitAuth>, String> {
+    let kind = repo.auth_kind.as_str();
+    if kind == "none" || kind.is_empty() {
+        return Ok(None);
+    }
+    let Some(ciphertext) = repo.auth_secret.as_deref() else {
+        return Err(format!("credential kind '{kind}' is set but no secret is stored"));
+    };
+    let plain = decrypt(ciphertext)?;
+    match kind {
+        "token" => Ok(Some(sync::GitAuth::Token {
+            username: repo
+                .auth_username
+                .clone()
+                .filter(|u| !u.trim().is_empty())
+                .unwrap_or_else(|| sync::DEFAULT_TOKEN_USER.to_string()),
+            token: plain,
+        })),
+        "ssh" => Ok(Some(sync::GitAuth::Ssh {
+            key: plain,
+            // dagron-api stores an SSH user for every key credential and the
+            // console displays it. Dropping it here meant ssh fell back to the
+            // URL's user or the process user, so an operator could enter a
+            // deploy account, see it reported as installed, and have the clone
+            // authenticate as someone else entirely — the failure this feature
+            // exists to prevent, reintroduced one layer down.
+            user: ssh_user(repo.auth_username.as_deref()),
+            known_hosts: repo
+                .auth_known_hosts
+                .clone()
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty()),
+        })),
+        other => Err(format!("unknown credential kind '{other}'")),
+    }
+}
+
+/// The SSH account from a stored credential, dropped unless it looks like one.
+///
+/// dagron-api constrains this on write, but the value arrives from a datastore
+/// row and lands inside `GIT_SSH_COMMAND`, which git re-parses through a shell.
+/// A row that predates that check — or one written directly — must not be able
+/// to smuggle an argument in; an unusable name is discarded so ssh falls back to
+/// the URL's user, rather than failing the sync over it.
+fn ssh_user(stored: Option<&str>) -> Option<String> {
+    let user = stored?.trim();
+    if user.is_empty() || !user.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
+        return None;
+    }
+    Some(user.to_string())
+}
+
+/// Dispatch on the stored ciphertext version, exactly as the engine does for
+/// environment secrets: `v2:` needs the KEK provider, `v1:` the single key.
+fn decrypt(ciphertext: &str) -> Result<String, String> {
+    match dagron_crypto::version_of(ciphertext) {
+        Some("v2") => {
+            let provider = dagron_crypto::provider_from_env()
+                .map_err(|e| format!("KEK provider ({}) failed to initialize: {e}", dagron_crypto::PROVIDER_ENV))?
+                .ok_or_else(|| {
+                    format!(
+                        "the credential is envelope-encrypted (v2) but no KEK provider is configured (set {} on this worker)",
+                        dagron_crypto::PROVIDER_ENV
+                    )
+                })?;
+            dagron_crypto::decrypt_envelope(provider.as_ref(), ciphertext)
+                .map_err(|e| format!("decrypting the Git credential: {e}"))
+        }
+        Some("v1") => {
+            let key = dagron_crypto::load_key().map_err(|e| {
+                format!(
+                    "the repository has a stored credential but {} is not set on this worker ({e})",
+                    dagron_crypto::KEY_ENV
+                )
+            })?;
+            dagron_crypto::decrypt(&key, ciphertext).map_err(|_| {
+                format!(
+                    "decrypting the Git credential failed — does this worker's {} match dagron-api's?",
+                    dagron_crypto::KEY_ENV
+                )
+            })
+        }
+        _ => Err("the stored Git credential has an unrecognized ciphertext version".to_string()),
+    }
 }
 
 /// Claim and reconcile everything due. Claiming is a conditional UPDATE, so two
@@ -140,6 +240,7 @@ async fn sweep(pool: &sqlx::PgPool, poll_secs: i64) -> anyhow::Result<()> {
     let stale = (chrono::Utc::now() - chrono::Duration::seconds(poll_secs)).to_rfc3339();
     let due: Vec<Due> = sqlx::query_as(
         "SELECT id, url, branch, path, last_synced_at,
+                auth_kind, auth_username, auth_secret, auth_known_hosts,
                 (sync_requested_at IS NOT NULL) AS requested
          FROM git_repos
          WHERE sync_requested_at IS NOT NULL
@@ -175,10 +276,22 @@ async fn sweep(pool: &sqlx::PgPool, poll_secs: i64) -> anyhow::Result<()> {
 /// Reconcile one repo and write its outcome back to the row — the same state,
 /// rev, count and message the console already renders.
 async fn run_one(pool: &sqlx::PgPool, repo: &Due) {
+    // A credential that cannot be decrypted is an operator-actionable failure,
+    // so it takes the same path as a failed clone: `Error` on the row with the
+    // reason, rather than a silent unauthenticated retry.
+    let auth = match decrypt_auth(repo) {
+        Ok(auth) => auth,
+        Err(e) => {
+            error!(repo = %repo.url, error = %e, "credential unusable");
+            write_result(pool, repo, None, "Error", 0, &e).await;
+            return;
+        }
+    };
     let target = sync::Repo {
         url: repo.url.clone(),
         branch: repo.branch.clone(),
         path: repo.path.clone(),
+        auth,
     };
     // State semantics: `Error` is reserved for failures an operator can act on —
     // the clone failed, the path is missing, auth was rejected. A sync that
@@ -220,7 +333,18 @@ async fn run_one(pool: &sqlx::PgPool, repo: &Due) {
         }
     };
     info!(repo = %repo.url, state, count, "reconciled");
+    write_result(pool, repo, rev.as_deref(), state, count, &message).await;
+}
 
+/// Write one reconcile outcome back to the repo row.
+async fn write_result(
+    pool: &sqlx::PgPool,
+    repo: &Due,
+    rev: Option<&str>,
+    state: &str,
+    count: i64,
+    message: &str,
+) {
     let res = sqlx::query(
         "UPDATE git_repos
          SET state = $1,
@@ -232,14 +356,118 @@ async fn run_one(pool: &sqlx::PgPool, repo: &Due) {
          WHERE id = $6",
     )
     .bind(state)
-    .bind(&rev)
+    .bind(rev)
     .bind(count)
-    .bind(&message)
+    .bind(message)
     .bind(chrono::Utc::now().to_rfc3339())
     .bind(&repo.id)
     .execute(pool)
     .await;
     if let Err(e) = res {
         warn!(error = %e, "writing sync result failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(kind: &str, secret: Option<String>, known_hosts: Option<String>) -> Due {
+        row_as(kind, secret, known_hosts, None)
+    }
+
+    fn row_as(
+        kind: &str,
+        secret: Option<String>,
+        known_hosts: Option<String>,
+        username: Option<&str>,
+    ) -> Due {
+        Due {
+            id: "r1".into(),
+            url: "https://github.com/o/r.git".into(),
+            branch: "main".into(),
+            path: "dagron".into(),
+            requested: true,
+            last_synced_at: None,
+            auth_kind: kind.into(),
+            auth_username: username.map(str::to_string),
+            auth_secret: secret,
+            auth_known_hosts: known_hosts,
+        }
+    }
+
+    /// Restores `DAGRON_ENV_SECRET_KEY` even when an assertion panics, so a
+    /// failure here cannot change what a parallel test sees.
+    struct EnvGuard(&'static str, Option<String>);
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            EnvGuard(key, previous)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
+    /// The seam that would break silently: dagron-api encrypts, this worker
+    /// decrypts, and nothing between them would notice a format drift until a
+    /// real repository failed to sync.
+    #[test]
+    fn decrypts_what_dagron_api_stored() {
+        let _key_env = EnvGuard::set(dagron_crypto::KEY_ENV, "test-key-for-gitops-credentials");
+        let key = dagron_crypto::load_key().unwrap();
+
+        let stored = dagron_crypto::encrypt(&key, "ghp_secret").unwrap();
+        match decrypt_auth(&row("token", Some(stored), None)).unwrap() {
+            Some(sync::GitAuth::Token { username, token }) => {
+                assert_eq!(token, "ghp_secret");
+                // No username stored → the documented default, not an empty one
+                // (git would send an empty user and the forge would refuse it).
+                assert_eq!(username, "x-access-token");
+            }
+            other => panic!("expected a token credential, got {other:?}"),
+        }
+
+        let stored = dagron_crypto::encrypt(&key, "-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
+        match decrypt_auth(&row("ssh", Some(stored), Some("  ".into()))).unwrap() {
+            Some(sync::GitAuth::Ssh { key, user, known_hosts }) => {
+                assert!(key.starts_with("-----BEGIN OPENSSH"));
+                // Blank known_hosts is "none", not an empty pin file that would
+                // fail every host-key check.
+                assert!(known_hosts.is_none());
+                assert!(user.is_none());
+            }
+            other => panic!("expected an ssh credential, got {other:?}"),
+        }
+
+        // The stored SSH account reaches the clone. It used to be dropped here,
+        // so the console reported a deploy user that ssh never used.
+        let stored = dagron_crypto::encrypt(&key, "-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
+        match decrypt_auth(&row_as("ssh", Some(stored.clone()), None, Some("deploy-bot"))).unwrap() {
+            Some(sync::GitAuth::Ssh { user, .. }) => assert_eq!(user.as_deref(), Some("deploy-bot")),
+            other => panic!("expected an ssh credential, got {other:?}"),
+        }
+        // A row carrying something that is not an account name — one written
+        // before the API validated it, or written directly — is dropped rather
+        // than interpolated into GIT_SSH_COMMAND.
+        match decrypt_auth(&row_as("ssh", Some(stored), None, Some("evil -o ProxyCommand=sh"))).unwrap() {
+            Some(sync::GitAuth::Ssh { user, .. }) => assert!(user.is_none(), "{user:?}"),
+            other => panic!("expected an ssh credential, got {other:?}"),
+        }
+
+        // No credential is not an error — the worker falls back as it always did.
+        assert!(decrypt_auth(&row("none", None, None)).unwrap().is_none());
+        // A credential that cannot be read is: cloning unauthenticated instead
+        // would report the repo as "not found".
+        assert!(decrypt_auth(&row("token", Some("garbage".into()), None)).is_err());
+        assert!(decrypt_auth(&row("token", None, None)).is_err());
     }
 }

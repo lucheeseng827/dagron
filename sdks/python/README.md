@@ -94,6 +94,6 @@ fake gateway (real sockets), so request construction is exercised end-to-end.
 
 ## Release
 
-Publishing `dagron-sdk` to PyPI (the `pip` repository) is documented step-by-step
-in [`RELEASING.md`](RELEASING.md) — version bump, `python -m build`, a TestPyPI
-dry-run, the `twine upload`, tagging, and the move to OIDC Trusted Publishing.
+`dagron-sdk` is published to PyPI, the Python Package Index. The version is the
+single literal in `dagron.__version__`, which `pyproject.toml` reads statically
+at build time — bump it there and nowhere else.

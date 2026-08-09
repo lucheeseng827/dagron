@@ -55,14 +55,33 @@ submit workflows, watch runs stream, inspect the DAG, and read task logs.
 > start a workflow via the CLI and via REST, chain one workflow from another,
 > monitor runs, and wire secrets/environment variables.
 
-**Option A — the full stack with UI** (needs podman or docker; ~a few minutes
-on first build):
+**Option A — the full stack with UI** (needs podman or docker). This pulls
+published images and builds nothing — a first run should not begin with
+compiling four Rust crates:
 
 ```bash
-podman compose up --build     # or: docker compose up --build
+docker compose -f compose.quickstart.yaml up -d
 ```
 
-Success looks like (trimmed; Postgres + frontend logs elided):
+On podman, `podman compose` is a thin wrapper that needs podman **≥ 4.7** *and*
+a compose provider (`docker-compose` or `podman-compose`) installed separately.
+Older podman has no `compose` subcommand at all, so call the provider directly:
+
+```bash
+podman compose   -f compose.quickstart.yaml up -d   # podman ≥ 4.7, provider installed
+podman-compose   -f compose.quickstart.yaml up -d   # standalone provider, older podman too
+```
+
+The images are pinned; override with `DAGRON_VERSION=0.6.0`. Floating `:latest`
+is deliberately not the default — a quickstart that silently changes under you
+is worse than one you have to bump.
+
+> **Changing dagron itself?** [`compose.yaml`](compose.yaml) next to it builds
+> every service from source (`docker compose up --build`) — right when you are
+> developing, wrong when you are meeting it.
+
+Success looks like (`… logs -f engine dagron-api`, since `-d` detaches; trimmed,
+Postgres + frontend logs elided):
 
 ```text
 engine-1      | INFO dagron_engine: scheduler starting worker_id=worker-… db=postgres://<redacted>@postgres:5432/workflow executor_kind=local worker_count=16 source_kind=file max_inflight_runs=64
@@ -72,8 +91,9 @@ dagron-api-1  | INFO dagron_api: dagron-api listening addr=0.0.0.0:8080
 ```
 
 Open <http://localhost:3000> and sign in with the seeded dev admin
-(`admin@local` / `dagron-admin` — from `compose.yaml`; change everything for a
-real deploy, see [`docs/OPERATIONS.md`](docs/OPERATIONS.md)).
+(`admin@local` / `dagron-admin` — from the compose file; seeded on first start
+only, so changing them later needs `down -v`. Change everything for a real
+deploy, see [`docs/OPERATIONS.md`](docs/OPERATIONS.md)).
 
 **Option B — one binary, zero infra** (default build = embedded SQLite + the
 management API):
@@ -180,6 +200,14 @@ tasks:
     retry_max_delay_secs: 60  # optional cap on the exponential backoff
     timeout_secs: 600      # per-task; default 25s
 ```
+
+> **`timeout_secs` defaults to 25 seconds** — the most common first surprise. A
+> task that genuinely runs longer is killed with `command timed out after 25s`,
+> and shows a single attempt because `max_attempts` defaults to `1`. There is no
+> upper bound on the value; set it per task, or once via `task_defaults`. Long
+> tasks are fine — a running task's lease is heartbeated, not capped.
+> [`docs/HOWTO.md` §8](docs/HOWTO.md#8-tasks-that-run-longer-than-25-seconds)
+> covers the three budgets and the unrelated 600 s cap on `?wait=true`.
 
 Fan-out tasks (`with_items` / `with_param`) may set
 `instance_key: "{{ item.region }}"` to name each expanded instance
@@ -464,7 +492,7 @@ backend, monitoring, security posture, symptom-first troubleshooting.
 ## dagron Enterprise
 
 Everything on this page is Apache-2.0 and complete on its own — the engine
-here is the same code the commercial fleet runs. **dagron Enterprise** adds
+here is the same code the managed fleet runs. **dagron Enterprise** adds
 the managed layer around a fleet of engines:
 
 | Open source (this repo) | dagron Enterprise adds |

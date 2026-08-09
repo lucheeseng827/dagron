@@ -124,9 +124,18 @@ services:
       DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
       # Seconds between auto-sync reconciles per repo (manual Sync is immediate).
       GITOPS_POLL_SECS: "60"
-      # A token is sent only to trusted forge hosts over https; leave unset for
-      # public repos.
+      # Decrypts the per-repository credentials (HTTPS token / SSH key) set on
+      # the GitOps page. MUST match dagron-api's — dagron-api encrypts them on
+      # write and this worker is the only thing that reads them back. Without
+      # it, a repo with a stored credential fails its sync saying so.
+      DAGRON_ENV_SECRET_KEY: *env_secret_key
+      # Fallback token for repos with no credential of their own. Sent only to
+      # trusted forge hosts over https; leave unset for public repos.
       # DAGRON_GIT_TOKEN: ""
+      # Refuse an SSH sync unless the repo has known_hosts pinned, instead of
+      # falling back to trusting whatever host answers. Off by default so
+      # existing repos keep syncing.
+      # DAGRON_GIT_SSH_STRICT: "1"
       RUST_LOG: info
     depends_on:
       postgres:

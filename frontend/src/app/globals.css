@@ -3,7 +3,7 @@
 @tailwind utilities;
 
 /* ── dagron design system ──────────────────────────────────────────────────
-   The console shares dagron.dev's material (see site/ + DESIGN.md): a steel
+   The console shares dagron.dev's material: a steel
    chrome layer around a dark content ground, paint-white text, one amber
    accent. It does NOT share the marketing page's display type or its flap
    ornament — this is an operator's tool, and a display face in a data table

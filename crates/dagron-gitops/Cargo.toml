@@ -15,6 +15,12 @@ path = "src/main.rs"
 # datastore, which is Postgres-only.
 dagron-core = { path = "../dagron-core", default-features = false, features = ["postgres"] }
 dagron-logging = { path = "../dagron-logging" }
+# Decrypts the per-repository Git credential dagron-api stored. Same crate, same
+# `v1:`/`v2:` wire format and the same key material as environment secrets — so
+# this worker needs DAGRON_ENV_SECRET_KEY (or the KEK provider vars) exactly as
+# the engine does, and a mismatched key surfaces as a decrypt error on the repo
+# row rather than a silent fall back to unauthenticated cloning.
+dagron-crypto = { path = "../dagron-crypto" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "signal"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros"] }
 anyhow = "1"

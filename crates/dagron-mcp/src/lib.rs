@@ -28,13 +28,18 @@ pub struct DagronClient {
 impl DagronClient {
     /// `DAGRON_API_URL` (default `http://localhost:8080`) + optional
     /// `DAGRON_MCP_TOKEN` (sent as `Authorization: Bearer …`).
-    pub fn from_env() -> Self {
-        Self {
-            http: reqwest::Client::new(),
-            base: std::env::var("DAGRON_API_URL")
-                .unwrap_or_else(|_| "http://localhost:8080".to_string()),
-            token: std::env::var("DAGRON_MCP_TOKEN").ok().filter(|t| !t.is_empty()),
-        }
+    ///
+    /// Fails when the token would cross the network in the clear — see
+    /// [`plaintext_token_verdict`] for the reasoning and the opt-out.
+    pub fn from_env() -> Result<Self> {
+        let base = std::env::var("DAGRON_API_URL")
+            .unwrap_or_else(|_| "http://localhost:8080".to_string());
+        let token = std::env::var("DAGRON_MCP_TOKEN").ok().filter(|t| !t.is_empty());
+        let opted_in = std::env::var("DAGRON_MCP_ALLOW_PLAINTEXT_TOKEN")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        plaintext_token_verdict(&base, token.is_some(), opted_in)?;
+        Ok(Self { http: reqwest::Client::new(), base, token })
     }
 
     fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -44,7 +49,9 @@ impl DagronClient {
         }
     }
 
-    async fn get(&self, path: &str) -> Result<String> {
+    /// GET `path` against dagron-api. Public so a composing server can add tools
+    /// without re-implementing base-URL and auth handling.
+    pub async fn get(&self, path: &str) -> Result<String> {
         let r = self
             .auth(self.http.get(format!("{}{path}", self.base)))
             .send()
@@ -53,7 +60,9 @@ impl DagronClient {
         body_or_status(r).await
     }
 
-    async fn post(&self, path: &str, body: Option<(String, &'static str)>) -> Result<String> {
+    /// POST `path` with an optional `(body, content-type)`. Public for the same
+    /// reason as [`DagronClient::get`].
+    pub async fn post(&self, path: &str, body: Option<(String, &'static str)>) -> Result<String> {
         let mut rb = self.auth(self.http.post(format!("{}{path}", self.base)));
         if let Some((b, ct)) = body {
             rb = rb.header("content-type", ct).body(b);
@@ -112,6 +121,67 @@ impl DagronClient {
         }
         Ok(String::from_utf8_lossy(&buf).into_owned())
     }
+}
+
+/// Refuse a configuration that would put the bearer token on the wire in the
+/// clear, unless the operator has explicitly opted in.
+///
+/// A warning was the first attempt here and it was the wrong call: a process
+/// cannot verify that a service mesh is protecting the connection, and a log line
+/// nobody reads does not stop a misconfigured deployment from shipping the token
+/// in cleartext. Refusing does stop it — and `DAGRON_MCP_ALLOW_PLAINTEXT_TOKEN=1`
+/// keeps the legitimate case (plaintext to an in-cluster Service, transport
+/// secured below us) fully supported while making that exception explicit and
+/// auditable rather than silent. `DAGRON_MCP_HTTP_ALLOW_UNAUTHENTICATED` is the
+/// same shape of risk answered the same way.
+fn plaintext_token_verdict(base: &str, has_token: bool, opted_in: bool) -> Result<()> {
+    if !has_token || opted_in {
+        return Ok(());
+    }
+    if let Some(host) = plaintext_remote_host(base) {
+        anyhow::bail!(
+            "refusing to send DAGRON_MCP_TOKEN to '{host}' over plaintext http://: anything on \
+             the path could read it. Use https://, point DAGRON_API_URL at loopback, or set \
+             DAGRON_MCP_ALLOW_PLAINTEXT_TOKEN=1 if the transport is already secured (a service \
+             mesh, an encrypted link)"
+        );
+    }
+    Ok(())
+}
+
+/// The host a bearer token would cross the network *in the clear* to reach, or
+/// `None` when the configuration is safe.
+///
+/// `http://` to a loopback address never leaves the box, so it doesn't count.
+/// Anything else on plaintext does.
+///
+/// Loopback is decided by parsing the host as an [`std::net::IpAddr`], not by a
+/// textual prefix: `127.0.0.1.example.com` is a perfectly ordinary remote
+/// hostname, and a `starts_with("127.")` test would silently exempt it while the
+/// token still crossed the wire.
+///
+/// The host is returned with any userinfo stripped, so a caller reporting it
+/// cannot accidentally print the credentials in `http://user:pass@host`.
+fn plaintext_remote_host(base: &str) -> Option<String> {
+    let rest = base.strip_prefix("http://")?;
+    // Authority is everything before the path/query/fragment; userinfo (which may
+    // carry credentials) is everything before the last '@' and is dropped here so
+    // it can neither be compared nor logged.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    // Strip the port, keeping a bracketed IPv6 literal intact.
+    let host = match host_port.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => host_port.rsplit_once(':').map_or(host_port, |(h, _)| h),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let is_loopback = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    };
+    (!is_loopback).then(|| host.to_string())
 }
 
 async fn body_or_status(r: reqwest::Response) -> Result<String> {
@@ -305,9 +375,13 @@ pub async fn call_tool(client: &DagronClient, name: &str, args: &Value) -> Resul
         "dagron_list_runs" => client.get("/api/runs").await,
         "dagron_get_run" => client.get(&format!("/api/runs/{}", safe_id("run_id")?)).await,
         "dagron_submit_run" => {
-            client
-                .post("/api/runs", Some((s("yaml")?, "application/yaml")))
-                .await
+            // `POST /api/runs` takes a JSON envelope (`{"yaml": "…"}`), not a raw
+            // YAML body: its handler binds `Json<SubmitBody>`, which rejects any
+            // request that isn't `application/json` with a 415 before the handler
+            // runs. Posting the spec as `application/yaml` meant the one tool an
+            // agent needs most — submit a workflow — never reached the engine.
+            let body = json!({ "yaml": s("yaml")? }).to_string();
+            client.post("/api/runs", Some((body, "application/json"))).await
         }
         "dagron_cancel_run" => {
             client
@@ -657,6 +731,159 @@ mod tests {
             assert!(
                 text.contains("invalid `run_id`"),
                 "expected local run_id validation before any request for {bad:?}, got {text:?}"
+            );
+        }
+    }
+
+    /// Serve exactly one HTTP request on an ephemeral port and hand back the
+    /// request head and body. Small enough to keep in-crate, and the only way to
+    /// assert the *wire shape* of a tool call — which is where a submit that
+    /// dagron-api answers with 415 hides from every other kind of test.
+    async fn capture_one_request() -> (String, tokio::task::JoinHandle<(String, String)>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 1024];
+            // Read the head, then exactly Content-Length bytes of body.
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw).into_owned();
+                let Some((head, body)) = text.split_once("\r\n\r\n") else { continue };
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse().ok())?
+                    })
+                    .unwrap_or(0);
+                if body.len() >= len {
+                    break;
+                }
+            }
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            let (head, body) = text.split_once("\r\n\r\n").unwrap();
+            sock.write_all(
+                b"HTTP/1.1 201 Created\r\ncontent-type: application/json\r\n\
+                  content-length: 21\r\n\r\n{\"run_id\":\"run-0001\"}",
+            )
+            .await
+            .unwrap();
+            sock.flush().await.unwrap();
+            (head.to_string(), body.to_string())
+        });
+        (base, handle)
+    }
+
+    #[tokio::test]
+    async fn submit_posts_the_spec_as_json() {
+        let (base, server) = capture_one_request().await;
+        let client = DagronClient { http: reqwest::Client::new(), base, token: None };
+        let out =
+            call_tool(&client, "dagron_submit_run", &json!({ "yaml": "name: w\ntasks: []\n" }))
+                .await
+                .unwrap();
+        assert!(out.contains("run-0001"), "got {out}");
+
+        let (head, body) = server.await.unwrap();
+        assert!(head.starts_with("POST /api/runs "), "got {head}");
+        assert!(
+            head.to_lowercase().contains("content-type: application/json"),
+            "submit must be application/json or dagron-api answers 415; head: {head}"
+        );
+        let sent: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(sent["yaml"], "name: w\ntasks: []\n");
+    }
+
+    #[test]
+    fn a_token_over_plaintext_to_a_remote_host_is_flagged() {
+        for (base, host) in [
+            ("http://dagron-api:8080", "dagron-api"),
+            ("http://10.0.0.5:8080", "10.0.0.5"),
+            ("http://dagron.example.com/api", "dagron.example.com"),
+            ("http://[2001:db8::1]:8080", "2001:db8::1"),
+            // A hostname that merely *starts* with 127. is a remote host like any
+            // other — a textual prefix test would have exempted it.
+            ("http://127.0.0.1.example.com", "127.0.0.1.example.com"),
+            ("http://127.example.com:8080", "127.example.com"),
+        ] {
+            assert_eq!(
+                plaintext_remote_host(base).as_deref(),
+                Some(host),
+                "{base} should be flagged"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_and_tls_are_not_flagged() {
+        for base in [
+            // Never leaves the box — the whole 127/8 block, not just 127.0.0.1.
+            "http://localhost:8080",
+            "http://LOCALHOST:8080",
+            "http://127.0.0.1:8080",
+            "http://127.2.3.4:8080",
+            "http://[::1]:8080",
+            // Encrypted.
+            "https://dagron.example.com",
+            "https://10.0.0.5:8080",
+        ] {
+            assert_eq!(plaintext_remote_host(base), None, "{base} should not be flagged");
+        }
+    }
+
+    #[test]
+    fn userinfo_never_reaches_the_message() {
+        // The client accepts credentials in the URL. Reporting a leaked token by
+        // printing a password would be its own disclosure.
+        let host = plaintext_remote_host("http://user:hunter2@dagron.example.com:8080/x");
+        assert_eq!(host.as_deref(), Some("dagron.example.com"));
+        let err = plaintext_token_verdict(
+            "http://user:hunter2@dagron.example.com:8080/x",
+            true,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("dagron.example.com"), "got {err}");
+        assert!(!err.contains("hunter2"), "credentials leaked into the error: {err}");
+    }
+
+    #[test]
+    fn a_plaintext_token_to_a_remote_host_refuses_to_start() {
+        let err = plaintext_token_verdict("http://dagron-api:8080", true, false)
+            .unwrap_err()
+            .to_string();
+        // The message has to name all three ways out, or it just blocks people.
+        assert!(err.contains("https://"), "got {err}");
+        assert!(err.contains("loopback"), "got {err}");
+        assert!(err.contains("DAGRON_MCP_ALLOW_PLAINTEXT_TOKEN"), "got {err}");
+    }
+
+    #[test]
+    fn the_opt_out_keeps_the_mesh_deployment_working() {
+        // Plaintext to an in-cluster Service with the transport secured below us
+        // is legitimate; the operator just has to say so once.
+        assert!(plaintext_token_verdict("http://dagron-api:8080", true, true).is_ok());
+    }
+
+    #[test]
+    fn safe_configurations_need_no_opt_out() {
+        for (base, has_token) in [
+            ("http://dagron-api:8080", false), // no token, nothing to leak
+            ("https://dagron-api:8080", true), // encrypted
+            ("http://127.0.0.1:8080", true),   // never leaves the box
+            ("http://localhost:8080", true),
+        ] {
+            assert!(
+                plaintext_token_verdict(base, has_token, false).is_ok(),
+                "{base} (token={has_token}) should be allowed"
             );
         }
     }

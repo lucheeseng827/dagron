@@ -47,6 +47,28 @@ export type GitRepoState = "Synced" | "OutOfSync" | "Syncing";
 export interface GitRepoList {
   repos: GitRepo[];
   worker_online: boolean;
+  /// Whether the API can encrypt a credential at all. False means
+  /// DAGRON_ENV_SECRET_KEY (or a KEK provider) is unset, so the credential form
+  /// would only ever 503 — the page says so instead of offering it.
+  credentials_configured: boolean;
+}
+
+/// How the GitOps worker authenticates to a repository.
+///
+/// `token` is HTTPS (a PAT, a GitHub App installation token, a GitLab project
+/// access token); `ssh` is a private key (a deploy key). Which one is legal
+/// follows from the repo's URL, and the API rejects the mismatch rather than
+/// storing a credential that could never be used.
+export type GitAuthKind = "none" | "token" | "ssh";
+
+/// Write-only credential payload. Nothing here is ever returned by the API —
+/// reads get `auth_kind` / `auth_username` / `auth_hint` instead.
+export interface GitAuthInput {
+  kind: GitAuthKind;
+  username?: string;
+  token?: string;
+  ssh_private_key?: string;
+  known_hosts?: string;
 }
 
 export interface GitRepo {
@@ -62,6 +84,14 @@ export interface GitRepo {
   last_message: string | null;
   last_synced_at: string | null;
   created_at: string;
+  auth_kind: GitAuthKind;
+  auth_username: string | null;
+  /// Non-secret identifier for the stored credential — `••••cdef` for a token,
+  /// `ssh-ed25519 SHA256:…` for a key (the same fingerprint the forge shows next
+  /// to the deploy key).
+  auth_hint: string | null;
+  auth_known_hosts: string | null;
+  auth_updated_at: string | null;
 }
 
 export interface TaskRow {
