@@ -34,7 +34,28 @@ use std::collections::{BTreeMap, BTreeSet};
 const MAX_DEPTH: usize = 64;
 /// Bound the total expanded task count so a fan-out × recursion blow-up fails
 /// loudly rather than exhausting memory.
+///
+/// This is the ceiling, not a recommendation. `expand()` materialises the WHOLE
+/// graph in memory before anything reaches the database, so a single run near
+/// this bound costs far more than the engine's idle footprint — and admission
+/// counts runs, so it passes the valve as a "1". A hosted plane, or any operator
+/// who would rather refuse a runaway fan-out than absorb it, should lower this.
 const MAX_TASKS: usize = 100_000;
+
+/// The effective per-run task ceiling: `DAGRON_MAX_TASKS_PER_RUN` when set to a
+/// positive value, else [`MAX_TASKS`].
+///
+/// Read per expansion rather than cached, so an operator can lower it on a
+/// restart without a rebuild. Values above the compiled ceiling are refused
+/// rather than honoured — this knob exists to tighten the bound, and letting it
+/// widen one that exists to prevent an OOM would defeat the point.
+fn max_tasks_per_run() -> usize {
+    std::env::var("DAGRON_MAX_TASKS_PER_RUN")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0 && n <= MAX_TASKS)
+        .unwrap_or(MAX_TASKS)
+}
 
 /// Result of expanding one task (or a list of tasks): the produced leaf tasks
 /// plus the boundary node-name sets used to rewire dependencies.
@@ -75,7 +96,7 @@ pub fn expand(mut spec: DagSpec) -> Result<DagSpec> {
         }
     }
 
-    let mut budget = MAX_TASKS;
+    let mut budget = max_tasks_per_run();
     let mut e = expand_list(&spec.tasks, "", &spec.parameters, 0, &templates, &mut budget)?;
 
     wire_hooks(&mut e.tasks)?;
@@ -371,7 +392,10 @@ fn expand_one(
             expand_call(task, &base, &inst_ctx, depth, templates, budget)?
         } else {
             if *budget == 0 {
-                bail!("expansion exceeded {MAX_TASKS} tasks (fan-out × recursion blow-up?)");
+                bail!(
+                    "expansion exceeded {} tasks (fan-out × recursion blow-up?)",
+                    max_tasks_per_run()
+                );
             }
             *budget -= 1;
             let leaf = build_leaf(task, &base, &inst_ctx, runtime_when.clone());
@@ -693,6 +717,33 @@ pub fn eval_when(expr: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The knob may only TIGHTEN the compiled ceiling. Letting it widen a bound
+    /// that exists to prevent an OOM would defeat the bound.
+    #[test]
+    fn task_ceiling_env_can_lower_but_never_raise() {
+        // Serialised via the env, so keep the mutations local and restore after.
+        let restore = std::env::var("DAGRON_MAX_TASKS_PER_RUN").ok();
+
+        std::env::set_var("DAGRON_MAX_TASKS_PER_RUN", "500");
+        assert_eq!(max_tasks_per_run(), 500, "a lower value applies");
+
+        std::env::set_var("DAGRON_MAX_TASKS_PER_RUN", "999999999");
+        assert_eq!(max_tasks_per_run(), MAX_TASKS, "above the ceiling is refused");
+
+        std::env::set_var("DAGRON_MAX_TASKS_PER_RUN", "0");
+        assert_eq!(max_tasks_per_run(), MAX_TASKS, "0 is not 'no limit' here");
+
+        std::env::set_var("DAGRON_MAX_TASKS_PER_RUN", "not-a-number");
+        assert_eq!(max_tasks_per_run(), MAX_TASKS, "garbage falls back");
+
+        std::env::remove_var("DAGRON_MAX_TASKS_PER_RUN");
+        assert_eq!(max_tasks_per_run(), MAX_TASKS, "unset → compiled ceiling");
+
+        if let Some(v) = restore {
+            std::env::set_var("DAGRON_MAX_TASKS_PER_RUN", v);
+        }
+    }
     use super::*;
     use std::collections::BTreeMap;
 

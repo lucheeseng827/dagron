@@ -2724,6 +2724,27 @@ pub async fn count_active_runs(pool: &Pool) -> Result<i64> {
     Ok(n)
 }
 
+/// Tasks currently in flight across every active run.
+///
+/// The companion to [`count_active_runs`], and the reason it exists: admission
+/// counts RUNS, so one run containing 100k tasks and one containing four are
+/// both "1". A fleet sitting comfortably under `MAX_INFLIGHT_RUNS` can be far
+/// past what the scheduler and the datastore can carry, because the unit the
+/// cap measures is not the unit that costs anything.
+///
+/// `('pending', 'ready', 'running')` mirrors the in-flight set used elsewhere in
+/// this module. `awaiting_approval` is deliberately excluded: a task parked on a
+/// human is not scheduler pressure, and counting it would let one forgotten
+/// approval close the valve on everything else.
+pub async fn count_active_tasks(pool: &Pool) -> Result<i64> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_runs WHERE status IN ('pending', 'ready', 'running')",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
 /// Finalize every `running` workflow_run whose task_runs are all terminal.
 ///
 /// The multi-run generalization of [`is_run_complete`]: rather than polling one

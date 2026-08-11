@@ -67,6 +67,11 @@ pub struct ApiState {
     /// Many Requests` + `Retry-After` instead of growing an unbounded backlog.
     /// `0` disables the cap (the historical "accept everything" behaviour).
     pub max_inflight_runs: i64,
+    /// Admission cap for `POST /runs` on the dimension that costs something: a
+    /// 100k-task run and a 4-task run are both one *run*, so the run cap alone
+    /// does not bound the work admitted. Counted against the task ROWS the
+    /// submission will create, including gang expansion. `0` disables it.
+    pub max_inflight_tasks: i64,
 }
 
 /// Bind `addr` and serve the management API until the process exits.
@@ -305,6 +310,38 @@ async fn submit_run(
                     "error": "too many in-flight runs",
                     "active": active,
                     "max_inflight_runs": st.max_inflight_runs,
+                })),
+            )
+                .into_response());
+        }
+    }
+
+    // The same valve on tasks. `MAX_INFLIGHT_TASKS` reached the IngestActor and
+    // stopped there, so this path — the engine's own ops API, and the one the
+    // load-test fleet actually submits through — was capped on runs only. A run
+    // is a poor unit for admission: one submission can expand to 100k tasks and
+    // still count as 1.
+    //
+    // The incoming run's own rows are added before comparing, rather than
+    // checking `active >= cap` as the ingest valve does. Otherwise a fleet
+    // sitting one task under the cap admits an arbitrarily large run and lands
+    // far above it, which is the case the cap exists for.
+    if st.max_inflight_tasks > 0 {
+        let incoming = dag.task_row_count();
+        let active_tasks = db::count_active_tasks(&st.pool).await?;
+        if active_tasks + incoming > st.max_inflight_tasks {
+            info!(
+                active_tasks, incoming, cap = st.max_inflight_tasks,
+                "run rejected — would exceed the inflight task cap"
+            );
+            return Ok((
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, "1")],
+                Json(json!({
+                    "error": "too many in-flight tasks",
+                    "active_tasks": active_tasks,
+                    "run_tasks": incoming,
+                    "max_inflight_tasks": st.max_inflight_tasks,
                 })),
             )
                 .into_response());
@@ -1009,12 +1046,21 @@ mod tests {
 
     /// Per-test SQLite database in a unique temp file.
     async fn temp_state(max_inflight_runs: i64) -> (ApiState, std::path::PathBuf) {
+        temp_state_with(max_inflight_runs, 0).await
+    }
+
+    /// As `temp_state`, with the task cap set too.
+    async fn temp_state_with(
+        max_inflight_runs: i64,
+        max_inflight_tasks: i64,
+    ) -> (ApiState, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!("module54_api_{}.db", uuid::Uuid::new_v4()));
         let pool = db::init_pool(path.to_str().unwrap()).await.unwrap();
         let state = ApiState {
             pool,
             metrics: Arc::new(Metrics::new()),
             max_inflight_runs,
+            max_inflight_tasks,
         };
         (state, path)
     }
@@ -1048,6 +1094,52 @@ mod tests {
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(second.headers().get(header::RETRY_AFTER).unwrap(), "1");
 
+        state.pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The task cap bounds the dimension that costs something. `MAX_INFLIGHT_TASKS`
+    /// used to reach only the IngestActor, so this path — the engine's own ops
+    /// API — was capped on runs alone and a single wide submission sailed past.
+    #[tokio::test]
+    async fn submit_run_sheds_load_at_inflight_task_cap() {
+        // Runs uncapped, tasks capped at 3.
+        let (state, path) = temp_state_with(0, 3).await;
+        let three = "name: wide\ntasks:\n  - name: a\n    command: [\"true\"]\n  \
+                     - name: b\n    command: [\"true\"]\n  - name: c\n    command: [\"true\"]\n";
+
+        // 0 active + 3 incoming == cap → admitted.
+        let first = submit_run(State(state.clone()), no_wait(), three.to_string())
+            .await
+            .unwrap()
+            .into_response();
+        assert_eq!(first.status(), StatusCode::CREATED);
+
+        // 3 active + 1 incoming > cap → rejected, even though the RUN cap is off
+        // and the datastore holds only one run.
+        let second = submit_run(State(state.clone()), no_wait(), ONE_TASK_DAG.to_string())
+            .await
+            .unwrap()
+            .into_response();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(second.headers().get(header::RETRY_AFTER).unwrap(), "1");
+
+        state.pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A submission wider than the whole cap is refused on its own, rather than
+    /// admitted because the datastore happened to be empty when it arrived.
+    #[tokio::test]
+    async fn a_single_oversized_run_cannot_slip_past_the_task_cap() {
+        let (state, path) = temp_state_with(0, 2).await;
+        let three = "name: wide\ntasks:\n  - name: a\n    command: [\"true\"]\n  \
+                     - name: b\n    command: [\"true\"]\n  - name: c\n    command: [\"true\"]\n";
+        let r = submit_run(State(state.clone()), no_wait(), three.to_string())
+            .await
+            .unwrap()
+            .into_response();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS, "0 active + 3 > cap of 2");
         state.pool.close().await;
         let _ = std::fs::remove_file(&path);
     }

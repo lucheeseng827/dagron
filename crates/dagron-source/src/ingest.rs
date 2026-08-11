@@ -54,6 +54,10 @@ pub struct IngestArgs {
     /// `count_active_runs() >= max_inflight_runs`. `0` (or less) disables the
     /// cap entirely; see [`at_inflight_cap`].
     pub max_inflight_runs: i64,
+    /// Second admission cap, on TASKS rather than runs. `0` (or less) disables
+    /// it. See the note on [`at_inflight_cap`] for why counting runs alone is
+    /// not enough.
+    pub max_inflight_tasks: i64,
     /// Set true once the source is permanently exhausted (one-shot file). The
     /// reconcile loop reads this to decide when draining is complete.
     pub exhausted: Arc<AtomicBool>,
@@ -68,9 +72,15 @@ pub struct IngestArgs {
     pub max_validation_attempts: i64,
 }
 
-/// Whether the admission valve is closed: `active` runs against a `cap` of which
+/// Whether an admission valve is closed: `active` against a `cap` of which
 /// **`0` (or less) means "no cap"**, the contract the chart documents and the
 /// engine's `POST /runs` gate already implements.
+///
+/// Used for BOTH dimensions, because runs alone are the wrong unit. A run
+/// containing 100,000 tasks and a run containing four both count as one, so a
+/// fleet sitting well under `MAX_INFLIGHT_RUNS` can be far past what the
+/// scheduler, the datastore, and `expand()`'s in-memory graph can carry. The
+/// task cap is the dimension that tracks the cost.
 fn at_inflight_cap(active: i64, cap: i64) -> bool {
     cap > 0 && active >= cap
 }
@@ -79,6 +89,7 @@ pub struct IngestState {
     pool: db::Pool,
     source: Box<dyn WorkflowSource>,
     max_inflight_runs: i64,
+    max_inflight_tasks: i64,
     exhausted: Arc<AtomicBool>,
     metrics: Arc<Metrics>,
     source_name: String,
@@ -128,6 +139,7 @@ impl Actor for IngestActor {
             pool: args.pool,
             source: args.source,
             max_inflight_runs: args.max_inflight_runs,
+            max_inflight_tasks: args.max_inflight_tasks,
             exhausted: args.exhausted,
             metrics: args.metrics,
             source_name: args.source_name,
@@ -168,6 +180,26 @@ impl Actor for IngestActor {
             tokio::time::sleep(THROTTLE).await;
             myself.cast(IngestMsg::Poll)?;
             return Ok(());
+        }
+
+        // The same valve on the dimension that actually costs something. Only
+        // queried when a cap is configured, so the default path pays no extra
+        // round trip.
+        if state.max_inflight_tasks > 0 {
+            let active_tasks = match db::count_active_tasks(&state.pool).await {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!(error = %e, "count_active_tasks failed — retrying after backoff");
+                    tokio::time::sleep(ERROR_BACKOFF).await;
+                    myself.cast(IngestMsg::Poll)?;
+                    return Ok(());
+                }
+            };
+            if at_inflight_cap(active_tasks, state.max_inflight_tasks) {
+                tokio::time::sleep(THROTTLE).await;
+                myself.cast(IngestMsg::Poll)?;
+                return Ok(());
+            }
         }
 
         // ── Pull one submission and turn it into a run ─────────────────────────
@@ -436,6 +468,7 @@ mod tests {
                 pool: pool.clone(),
                 source: Box::new(ChannelSource::new(rx)),
                 max_inflight_runs: 64,
+                max_inflight_tasks: 0,
                 exhausted: Arc::new(AtomicBool::new(false)),
                 metrics: Arc::clone(&metrics),
                 source_name: "channel".to_string(),
@@ -534,6 +567,7 @@ mod tests {
                         pool,
                         source: Box::new(src),
                         max_inflight_runs: 64,
+                        max_inflight_tasks: 0,
                         exhausted: Arc::new(AtomicBool::new(false)),
                         metrics: Arc::new(Metrics::new()),
                         source_name: "cursor-test".to_string(),

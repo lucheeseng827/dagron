@@ -136,6 +136,154 @@ impl Executor for KubeExecutor {
     }
 }
 
+
+/// How task pods are hardened, read once from the environment.
+///
+/// WHY THIS EXISTS: `build_pod` used to emit a Pod carrying only image, command,
+/// env, resources and an optional serviceAccountName — no securityContext, no
+/// runtimeClassName, no `automountServiceAccountToken`, no
+/// `activeDeadlineSeconds`, no node placement. Meanwhile the customer-image
+/// contract (`ee/images/runners/README.md`) told customers that "task pods run
+/// with the engine's pod security context". They did not: that context is on the
+/// engine's own Deployment and is not inherited by pods the engine creates, so a
+/// customer image whose final layer is `USER root` ran as root.
+///
+/// A hosted plane can enforce this at admission (Kyverno). A self-hosted install
+/// has no admission controller, which is exactly where the contract was least
+/// true and most believed — so the engine has to be able to do it itself.
+///
+/// DEFAULTS PRESERVE TODAY'S BEHAVIOUR, with one exception noted on
+/// `automount_sa_token`. Turning hardening on by default would break images that
+/// legitimately need root or extra capabilities, and silently changing what a
+/// working task is allowed to do is not a thing to do in a patch release. The
+/// hosted plane sets these explicitly; self-hosted operators opt in.
+#[derive(Debug, Clone, Default)]
+pub struct PodHardening {
+    /// `DAGRON_TASK_RUN_AS_USER` — numeric uid; also sets `runAsNonRoot` when > 0.
+    pub run_as_user: Option<i64>,
+    /// `DAGRON_TASK_READ_ONLY_ROOT_FS=1`
+    pub read_only_root_fs: bool,
+    /// `DAGRON_TASK_DROP_ALL_CAPABILITIES=1`
+    pub drop_all_capabilities: bool,
+    /// `DAGRON_TASK_SECCOMP_RUNTIME_DEFAULT=1`
+    pub seccomp_runtime_default: bool,
+    /// `DAGRON_TASK_ACTIVE_DEADLINE_SECS` — a task that hangs otherwise holds a
+    /// node slot until the run-level timeout notices.
+    pub active_deadline_secs: Option<i64>,
+    /// `DAGRON_TASK_RUNTIME_CLASS` — e.g. `gvisor`, for untrusted images.
+    pub runtime_class: Option<String>,
+    /// `DAGRON_TASK_NODE_SELECTOR` — `k=v,k=v`.
+    pub node_selector: Vec<(String, String)>,
+    /// Mount a ServiceAccount token into task pods that did NOT ask for one.
+    ///
+    /// This is the single default that CHANGES: it is `false`, so a task with no
+    /// `service_account:` gets no token. A task that declared no identity has no
+    /// use for one, and on a cluster using IRSA that token is an IAM credential
+    /// handed to arbitrary customer code. Set
+    /// `DAGRON_TASK_AUTOMOUNT_SA_TOKEN=1` to restore the old behaviour.
+    pub automount_sa_token: bool,
+}
+
+impl PodHardening {
+    pub fn from_env() -> Self {
+        fn flag(k: &str) -> bool {
+            matches!(std::env::var(k).ok().as_deref(), Some("1" | "true" | "yes" | "on"))
+        }
+        Self {
+            run_as_user: std::env::var("DAGRON_TASK_RUN_AS_USER").ok().and_then(|v| v.parse().ok()),
+            read_only_root_fs: flag("DAGRON_TASK_READ_ONLY_ROOT_FS"),
+            drop_all_capabilities: flag("DAGRON_TASK_DROP_ALL_CAPABILITIES"),
+            seccomp_runtime_default: flag("DAGRON_TASK_SECCOMP_RUNTIME_DEFAULT"),
+            active_deadline_secs: std::env::var("DAGRON_TASK_ACTIVE_DEADLINE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&n: &i64| n > 0),
+            runtime_class: std::env::var("DAGRON_TASK_RUNTIME_CLASS").ok().filter(|v| !v.is_empty()),
+            node_selector: std::env::var("DAGRON_TASK_NODE_SELECTOR")
+                .ok()
+                .map(|v| {
+                    v.split(',')
+                        .filter_map(|kv| kv.split_once('='))
+                        .map(|(k, val)| (k.trim().to_string(), val.trim().to_string()))
+                        .filter(|(k, _)| !k.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            automount_sa_token: flag("DAGRON_TASK_AUTOMOUNT_SA_TOKEN"),
+        }
+    }
+}
+
+/// Apply hardening to a built Pod manifest.
+///
+/// Pure and `Value`-shaped, mirroring `ee/dagron-executor-ee`'s confidential
+/// path so both shape the same manifest through the same kind of seam rather
+/// than two divergent ones.
+pub fn apply_hardening(pod: &mut serde_json::Value, h: &PodHardening, wants_sa: bool) {
+    let Some(spec) = pod.get_mut("spec").and_then(serde_json::Value::as_object_mut) else {
+        return;
+    };
+
+    if let Some(uid) = h.run_as_user {
+        let mut sc = serde_json::json!({ "runAsUser": uid });
+        if uid > 0 {
+            sc["runAsNonRoot"] = serde_json::json!(true);
+        }
+        if h.seccomp_runtime_default {
+            sc["seccompProfile"] = serde_json::json!({ "type": "RuntimeDefault" });
+        }
+        spec.insert("securityContext".to_string(), sc);
+    } else if h.seccomp_runtime_default {
+        spec.insert(
+            "securityContext".to_string(),
+            serde_json::json!({ "seccompProfile": { "type": "RuntimeDefault" } }),
+        );
+    }
+
+    if let Some(secs) = h.active_deadline_secs {
+        spec.insert("activeDeadlineSeconds".to_string(), serde_json::json!(secs));
+    }
+    if let Some(rc) = &h.runtime_class {
+        spec.insert("runtimeClassName".to_string(), serde_json::json!(rc));
+    }
+    if !h.node_selector.is_empty() {
+        let m: serde_json::Map<String, serde_json::Value> = h
+            .node_selector
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::json!(v)))
+            .collect();
+        spec.insert("nodeSelector".to_string(), serde_json::Value::Object(m));
+    }
+    // Only withhold the token from tasks that never asked for an identity;
+    // a task with `service_account:` wants IRSA and must keep its token.
+    if !h.automount_sa_token && !wants_sa {
+        spec.insert("automountServiceAccountToken".to_string(), serde_json::json!(false));
+    }
+
+    if h.read_only_root_fs || h.drop_all_capabilities {
+        if let Some(containers) = spec.get_mut("containers").and_then(serde_json::Value::as_array_mut) {
+            for c in containers.iter_mut() {
+                let csc = c
+                    .as_object_mut()
+                    .and_then(|o| {
+                        o.entry("securityContext")
+                            .or_insert_with(|| serde_json::json!({}))
+                            .as_object_mut()
+                    });
+                if let Some(csc) = csc {
+                    csc.insert("allowPrivilegeEscalation".to_string(), serde_json::json!(false));
+                    if h.read_only_root_fs {
+                        csc.insert("readOnlyRootFilesystem".to_string(), serde_json::json!(true));
+                    }
+                    if h.drop_all_capabilities {
+                        csc.insert("capabilities".to_string(), serde_json::json!({ "drop": ["ALL"] }));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Build the one-shot task Pod manifest. Split out (and free of any client) so it
 /// is unit-testable without a cluster.
 ///
@@ -180,7 +328,7 @@ fn build_pod(name: &str, image: &str, command: &[String], ctx: &ExecContext) -> 
         spec["serviceAccountName"] = serde_json::Value::String(sa.to_string());
     }
 
-    let pod = serde_json::from_value(serde_json::json!({
+    let mut manifest = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Pod",
         "metadata": {
@@ -188,8 +336,17 @@ fn build_pod(name: &str, image: &str, command: &[String], ctx: &ExecContext) -> 
             "labels": { "app": "module-54-scheduler" },
         },
         "spec": spec,
-    }))
-    .map_err(|e| anyhow::anyhow!("build pod manifest: {e}"))?;
+    });
+
+    // Shape the manifest before it is deserialized, so hardening applies to every
+    // task pod this executor creates rather than to whichever call sites
+    // remembered. `wants_sa` distinguishes a task that asked for an identity from
+    // one that did not: the former keeps its token, the latter should not be
+    // handed one it never requested.
+    apply_hardening(&mut manifest, &PodHardening::from_env(), ctx.service_account.is_some());
+
+    let pod = serde_json::from_value(manifest)
+        .map_err(|e| anyhow::anyhow!("build pod manifest: {e}"))?;
     Ok(pod)
 }
 
@@ -199,6 +356,57 @@ mod tests {
 
     /// The manifest builder produces a valid one-shot Pod with the task's image
     /// and command — verifiable without a cluster.
+        /// The default must not change what a working task pod is allowed to do --
+    /// except for the token nobody asked for.
+    #[test]
+    fn hardening_defaults_are_inert_apart_from_the_unrequested_token() {
+        let mut pod = serde_json::json!({"spec": {"containers": [{"name": "task"}]}});
+        apply_hardening(&mut pod, &PodHardening::default(), false);
+        let spec = &pod["spec"];
+        assert!(spec.get("securityContext").is_none(), "no securityContext by default");
+        assert!(spec.get("runtimeClassName").is_none());
+        assert!(spec.get("activeDeadlineSeconds").is_none());
+        // The one changed default: a task that declared no service_account is
+        // not handed a token, because on an IRSA cluster that token is an IAM
+        // credential given to arbitrary customer code.
+        assert_eq!(spec["automountServiceAccountToken"], serde_json::json!(false));
+    }
+
+    /// A task that DID ask for an identity keeps its token.
+    #[test]
+    fn a_task_requesting_a_service_account_keeps_its_token() {
+        let mut pod = serde_json::json!({"spec": {"containers": [{"name": "task"}]}});
+        apply_hardening(&mut pod, &PodHardening::default(), true);
+        assert!(pod["spec"].get("automountServiceAccountToken").is_none());
+    }
+
+    #[test]
+    fn hardening_shapes_every_field_it_is_given() {
+        let h = PodHardening {
+            run_as_user: Some(65532),
+            read_only_root_fs: true,
+            drop_all_capabilities: true,
+            seccomp_runtime_default: true,
+            active_deadline_secs: Some(3600),
+            runtime_class: Some("gvisor".into()),
+            node_selector: vec![("dagron.io/untrusted".into(), "true".into())],
+            automount_sa_token: false,
+        };
+        let mut pod = serde_json::json!({"spec": {"containers": [{"name": "task"}]}});
+        apply_hardening(&mut pod, &h, false);
+        let spec = &pod["spec"];
+        assert_eq!(spec["securityContext"]["runAsUser"], 65532);
+        assert_eq!(spec["securityContext"]["runAsNonRoot"], true);
+        assert_eq!(spec["securityContext"]["seccompProfile"]["type"], "RuntimeDefault");
+        assert_eq!(spec["activeDeadlineSeconds"], 3600);
+        assert_eq!(spec["runtimeClassName"], "gvisor");
+        assert_eq!(spec["nodeSelector"]["dagron.io/untrusted"], "true");
+        let csc = &spec["containers"][0]["securityContext"];
+        assert_eq!(csc["allowPrivilegeEscalation"], false);
+        assert_eq!(csc["readOnlyRootFilesystem"], true);
+        assert_eq!(csc["capabilities"]["drop"][0], "ALL");
+    }
+
     #[test]
     fn build_pod_sets_image_command_and_restart_policy() {
         let ctx = ExecContext::new(
@@ -238,7 +446,11 @@ mod tests {
             timeout_secs: Some(120),
             docker_image: Some("etl-task:latest".to_string()),
             env: vec![EnvVar { name: "S3_BUCKET".into(), value: "dagron-lt".into(), value_from: None }],
-            resources: Some(ResourceRequirements { requests, limits }),
+            // `gpu` was added to ResourceRequirements and this test was never
+            // updated, so the whole `kubernetes` test target stopped compiling --
+            // which is why build_pod's missing securityContext went unnoticed for
+            // so long: the tests that describe the pod's shape were dead.
+            resources: Some(ResourceRequirements { requests, limits, gpu: None }),
             service_account: Some("dagron-etl".to_string()),
             log_sink: None,
         };

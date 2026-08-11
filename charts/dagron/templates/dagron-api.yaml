@@ -31,6 +31,18 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.dagronApi.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.dagronApi.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.dagronApi.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: dagron-api
           image: {{ include "dagron.image" (dict "image" $.Values.dagronApi.image "root" $) | quote }}
@@ -46,6 +58,16 @@ spec:
                 secretKeyRef:
                   name: {{ include "dagron.dbSecretName" . }}
                   key: {{ include "dagron.dbSecretKey" . }}
+            {{- if and (not .Values.postgres.enabled) .Values.externalDatabaseSecret.listenKey }}
+            # Split-DSN: DATABASE_URL may point at a transaction pooler, which
+            # cannot serve the session-scoped LISTEN the reconcile loop needs.
+            # This key carries the DIRECT endpoint for that one connection.
+            - name: DATABASE_LISTEN_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "dagron.dbSecretName" . }}
+                  key: {{ .Values.externalDatabaseSecret.listenKey }}
+            {{- end }}
             - name: DAGRON_JWT_SECRET
               valueFrom:
                 secretKeyRef:

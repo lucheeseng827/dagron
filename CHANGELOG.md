@@ -6,6 +6,78 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-12
+
+Minor, not patch: task pods created by the Kubernetes executor no longer receive
+a ServiceAccount token unless they asked for one. That is a changed default, and
+pre-1.0 this project treats a breaking change as a minor bump (see the header
+above). Everything else here is additive or a fix.
+
+### Fixed
+- **`dagron-api` and `dagron-gitops` could not connect to any Postgres that
+  requires TLS.** `sqlx` is declared `default-features = false`, and neither
+  crate enabled a TLS backend — so an `sslmode=require` DSN failed at connect
+  with *"TLS upgrade required by connect options but SQLx was built without TLS
+  support enabled"*. That is not an edge case: it rules out Amazon RDS (which
+  forces SSL by default), Cloud SQL, Azure Database, and any hardened
+  self-hosted instance. The engine's `postgres` feature had the same gap. All
+  three now enable `tls-rustls-ring`, the stack the rest of the workspace
+  already resolves, so no second TLS implementation enters the build.
+
+  If you run Postgres without TLS, nothing changes.
+
+- **`POST /runs` bypassed admission control.** `MAX_INFLIGHT_RUNS` was enforced
+  on the ingestion path but not on the engine's own HTTP API, so the route most
+  likely to be scripted against was the one route with no valve on it.
+
+### Added
+- **A second admission dimension, counted in tasks.** Runs are the wrong unit on
+  their own: a run of 100,000 tasks and a run of four both count as one against
+  `MAX_INFLIGHT_RUNS`, so a fleet sitting comfortably under the run cap can be
+  far past what the scheduler and the datastore can carry. `MAX_INFLIGHT_TASKS`
+  (default `0`, off) caps the tasks in `pending`/`ready`/`running`. A task parked
+  on an approval is not pressure and is excluded. The cap counts the rows a
+  submission will actually insert — a `gang:` task is one spec but `size` rows,
+  so a run of ten 64-member gangs is admitted as 640, not as 10. Only queried
+  when set, so the default path pays no extra round trip.
+
+- **`DAGRON_MAX_TASKS_PER_RUN`** — a per-run ceiling on the expanded graph.
+  `expand()` materialises the whole graph in memory before anything reaches the
+  database, so one runaway fan-out costs far more than the engine's idle
+  footprint. May only *lower* the compiled ceiling of 100,000; a larger value is
+  ignored, because the knob exists to tighten a bound that prevents an OOM.
+
+- **Security context for Kubernetes task pods.** Task pods were built with no
+  `securityContext` at all — no user, no capability drop, no seccomp profile, no
+  deadline, no placement — which meant a task image whose final layer is
+  `USER root` ran as root, and a hung task held a node slot until the run-level
+  timeout noticed. Each control is opt-in and off by default, because turning
+  them on wholesale would break images that legitimately need what they remove:
+  `DAGRON_TASK_RUN_AS_USER`, `DAGRON_TASK_READ_ONLY_ROOT_FS`,
+  `DAGRON_TASK_DROP_ALL_CAPABILITIES`, `DAGRON_TASK_SECCOMP_RUNTIME_DEFAULT`,
+  `DAGRON_TASK_ACTIVE_DEADLINE_SECS`, `DAGRON_TASK_RUNTIME_CLASS` (e.g. `gvisor`,
+  for images you do not control) and `DAGRON_TASK_NODE_SELECTOR`.
+
+- **Chart: node placement for the engine and the API.** `engine.nodeSelector` /
+  `tolerations` / `affinity` and the same three under `dagronApi`. With the
+  `k8s` executor the engine and the task pods it creates are separate workloads
+  with opposite shapes, and an engine that lands among its own task pods
+  competes with them for the CPU it needs to keep dispatching.
+
+- **Chart: `externalDatabaseSecret.listenKey`** — an optional second Secret key
+  holding the *direct* connection string, for deployments whose main DSN points
+  at a transaction pooler. Transaction pooling cannot serve a session-scoped
+  `LISTEN`, which the reconcile loop's wake depends on, so that one connection
+  needs a non-pooled endpoint of its own.
+
+### Changed
+- **Task pods no longer get a ServiceAccount token by default.** A task that did
+  not declare `service_account:` never asked for an identity, and on a cluster
+  using IAM-for-ServiceAccounts the token it was being handed is a cloud
+  credential handed to arbitrary task code. Tasks that *do* declare
+  `service_account:` are unaffected and keep their token. Set
+  `DAGRON_TASK_AUTOMOUNT_SA_TOKEN=1` to restore the previous behaviour.
+
 ## [0.6.0] - 2026-08-09
 
 Minor, not patch: `DagronClient::from_env` now returns `Result<Self>`, and

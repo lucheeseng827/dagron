@@ -17,7 +17,26 @@ default = ["sqlite"]
 # Zero-infra single-node backend (optimistic CAS claim).
 sqlite = ["sqlx/sqlite"]
 # Horizontal scale: FOR UPDATE SKIP LOCKED + LISTEN/NOTIFY.
-postgres = ["sqlx/postgres"]
+#
+# TLS ships WITH the backend, not as a separate opt-in, because a Postgres you
+# would actually run this against requires it. sqlx is declared
+# `default-features = false` below, so without this the driver has no TLS at all
+# and any `sslmode=require` DSN dies at connect with:
+#
+#   TLS upgrade required by connect options but SQLx was built without TLS
+#   support enabled
+#
+# That rules out every managed Postgres -- RDS (which sets rds.force_ssl by
+# default), Cloud SQL, Azure -- and any hardened self-hosted instance. The
+# documented engine build (`--features postgres,ops,kubernetes`) could not
+# connect to RDS at all until this was added.
+#
+# `tls-rustls-ring` is the TLS stack the rest of this workspace's Postgres
+# clients already use, so one is resolved rather than two. It builds `ring` (C/asm), which the
+# engine Dockerfile already has a toolchain for (build-essential, cmake,
+# pkg-config), and the distroless/cc runtime image carries the CA bundle.
+# sqlite-only builds are untouched.
+postgres = ["sqlx/postgres", "sqlx/tls-rustls-ring"]
 # Management/UI surface: the extra datastore queries (run listings, dead-letter
 # inspection, DB-backed schedules, status counts) + metrics fields that back the
 # `ops` HTTP API in the binary. Pure gating, no deps — a lean reconcile-only build

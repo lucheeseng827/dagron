@@ -25,7 +25,7 @@ imagePullSecrets: []
 # `kubernetes` cargo features. The module Dockerfile defaults to a sqlite-only
 # build — see terraform/README.md §"Building the images".
 engine:
-  image: mancube/dagron-engine:0.6.0
+  image: mancube/dagron-engine:0.7.0
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 8080
@@ -51,6 +51,18 @@ engine:
   resources:
     requests: {cpu: 100m, memory: 128Mi}
     limits: {memory: 512Mi}
+  # Where the scheduler runs. Worth setting whenever the cluster has a node pool
+  # the engine should stay on (or off): with executor "k8s" the engine and the
+  # task pods it creates are separate workloads with opposite shapes, and an
+  # engine that lands among its own task pods competes with them for the CPU it
+  # needs to keep dispatching.
+  #
+  #   nodeSelector: {workload: control}
+  #   tolerations:
+  #     - {key: workload, operator: Equal, value: control, effect: NoSchedule}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
   service:
     type: ClusterIP
 
@@ -93,6 +105,13 @@ externalDatabaseUrl: ""
 externalDatabaseSecret:
   name: ""              # name of the existing Secret (empty = chart-managed)
   key: "DATABASE_URL"   # key within that Secret holding the connection string
+  # Optional second key holding the DIRECT connection string, for deployments
+  # where `key` above points at a transaction pooler (PgBouncer). Transaction
+  # pooling cannot serve a session-scoped LISTEN, so the reconcile loop's
+  # listener needs its own non-pooled endpoint; without this the engine connects
+  # and then never wakes on new work, which reads as "the scheduler is slow".
+  # Empty = single-DSN mode, and `key` must then be a direct endpoint.
+  listenKey: ""
 
 # ── dagron-api (authenticated UI gateway) ───────────────────────────────────
 # Stateless edge over the same Postgres the engine writes; owns login (its own
@@ -109,7 +128,7 @@ gitops:
   enabled: false
   # First published in 0.5.0. Release packaging rewrites this tag to the release
   # version (docker.yml), so the pin here only matters to a repo checkout.
-  image: mancube/dagron-gitops:0.6.0
+  image: mancube/dagron-gitops:0.7.0
   imagePullPolicy: IfNotPresent
   # Seconds between auto-sync reconciles per repo. A manual Sync is immediate.
   pollSecs: 60
@@ -141,7 +160,7 @@ gitops:
 
 dagronApi:
   enabled: true
-  image: mancube/dagron-api:0.6.0
+  image: mancube/dagron-api:0.7.0
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 8080
@@ -171,6 +190,10 @@ dagronApi:
   existingSecret:
     name: ""
   extraEnv: []
+  # Same node-placement knobs as `engine` above; see the note there.
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
   resources:
     requests: {cpu: 50m, memory: 64Mi}
     limits: {memory: 256Mi}
@@ -198,7 +221,7 @@ envSecrets:
 # ── Frontend (Next.js UI) ────────────────────────────────────────────────────
 frontend:
   enabled: true
-  image: mancube/dagron-frontend:0.6.0
+  image: mancube/dagron-frontend:0.7.0
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 3000

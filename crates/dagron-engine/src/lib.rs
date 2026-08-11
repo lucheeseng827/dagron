@@ -476,6 +476,13 @@ pub async fn run(seams: Seams) -> Result<()> {
     // a large influx by leaving the overflow buffered in the queue.
     let source_kind = std::env::var("SOURCE").unwrap_or_else(|_| "file".to_string());
     let max_inflight_runs: i64 = parse_max_inflight_runs(std::env::var("MAX_INFLIGHT_RUNS").ok());
+    // Second admission dimension. Unset/0 = off, so nothing changes for anyone
+    // who has not asked for it: runs remain the only cap unless a task cap is
+    // configured. See docs/CONFIG.md for why runs alone are the wrong unit.
+    let max_inflight_tasks: i64 = std::env::var("MAX_INFLIGHT_TASKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     // How many times a transient create_run failure is retried (nacked) before a
     // submission is dead-lettered. Parse failures dead-letter immediately.
     let dead_letter_max_attempts: i64 = std::env::var("DEAD_LETTER_MAX_ATTEMPTS")
@@ -484,7 +491,7 @@ pub async fn run(seams: Seams) -> Result<()> {
         .unwrap_or(3)
         .max(1);
 
-    info!(%worker_id, %dag_path, db = %redact_conn(&db_target), %executor_kind, worker_count, %source_kind, max_inflight_runs, runner_classes = ?runner_classes, pools = ?pool_caps, "scheduler starting");
+    info!(%worker_id, %dag_path, db = %redact_conn(&db_target), %executor_kind, worker_count, %source_kind, max_inflight_runs, max_inflight_tasks, runner_classes = ?runner_classes, pools = ?pool_caps, "scheduler starting");
 
     // rustls 0.23 needs a process-level CryptoProvider before the kube client
     // opens TLS to the apiserver (KubeExecutor); install it once at startup.
@@ -603,6 +610,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                         pool: pool.clone(),
                         metrics: Arc::clone(&metrics),
                         max_inflight_runs,
+                        max_inflight_tasks,
                     };
                     tokio::spawn(async move {
                         if let Err(e) = api::serve(addr, state).await {
@@ -741,6 +749,7 @@ pub async fn run(seams: Seams) -> Result<()> {
             pool: pool.clone(),
             source: wf_source,
             max_inflight_runs,
+            max_inflight_tasks,
             exhausted: Arc::clone(&exhausted),
             metrics: Arc::clone(&metrics),
             source_name: source_kind.clone(),

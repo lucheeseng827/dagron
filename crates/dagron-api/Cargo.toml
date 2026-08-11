@@ -31,7 +31,13 @@ archive-cloud = ["dep:object_store"]
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros"] }
+# tls-rustls-ring: sqlx is declared default-features=false, so without a TLS
+# backend any `sslmode=require` DSN fails at connect with "TLS upgrade
+# required by connect options but SQLx was built without TLS support
+# enabled". That rules out RDS (rds.force_ssl is on by default), Cloud SQL,
+# Azure, and any hardened self-hosted Postgres. Same TLS stack the rest of
+# this workspace's Postgres clients already use, so only one is resolved.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros", "tls-rustls-ring"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal", "time", "process"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"

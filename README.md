@@ -72,7 +72,7 @@ podman compose   -f compose.quickstart.yaml up -d   # podman ≥ 4.7, provider i
 podman-compose   -f compose.quickstart.yaml up -d   # standalone provider, older podman too
 ```
 
-The images are pinned; override with `DAGRON_VERSION=0.6.0`. Floating `:latest`
+The images are pinned; override with `DAGRON_VERSION=0.7.0`. Floating `:latest`
 is deliberately not the default — a quickstart that silently changes under you
 is worse than one you have to bump.
 

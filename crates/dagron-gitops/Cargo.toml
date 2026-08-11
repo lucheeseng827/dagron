@@ -22,7 +22,13 @@ dagron-logging = { path = "../dagron-logging" }
 # row rather than a silent fall back to unauthenticated cloning.
 dagron-crypto = { path = "../dagron-crypto" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "signal"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros"] }
+# tls-rustls-ring: sqlx is declared default-features=false, so without a TLS
+# backend any `sslmode=require` DSN fails at connect with "TLS upgrade
+# required by connect options but SQLx was built without TLS support
+# enabled". That rules out RDS (rds.force_ssl is on by default), Cloud SQL,
+# Azure, and any hardened self-hosted Postgres. Same TLS stack the rest of
+# this workspace's Postgres clients already use, so only one is resolved.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros", "tls-rustls-ring"] }
 anyhow = "1"
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }

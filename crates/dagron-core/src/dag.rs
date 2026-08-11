@@ -1170,6 +1170,21 @@ impl DagGraph {
     pub fn task_spec(&self, task_name: &str) -> Option<&TaskSpec> {
         self.spec.tasks.iter().find(|t| t.name == task_name)
     }
+
+    /// How many task ROWS `create_run` will insert for this graph.
+    ///
+    /// Not `spec.tasks.len()`: matrix and `template:` expansion has already
+    /// happened by the time a `DagGraph` exists, but a `gang:` task is still one
+    /// spec that becomes `size` rows (`<name>.<rank>`). Admission control counts
+    /// what lands in the datastore, so it has to count the same way — otherwise a
+    /// run of ten 64-member gangs is admitted as ten tasks and arrives as 640.
+    pub fn task_row_count(&self) -> i64 {
+        self.spec
+            .tasks
+            .iter()
+            .map(|t| t.gang.as_ref().map(|g| g.size as i64).unwrap_or(1))
+            .sum()
+    }
 }
 
 #[cfg(test)]
