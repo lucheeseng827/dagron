@@ -10,6 +10,7 @@
 use axum::extract::{Path, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
+use badgelib::{Badge, Color};
 
 use crate::state::AppState;
 
@@ -59,55 +60,13 @@ fn status_style(status: Option<&str>) -> (&str, &str) {
     }
 }
 
-/// Render a shields-style flat SVG badge with a grey `label` segment and a
-/// colored `status` segment.
 fn render_badge(label: &str, status: &str, color: &str) -> String {
-    let (label, status) = (xml_escape(label), xml_escape(status));
-    let lw = seg_width(&label);
-    let rw = seg_width(&status);
-    let w = lw + rw;
-    let (lx, rx) = (lw * 10 / 2, lw * 10 + rw * 10 / 2); // tenths, for crisp centering
-    format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="20" role="img" aria-label="{label}: {status}">
-  <linearGradient id="s" x2="0" y2="100%"><stop offset="0" stop-color="#bbb" stop-opacity=".1"/><stop offset="1" stop-opacity=".1"/></linearGradient>
-  <clipPath id="r"><rect width="{w}" height="20" rx="3" fill="#fff"/></clipPath>
-  <g clip-path="url(#r)">
-    <rect width="{lw}" height="20" fill="#555"/>
-    <rect x="{lw}" width="{rw}" height="20" fill="{color}"/>
-    <rect width="{w}" height="20" fill="url(#s)"/>
-  </g>
-  <g fill="#fff" text-anchor="middle" font-family="Verdana,DejaVu Sans,Geneva,sans-serif" font-size="11">
-    <text x="{lx}" y="15" fill="#010101" fill-opacity=".3" transform="scale(.1)" textLength="{ltl}">{label}</text>
-    <text x="{lx}" y="14" transform="scale(.1)" textLength="{ltl}">{label}</text>
-    <text x="{rx}" y="15" fill="#010101" fill-opacity=".3" transform="scale(.1)" textLength="{rtl}">{status}</text>
-    <text x="{rx}" y="14" transform="scale(.1)" textLength="{rtl}">{status}</text>
-  </g>
-</svg>
-"##,
-        w = w,
-        lw = lw,
-        rw = rw,
-        lx = lx,
-        rx = rx,
-        color = color,
-        label = label,
-        status = status,
-        ltl = (lw - 10) * 10,
-        rtl = (rw - 10) * 10,
-    )
-}
-
-/// Approximate pixel width of a badge segment (≈6px/char + 10px padding), the
-/// same heuristic shields.io uses for its flat style.
-fn seg_width(text: &str) -> usize {
-    text.chars().count() * 6 + 10
-}
-
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    Badge::new()
+        .label(label)
+        .value(status)
+        .label_color(Color::Hex("555".into()))
+        .value_color(Color::Hex(color.trim_start_matches('#').into()))
+        .to_svg()
 }
 
 #[cfg(test)]

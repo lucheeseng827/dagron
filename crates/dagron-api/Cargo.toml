@@ -30,6 +30,7 @@ archive-cloud = ["dep:object_store"]
 
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
+badgelib = "0.5.1"
 tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
 # tls-rustls-ring: sqlx is declared default-features=false, so without a TLS
 # backend any `sslmode=require` DSN fails at connect with "TLS upgrade
