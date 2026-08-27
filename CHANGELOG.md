@@ -6,6 +6,371 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-28
+
+### Added
+- **The first outside contribution, from [@vladkens](https://github.com/vladkens)**
+  ([mirror PR #2](https://github.com/lucheeseng827/dagron/pull/2)): the run-status
+  badge at `GET /api/workflows/{name}/badge.svg` is now rendered by
+  [`badgelib`](https://crates.io/crates/badgelib) instead of a hand-rolled
+  shields-style SVG template. That retires about fifty lines this project was
+  maintaining for no reason it could defend — a `seg_width` character-width
+  heuristic guessing at Verdana metrics, and a four-replacement `xml_escape` — in
+  favour of a crate whose job this is. The badge keeps its shape: grey label
+  segment, coloured status segment, flat style. The two tests that would catch a
+  renderer swap are untouched and still pass — `aria-label="dagron: succeeded"` is
+  still emitted, and a status value of `a<b&c` still escapes to `a&lt;b&amp;c`.
+
+  It is listed first because of how it arrived, not because of its size. It is the
+  first change to reach this project from outside it, and the first to travel the
+  inbound path described below: reviewed on the public mirror, carried upstream by
+  `scripts/ossync-backport.py` with `Co-authored-by` and `Signed-off-by` intact,
+  and republished here. Everything else in this section exists so that path works.
+
+- **Pull-request CI in the public mirror**
+  ([.github/workflows/ci.yml](.github/workflows/ci.yml)): build and test on every PR
+  and every push to `main`, over the same two feature worlds the release gate uses (`--workspace` minus `dagron-api`/`dagron-gitops`, then those
+  two on their own — `dagron-core` compiles exactly one sqlx backend, so a single
+  unified build cannot work). Until now the mirror carried only the two
+  tag-triggered publish workflows, so a contributor's PR sat with no checks at all
+  even though [CONTRIBUTING.md](CONTRIBUTING.md) said otherwise; the build was
+  gated privately, after the fact, where the contributor could not see it. Builds
+  with `--locked`, so a PR that edits a manifest without refreshing `Cargo.lock`
+  fails with a clear message instead of drifting the published lockfile. `fmt` and
+  `clippy` run alongside but are **advisory**, measured on an untouched tree: stock
+  rustfmt reports ~960 diffs (there is no `rustfmt.toml`, so it compares against a
+  style this code was never written in) and `clippy -D warnings` fails on 3 findings
+  in `dagron-core`. None of it is attributable to a contributor, so gating on either
+  would paint every incoming PR red on arrival. Promoting them is cheap: clear the 3
+  findings, add a `rustfmt.toml`, reformat in one commit, drop the two
+  `continue-on-error` lines.
+- **CONTRIBUTING.md now states the cadence**: an accepted PR is labelled
+  `ready-to-backport` and travels upstream in a daily batch with the other accepted
+  PRs, so the label can sit for up to a day before anything else happens. Without
+  saying so, that gap reads as a stalled review.
+- **CONTRIBUTING.md now explains how a PR actually lands** — reviewed and CI'd on
+  the mirror, backported upstream with `Co-authored-by` and `Signed-off-by`
+  preserved, republished in the next release sync, and the PR then *closed* with a
+  link to the release carrying it. `main` here is a published snapshot, so a merge
+  on this side is overwritten by the next sync; without saying so, a closed PR
+  reads as a rejection it is not.
+- **Low-latency profile, §4 (API & readiness)**
+  ([docs/LOW_LATENCY.md](docs/LOW_LATENCY.md)): `GET /readyz` on both HTTP
+  surfaces — on `dagron-api` it answers 200 only when a pooled connection is
+  acquired and queried within its own budget (`DAGRON_READY_TIMEOUT_MS`, 500 ms),
+  so an orchestrator stops routing to a replica whose pool or database is
+  down; the shared SSE listener's state is advisory (reported in the `/readyz`
+  body and as `event_listener` in `/api/health` — its failure is
+  fleet-correlated via the one shared `DATABASE_LISTEN_URL`, so gating on it
+  would empty the Service rather than reroute; `DAGRON_READY_REQUIRE_LISTENER=1`
+  opts into strict gating). On the engine's ops API `/readyz` is a datastore
+  round trip under the same budget knob. `/healthz` stays pure liveness; the
+  Helm chart's readiness probe moves to `/readyz` (with explicit
+  `timeoutSeconds` and an eviction threshold) and gains a startupProbe, and
+  `dagron-api` drains on SIGTERM instead of severing requests mid-response —
+  bounded by `DAGRON_SHUTDOWN_DRAIN_MS` (default 15 s), since open SSE
+  streams and long-polls never finish on their own and an unbounded drain
+  would hang every rollout until the SIGKILL. The API's pool is now tunable
+  and warmable
+  (`DAGRON_DB_MAX_CONNECTIONS`/`_MIN_CONNECTIONS`/`_ACQUIRE_TIMEOUT_MS`/
+  `_TEST_BEFORE_ACQUIRE`, defaults preserving the old hard-coded behaviour;
+  the warm floor is acquired eagerly before Ready). The submit path parses the
+  document once for the environment-key read and the `workflow_ref` check
+  (previously two extra full parses) and fetches referenced workflows one
+  nesting level per query (`WHERE name = ANY(...)`) instead of one query per
+  reference. `GET /api/runs/{id}/wait` blocks on the LISTEN-fed broadcast
+  instead of a 200 ms busy-poll (5 queries/second per waiter, up to 200 ms of
+  avoidable tail latency per sync invocation), with a slow re-check as the
+  listener-reconnect safety net. Migrations 047–049 add the read-path indexes
+  the runs list actually needs (`workflow_runs(created_at)`,
+  `(status, created_at)`, `workflow_definitions(name)`; one single-statement
+  CONCURRENTLY migration each, per the 022/023 convention). On
+  enterprise builds the audit middleware no longer authenticates non-mutating
+  requests it will never audit — for token callers that was two wasted DB
+  round trips on every GET.
+- **Low-latency profile, §5 (server-settings management)**: every knob the
+  engine binary reads (92, mechanically derived) and every `dagron-api` knob
+  (55) now live in per-process registries. `DAGRON_CONFIG=/etc/dagron/dagron.yaml`
+  layers a reviewed YAML file UNDER the environment (env → file →
+  `profile:` preset → default), with `profile: low-latency` applying the
+  documented engine preset (`POLL_INTERVAL_MS=25`, `SWEEP_INTERVAL_MS=500`,
+  `LEASE_SECS=5`); unknown file keys and unknown profiles are startup errors,
+  while an env var that merely looks like a knob (`POLL_INTERVAL_M`) warns.
+  `dagron config [--json]` and the ops API's `GET /config` print every knob's
+  effective value (secrets redacted) with per-knob provenance, and both
+  processes log and serve a stable configuration fingerprint (`dagron-api` in
+  `/api/health` as `config_fingerprint`) so a fleet can alert on a replica
+  whose settings drift from the reviewed set. The API's per-request env reads
+  (proxy trust, session TTL, insecure-git opt-in) are memoized — settings are
+  boot-immutable by policy. `docs/CONFIG.md` documents all of it.
+- **Low-latency profile, Phase B** ([docs/LOW_LATENCY.md](docs/LOW_LATENCY.md)):
+  set-based SQL on the dispatch critical path, in both backends.
+  `advance_ready_tasks` now flips every default-shaped candidate
+  (`trigger_rule: all_success`, not an approval, no runtime `when`) with one
+  set-based UPDATE pair instead of two statements per task — the old shape made
+  a 200-wide fan-out becoming ready cost ~400 sequential round trips; custom
+  rules, approvals, and `when` conditions keep the original per-task code as
+  the slow path, and a LIMIT-1 probe keeps the idle tick at the old cost.
+  `mark_task_succeeded` promotes the default-shaped dependents its decrement
+  just unblocked straight to `ready` in the same transaction, so the
+  happy-path hop is mark → claim with no advance step between (measured:
+  a dependency's terminal mark to its dependent's dispatch in 9.4 ms).
+  `create_run` inserts task rows and dependency edges in multi-row chunks
+  (1,000/5,000 rows per statement) instead of one statement per row — a
+  2,000-task/19,500-edge DAG's submit→first-dispatch drops 2.26 s → 0.58 s,
+  and `dagron-api`'s submit path inherits it via `dagron_core::db::create_run`.
+  The parsed `TaskSpec` rides the dispatch payload and returns on the result,
+  removing a per-completion input re-read + re-parse. Worker dispatch is
+  idle-first (per-slot busy flags with a drop-guard clear and the old
+  round-robin as fallback), eliminating head-of-line blocking behind
+  long-running tasks. Cumulative at stock defaults since the phase-0 baseline:
+  8-task chain 7.78 s → 0.14 s, 200-wide fan-out 6.35 s → 0.42 s, dense
+  2,000-task DAG 48.4 s → 4.2 s. Parallel per-task dispatch prep and batched
+  result marking are deferred with their motivating measurement recorded in
+  the doc's Phase B gate.
+- **Low-latency profile, Phase A** ([docs/LOW_LATENCY.md](docs/LOW_LATENCY.md)):
+  the reconcile loop now wakes the moment a local task completes, instead of
+  sleeping out the remainder of the poll interval — before this, every
+  dependency hop of a short-task chain paid up to 500 ms (measured: an 8-task
+  serial chain of no-op commands took 7.78 s; it now takes ~0.13 s at stock
+  defaults, a 2,000-task/19,500-edge DAG went 48.4 s → ~5.9 s). A tick that
+  marked work terminal re-enters immediately, so SQLite gets the same
+  event-driven hops as Postgres. Three new knobs (defaults preserve today's
+  behaviour exactly): `POLL_INTERVAL_MS` (timer bound, default 500, floor 10),
+  `SWEEP_INTERVAL_MS` (maintenance sweeps — lease recovery, deadlines,
+  approvals, sensors — now run on their own cadence instead of on every tick;
+  default = poll interval), and `LEASE_SECS` (the claim lease window, formerly
+  hard-coded 30 s in the claim SQL — the knob `docs/HA.md` had planned; the
+  worker heartbeat scales with it at ⌊lease/3⌋ s (floor 1 s), preserving the
+  two-missed-renewals headroom at any setting).
+- **Dispatch-path latency metrics**: `scheduler_dispatch_latency_seconds`
+  (became-claimable → handed to a worker), `scheduler_result_wait_seconds`
+  (executor finished → result drained), and `scheduler_claim_batch_size`.
+  Histogram buckets now resolve down to 250 µs (previously the smallest bound
+  was 5 ms, so sub-tick scheduling latency was unmeasurable). To make ready-age
+  true, the `pending → ready` transition now stamps `scheduled_at` with the
+  readiness time (a run's tasks previously all carried the run's single
+  creation timestamp): claim order within equal priority becomes
+  readiness-FIFO, and the stale-ready alarm and spillover reclassing now
+  measure time-since-claimable rather than time-since-run-creation.
+
+- **`arguments:` on a `type: workflow` task — a sub-workflow trigger can now
+  parameterise its child run.**
+
+  ```yaml
+  - name: turn
+    type: workflow
+    workflow: agent-turn
+    arguments:
+      state_dir: "/tmp/agent/{{ conversation }}"
+  ```
+
+  A trigger used to run the child's stored spec as-is, so it could only ever
+  hand the child constants and every run of a child workflow was identical.
+  That is what made the durable agent loop single-conversation: two runs of the
+  same parent would read and write the same state, and nothing would notice.
+
+  The field is the one `template:` calls already use, because it is one idea —
+  arguments for whatever this task calls. The difference is where they are
+  consumed: a template's are consumed by the expander, inline, so nothing
+  survives on the leaf; a trigger's **survive expansion**, because the child run
+  does not exist until dispatch. They are substituted at expansion, so a parent
+  passes its own scope down (`{{ conversation }}` above), and the engine builds
+  the child with the same call `POST /api/runs` makes for a caller-supplied
+  `parameters` map.
+
+  The child's stored definition is unchanged — parameters are applied to the
+  graph, not written into the definition — so a workflow keeps one definition
+  however many ways it is called.
+
+  `arguments` with no `template` and no `type: workflow` is now rejected by the
+  engine as well as the API. It was silently ignored there, which is the failure
+  mode of a parameter that looks configured and goes nowhere.
+
+### Added
+- **`repeat:` now works on a `type: workflow` task — the durable agent loop.**
+  A trigger with a `repeat:` runs its child workflow once per iteration, so a
+  multi-turn conversation is a stack of runs: turn 7 has its own tasks, logs,
+  timings and failures rather than being a line in a log file.
+
+  ```yaml
+  - name: turn
+    type: workflow
+    workflow: agent-turn
+    repeat: { until: "{{ output }} == done", max_iterations: 10 }
+  ```
+
+  Nothing new was needed to make a conversation durable. The turn number is the
+  task's `attempt` column, the state is whatever the turn writes, and the rest is
+  rows — kill the engine mid-conversation and the next reconcile tick resumes it.
+
+  **The decision is made before the trigger is resolved, never after.** Resolving
+  a task decrements its dependents, so a loop that resolved and then re-armed
+  would release the rest of the DAG on the first turn and again on every turn
+  after it. A continuing iteration never touches a dependent.
+
+  A **failed** turn fails the loop rather than being repeated: `repeat` decides
+  when a conversation is over, not whether a failure counts — retrying a broken
+  turn is `max_attempts`. Exhausting `max_iterations` also fails, and says what
+  the last turn returned.
+
+  `max_iterations` is the only hard bound on how many runs one submission
+  creates — `SUBWORKFLOW_MAX_DEPTH` bounds nesting, and every iteration is a
+  sibling at the same depth. See
+  [Loops over sub-workflows](docs/CONFIG.md#loops-over-sub-workflows), and
+  `examples/ai/agent_loop.yaml` for a runnable one.
+
+  `repeat` on `type: wait` or `type: approval` stays rejected. Re-asking a person
+  until they give the answer a condition wants is not a loop, and "wait again" is
+  what a longer `for:` already says.
+
+### Fixed
+- **A sub-workflow's result now reaches its parent task.** `result_from` gives a
+  run a single return value, and a `type: workflow` task threw it away — it
+  recorded the constant `"sub-workflow succeeded"` instead. So
+  `{{ tasks.<trigger>.output }}` in a parent DAG was a fixed string and nothing
+  downstream could branch on what the child decided. A sub-workflow was a
+  procedure; it is now a function.
+
+  The failure side improves too: a child that died on its `run_timeout_secs`
+  deadline records *why* on its run row, and the parent's failure summary now
+  shows that rather than the word "failed". A child with no result of its own
+  still reads `"sub-workflow succeeded"`, so nothing that worked changes.
+
+- **`repeat:` on a task kind that never evaluates it is now rejected.** The loop
+  operator is evaluated where an executor's result comes back. Every other kind
+  reaches success through a *sweep* — an approval resolved by an operator, a
+  sub-workflow resolved when its child run goes terminal, a wait sensor resolved
+  at its deadline — and those paths never consult it.
+
+  So `repeat:` on one of them was a silent no-op: the task succeeded once, the
+  loop never ran, and nothing said so. A loop operator that quietly does not
+  loop is worse than one that is unavailable, because the workflow reads as
+  correct. It now fails validation, naming the kind. `repeat` on an ordinary
+  command task — the only place it ever worked — is unchanged.
+
+### Added
+- **`dagron-step-mcp` — a workflow task that calls an MCP tool.** The inverse of
+  the `dagron-mcp` server: that one lets an agent drive dagron, this lets a
+  dagron DAG drive an agent's tools.
+
+  The reason to want it is what a task already is. Once a tool call is a task it
+  gets retries with backoff, a timeout, captured output, artifacts to hand to the
+  next step, an approval gate in front of it, and a row in the run's history. A
+  tool call inside an agent's own loop has none of that — when it fails halfway
+  there is nothing to resume, and nothing that records it happened.
+
+  Speaks **stdio JSON-RPC**, the one transport every MCP server supports: the
+  server is spawned as a child and read exactly as `dagron-mcp` reads its own
+  input. A task's `command` already spawns a process, so a child is native here
+  in a way an HTTP connection is not.
+
+  Configured by environment like every other dagron step. Server arguments are a
+  JSON array rather than a command line, because a whitespace split breaks
+  silently on any argument containing a space and a shell would make a workflow
+  parameter injectable. All-text results come back as plain text so the next
+  task can use them directly; mixed content keeps its JSON rather than losing
+  the parts that are not text. A tool reporting `isError` fails the task —
+  without writing the output file, so the retry it triggers is not satisfied by
+  a stale error.
+
+  See [`docs/MCP.md`](docs/MCP.md) and
+  [`examples/ai/mcp_tool_step.yaml`](examples/ai/mcp_tool_step.yaml).
+- **`GET /api/runs/{id}/wait` now carries `failure` too.** The same object the
+  run detail returns, present only when the wait ended on a failure.
+
+  The summary landed on the run detail first, which is the route a *human* opens
+  and not the one a synchronous caller uses. An agent blocking on a run holds the
+  wait response, so it still got a bare `status: "failed"` and had to start a
+  second investigation with whatever tools it had. The reason now travels in the
+  response the caller is already holding.
+
+  The task rows behind the summary are read only when there is a failure to
+  explain, so a succeeding wait — the common case, and the one that decides this
+  endpoint's cost — pays nothing.
+
+### Changed
+- **`POST /api/workflows/{id}/run` now answers `201 Created`, not `200 OK`.**
+  It creates a run, and every other route that creates one already said so.
+  This was not merely inconsistent: a layer in front that counts created runs by
+  status — a proxy, a quota, a meter — saw a creation it could not tell from a
+  read, so runs submitted by name went uncounted. Clients check for 2xx, so
+  nothing that works today stops working; anything asserting `== 200` on this
+  route needs updating.
+
+### Added
+- **`budget:` on a workflow spec — a ceiling on how big one run may get.**
+  `budget: { tasks: N }` refuses a run that would create more than `N` tasks,
+  at creation, before anything executes. A scheduler called by an agent is an
+  unbounded amplifier: one call can fan out to hundreds of tasks, and the first
+  place anyone notices is the invoice.
+
+  The count is the task **rows** a run would create, not the spec entries an
+  author typed — the same gang-aware count admission uses. A `with_items`
+  fan-out or a `gang:` co-scheduled task is one line on the page and many rows in
+  the database, and budgeting the page would budget nothing. Refusing at creation
+  rather than mid-run is deliberate: dagron already knows the exact final task
+  count at submit, so a run that would break its budget never starts instead of
+  being killed with work already spent.
+
+  Distinct from `max_active_runs` (how many runs of a workflow may be in
+  flight) and from `DAGRON_MAX_TASKS_PER_RUN` (the operator's process-wide
+  ceiling against an OOM). This one lets a workflow's author say what *this*
+  workflow is supposed to cost.
+
+  **Only `tasks` is enforceable, and that is a statement about the data.** A
+  task count is exact at creation; spend and model-token counts are not metered
+  per run anywhere in the engine, so a `spend:` field would be a promise with no
+  measurement behind it.
+- **`GET /api/runs/{id}` now says why a run failed.** A new `failure` object —
+  `{task_id, task_name, attempt, failed_tasks, message, truncated}`, or `null`
+  when nothing failed. Previously a caller holding a failed run had a status and
+  a list of task rows, and had to work out which one broke and then fetch its
+  logs; the reason is now in the response it already has.
+
+  It names the **earliest-finished** failed task rather than the first row: with
+  fail-fast off several tasks fail independently, and the earliest is the
+  likeliest cause rather than a downstream casualty. `failed_tasks` says how
+  many there were, so summarising one out of several stays honest. `message` is
+  the tail of that task's output, clipped to 20 lines / 4 KB with
+  `truncated: true` — `GET /api/runs/{id}/logs` is still the full view.
+
+  Two cases worth knowing. A run failed with **no** failed task — a
+  `run_timeout_secs` overrun fails the run and *cancels* its tasks — reports the
+  run's own reason with `task_id: null`, which is exactly the case that was
+  previously unexplainable from the task rows. And the summary appears as soon
+  as a task fails, so a still-`running` run can carry one; a caller polling it
+  can stop waiting on work that is already doomed.
+
+  Additive and nullable, so no existing client changes.
+
+- **`POST /api/runs` accepts an optional `Idempotency-Key` header.** Repeating a
+  submit with the same key returns the **same** `run_id` with `200` instead of
+  creating a second run; a first submit still answers `201`. Without the header
+  the endpoint is unchanged.
+
+  This is the difference between an API a client calls and one it can call
+  safely in a retry loop. A dropped response used to leave the caller unable to
+  tell a duplicated run from a lost one, and both guesses are wrong: re-submit
+  and a pipeline may run twice, don't and it may run zero times.
+
+  A key reused for a *different* body is `409`, not a replay — handing back a
+  run id for work that never ran is the worst available answer, so the request
+  is fingerprinted (SHA-256 over the spec and parameters) and checked. An
+  identical submit still in flight is also `409`; retry and get the run id.
+  Keys are printable ASCII up to 255 characters, and an *empty* key is a `400`
+  rather than being treated as absent — a client that sends one believes it has
+  retry safety.
+
+  Keys need no separate expiry: a key lives exactly as long as the run it names,
+  and the retention GC that purges the run frees the key with it.
+
+- **Both SDKs can use the above.** `submit_run` / `submitRun` take
+  `parameters` (added to the API in the previous change but never reachable from
+  the SDKs) and an idempotency key — `idempotency_key=` in Python,
+  `{ idempotencyKey }` in TypeScript. Omitted parameters are not sent at all, so
+  the request body older servers expect is unchanged.
+
 ## [0.7.0] - 2026-08-12
 
 Minor, not patch: task pods created by the Kubernetes executor no longer receive

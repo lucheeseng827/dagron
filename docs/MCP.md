@@ -49,6 +49,67 @@ returns them as a single tool response. The window is hard-capped at 10 s
 wall-clock and 256 KiB so a JSON-RPC call always returns promptly — agents
 poll the tool in a loop instead of holding a long-lived stream.
 
+## The other direction: a workflow that calls MCP tools
+
+`dagron-mcp` lets an agent drive dagron. **`dagron-step-mcp` lets a dagron DAG
+drive an agent's tools** — a task whose job is to call one tool on one MCP
+server.
+
+The reason to want it is what a task already is. Once a tool call is a task it
+inherits retries with backoff, a timeout, captured output, artifacts to hand to
+the next step, an approval gate in front of it if you want one, and a row in the
+run's history. A tool call inside an agent's own loop has none of that: when it
+fails halfway there is nothing to resume, and nothing that records it happened.
+
+```yaml
+- name: fetch
+  command: ["dagron-step-mcp"]
+  env:
+    - { name: DAGRON_MCP_STEP_SERVER, value: "npx" }
+    - name: DAGRON_MCP_STEP_SERVER_ARGS
+      value: '["-y", "@modelcontextprotocol/server-filesystem", "/data"]'
+    - { name: DAGRON_MCP_STEP_TOOL, value: "read_file" }
+    - { name: DAGRON_MCP_STEP_ARGS, value: '{"path": "{{ doc }}"}' }
+    - { name: DAGRON_MCP_STEP_OUTPUT, value: "/artifacts/doc.txt" }
+  max_attempts: 3
+```
+
+Full example: [`examples/ai/mcp_tool_step.yaml`](../examples/ai/mcp_tool_step.yaml).
+
+| Env | Purpose |
+|---|---|
+| `DAGRON_MCP_STEP_SERVER` | MCP server program to spawn (**required**) |
+| `DAGRON_MCP_STEP_SERVER_ARGS` | JSON **array** of its arguments |
+| `DAGRON_MCP_STEP_TOOL` | tool name to call (**required**) |
+| `DAGRON_MCP_STEP_ARGS` | JSON **object** of tool arguments (default `{}`) |
+| `DAGRON_MCP_STEP_ARGS_FILE` | read them from a file instead (`-` = stdin) |
+| `DAGRON_MCP_STEP_OUTPUT` | write the result here instead of stdout |
+| `DAGRON_MCP_STEP_TIMEOUT_SECS` | whole-exchange deadline (default 300) |
+
+Details worth knowing before you write one:
+
+- **Server arguments are a JSON array, not a command line.** A whitespace split
+  breaks on any argument containing a space — which is most paths worth passing
+  — and it does so silently. Handing the string to a shell instead would make a
+  workflow parameter injectable into a command line.
+- **All-text results come back as plain text**, so `{{ tasks.fetch.output }}`
+  works in the next task without a JSON step in between. Mixed content (an
+  image, a resource) comes back as the JSON `content` array, because flattening
+  it would drop the parts that are not text.
+- **A tool that reports `isError` fails the task**, so the engine's retry policy
+  and the run's failure summary both see it. The result is deliberately *not*
+  written to `DAGRON_MCP_STEP_OUTPUT` in that case — an error file would satisfy
+  the idempotency check below and the retry would skip the call.
+- **Set `DAGRON_MCP_STEP_OUTPUT` for anything that matters.** Besides handing the
+  result to the next task, a non-empty output file makes a retry skip the call:
+  if a prior attempt succeeded and then died before exiting 0, the tool is not
+  invoked twice. That matters more here than for a text completion, because an
+  MCP tool need not be read-only.
+- **The binary must be on the task's PATH**, and so must the MCP server it
+  spawns — both run inside whatever image the task runs in.
+- The server's **stderr is inherited**, so its diagnostics land in the task's
+  captured output instead of being discarded with the child.
+
 ## Configuration
 
 | Env | Purpose |

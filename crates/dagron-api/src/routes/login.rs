@@ -20,12 +20,16 @@ use crate::pwhash;
 use crate::state::AppState;
 
 /// Default session lifetime; override with DAGRON_SESSION_TTL_SECS.
+/// Memoized — it was read twice per login (LOW_LATENCY §5).
 fn ttl_secs() -> i64 {
-    std::env::var("DAGRON_SESSION_TTL_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(60 * 60 * 24 * 7)
+    static TTL: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *TTL.get_or_init(|| {
+        std::env::var("DAGRON_SESSION_TTL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(60 * 60 * 24 * 7)
+    })
 }
 
 // ── Login ───────────────────────────────────────────────────────────────────

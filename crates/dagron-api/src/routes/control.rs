@@ -13,7 +13,7 @@
 //! keep them in sync if the engine schema changes. The submitted task `input`
 //! JSON must match the engine's `dag::TaskSpec` shape (see `TaskSpecInput`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -572,9 +572,13 @@ pub(crate) struct TaskSpecInput {
     /// chain (`workflow_ref`) — see [`validate_graph`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) template: Option<String>,
-    /// Arguments for the called template, filling its declared `parameters`
-    /// (engine `arguments`). Values may reference the caller's scope via
-    /// `{{ name }}`. Only meaningful alongside `template`.
+    /// Arguments for this task's callee (engine `arguments`). Values may
+    /// reference the caller's scope via `{{ name }}`. Meaningful in exactly two
+    /// places: alongside `template` (fills the called template's declared
+    /// `parameters`, consumed inline at expansion) and on a `type: workflow`
+    /// trigger (becomes the **child run's parameters**, consumed by the engine
+    /// at dispatch). On any other task kind it has nothing to pass to and is
+    /// rejected.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub(crate) arguments: std::collections::BTreeMap<String, String>,
     /// Task kind (engine `type`). `type: approval` makes this a human approval
@@ -582,6 +586,14 @@ pub(crate) struct TaskSpecInput {
     /// Round-tripped into the stored task JSON so the engine sees it.
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
     pub(crate) task_type: Option<String>,
+    /// For a `type: workflow` trigger (#23): the name of the **registered
+    /// workflow** to run as a child. Mirrors engine `dag::TaskSpec::workflow` so
+    /// the field round-trips into the stored task JSON. Required for (and only
+    /// valid on) a `type: workflow` task — see [`validate_graph`], which mirrors
+    /// `dag::from_spec`. Without this field the API accepted a trigger whose
+    /// target was silently dropped and never validated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) workflow: Option<String>,
     /// Approval timeout knobs (engine `approval_timeout_secs`/`approval_on_timeout`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) approval_timeout_secs: Option<u64>,
@@ -868,10 +880,20 @@ pub(crate) fn validate_graph(
                     format!("task '{}' repeat.max_iterations must be >= 1", t.name),
                 ));
             }
-            if t.is_approval() {
+            // Mirrors core: `repeat` is evaluated after a success, by the
+            // executor-result path for a command task and by the sub-workflow
+            // sweep for a trigger. An approval and a wait sensor have no
+            // iteration, so a loop on either would never run. Rejecting here
+            // keeps the API's error identical to the engine's rather than
+            // deferring to a later, less specific one.
+            if !matches!(t.task_type.as_deref(), None | Some("task") | Some("workflow")) {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    format!("task '{}' cannot combine `repeat` with an approval gate", t.name),
+                    format!(
+                        "task '{}' cannot combine `repeat` with `type: {}` — `repeat` applies to command tasks and sub-workflow triggers",
+                        t.name,
+                        t.task_type.as_deref().unwrap_or("task")
+                    ),
                 ));
             }
         }
@@ -951,6 +973,28 @@ pub(crate) fn validate_graph(
                 }
             }
         }
+        // Mirror `dag::from_spec`'s workflow-target rule (same rule stated
+        // twice, like the command-less-kind check above): a `type: workflow`
+        // trigger must name a nonblank `workflow:` to run, and no other kind may
+        // set one. Before `TaskSpecInput` carried the field, the API accepted a
+        // trigger whose target was dropped on the floor — the engine then
+        // rejected it at run creation, so a spec that saved failed to run.
+        if t.is_workflow() {
+            match t.workflow.as_deref() {
+                Some(w) if !w.trim().is_empty() => {}
+                _ => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("task '{}' is type: workflow but names no `workflow:` to trigger", t.name),
+                    ));
+                }
+            }
+        } else if t.workflow.is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("task '{}' sets `workflow:` but is not `type: workflow`", t.name),
+            ));
+        }
         // A call must name a template this spec declares. Unlike `workflow_ref`
         // (which resolves against the saved-workflow table at run creation), a
         // template is local to the spec, so this is fully checkable at save time.
@@ -964,10 +1008,17 @@ pub(crate) fn validate_graph(
                     ),
                 ));
             }
-        } else if !t.arguments.is_empty() {
+        } else if !t.arguments.is_empty() && t.task_type.as_deref() != Some("workflow") {
+            // A `type: workflow` trigger is the second legitimate callee: its
+            // `arguments` become the child run's parameters (#23). Everything
+            // else has nothing to pass them to, and accepting them there would
+            // make a parameter that looks configured and goes nowhere.
             return Err((
                 StatusCode::BAD_REQUEST,
-                format!("task '{}' sets `arguments` without a `template` to pass them to", t.name),
+                format!(
+                    "task '{}' sets `arguments` with no `template` or `type: workflow` to pass them to",
+                    t.name
+                ),
             ));
         }
         idx.insert(t.name.clone(), graph.add_node(()));
@@ -1226,13 +1277,55 @@ tasks:
   - { name: a, command: [\"true\"], arguments: { x: \"1\" } }
 ";
         let err = parse_and_validate(spec).unwrap_err();
-        assert!(err.1.contains("`arguments` without a `template`"), "got: {}", err.1);
+        assert!(err.1.contains("`arguments`"), "got: {}", err.1);
+    }
+
+    /// The API mirror must gate a `type: workflow` trigger's target the same way
+    /// `dag::from_spec` does — otherwise a spec that saves here fails at run
+    /// creation. A trigger names a nonblank `workflow:`; no other kind may.
+    #[test]
+    fn workflow_target_validation_mirrors_the_engine() {
+        // A trigger with a target (and its child arguments) is accepted.
+        parse_and_validate(
+            "
+name: p
+tasks:
+  - { name: t, type: workflow, workflow: child, arguments: { x: \"1\" } }
+",
+        )
+        .expect("a type: workflow trigger with a target must be accepted");
+
+        // A trigger with no target is rejected.
+        let err = parse_and_validate(
+            "
+name: p
+tasks:
+  - { name: t, type: workflow, arguments: { x: \"1\" } }
+",
+        )
+        .unwrap_err();
+        assert!(err.1.contains("names no `workflow:`"), "got: {}", err.1);
+
+        // `workflow:` on a non-trigger task is rejected.
+        let err = parse_and_validate(
+            "
+name: p
+tasks:
+  - { name: t, command: [\"true\"], workflow: child }
+",
+        )
+        .unwrap_err();
+        assert!(err.1.contains("not `type: workflow`"), "got: {}", err.1);
     }
 }
 
 #[derive(Deserialize)]
 pub struct SubmitBody {
     yaml: String,
+    /// Arguments for the spec's declared `parameters:`. Optional, so the
+    /// pre-existing `{"yaml": "..."}` body stays valid unchanged.
+    #[serde(default)]
+    parameters: BTreeMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -1240,18 +1333,398 @@ pub struct SubmitResponse {
     pub run_id: String,
 }
 
-/// `POST /api/runs` — submit a DAG (YAML in `{ "yaml": "..." }`). Parses and
-/// cycle-checks server-side (the authoritative validation), resolves any
+#[cfg(test)]
+mod submit_body_tests {
+    use super::SubmitBody;
+
+    /// The pre-existing body shape must keep parsing unchanged. `parameters`
+    /// was added to a request type that every client already sends, so a
+    /// missing field has to mean "none", not a 422.
+    #[test]
+    fn body_without_parameters_still_parses() {
+        let b: SubmitBody = serde_json::from_str(r#"{"yaml":"name: x"}"#).unwrap();
+        assert_eq!(b.yaml, "name: x");
+        assert!(b.parameters.is_empty());
+    }
+
+    #[test]
+    fn parameters_are_read_when_present() {
+        let b: SubmitBody =
+            serde_json::from_str(r#"{"yaml":"name: x","parameters":{"date":"2026-08-18"}}"#)
+                .unwrap();
+        assert_eq!(b.parameters.get("date").map(String::as_str), Some("2026-08-18"));
+    }
+
+    /// An explicit empty object is the same as omitting the field — no caller
+    /// should have to care which of the two its HTTP library produces.
+    #[test]
+    fn empty_parameters_object_is_the_same_as_none() {
+        let a: SubmitBody = serde_json::from_str(r#"{"yaml":"y"}"#).unwrap();
+        let b: SubmitBody = serde_json::from_str(r#"{"yaml":"y","parameters":{}}"#).unwrap();
+        assert_eq!(a.parameters, b.parameters);
+    }
+}
+
+#[cfg(test)]
+mod idempotency_tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    fn headers(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("idempotency-key", value.parse().unwrap());
+        h
+    }
+
+    fn body(yaml: &str, params: &[(&str, &str)]) -> SubmitBody {
+        SubmitBody {
+            yaml: yaml.to_string(),
+            parameters: params.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        }
+    }
+
+    /// The header is opt-in. Every caller that exists today sends no key, and
+    /// must keep getting the old behaviour rather than a validation error.
+    #[test]
+    fn no_header_means_not_idempotent() {
+        assert_eq!(idempotency_key(&HeaderMap::new()).unwrap(), None);
+    }
+
+    /// An empty key is rejected rather than treated as absent. A client that
+    /// sends one believes it has retry safety; silently giving it none is the
+    /// exact failure the header exists to remove.
+    #[test]
+    fn an_empty_key_is_rejected_not_ignored() {
+        let err = idempotency_key(&headers("   ")).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("must not be empty"), "got: {}", err.1);
+    }
+
+    #[test]
+    fn an_oversized_key_is_rejected() {
+        let err = idempotency_key(&headers(&"k".repeat(MAX_IDEMPOTENCY_KEY + 1))).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn a_normal_key_is_accepted_and_trimmed() {
+        let k = idempotency_key(&headers(" 6f1e2b9c-run-42 ")).unwrap();
+        assert_eq!(k.as_deref(), Some("6f1e2b9c-run-42"));
+    }
+
+    /// The same request fingerprints the same, or a legitimate retry would be
+    /// rejected as a key reuse — the failure that would make the feature worse
+    /// than not having it.
+    #[test]
+    fn an_identical_request_fingerprints_identically() {
+        let a = request_fingerprint(&body("name: x", &[("date", "2026-08-18")]));
+        let b = request_fingerprint(&body("name: x", &[("date", "2026-08-18")]));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn a_different_spec_fingerprints_differently() {
+        let a = request_fingerprint(&body("name: x", &[]));
+        let b = request_fingerprint(&body("name: y", &[]));
+        assert_ne!(a, b);
+    }
+
+    /// Same spec, different arguments, is a *different* request. Replaying the
+    /// first run for it would hand the caller a run id for work that never ran.
+    #[test]
+    fn different_parameters_fingerprint_differently() {
+        let a = request_fingerprint(&body("name: x", &[("date", "2026-08-18")]));
+        let b = request_fingerprint(&body("name: x", &[("date", "2026-08-19")]));
+        assert_ne!(a, b);
+    }
+
+    /// Fields are length-prefixed for this: without it, splitting the same
+    /// bytes at a different boundary would collide, and two genuinely different
+    /// requests would share a fingerprint.
+    #[test]
+    fn a_field_boundary_cannot_be_moved_without_changing_the_fingerprint() {
+        let a = request_fingerprint(&body("y", &[("a", "bc")]));
+        let b = request_fingerprint(&body("y", &[("ab", "c")]));
+        assert_ne!(a, b);
+    }
+
+    /// `parameters` is a BTreeMap, so insertion order cannot leak into the
+    /// digest — an agent whose map iterates differently between retries must
+    /// still hit the replay.
+    #[test]
+    fn parameter_order_does_not_change_the_fingerprint() {
+        let a = request_fingerprint(&body("y", &[("a", "1"), ("b", "2")]));
+        let b = request_fingerprint(&body("y", &[("b", "2"), ("a", "1")]));
+        assert_eq!(a, b);
+    }
+}
+
+// ── idempotent submit (G-AG2) ───────────────────────────────────────────────
+
+/// Cap on an `Idempotency-Key`. Comfortably past a UUID or a hex digest, and
+/// short enough that a hostile client cannot use a primary-key index as free
+/// storage.
+const MAX_IDEMPOTENCY_KEY: usize = 255;
+
+/// How long a claimed-but-unresolved key is honoured before another submit may
+/// take it. The window only matters when a submitter died between claiming the
+/// key and creating the run; a live submit resolves its claim in the time one
+/// `create_run` takes, so this is far longer than any healthy path needs and
+/// short enough that a crash does not strand a key until its run's retention.
+const IN_FLIGHT_CLAIM_SECS: i64 = 300;
+
+/// What the key lookup decided.
+enum Claim {
+    /// This request owns the key and must create the run, then resolve the
+    /// claim to its id.
+    Held,
+    /// The key already names a completed submission. Return *that* run rather
+    /// than making a second one — the whole point of the header.
+    Replay(String),
+}
+
+/// The `Idempotency-Key` header, validated.
+///
+/// An absent header means "not idempotent", which is every caller today. An
+/// **empty** one is a 400 rather than the same thing: a client sending it
+/// believes it has retry safety, and quietly giving it none is the failure this
+/// endpoint exists to remove.
+fn idempotency_key(
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<String>, (StatusCode, String)> {
+    let Some(raw) = headers.get("idempotency-key") else {
+        return Ok(None);
+    };
+    let key = raw.to_str().map_err(|_| bad_key("must be ASCII"))?.trim();
+    if key.is_empty() {
+        return Err(bad_key("must not be empty"));
+    }
+    if key.len() > MAX_IDEMPOTENCY_KEY {
+        return Err(bad_key(&format!("must be at most {MAX_IDEMPOTENCY_KEY} characters")));
+    }
+    if !key.chars().all(|c| c.is_ascii_graphic()) {
+        return Err(bad_key("must be printable ASCII without spaces"));
+    }
+    Ok(Some(key.to_string()))
+}
+
+/// A rejected `Idempotency-Key`, as a 400 that names what was wrong with it.
+fn bad_key(msg: &str) -> (StatusCode, String) {
+    (StatusCode::BAD_REQUEST, format!("Idempotency-Key {msg}"))
+}
+
+/// A key that cannot be honoured as asked: 409, naming the key so a retrying
+/// caller can tell which of its in-flight submits this is about.
+fn key_conflict(key: &str, msg: &str) -> (StatusCode, String) {
+    (StatusCode::CONFLICT, format!("Idempotency-Key '{key}': {msg}"))
+}
+
+/// SHA-256 over the request this key is claimed for.
+///
+/// Stored so a key replayed with a *different* body can be rejected. Serving
+/// the first run for a second, different request is the worst available
+/// answer: the caller gets a 200 and a run id for work that never ran.
+///
+/// Every field is length-prefixed, so `{"a": "bc"}` and `{"ab": "c"}` cannot
+/// hash alike. `parameters` is a `BTreeMap`, so iteration order is the key
+/// order and two equal maps always fingerprint the same.
+fn request_fingerprint(body: &SubmitBody) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    hash_field(&mut h, &body.yaml);
+    for (k, v) in &body.parameters {
+        hash_field(&mut h, k);
+        hash_field(&mut h, v);
+    }
+    // Lowercase hex, the same way `tokens::hash_token` writes a digest.
+    let mut out = String::with_capacity(64);
+    for b in h.finalize() {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Feed one length-prefixed field into the digest.
+fn hash_field(h: &mut sha2::Sha256, s: &str) {
+    use sha2::Digest;
+    h.update((s.len() as u64).to_le_bytes());
+    h.update(s.as_bytes());
+}
+
+/// Claim `key` for this submit, or discover what already holds it.
+///
+/// The claim is inserted **before** the run exists, which is what makes two
+/// concurrent identical submits resolve to one run. A lookup-then-insert would
+/// let both miss and both create; here exactly one `INSERT` wins and the loser
+/// reads the winner's row.
+///
+/// The claim is scoped to `principal` (the authenticated caller): the key is
+/// that caller's private handle on its own retry, so two principals sharing one
+/// engine never collide on a key string one of them never issued.
+async fn claim_idempotency_key(
+    state: &AppState,
+    principal: &str,
+    key: &str,
+    fingerprint: &str,
+) -> Result<Claim, (StatusCode, String)> {
+    let now = chrono::Utc::now();
+    let stale = (now - chrono::Duration::seconds(IN_FLIGHT_CLAIM_SECS)).to_rfc3339();
+    let now = now.to_rfc3339();
+
+    // `DO UPDATE ... WHERE` makes stale-claim recovery part of the same atomic
+    // statement: the row is taken over only if it is still unresolved *and*
+    // old. `RETURNING` yields a row only when the insert or the update actually
+    // happened, so "did I win" needs no second read.
+    let won: Option<String> = sqlx::query_scalar(
+        "INSERT INTO run_idempotency (principal, idempotency_key, run_id, fingerprint, created_at)
+         VALUES ($1, $2, NULL, $3, $4)
+         ON CONFLICT (principal, idempotency_key) DO UPDATE
+            SET fingerprint = EXCLUDED.fingerprint, created_at = EXCLUDED.created_at
+          WHERE run_idempotency.run_id IS NULL
+            AND run_idempotency.created_at < $5
+         RETURNING idempotency_key",
+    )
+    .bind(principal)
+    .bind(key)
+    .bind(fingerprint)
+    .bind(&now)
+    .bind(&stale)
+    .fetch_optional(&state.write_pool)
+    .await
+    .map_err(internal_msg)?;
+
+    if won.is_some() {
+        return Ok(Claim::Held);
+    }
+
+    let existing: Option<(Option<String>, String)> = sqlx::query_as(
+        "SELECT run_id, fingerprint FROM run_idempotency WHERE principal = $1 AND idempotency_key = $2",
+    )
+    .bind(principal)
+    .bind(key)
+    // The primary, not a replica: this read resolves the outcome of the write
+    // above in the same logical operation. Reading a replica could observe a
+    // stale snapshot — a resolved claim still showing run_id NULL, or a row not
+    // yet arrived — and answer 409 to a caller whose run already exists, which
+    // is exactly the failure the header is meant to remove.
+    .fetch_optional(&state.write_pool)
+    .await
+    .map_err(internal_msg)?;
+
+    match existing {
+        // Fingerprint first: a key reused for a *different* body is a client
+        // bug, and it must be reported as one whether or not the first
+        // submission has finished.
+        Some((_, fp)) if fp != fingerprint => {
+            Err(key_conflict(key, "already used for a different request body"))
+        }
+        Some((Some(run_id), _)) => Ok(Claim::Replay(run_id)),
+        // Claimed, not yet resolved, and not yet stale: an identical submit is
+        // in flight. 409 rather than a wait — the caller retries and gets the
+        // run id, which is cheaper than holding a connection open here.
+        Some((None, _)) => {
+            Err(key_conflict(key, "a submission with this key is in flight; retry"))
+        }
+        // The row vanished between the two statements — only reachable if the
+        // named run was purged concurrently. Treat it as contention.
+        None => Err(key_conflict(key, "raced with a concurrent submission; retry")),
+    }
+}
+
+/// Point a held claim at the run it produced. After this, replays return it.
+async fn resolve_idempotency_claim(state: &AppState, principal: &str, key: &str, run_id: &str) {
+    if let Err(e) = sqlx::query(
+        "UPDATE run_idempotency SET run_id = $1
+          WHERE principal = $2 AND idempotency_key = $3 AND run_id IS NULL",
+    )
+    .bind(run_id)
+    .bind(principal)
+    .bind(key)
+    .execute(&state.write_pool)
+    .await
+    {
+        // The run exists and the caller is about to be told so. Failing the
+        // request now would be the worse answer — it would report a failure for
+        // work that succeeded. The cost is that a retry within the in-flight
+        // window sees a 409 instead of the replay.
+        tracing::error!(error = ?e, %key, %run_id, "failed to resolve idempotency claim");
+    }
+}
+
+/// Drop a held claim whose submit failed, so the key is usable again.
+///
+/// Guarded on `run_id IS NULL`: a resolved claim can never be deleted by this,
+/// whatever it is called with.
+async fn release_idempotency_claim(state: &AppState, principal: &str, key: &str) {
+    if let Err(e) = sqlx::query(
+        "DELETE FROM run_idempotency
+          WHERE principal = $1 AND idempotency_key = $2 AND run_id IS NULL",
+    )
+    .bind(principal)
+    .bind(key)
+    .execute(&state.write_pool)
+    .await
+    {
+        // Left behind, the claim ages out via IN_FLIGHT_CLAIM_SECS rather than
+        // poisoning the key, so this is a log line and not a failed request.
+        tracing::error!(error = ?e, %key, "failed to release idempotency claim");
+    }
+}
+
+/// `POST /api/runs` — submit a DAG
+/// (`{ "yaml": "...", "parameters": { … } }`; `parameters` optional). Parses
+/// and cycle-checks server-side (the authoritative validation), resolves any
 /// `workflow_ref` chains into a flat DAG, then creates the run. The original
 /// (un-expanded) YAML is stored as the run's definition.
+///
+/// Optionally idempotent (G-AG2). With an `Idempotency-Key` header, a repeat of
+/// the same submit returns the **same** `run_id` with `200 OK` instead of
+/// creating a second run; a first submit still answers `201 Created`. Without
+/// the header the endpoint behaves exactly as before, so no existing caller
+/// changes.
 pub async fn submit_run(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<SubmitBody>,
 ) -> Result<(StatusCode, Json<SubmitResponse>), (StatusCode, String)> {
     parse_and_validate(&body.yaml)?;
-    let run_id = submit_yaml(&state, &body.yaml, &body.yaml).await?;
-    Ok((StatusCode::CREATED, Json(SubmitResponse { run_id })))
+
+    // Idempotency claims are scoped to the authenticated caller: the key names
+    // *this* principal's retry, never a run some other caller submitted under
+    // the same string.
+    let principal = auth.0.sub.as_str();
+
+    // Validated before anything is written, so a malformed key never leaves a
+    // run behind that its caller cannot find again by retrying.
+    let Some(key) = idempotency_key(&headers)? else {
+        let run_id =
+            submit_yaml_with_params(&state, &body.yaml, &body.yaml, &body.parameters).await?;
+        return Ok((StatusCode::CREATED, Json(SubmitResponse { run_id })));
+    };
+
+    match claim_idempotency_key(&state, principal, &key, &request_fingerprint(&body)).await? {
+        // 200, not 201: nothing was created. The status is the whole signal
+        // here — anything counting created runs in front of this endpoint
+        // (a proxy, a quota, a meter) reads 201 and must not be told a
+        // replay is a new run.
+        Claim::Replay(run_id) => Ok((StatusCode::OK, Json(SubmitResponse { run_id }))),
+        Claim::Held => {
+            match submit_yaml_with_params(&state, &body.yaml, &body.yaml, &body.parameters).await {
+                Ok(run_id) => {
+                    resolve_idempotency_claim(&state, principal, &key, &run_id).await;
+                    Ok((StatusCode::CREATED, Json(SubmitResponse { run_id })))
+                }
+                Err(e) => {
+                    // A rejected submit must not burn the key. The caller fixed
+                    // nothing by retrying if the key it chose is now spent.
+                    release_idempotency_claim(&state, principal, &key).await;
+                    Err(e)
+                }
+            }
+        }
+    }
 }
 
 /// Create a run from spec YAML: inline `workflow_ref` chains, fold the declared
@@ -1275,12 +1748,54 @@ pub(crate) async fn submit_yaml(
     yaml: &str,
     authored_yaml: &str,
 ) -> Result<String, (StatusCode, String)> {
-    let expanded = crate::expand::expand_workflow_refs(state, yaml).await?;
-    let params = environment_params(state, &expanded).await?;
+    submit_yaml_with_params(state, yaml, authored_yaml, &BTreeMap::new()).await
+}
+
+/// [`submit_yaml`], plus caller-supplied `parameters` — arguments for the
+/// spec's declared `parameters:` block.
+///
+/// This is what makes a stored workflow callable as a *function*: the caller
+/// names the workflow and passes arguments, instead of fetching its spec,
+/// splicing values in on the client, and submitting the result as new YAML.
+/// Every caller — the CLI, an SDK, curl, the console — gets the same path, and
+/// the substitution stays in one place (the engine's), not two.
+///
+/// **Precedence: the declared environment wins.** Caller parameters go in
+/// first, then `environment_params` on top, so a caller cannot shadow an
+/// `env.NAME` key with a value of its own. The environment is a property of the
+/// spec and the deployment; letting a request override it would make a declared
+/// environment advisory.
+///
+/// Overrides beat the spec's own `parameters:` defaults (that is
+/// `from_yaml_with_params`' documented behaviour), and keys the spec never
+/// references are harmless.
+pub(crate) async fn submit_yaml_with_params(
+    state: &AppState,
+    yaml: &str,
+    authored_yaml: &str,
+    caller_params: &BTreeMap<String, String>,
+) -> Result<String, (StatusCode, String)> {
+    // One Value parse serves both the environment-key read and the
+    // `workflow_ref` check (LOW_LATENCY R-3) — previously each step re-parsed
+    // the full document. Reading `environment` from the PRE-expansion document
+    // is deliberate and equivalent: expansion only rewrites `tasks:` (inlined
+    // children's top-level keys are never merged), so the key cannot change.
+    let root: serde_yaml::Value = serde_yaml::from_str(yaml)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid YAML: {e}")))?;
+    let mut params = caller_params.clone();
+    params.extend(environment_params(state, &root).await?);
+    let expanded = crate::expand::expand_workflow_refs(state, root, yaml).await?;
     // The engine's own parse → expand (task_defaults, parameters, templates,
     // fan-out, submit-time `when:`) → validate pipeline.
-    let dag = dagron_core::dag::DagGraph::from_yaml_with_params(&expanded, &params)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid DAG: {e}")))?;
+    let dag = dagron_core::dag::DagGraph::from_yaml_with_params(&expanded, &params).map_err(|e| {
+        // A budget refusal is not a malformed spec, and must not read as one.
+        // "invalid DAG: workflow 'x' would create 900 tasks…" tells an author to
+        // go looking for a syntax error that isn't there.
+        if let Some(b) = e.downcast_ref::<dagron_core::models::TaskBudgetExceeded>() {
+            return (StatusCode::BAD_REQUEST, b.to_string());
+        }
+        (StatusCode::BAD_REQUEST, format!("invalid DAG: {e}"))
+    })?;
     dagron_core::db::create_run(&state.write_pool, &dag, authored_yaml).await.map_err(|e| {
         // A per-workflow concurrency cap is a capacity condition, not a failure:
         // answer 429 like the engine's ops API, never 500. (No Retry-After here —
@@ -1309,11 +1824,9 @@ pub(crate) async fn submit_yaml(
 /// — no second implementation of `{{ }}`.
 async fn environment_params(
     state: &AppState,
-    yaml: &str,
+    doc: &serde_yaml::Value,
 ) -> Result<std::collections::BTreeMap<String, String>, (StatusCode, String)> {
     let mut out = std::collections::BTreeMap::new();
-    let doc: serde_yaml::Value = serde_yaml::from_str(yaml)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid YAML: {e}")))?;
     let Some(env_name) = doc.get("environment").and_then(serde_yaml::Value::as_str) else {
         return Ok(out);
     };

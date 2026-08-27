@@ -1,0 +1,87 @@
+# Pull-request CI for the PUBLIC MIRROR (lucheeseng827/dagron); inert in the
+# monorepo, whose only active workflows live in the repo-root `.github/workflows`.
+# Same arrangement as docker.yml and binaries.yml alongside it.
+#
+# Why this exists: CONTRIBUTING.md tells contributors "CI runs fmt, clippy, build,
+# and test on every PR", and until this file the mirror carried only the two
+# tag-triggered publish workflows — so a contributor's PR sat with no checks at all
+# and neither side could tell whether the change even compiled. The monorepo gates
+# the same commands before publishing, but that runs after the fact, in a private
+# repo the contributor cannot see.
+#
+# NOTE FOR CONTRIBUTORS: a green run here is the signal that a maintainer can take
+# the change. Merging happens in the upstream source tree this repository is
+# published from, and the PR is then closed with a pointer to the commit that
+# carries it — see CONTRIBUTING.md. Nothing is lost when that happens.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: build · test (required) · fmt · clippy (advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      # ADVISORY, not required — and deliberately so. Measured on an untouched tree:
+      # stock rustfmt reports ~960 diffs (there is no rustfmt.toml, so it is comparing
+      # against a style this code was never written in), and `clippy -D warnings` fails
+      # on 3 findings in dagron-core. Neither is anything a contributor introduced or
+      # can fix in their PR, so gating on them would paint every incoming PR red on
+      # arrival — worse than no signal, because it teaches everyone to ignore the X.
+      # They run here so the output is visible next to the baseline.
+      #
+      # Promoting them is cheap and worth doing: clear the 3 clippy findings, land a
+      # `rustfmt.toml` capturing the style actually in use, reformat in one commit,
+      # then drop the two continue-on-error lines below. The release gate has never
+      # run either, which is how the drift accumulated unnoticed.
+      - name: Format (advisory)
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      # This workspace CANNOT be built as one unit, by design: dagron-core compiles
+      # exactly one sqlx backend (compile_error! otherwise), the engine wants sqlite,
+      # and dagron-api/dagron-gitops want postgres. `--workspace` unifies features,
+      # enables both, and fails to compile — so each step covers the two feature
+      # worlds separately, which is also how the images are actually built. Every
+      # member is covered exactly once; a new member that picks postgres belongs in
+      # the second command of each pair.
+      - name: Clippy (advisory — see the note above)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cargo clippy --locked --workspace --exclude dagron-api --exclude dagron-gitops \
+            --all-targets -- -D warnings
+          cargo clippy --locked -p dagron-api -p dagron-gitops --all-targets -- -D warnings
+
+      # --locked, so a PR that edits a Cargo.toml without refreshing Cargo.lock fails
+      # here with a clear message rather than drifting the published lockfile.
+      - name: Build (required)
+        run: |
+          set -euo pipefail
+          cargo build --locked --workspace --exclude dagron-api --exclude dagron-gitops
+          cargo build --locked -p dagron-api -p dagron-gitops
+
+      - name: Test (required)
+        run: |
+          set -euo pipefail
+          cargo test --locked --workspace --exclude dagron-api --exclude dagron-gitops
+          cargo test --locked -p dagron-api -p dagron-gitops

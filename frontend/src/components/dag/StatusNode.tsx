@@ -4,6 +4,31 @@ import { Handle, Position, type NodeProps } from "@xyflow/react";
 import { statusColor, statusLabel, type WaitingOn } from "@/lib/adapter";
 import { fromNow } from "@/lib/time";
 import type { TaskStatus } from "@/types/dagron";
+import {
+  NODE_MID_GAP,
+  NODE_PAD_Y,
+  NODE_ROW_GAP,
+  NODE_ROW_LH,
+  NODE_TITLE_LH,
+} from "./layout";
+
+/// Every row is `flexShrink: 0` with an explicit `lineHeight`. The node is a
+/// fixed-height flex column, so a shrinkable row absorbs any shortfall between
+/// the declared height and what the rows need — and on the name row, which
+/// clips its overflow, that shows up as letters cut off mid-glyph rather than
+/// as anything that looks like a layout bug. Holding the line boxes fixed means
+/// a future extra row overflows visibly instead of quietly cropping text.
+const ROW = { flexShrink: 0, lineHeight: `${NODE_ROW_LH}px` } as const;
+/// Shared by the two subtitle rows (sub-workflow / template / image).
+const SUBTITLE = {
+  ...ROW,
+  color: "var(--muted)",
+  fontSize: 11,
+  marginTop: NODE_MID_GAP,
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
+} as const;
 
 export interface StatusNodeData {
   name: string;
@@ -86,41 +111,50 @@ export default function StatusNode({ data, sourcePosition, targetPosition }: Nod
         // Dashed outline distinguishes a chained sub-workflow from a leaf step.
         borderStyle: isRef ? "dashed" : "solid",
         borderRadius: 6,
-        padding: "8px 10px",
+        padding: `${NODE_PAD_Y}px 10px`,
         color: "var(--fg)",
         fontSize: 13,
       }}
     >
       <Handle type="target" position={targetPosition ?? Position.Top} />
-      <div style={{ fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+      <div
+        style={{
+          flexShrink: 0,
+          lineHeight: `${NODE_TITLE_LH}px`,
+          fontWeight: 600,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+        }}
+        title={d.name}
+      >
         {d.name}
       </div>
       {isWorkflowRef && (
-        <div
-          style={{ color: "var(--muted)", fontSize: 11, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-          title={`Runs saved workflow: ${d.workflowRef}`}
-        >
+        <div style={SUBTITLE} title={`Runs saved workflow: ${d.workflowRef}`}>
           ⧉ {d.workflowRef}
         </div>
       )}
       {isTemplate && (
-        <div
-          style={{ color: "var(--muted)", fontSize: 11, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-          title={`Calls template: ${d.templateRef}`}
-        >
+        <div style={SUBTITLE} title={`Calls template: ${d.templateRef}`}>
           ⧉ {d.templateRef}
           {d.templateTasks ? ` · ${d.templateTasks} tasks` : ""}
         </div>
       )}
       {!isRef && d.dockerImage && (
-        <div
-          style={{ color: "var(--muted)", fontSize: 11, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-          title={`Runs in container image: ${d.dockerImage}`}
-        >
+        <div style={SUBTITLE} title={`Runs in container image: ${d.dockerImage}`}>
           ◳ {d.dockerImage}
         </div>
       )}
-      <div style={{ display: "flex", justifyContent: "space-between", gap: 6, marginTop: 4 }}>
+      <div
+        style={{
+          ...ROW,
+          display: "flex",
+          justifyContent: "space-between",
+          gap: 6,
+          marginTop: NODE_ROW_GAP,
+        }}
+      >
         <span
           style={{ color: d.waiting ? "var(--blue)" : color, fontSize: 11 }}
           title={d.waiting ? `${d.waiting.label}: ${d.waiting.detail}` : undefined}

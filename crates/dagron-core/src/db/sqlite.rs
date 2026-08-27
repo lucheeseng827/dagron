@@ -72,6 +72,13 @@ pub async fn init_pool(db_path: &str) -> Result<Pool> {
     Ok(pool)
 }
 
+/// Readiness probe: one round trip proving a pooled connection can be acquired
+/// and the datastore answers. Used by the ops API's `/readyz` (LOW_LATENCY R-1).
+pub async fn ping(pool: &Pool) -> Result<()> {
+    sqlx::query("SELECT 1").execute(pool).await?;
+    Ok(())
+}
+
 /// Inserts a workflow_definition + workflow_run + all task_runs + dependency edges
 /// in a single transaction. Returns the new run_id.
 pub async fn create_run(pool: &Pool, dag: &DagGraph, yaml_spec: &str) -> Result<String> {
@@ -173,7 +180,95 @@ async fn create_run_inner(
     // share a gang_id — the unit the gang-aware claimer seizes all-or-nothing.
     // `task_ids` maps the AUTHORED name to every row it produced, so an edge
     // to a gang fans out to all members (a dependent waits for the whole gang).
+    // (LOW_LATENCY B-3) Rows are inserted in multi-row chunks — one statement
+    // per ~1,000 tasks / ~5,000 edges instead of one statement per row. On a
+    // networked datastore the old shape made submit latency O(tasks + edges)
+    // round trips inside one transaction (a 2,000-task / 19,500-edge DAG paid
+    // ~21,500 sequential executions); the chunked shape is a handful. Chunks
+    // flush as they fill rather than buffering the whole DAG: the serialized
+    // TaskSpec is the heavy field, so peak memory is one chunk of rows, not
+    // the full run (`task_ids` — name → row ids for edge wiring — is the only
+    // whole-DAG structure, and it holds ids alone). Semantics are unchanged:
+    // same transaction, same duplicate-name check, same gang fan-out, same
+    // column values.
+    struct TaskRow {
+        id: String,
+        name: String,
+        dep_count: i64,
+        input_json: String,
+        trigger_rule: String,
+        allow_failure: i64,
+        is_approval: i64,
+        approval_timeout: Option<i64>,
+        approval_on_timeout: Option<String>,
+        runner_class: String,
+        gang_id: Option<String>,
+        gang_rank: Option<i64>,
+        gang_size: Option<i64>,
+        priority: i64,
+        pool_name: Option<String>,
+    }
+    // Chunk sizes stay well inside both backends' bind limits: 18 columns ×
+    // 1,000 rows = 18,000 binds (Postgres caps at 65,535; bundled SQLite at
+    // 32,766), edges are 2 × 5,000 = 10,000.
+    const TASK_INSERT_CHUNK: usize = 1_000;
+    const EDGE_INSERT_CHUNK: usize = 5_000;
+
+    // One multi-row INSERT of at most TASK_INSERT_CHUNK buffered rows — the
+    // flush target for the build loop below.
+    async fn insert_task_chunk(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        run_id: &str,
+        now: &str,
+        rows: &[TaskRow],
+    ) -> Result<()> {
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "INSERT INTO task_runs \
+             (id, run_id, name, status, remaining_deps, input, scheduled_at, trigger_rule, \
+              allow_failure, is_approval, approval_timeout_secs, approval_on_timeout, \
+              runner_class, gang_id, gang_rank, gang_size, priority, pool) ",
+        );
+        qb.push_values(rows, |mut b, r| {
+            b.push_bind(&r.id)
+                .push_bind(run_id)
+                .push_bind(&r.name)
+                .push_bind("pending")
+                .push_bind(r.dep_count)
+                .push_bind(&r.input_json)
+                .push_bind(now)
+                .push_bind(&r.trigger_rule)
+                .push_bind(r.allow_failure)
+                .push_bind(r.is_approval)
+                .push_bind(r.approval_timeout)
+                .push_bind(r.approval_on_timeout.as_deref())
+                .push_bind(&r.runner_class)
+                .push_bind(r.gang_id.as_deref())
+                .push_bind(r.gang_rank)
+                .push_bind(r.gang_size)
+                .push_bind(r.priority)
+                .push_bind(r.pool_name.as_deref());
+        });
+        qb.build().execute(&mut **tx).await?;
+        Ok(())
+    }
+
+    // Same flush shape for dependency edges.
+    async fn insert_edge_chunk(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        edges: &[(String, String)],
+    ) -> Result<()> {
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "INSERT INTO task_dependencies (dependent_id, dependency_id) ",
+        );
+        qb.push_values(edges, |mut b, (dependent_id, dependency_id)| {
+            b.push_bind(dependent_id).push_bind(dependency_id);
+        });
+        qb.build().execute(&mut **tx).await?;
+        Ok(())
+    }
+
     let mut task_ids: HashMap<String, Vec<String>> = HashMap::new();
+    let mut task_rows: Vec<TaskRow> = Vec::new();
     for task_spec in &dag.spec.tasks {
         if task_ids.contains_key(&task_spec.name) {
             bail!("duplicate task name '{}' in run '{}'", task_spec.name, run_id);
@@ -195,7 +290,7 @@ async fn create_run_inner(
         let allow_failure = i64::from(task_spec.allow_failure);
         let is_approval = i64::from(task_spec.is_approval());
         let approval_timeout = task_spec.approval_timeout_secs.map(|s| s as i64);
-        let approval_on_timeout = task_spec.approval_on_timeout.as_deref();
+        let approval_on_timeout = task_spec.approval_on_timeout.clone();
         // Resolved task → DAG default → 'default', so the claim-path filter can
         // stay a plain column predicate with no spec re-parse.
         let runner_class = task_spec
@@ -223,40 +318,42 @@ async fn create_run_inner(
                 }
                 _ => (task_spec.name.clone(), serde_json::to_string(task_spec)?),
             };
-            sqlx::query(
-                "INSERT INTO task_runs
-                 (id, run_id, name, status, remaining_deps, input, scheduled_at, trigger_rule,
-                  allow_failure, is_approval, approval_timeout_secs, approval_on_timeout,
-                  runner_class, gang_id, gang_rank, gang_size, priority, pool)
-                 VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&task_id)
-            .bind(&run_id)
-            .bind(&name)
-            .bind(dep_count)
-            .bind(&input_json)
-            .bind(&now)
-            .bind(trigger_rule)
-            .bind(allow_failure)
-            .bind(is_approval)
-            .bind(approval_timeout)
-            .bind(approval_on_timeout)
-            .bind(runner_class)
-            .bind(&gang_id)
-            .bind(gang_id.as_ref().map(|_| rank as i64))
-            .bind(gang_size.map(|s| s as i64))
-            // Priority (#25) and pool (#21) are per-task claim inputs; every
-            // member of a gang inherits the authored task's values.
-            .bind(task_spec.priority)
-            .bind(task_spec.pool.as_deref())
-            .execute(&mut *tx)
-            .await?;
+            task_rows.push(TaskRow {
+                id: task_id.clone(),
+                name,
+                dep_count,
+                input_json,
+                trigger_rule: trigger_rule.to_string(),
+                allow_failure,
+                is_approval,
+                approval_timeout,
+                approval_on_timeout: approval_on_timeout.clone(),
+                runner_class: runner_class.to_string(),
+                gang_id: gang_id.clone(),
+                gang_rank: gang_id.as_ref().map(|_| rank as i64),
+                gang_size: gang_size.map(|s| s as i64),
+                // Priority (#25) and pool (#21) are per-task claim inputs;
+                // every member of a gang inherits the authored task's values.
+                priority: task_spec.priority,
+                pool_name: task_spec.pool.clone(),
+            });
             ids.push(task_id);
+            // Flush a full chunk immediately — the buffer never holds more
+            // than one chunk (a gang wider than the chunk flushes mid-task).
+            if task_rows.len() >= TASK_INSERT_CHUNK {
+                insert_task_chunk(&mut tx, &run_id, &now, &task_rows).await?;
+                task_rows.clear();
+            }
         }
         task_ids.insert(task_spec.name.clone(), ids);
     }
+    if !task_rows.is_empty() {
+        insert_task_chunk(&mut tx, &run_id, &now, &task_rows).await?;
+    }
 
-    // Wire up dependency edges (fanning across gang members on either side).
+    // Wire up dependency edges (fanning across gang members on either side),
+    // flushed in chunks as they accumulate like the task rows above.
+    let mut edges: Vec<(String, String)> = Vec::new();
     for task_spec in &dag.spec.tasks {
         for dep_name in &task_spec.depends_on {
             // DagGraph::from_yaml already rejects unknown deps, but don't panic
@@ -271,16 +368,17 @@ async fn create_run_inner(
             };
             for dependent_id in &task_ids[&task_spec.name] {
                 for dependency_id in dependency_ids {
-                    sqlx::query(
-                        "INSERT INTO task_dependencies (dependent_id, dependency_id) VALUES (?, ?)",
-                    )
-                    .bind(dependent_id)
-                    .bind(dependency_id)
-                    .execute(&mut *tx)
-                    .await?;
+                    edges.push((dependent_id.clone(), dependency_id.clone()));
+                    if edges.len() >= EDGE_INSERT_CHUNK {
+                        insert_edge_chunk(&mut tx, &edges).await?;
+                        edges.clear();
+                    }
                 }
             }
         }
+    }
+    if !edges.is_empty() {
+        insert_edge_chunk(&mut tx, &edges).await?;
     }
 
     // Exactly-once: the source cursor rides the run's transaction.
@@ -473,16 +571,127 @@ pub async fn recover_expired_leases(pool: &Pool) -> Result<u64> {
 }
 
 /// Advance pending tasks whose dependencies are all terminal
-/// (`remaining_deps == 0`): evaluate each task's `trigger_rule` against its
-/// dependencies' outcomes and either flip it to `ready` (rule satisfied) or
-/// `skipped` (not satisfied — e.g. an `all_success` task with a failed
-/// dependency). A newly-skipped task is itself terminal, so its dependents'
-/// `remaining_deps` are decremented; the resulting cascade resolves over
-/// subsequent reconcile ticks. Returns the number of tasks transitioned.
+/// (`remaining_deps == 0`) to `ready` or `skipped`, per their `trigger_rule`.
+/// Returns the number of tasks transitioned.
+///
+/// (LOW_LATENCY B-1) Two paths share the work. The **fast path** is one
+/// set-based UPDATE pair covering the default shape — `trigger_rule =
+/// 'all_success'`, not an approval gate, no runtime `when` — which is nearly
+/// every task: ready when every dependency succeeded, skipped otherwise, with
+/// skipped rows' dependents decremented atomically with the skip itself. The
+/// old per-candidate implementation issued a dependency-status SELECT plus an
+/// UPDATE per task, serially — a 200-wide fan-out becoming ready cost ~400
+/// sequential round trips on the dispatch critical path. Everything not
+/// *provably* default-shaped (custom rules, approvals, anything whose stored
+/// input merely *contains* a `"when"` key — the LIKE filter is deliberately
+/// conservative) takes the **slow path**: the original per-task evaluation,
+/// byte-for-byte, so exotic semantics cannot drift.
+///
+/// Rounds alternate the two paths so a skip cascade feeds newly-unblocked
+/// dependents of either shape back in; the cap bounds one call, and anything
+/// deeper resolves on the next tick — the old one-level-per-call behaviour,
+/// except cascades now usually finish in a single call.
+///
+/// Every transition stays guarded by `status = 'pending'`, so concurrent
+/// schedulers remain winner-take-all and a skip's dependent-decrement runs
+/// exactly once.
+pub async fn advance_ready_tasks(pool: &Pool) -> Result<u64> {
+    let mut transitioned = 0u64;
+    for _round in 0..64 {
+        // Cheap round gate: with no candidate at all — the common idle tick —
+        // this probe is the whole call, matching the old implementation's
+        // single candidates query instead of paying the fast path's two
+        // UPDATE scans plus the slow path's fetch. `pending` rows only exist
+        // for active runs, so every statement here scans live work, never
+        // history.
+        let any: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM task_runs WHERE status = 'pending' AND remaining_deps = 0 LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await?;
+        if any.is_none() {
+            break;
+        }
+        let n = advance_default_shaped(pool).await? + advance_exotic_once(pool).await?;
+        transitioned += n;
+        if n == 0 {
+            break;
+        }
+    }
+    Ok(transitioned)
+}
+
+/// One set-based pass over the default-shaped frontier — the Postgres twin's
+/// rationale applies verbatim (see [`advance_ready_tasks`] and
+/// `db/postgres.rs`); only the parameter syntax and the skip-decrement shape
+/// differ (SQLite has no array binds, so skipped rows decrement their
+/// dependents one terminal task at a time — exactly the old per-task cost, on
+/// what is the rare path).
+async fn advance_default_shaped(pool: &Pool) -> Result<u64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let readied = sqlx::query(
+        "UPDATE task_runs SET status = 'ready', scheduled_at = ?
+         WHERE status = 'pending' AND remaining_deps = 0
+           AND trigger_rule = 'all_success' AND is_approval = 0
+           AND (input IS NULL OR input NOT LIKE '%\"when\"%')
+           AND NOT EXISTS (
+               SELECT 1 FROM task_dependencies d
+               JOIN task_runs dep ON dep.id = d.dependency_id
+               WHERE d.dependent_id = task_runs.id AND dep.status <> 'succeeded'
+           )",
+    )
+    .bind(&now)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    // The skip and its dependent-decrements are ONE transaction — a skip is
+    // terminal, and the old per-task path made the pair atomic. Split across
+    // auto-commit statements, a crash between them would leave the skipped
+    // rows terminal but their dependents' `remaining_deps` inflated forever:
+    // nothing revisits a terminal task, so the run stalls permanently.
+    let mut tx = pool.begin().await?;
+    let skipped: Vec<String> = sqlx::query_scalar(
+        "UPDATE task_runs SET status = 'skipped', finished_at = ?
+         WHERE status = 'pending' AND remaining_deps = 0
+           AND trigger_rule = 'all_success' AND is_approval = 0
+           AND (input IS NULL OR input NOT LIKE '%\"when\"%')
+           AND EXISTS (
+               SELECT 1 FROM task_dependencies d
+               JOIN task_runs dep ON dep.id = d.dependency_id
+               WHERE d.dependent_id = task_runs.id AND dep.status <> 'succeeded'
+           )
+         RETURNING id",
+    )
+    .bind(&now)
+    .fetch_all(&mut *tx)
+    .await?;
+    for id in &skipped {
+        sqlx::query(
+            "UPDATE task_runs SET remaining_deps = remaining_deps - 1
+             WHERE status = 'pending' AND id IN (
+                 SELECT dependent_id FROM task_dependencies WHERE dependency_id = ?
+             )",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(readied + skipped.len() as u64)
+}
+
+/// One per-task pass over candidates the fast path could not prove
+/// default-shaped: custom trigger rules, approval gates, and runtime `when`
+/// conditions (plus LIKE-filter false positives, which are merely slower here,
+/// never wrong). Evaluates each task's `trigger_rule` against its
+/// dependencies' outcomes and flips it to `ready` (satisfied) or `skipped`
+/// (not satisfied); a newly-skipped task decrements its dependents. This is
+/// the original `advance_ready_tasks` body, unchanged.
 ///
 /// Each transition is guarded by `status = 'pending'`, so concurrent schedulers
 /// are winner-take-all and a skip's dependent-decrement runs exactly once.
-pub async fn advance_ready_tasks(pool: &Pool) -> Result<u64> {
+async fn advance_exotic_once(pool: &Pool) -> Result<u64> {
     // (id, run_id, trigger_rule, is_approval, input) for every task whose deps
     // are all terminal.
     let candidates: Vec<(String, String, String, i64, Option<String>)> = sqlx::query_as(
@@ -578,9 +787,19 @@ pub async fn advance_ready_tasks(pool: &Pool) -> Result<u64> {
                 .await?
                 .rows_affected()
             } else {
+                // Stamp `scheduled_at` with the moment the task became
+                // claimable — the Postgres twin's rationale applies verbatim:
+                // it refines the claim order into readiness-FIFO (a run's
+                // tasks all share one creation timestamp) and makes ready-age
+                // honest for the dispatch-latency histogram, the stale-ready
+                // alarm, and spillover reclassing. Retries and approval parks
+                // already stamp their own `scheduled_at` on transition.
+                let now = chrono::Utc::now().to_rfc3339();
                 sqlx::query(
-                    "UPDATE task_runs SET status = 'ready' WHERE id = ? AND status = 'pending'",
+                    "UPDATE task_runs SET status = 'ready', scheduled_at = ?
+                     WHERE id = ? AND status = 'pending'",
                 )
+                .bind(&now)
                 .bind(&task_id)
                 .execute(pool)
                 .await?
@@ -735,7 +954,8 @@ async fn claim_ready_filtered(
         return Ok(vec![]);
     }
 
-    let lease_exp = (chrono::Utc::now() + chrono::TimeDelta::seconds(30)).to_rfc3339();
+    let lease_exp =
+        (chrono::Utc::now() + chrono::TimeDelta::seconds(super::lease_secs())).to_rfc3339();
     let mut claimed = Vec::with_capacity(candidates.len());
 
     for task in candidates {
@@ -855,7 +1075,8 @@ pub async fn claim_ready_gang(
         return Ok(Vec::new());
     };
 
-    let lease_exp = (chrono::Utc::now() + chrono::TimeDelta::seconds(30)).to_rfc3339();
+    let lease_exp =
+        (chrono::Utc::now() + chrono::TimeDelta::seconds(super::lease_secs())).to_rfc3339();
     let claimed = sqlx::query_as::<_, TaskRun>(
         "UPDATE task_runs
          SET status = 'running',
@@ -997,7 +1218,8 @@ async fn mark_task_succeeded_inner(
         return Ok(false);
     }
 
-    // Decrement remaining_deps; advance_ready_tasks will flip zeros to 'ready'.
+    // Decrement remaining_deps; dependents this statement does not promote
+    // below are flipped by advance_ready_tasks.
     sqlx::query(
         "UPDATE task_runs
          SET remaining_deps = remaining_deps - 1
@@ -1005,6 +1227,35 @@ async fn mark_task_succeeded_inner(
              SELECT dependent_id FROM task_dependencies WHERE dependency_id = ?
          ) AND status = 'pending'",
     )
+    .bind(task_id)
+    .execute(&mut *tx)
+    .await?;
+
+    // (LOW_LATENCY B-2) Advance-on-mark: promote this task's default-shaped
+    // dependents that just hit `remaining_deps = 0` straight to `ready`, in
+    // the same transaction as the decrement above. The happy-path hop then
+    // needs no separate advance step at all — mark → NOTIFY → claim. Same
+    // predicate as the fast path in `advance_default_shaped` (all_success,
+    // not an approval, no `when` key), and the NOT EXISTS re-checks *every*
+    // dependency of the dependent, not just this one, so a dependent with a
+    // separately-failed dependency is left for the skip half of the next
+    // advance sweep. Success-mark only: a failure's dependents skip-cascade
+    // through `advance_ready_tasks` on the next tick, off the hot path.
+    sqlx::query(
+        "UPDATE task_runs SET status = 'ready', scheduled_at = ?
+         WHERE status = 'pending' AND remaining_deps = 0
+           AND trigger_rule = 'all_success' AND is_approval = 0
+           AND (input IS NULL OR input NOT LIKE '%\"when\"%')
+           AND id IN (
+               SELECT dependent_id FROM task_dependencies WHERE dependency_id = ?
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM task_dependencies d
+               JOIN task_runs dep ON dep.id = d.dependency_id
+               WHERE d.dependent_id = task_runs.id AND dep.status <> 'succeeded'
+           )",
+    )
+    .bind(&now)
     .bind(task_id)
     .execute(&mut *tx)
     .await?;
@@ -1276,7 +1527,36 @@ pub async fn release_subworkflow_task(pool: &Pool, task_id: &str, fence: i64) ->
 /// `succeeded` → the task succeeds and dependents advance; otherwise it fails
 /// (its `all_success` dependents skip). Guarded on the parked shape
 /// (`status = 'running' AND sub_run_id IS NOT NULL`), so a re-sweep is a no-op.
-pub async fn resolve_subworkflow(pool: &Pool, task_id: &str, succeeded: bool) -> Result<bool> {
+///
+/// **The child run's own output becomes this task's output** when it has one,
+/// falling back to the constant below when it does not (G-AG5). Without that a
+/// sub-workflow is a procedure and not a function: `result_from` gives a run a
+/// single return value, and the parent used to throw it away and write
+/// "sub-workflow succeeded" instead, so `{{ tasks.<child>.output }}` in the
+/// parent was a constant and nothing downstream could branch on what the child
+/// decided.
+///
+/// It matters on the failure side too. A child that died on its
+/// `run_timeout_secs` deadline records *why* on the run row; propagating it puts
+/// that reason in the parent's failure summary instead of the word "failed".
+///
+/// It is also what any loop over a sub-workflow needs: a condition on the
+/// trigger's output can only mean something once that output is the child's
+/// verdict rather than a constant.
+///
+/// Guarded on the **specific** `child_run_id` the sweep observed, for the same
+/// reason [`requeue_parked_subworkflow`] is. Before `repeat:` existed a trigger
+/// parked exactly once, so `sub_run_id IS NOT NULL` was enough: a stale
+/// duplicate sweep found the row already resolved and did nothing. A repeating
+/// trigger re-parks, so under Postgres HA a stale sweep could resolve a trigger
+/// that had already moved on — ending the loop early, releasing downstream work,
+/// and orphaning the turn still running. The CAS makes that a no-op.
+pub async fn resolve_subworkflow(
+    pool: &Pool,
+    task_id: &str,
+    child_run_id: &str,
+    succeeded: bool,
+) -> Result<bool> {
     let now = chrono::Utc::now().to_rfc3339();
     let (status, output) = if succeeded {
         ("succeeded", "sub-workflow succeeded")
@@ -1284,14 +1564,130 @@ pub async fn resolve_subworkflow(pool: &Pool, task_id: &str, succeeded: bool) ->
         ("failed", "sub-workflow failed")
     };
     let mut tx = pool.begin().await?;
+    // The child's output, or the constant when it has none. A correlated
+    // subquery rather than a second round trip: the read and the write must see
+    // the same row, and the guard below already makes this statement the one
+    // place the parked shape is resolved.
     let rows = sqlx::query(
-        "UPDATE task_runs SET status = ?, finished_at = ?, output = ?
-         WHERE id = ? AND status = 'running' AND sub_run_id IS NOT NULL",
+        "UPDATE task_runs SET status = ?, finished_at = ?,
+                output = COALESCE(
+                    (SELECT wr.output FROM workflow_runs wr WHERE wr.id = task_runs.sub_run_id),
+                    ?)
+         WHERE id = ? AND status = 'running' AND sub_run_id = ?",
     )
     .bind(status)
     .bind(&now)
     .bind(output)
     .bind(task_id)
+    .bind(child_run_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if rows == 0 {
+        tx.commit().await?;
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE task_runs SET remaining_deps = remaining_deps - 1
+         WHERE id IN (
+             SELECT dependent_id FROM task_dependencies WHERE dependency_id = ?
+         ) AND status = 'pending'",
+    )
+    .bind(task_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Re-arm a **parked** sub-workflow trigger for another iteration (`repeat:`).
+///
+/// The loop operator's existing re-queue, [`retry_task`], is fence-guarded on
+/// `claimed_by = worker_id AND version = fence` — it re-arms a task whose worker
+/// is handing it back. A parked trigger has `claimed_by = NULL` by construction:
+/// `park_subworkflow` clears the lease precisely so lease recovery leaves it
+/// alone while its child run works. There is no worker to authenticate, so this
+/// guards on the **parked shape** instead, exactly as `resolve_subworkflow`
+/// does, which makes it idempotent under a concurrent sweep on another
+/// scheduler.
+///
+/// `sub_run_id` is cleared in the same statement, and that is the whole
+/// correctness argument: it is what takes the row out of the parked set, so the
+/// sweep cannot see this iteration twice and start two child runs for one turn.
+///
+/// The guard is on the **specific** `child_run_id` the sweep observed terminal,
+/// not merely on "parked". A concurrent HA sweep working a stale snapshot could
+/// otherwise re-arm this trigger after another scheduler already requeued it,
+/// the worker re-dispatched it, and it re-parked on a *newer* child — clobbering
+/// that child's parking and orphaning its run. Matching the observed child means
+/// a stale re-arm finds no row and is a no-op.
+///
+/// `version` is bumped so any fence still held from the original claim — a
+/// worker that dispatched the trigger and has not noticed — cannot act on the
+/// re-armed row.
+///
+/// Deliberately does **not** touch `remaining_deps` on dependents. This is not a
+/// completion: the trigger is going round again, and its dependents must stay
+/// blocked until the loop is genuinely over. That is why the caller decides
+/// *before* resolving rather than resolving and re-arming — resolving already
+/// decrements them, and a loop that decremented once per turn would release
+/// downstream work on the first turn.
+pub async fn requeue_parked_subworkflow(
+    pool: &Pool,
+    task_id: &str,
+    child_run_id: &str,
+    output: Option<&str>,
+    retry_at: &str,
+) -> Result<bool> {
+    let rows = sqlx::query(
+        "UPDATE task_runs
+         SET status = 'ready',
+             scheduled_at = ?,
+             sub_run_id = NULL,
+             claimed_by = NULL,
+             lease_expires_at = NULL,
+             finished_at = NULL,
+             output = ?,
+             version = version + 1
+         WHERE id = ? AND status = 'running' AND sub_run_id = ?",
+    )
+    .bind(retry_at)
+    .bind(output)
+    .bind(task_id)
+    .bind(child_run_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(rows > 0)
+}
+
+/// Fail a **parked** sub-workflow trigger with `reason`, advancing its
+/// dependents the way a normal failure does.
+///
+/// Used when `repeat:` runs out of iterations: the child run succeeded, so
+/// [`resolve_subworkflow`] would record a success, but the *loop* failed and the
+/// task must say so. Same dependent decrement as a resolution, so it is
+/// interchangeable with one and equally idempotent — and, like
+/// [`requeue_parked_subworkflow`], guarded on the **specific** `child_run_id` the
+/// sweep observed, so a stale HA sweep cannot fail a trigger that has already
+/// moved on to a newer iteration.
+pub async fn fail_parked_subworkflow(
+    pool: &Pool,
+    task_id: &str,
+    child_run_id: &str,
+    reason: &str,
+) -> Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    let rows = sqlx::query(
+        "UPDATE task_runs SET status = 'failed', finished_at = ?, output = ?,
+                sub_run_id = NULL
+         WHERE id = ? AND status = 'running' AND sub_run_id = ?",
+    )
+    .bind(&now)
+    .bind(reason)
+    .bind(task_id)
+    .bind(child_run_id)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -1313,9 +1709,23 @@ pub async fn resolve_subworkflow(pool: &Pool, task_id: &str, succeeded: bool) ->
 }
 
 /// Sweep parked sub-workflow tasks (#23): for each `running` task holding a
-/// `sub_run_id`, if its child run is terminal, resolve the parent (succeed/fail).
-/// Returns the `(task_id, succeeded)` resolutions. Run each reconcile tick;
-/// idempotent via `resolve_subworkflow`'s guard.
+/// `sub_run_id`, if its child run is terminal, decide what happens to the
+/// trigger.
+///
+/// Without `repeat:` that decision is the old one: the trigger succeeds or fails
+/// with its child. With `repeat:` the trigger is a **loop** and each child run is
+/// one iteration — the condition is evaluated against the child's result and,
+/// unless it holds, the trigger is re-armed to start the next child run.
+///
+/// **The decision is made before resolving, never after.** `resolve_subworkflow`
+/// decrements dependents' `remaining_deps` as part of completing the task, so
+/// resolving first and re-arming afterwards would release downstream work on the
+/// first iteration and again on every one after it. Deciding first means a
+/// continuing loop never touches a dependent at all.
+///
+/// Returns the `(task_id, succeeded)` resolutions — iterations that continued are
+/// not resolutions and are not reported. Run each reconcile tick; idempotent via
+/// the parked-shape guards, so every scheduler in an HA set may sweep.
 pub async fn reconcile_subworkflows(pool: &Pool) -> Result<Vec<(String, bool)>> {
     let parked: Vec<(String, String)> = sqlx::query_as(
         "SELECT id, sub_run_id FROM task_runs
@@ -1326,22 +1736,105 @@ pub async fn reconcile_subworkflows(pool: &Pool) -> Result<Vec<(String, bool)>> 
 
     let mut resolved = Vec::new();
     for (task_id, child_run_id) in parked {
-        let child_status: Option<String> =
-            sqlx::query_scalar("SELECT status FROM workflow_runs WHERE id = ?")
+        let child: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT status, output FROM workflow_runs WHERE id = ?")
                 .bind(&child_run_id)
                 .fetch_optional(pool)
                 .await?;
-        let Some(cs) = child_status else { continue }; // child gone → leave parked
-        let succeeded = match cs.as_str() {
+        let Some((child_status, child_output)) = child else { continue }; // child gone → leave parked
+        let succeeded = match child_status.as_str() {
             "succeeded" => true,
             "failed" | "cancelled" => false,
             _ => continue, // still running/pending
         };
-        if resolve_subworkflow(pool, &task_id, succeeded).await? {
+
+        // A *successful* iteration is the only thing a loop condition gets to
+        // judge. A failed child fails the trigger outright: `repeat` decides when
+        // a loop is over, not whether a failure counts — retries are the task's
+        // own `max_attempts`.
+        if succeeded {
+            match repeat_spec_of(pool, &task_id).await {
+                Ok(Some(rep)) => {
+                    // `attempt` is incremented on claim, so the stored value is the
+                    // number of iterations that have run, this one included.
+                    let iteration: i64 =
+                        sqlx::query_scalar("SELECT attempt FROM task_runs WHERE id = ?")
+                            .bind(&task_id)
+                            .fetch_optional(pool)
+                            .await?
+                            .unwrap_or(1);
+                    let output = child_output.clone().unwrap_or_default();
+                    match rep.decide(&output, iteration) {
+                        crate::dag::RepeatDecision::Done => {}
+                        crate::dag::RepeatDecision::Again { delay_secs } => {
+                            let retry_at = crate::dag::delayed_retry_at(delay_secs);
+                            // The last turn's result is carried forward as the
+                            // trigger's output, so a run inspected mid-loop shows
+                            // where the conversation has got to, not a stale value.
+                            requeue_parked_subworkflow(
+                                pool,
+                                &task_id,
+                                &child_run_id,
+                                child_output.as_deref(),
+                                &retry_at,
+                            )
+                            .await?;
+                            continue;
+                        }
+                        crate::dag::RepeatDecision::Fail { reason } => {
+                            // Report a resolution only if this sweep actually
+                            // landed the failure. The CAS guard means a stale HA
+                            // sweep can match nothing; pushing regardless would
+                            // log a phantom "resolved" for a task it never
+                            // touched — the `Done` path already checks its bool.
+                            if fail_parked_subworkflow(pool, &task_id, &child_run_id, &reason)
+                                .await?
+                            {
+                                resolved.push((task_id, false));
+                            }
+                            continue;
+                        }
+                    }
+                }
+                // Not a loop — fall through to the ordinary resolution below.
+                Ok(None) => {}
+                // A *read* error (not a parse failure — see `repeat_spec_of`) must
+                // not be mistaken for "no loop": resolving here would end a
+                // conversation and release its downstream on a transient blip.
+                // Leave the trigger parked and let the next sweep retry.
+                Err(e) => {
+                    tracing::warn!(%task_id, error = %e, "could not read a parked trigger's spec; leaving it parked for the next sweep");
+                    continue;
+                }
+            }
+        }
+
+        if resolve_subworkflow(pool, &task_id, &child_run_id, succeeded).await? {
             resolved.push((task_id, succeeded));
         }
     }
     Ok(resolved)
+}
+
+/// The `repeat:` spec of a task, from its stored `TaskSpec` JSON.
+///
+/// `Ok(None)` for the overwhelming majority of tasks, and for a row whose spec
+/// will not parse — a malformed `input` must not wedge the sweep for every other
+/// parked trigger, and a trigger with no readable loop resolves the way it always
+/// did. A **read** error is different and propagates as `Err`: swallowing it as
+/// `None` would let a transient DB blip silently end a conversation and release
+/// its downstream, which is the one outcome this feature must never produce.
+async fn repeat_spec_of(pool: &Pool, task_id: &str) -> Result<Option<crate::dag::RepeatSpec>> {
+    let Some(json) = task_input_json(pool, task_id).await? else {
+        return Ok(None);
+    };
+    match serde_json::from_str::<crate::dag::TaskSpec>(&json) {
+        Ok(spec) => Ok(spec.repeat),
+        Err(e) => {
+            tracing::warn!(%task_id, error = %e, "parked trigger has an unparseable spec; resolving without repeat");
+            Ok(None)
+        }
+    }
 }
 
 /// Park a claimed `type: wait` task on its resume deadline (#27): keep it
@@ -4350,6 +4843,383 @@ mod tests {
             .bind(&parent_run).fetch_one(&pool).await.unwrap();
         assert_eq!(down.0, "ready", "downstream advanced once the sub-workflow succeeded");
 
+        // A child with no result of its own falls back to the constant, so a
+        // sub-workflow that returns nothing still reads as having succeeded.
+        let out: (Option<String>,) =
+            sqlx::query_as("SELECT output FROM task_runs WHERE id = ?")
+                .bind(&trigger.id).fetch_one(&pool).await.unwrap();
+        assert_eq!(out.0.as_deref(), Some("sub-workflow succeeded"));
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The durable agent loop, end to end: a `repeat:` on a sub-workflow trigger
+    /// runs one child run per iteration and stops when the condition holds.
+    ///
+    /// The property that matters is the one that is easy to get wrong:
+    /// **downstream work stays blocked while the loop runs.** Resolving a
+    /// trigger decrements its dependents, so a loop that resolved-then-re-armed
+    /// would release the rest of the DAG on the first turn and again on every
+    /// turn after it. This asserts the dependent is still `pending` mid-loop.
+    #[tokio::test]
+    async fn a_repeating_sub_workflow_trigger_runs_one_child_per_iteration() {
+        let (pool, path) = temp_pool().await;
+
+        let child_yaml = "name: turn\ntasks:\n  - { name: c, command: [\"true\"] }\n";
+        sqlx::query("INSERT INTO workflows (id, name, spec, created_at, updated_at) VALUES ('wf-turn','turn',?,?,?)")
+            .bind(child_yaml).bind("t").bind("t").execute(&pool).await.unwrap();
+
+        let parent_yaml = "name: conversation\ntasks:\n  - { name: turn, type: workflow, workflow: turn, repeat: { until: \"{{ output }} == done\", max_iterations: 5 } }\n  - name: after\n    command: [\"true\"]\n    depends_on: [turn]\n";
+        let dag = DagGraph::from_yaml(parent_yaml).unwrap();
+        let parent_run = create_run(&pool, &dag, parent_yaml).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+
+        let child_dag = DagGraph::from_yaml(child_yaml).unwrap();
+        let mut child_runs = Vec::new();
+
+        // ── turn 1: the child says "continue" ───────────────────────────────
+        let claimed = claim_ready(&pool, "w", 10).await.unwrap();
+        let trigger = claimed.iter().find(|t| t.name == "turn").expect("trigger claimed");
+        let trigger_id = trigger.id.clone();
+        let child1 = create_run(&pool, &child_dag, child_yaml).await.unwrap();
+        assert!(park_subworkflow(&pool, &trigger_id, trigger.version + 1, &child1).await.unwrap());
+        sqlx::query("UPDATE workflow_runs SET status='succeeded', output='continue' WHERE id = ?")
+            .bind(&child1).execute(&pool).await.unwrap();
+        child_runs.push(child1);
+
+        // Not a resolution — the loop continues, so nothing is reported.
+        assert!(
+            reconcile_subworkflows(&pool).await.unwrap().is_empty(),
+            "a continuing iteration is not a resolution"
+        );
+
+        // Re-armed: claimable again, and out of the parked set so the next sweep
+        // cannot start a second child run for the same turn.
+        let (status, sub, out): (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT status, sub_run_id, output FROM task_runs WHERE id = ?")
+                .bind(&trigger_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(status, "ready", "the trigger is armed for the next turn");
+        assert_eq!(sub, None, "cleared, or the sweep would see this turn twice");
+        assert_eq!(out.as_deref(), Some("continue"), "the last turn's result is visible mid-loop");
+
+        // The rest of the DAG has NOT been released.
+        let (after_status, deps): (String, i64) = sqlx::query_as(
+            "SELECT status, remaining_deps FROM task_runs WHERE name='after' AND run_id = ?",
+        )
+        .bind(&parent_run).fetch_one(&pool).await.unwrap();
+        assert_eq!(after_status, "pending", "downstream must not start mid-loop");
+        assert_eq!(deps, 1, "a continuing iteration must not decrement a dependent");
+
+        // ── turn 2: the child says "done" ───────────────────────────────────
+        let claimed = claim_ready(&pool, "w", 10).await.unwrap();
+        let trigger = claimed.iter().find(|t| t.name == "turn").expect("re-claimed for turn 2");
+        let child2 = create_run(&pool, &child_dag, child_yaml).await.unwrap();
+        assert_ne!(child2, child_runs[0], "each turn is its own child run");
+        assert!(park_subworkflow(&pool, &trigger.id, trigger.version + 1, &child2).await.unwrap());
+        sqlx::query("UPDATE workflow_runs SET status='succeeded', output='done' WHERE id = ?")
+            .bind(&child2).execute(&pool).await.unwrap();
+
+        assert_eq!(
+            reconcile_subworkflows(&pool).await.unwrap(),
+            vec![(trigger_id.clone(), true)],
+            "the condition holds — now it is a resolution"
+        );
+        advance_ready_tasks(&pool).await.unwrap();
+        let (after_status,): (String,) = sqlx::query_as(
+            "SELECT status FROM task_runs WHERE name='after' AND run_id = ?",
+        )
+        .bind(&parent_run).fetch_one(&pool).await.unwrap();
+        assert_eq!(after_status, "ready", "downstream advances once, when the loop is over");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A loop that never converges fails, and says what it last saw. Succeeding
+    /// would hand `after` a result the conversation never reached.
+    #[tokio::test]
+    async fn a_loop_that_never_converges_fails_the_trigger() {
+        let (pool, path) = temp_pool().await;
+
+        let child_yaml = "name: turn\ntasks:\n  - { name: c, command: [\"true\"] }\n";
+        let parent_yaml = "name: conversation\ntasks:\n  - { name: turn, type: workflow, workflow: turn, repeat: { until: \"{{ output }} == done\", max_iterations: 1 } }\n";
+        let dag = DagGraph::from_yaml(parent_yaml).unwrap();
+        create_run(&pool, &dag, parent_yaml).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+
+        let claimed = claim_ready(&pool, "w", 10).await.unwrap();
+        let trigger = claimed.iter().find(|t| t.name == "turn").expect("trigger claimed");
+        let child_dag = DagGraph::from_yaml(child_yaml).unwrap();
+        let child = create_run(&pool, &child_dag, child_yaml).await.unwrap();
+        assert!(park_subworkflow(&pool, &trigger.id, trigger.version + 1, &child).await.unwrap());
+        sqlx::query("UPDATE workflow_runs SET status='succeeded', output='still thinking' WHERE id = ?")
+            .bind(&child).execute(&pool).await.unwrap();
+
+        assert_eq!(
+            reconcile_subworkflows(&pool).await.unwrap(),
+            vec![(trigger.id.clone(), false)],
+            "the only iteration allowed did not converge"
+        );
+        let (status, out): (String, Option<String>) =
+            sqlx::query_as("SELECT status, output FROM task_runs WHERE id = ?")
+                .bind(&trigger.id).fetch_one(&pool).await.unwrap();
+        assert_eq!(status, "failed");
+        let out = out.unwrap_or_default();
+        assert!(out.contains("not satisfied after 1 iterations"), "got: {out}");
+        assert!(out.contains("still thinking"), "the last turn's output has to be in the reason");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A failed child fails the trigger even under `repeat:`. The loop operator
+    /// decides when a conversation is over, not whether a failure counts —
+    /// retrying a broken turn is `max_attempts`, and conflating the two would
+    /// make a loop silently paper over every failure inside it.
+    #[tokio::test]
+    async fn a_failed_turn_fails_the_loop_rather_than_repeating_it() {
+        let (pool, path) = temp_pool().await;
+
+        let child_yaml = "name: turn\ntasks:\n  - { name: c, command: [\"true\"] }\n";
+        let parent_yaml = "name: conversation\ntasks:\n  - { name: turn, type: workflow, workflow: turn, repeat: { until: \"{{ output }} == done\", max_iterations: 9 } }\n";
+        let dag = DagGraph::from_yaml(parent_yaml).unwrap();
+        create_run(&pool, &dag, parent_yaml).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+
+        let claimed = claim_ready(&pool, "w", 10).await.unwrap();
+        let trigger = claimed.iter().find(|t| t.name == "turn").expect("trigger claimed");
+        let child_dag = DagGraph::from_yaml(child_yaml).unwrap();
+        let child = create_run(&pool, &child_dag, child_yaml).await.unwrap();
+        assert!(park_subworkflow(&pool, &trigger.id, trigger.version + 1, &child).await.unwrap());
+        sqlx::query("UPDATE workflow_runs SET status='failed', output='the tool exploded' WHERE id = ?")
+            .bind(&child).execute(&pool).await.unwrap();
+
+        assert_eq!(
+            reconcile_subworkflows(&pool).await.unwrap(),
+            vec![(trigger.id.clone(), false)],
+            "iterations remained, but a failed turn is not something to repeat"
+        );
+        let (status, out): (String, Option<String>) =
+            sqlx::query_as("SELECT status, output FROM task_runs WHERE id = ?")
+                .bind(&trigger.id).fetch_one(&pool).await.unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(out.as_deref(), Some("the tool exploded"), "the turn's reason carries up");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The *resolution* needs the same guard, and for a sharper reason: it is
+    /// the one that ends the loop. A stale HA sweep resolving a trigger that has
+    /// already moved on would succeed the task while a turn was still running —
+    /// releasing every downstream task and orphaning that turn's run.
+    ///
+    /// Before `repeat:` a trigger parked exactly once, so `sub_run_id IS NOT
+    /// NULL` was enough: a duplicate sweep found the row already resolved and
+    /// did nothing. Re-parking is what made the old guard too loose.
+    #[tokio::test]
+    async fn resolve_only_matches_the_observed_child() {
+        let (pool, path) = temp_pool().await;
+
+        let child_yaml = "name: turn
+tasks:
+  - { name: c, command: [\"true\"] }
+";
+        let parent_yaml = "name: parent
+tasks:
+  - { name: trigger, type: workflow, workflow: turn }
+  - name: down
+    command: [\"true\"]
+    depends_on: [trigger]
+";
+        let dag = DagGraph::from_yaml(parent_yaml).unwrap();
+        let parent_run = create_run(&pool, &dag, parent_yaml).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+
+        let claimed = claim_ready(&pool, "w", 10).await.unwrap();
+        let trigger = claimed.iter().find(|t| t.name == "trigger").expect("trigger claimed");
+        let trigger_id = trigger.id.clone();
+        let child_dag = DagGraph::from_yaml(child_yaml).unwrap();
+        let child = create_run(&pool, &child_dag, child_yaml).await.unwrap();
+        assert!(park_subworkflow(&pool, &trigger_id, trigger.version + 1, &child).await.unwrap());
+
+        // A resolution naming a child this trigger is not parked on is inert.
+        assert!(
+            !resolve_subworkflow(&pool, &trigger_id, "a-newer-child", true).await.unwrap(),
+            "a stale resolve must not end a loop that has moved on"
+        );
+        let (status,): (String,) =
+            sqlx::query_as("SELECT status FROM task_runs WHERE id = ?")
+                .bind(&trigger_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(status, "running", "still parked");
+        // …and downstream is untouched, which is the damage a stale resolve does.
+        let (down, deps): (String, i64) = sqlx::query_as(
+            "SELECT status, remaining_deps FROM task_runs WHERE name='down' AND run_id = ?",
+        )
+        .bind(&parent_run).fetch_one(&pool).await.unwrap();
+        assert_eq!(down, "pending");
+        assert_eq!(deps, 1, "a stale resolve must not release a dependent");
+
+        // The observed child resolves it.
+        assert!(resolve_subworkflow(&pool, &trigger_id, &child, true).await.unwrap());
+        let (status,): (String,) =
+            sqlx::query_as("SELECT status FROM task_runs WHERE id = ?")
+                .bind(&trigger_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(status, "succeeded");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Re-arm and fail both match only the child the sweep observed — not any
+    /// parked child. Under Postgres HA two schedulers sweep concurrently; a
+    /// stale one could otherwise re-arm a trigger that another scheduler already
+    /// requeued and a worker re-parked on a *newer* child, clobbering that
+    /// child's parking and orphaning its run. The guard is `sub_run_id = <the
+    /// observed child>`, so a stale re-arm finds no row and is a no-op.
+    #[tokio::test]
+    async fn requeue_and_fail_only_match_the_observed_child() {
+        let (pool, path) = temp_pool().await;
+
+        let child_yaml = "name: turn\ntasks:\n  - { name: c, command: [\"true\"] }\n";
+        let parent_yaml = "name: conversation\ntasks:\n  - { name: turn, type: workflow, workflow: turn, repeat: { until: \"{{ output }} == done\", max_iterations: 5 } }\n";
+        let dag = DagGraph::from_yaml(parent_yaml).unwrap();
+        create_run(&pool, &dag, parent_yaml).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+
+        let claimed = claim_ready(&pool, "w", 10).await.unwrap();
+        let trigger = claimed.iter().find(|t| t.name == "turn").expect("trigger claimed");
+        let trigger_id = trigger.id.clone();
+        let child_dag = DagGraph::from_yaml(child_yaml).unwrap();
+        let child = create_run(&pool, &child_dag, child_yaml).await.unwrap();
+        assert!(park_subworkflow(&pool, &trigger_id, trigger.version + 1, &child).await.unwrap());
+
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // A re-arm naming a child this trigger is NOT parked on is a no-op, and
+        // leaves the real parking untouched.
+        assert!(
+            !requeue_parked_subworkflow(&pool, &trigger_id, "a-newer-child", Some("stale"), &now)
+                .await
+                .unwrap(),
+            "a re-arm for the wrong child must not touch the parking"
+        );
+        // A fail for the wrong child is equally inert.
+        assert!(
+            !fail_parked_subworkflow(&pool, &trigger_id, "a-newer-child", "stale")
+                .await
+                .unwrap(),
+            "a fail for the wrong child must not touch the parking"
+        );
+        let (status, sub): (String, Option<String>) =
+            sqlx::query_as("SELECT status, sub_run_id FROM task_runs WHERE id = ?")
+                .bind(&trigger_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "running", "still parked after both stale calls");
+        assert_eq!(sub.as_deref(), Some(child.as_str()), "still on its real child");
+
+        // The observed child re-arms it.
+        assert!(
+            requeue_parked_subworkflow(&pool, &trigger_id, &child, Some("continue"), &now)
+                .await
+                .unwrap(),
+            "the observed child re-arms the trigger"
+        );
+        let (status, sub): (String, Option<String>) =
+            sqlx::query_as("SELECT status, sub_run_id FROM task_runs WHERE id = ?")
+                .bind(&trigger_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "ready");
+        assert_eq!(sub, None, "cleared out of the parked set");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A sub-workflow's `result_from` result reaches the parent (G-AG5).
+    ///
+    /// Without this a sub-workflow is a procedure, not a function: the run has a
+    /// single return value and the parent threw it away for the constant
+    /// "sub-workflow succeeded", so `{{ tasks.<trigger>.output }}` could not
+    /// carry what the child decided — and `repeat: { until: … }` on the trigger
+    /// had nothing to read but a string that never changes.
+    #[tokio::test]
+    async fn a_sub_workflows_result_reaches_its_parent_task() {
+        let (pool, path) = temp_pool().await;
+
+        let child_yaml = "name: child\ntasks:\n  - { name: c, command: [\"true\"] }\n";
+        let parent_yaml = "name: parent\ntasks:\n  - { name: trigger, type: workflow, workflow: child }\n";
+        let dag = DagGraph::from_yaml(parent_yaml).unwrap();
+        create_run(&pool, &dag, parent_yaml).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+
+        let claimed = claim_ready(&pool, "w", 10).await.unwrap();
+        let trigger = claimed.iter().find(|t| t.name == "trigger").expect("trigger claimed");
+        let child_dag = DagGraph::from_yaml(child_yaml).unwrap();
+        let child_run = create_run(&pool, &child_dag, child_yaml).await.unwrap();
+        assert!(park_subworkflow(&pool, &trigger.id, trigger.version + 1, &child_run).await.unwrap());
+
+        // The child finishes with a result — what `result_from` writes onto the
+        // run row when the run succeeds.
+        sqlx::query("UPDATE workflow_runs SET status='succeeded', output='done' WHERE id = ?")
+            .bind(&child_run).execute(&pool).await.unwrap();
+        assert_eq!(
+            reconcile_subworkflows(&pool).await.unwrap(),
+            vec![(trigger.id.clone(), true)]
+        );
+
+        let out: (Option<String>,) =
+            sqlx::query_as("SELECT output FROM task_runs WHERE id = ?")
+                .bind(&trigger.id).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            out.0.as_deref(),
+            Some("done"),
+            "the child's result is the parent task's output, not a constant"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The same propagation on the failure side. A child that died on its
+    /// `run_timeout_secs` deadline records why on the run row; the parent's
+    /// failure summary should say that rather than the word "failed".
+    #[tokio::test]
+    async fn a_failed_sub_workflow_carries_its_reason_up() {
+        let (pool, path) = temp_pool().await;
+
+        let child_yaml = "name: child\ntasks:\n  - { name: c, command: [\"true\"] }\n";
+        let parent_yaml = "name: parent\ntasks:\n  - { name: trigger, type: workflow, workflow: child }\n";
+        let dag = DagGraph::from_yaml(parent_yaml).unwrap();
+        create_run(&pool, &dag, parent_yaml).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+
+        let claimed = claim_ready(&pool, "w", 10).await.unwrap();
+        let trigger = claimed.iter().find(|t| t.name == "trigger").expect("trigger claimed");
+        let child_dag = DagGraph::from_yaml(child_yaml).unwrap();
+        let child_run = create_run(&pool, &child_dag, child_yaml).await.unwrap();
+        assert!(park_subworkflow(&pool, &trigger.id, trigger.version + 1, &child_run).await.unwrap());
+
+        sqlx::query(
+            "UPDATE workflow_runs SET status='failed', output='run deadline exceeded (run_timeout_secs)' WHERE id = ?",
+        )
+        .bind(&child_run).execute(&pool).await.unwrap();
+        assert_eq!(
+            reconcile_subworkflows(&pool).await.unwrap(),
+            vec![(trigger.id.clone(), false)]
+        );
+
+        let (status, out): (String, Option<String>) =
+            sqlx::query_as("SELECT status, output FROM task_runs WHERE id = ?")
+                .bind(&trigger.id).fetch_one(&pool).await.unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(out.as_deref(), Some("run deadline exceeded (run_timeout_secs)"));
+
         pool.close().await;
         let _ = std::fs::remove_file(&path);
     }
@@ -5878,6 +6748,168 @@ mod tests {
         assert_eq!(batch.len(), 1, "the enqueued event is claimable");
         assert_eq!(batch[0].event_type, "backfill.catchup");
         assert_eq!(batch[0].run_id, run_id);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// (LOW_LATENCY B-3) The chunked multi-row `create_run` writes exactly the
+    /// rows and dependency edges the per-row version did — including across a
+    /// chunk boundary (>1,000 task rows in one insert set) and fan-in
+    /// `remaining_deps` seeding.
+    #[tokio::test]
+    async fn batched_create_run_preserves_rows_edges_and_dep_counts() {
+        let (pool, path) = temp_pool().await;
+        // 1 root + 1,100 dependents (crosses the 1,000-row chunk) + a joiner
+        // depending on three of them (fan-in dep_count = 3).
+        let mut yaml = String::from("name: big\ntasks:\n  - { name: root, command: [\"true\"] }\n");
+        for i in 0..1100 {
+            yaml.push_str(&format!(
+                "  - {{ name: w{i}, command: [\"true\"], depends_on: [root] }}\n"
+            ));
+        }
+        yaml.push_str("  - { name: join, command: [\"true\"], depends_on: [w0, w1, w2] }\n");
+        let dag = DagGraph::from_yaml(&yaml).unwrap();
+        let run_id = create_run(&pool, &dag, &yaml).await.unwrap();
+
+        let tasks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_runs WHERE run_id = ?")
+            .bind(&run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(tasks, 1102, "root + 1100 dependents + join");
+        let edges: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_dependencies d
+             JOIN task_runs t ON t.id = d.dependent_id WHERE t.run_id = ?",
+        )
+        .bind(&run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(edges, 1103, "1100 root edges + 3 join edges");
+        let join_deps: i64 = sqlx::query_scalar(
+            "SELECT remaining_deps FROM task_runs WHERE run_id = ? AND name = 'join'",
+        )
+        .bind(&run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(join_deps, 3, "fan-in seeds remaining_deps to in-degree");
+        let root_deps: i64 = sqlx::query_scalar(
+            "SELECT remaining_deps FROM task_runs WHERE run_id = ? AND name = 'root'",
+        )
+        .bind(&run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(root_deps, 0);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// (LOW_LATENCY B-2) Advance-on-mark: a default-shaped dependent whose last
+    /// dependency just succeeded is `ready` — with a fresh `scheduled_at`
+    /// readiness stamp — straight out of `mark_task_succeeded`, before any
+    /// `advance_ready_tasks` sweep runs. A dependent with another, failed
+    /// dependency is NOT promoted (the mark re-checks every dependency).
+    #[tokio::test]
+    async fn mark_succeeded_promotes_default_shaped_dependents_in_tx() {
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: prom\ntasks:\n  \
+            - { name: a, command: [\"true\"] }\n  \
+            - { name: x, command: [\"false\"] }\n  \
+            - { name: b, command: [\"true\"], depends_on: [a] }\n  \
+            - { name: mixed, command: [\"true\"], depends_on: [a, x], trigger_rule: all_done }\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let run_id = create_run(&pool, &dag, yaml).await.unwrap();
+
+        advance_ready_tasks(&pool).await.unwrap();
+        let claimed = claim_ready(&pool, "w", 10).await.unwrap();
+        let a = claimed.iter().find(|t| t.name == "a").unwrap();
+        let x = claimed.iter().find(|t| t.name == "x").unwrap();
+        assert!(mark_task_failed(&pool, &x.id, "w", x.version + 1, Some("boom".into())).await.unwrap());
+        assert!(mark_task_succeeded(&pool, &a.id, "w", a.version + 1, Some("ok".into())).await.unwrap());
+
+        // No advance sweep has run since the marks: b must already be ready.
+        let (b_status, b_sched): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, scheduled_at FROM task_runs WHERE run_id = ? AND name = 'b'",
+        )
+        .bind(&run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(b_status, "ready", "promoted inside the mark transaction");
+        assert!(b_sched.is_some(), "readiness stamp present");
+        // `mixed` has a non-default rule (all_done) — never touched by the
+        // promotion; the next advance sweep readies it via the slow path.
+        let mixed_status: String = sqlx::query_scalar(
+            "SELECT status FROM task_runs WHERE run_id = ? AND name = 'mixed'",
+        )
+        .bind(&run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(mixed_status, "pending", "non-default shapes wait for the sweep");
+        advance_ready_tasks(&pool).await.unwrap();
+        let mixed_status: String = sqlx::query_scalar(
+            "SELECT status FROM task_runs WHERE run_id = ? AND name = 'mixed'",
+        )
+        .bind(&run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(mixed_status, "ready", "all_done readies once every dep is terminal");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// (LOW_LATENCY B-1) The set-based fast path and the per-task slow path
+    /// agree: a command merely *containing* the literal string "when" is a
+    /// conservative LIKE-filter false positive that routes to the slow path
+    /// and still advances correctly, while a real runtime `when` evaluates on
+    /// the slow path (true → ready, false → skipped, and the skip cascades).
+    #[tokio::test]
+    async fn when_filter_routes_conservatively_and_evaluates() {
+        use crate::models::TaskStatus;
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: whens\ntasks:\n  \
+            - { name: a, command: [\"true\"] }\n  \
+            - { name: fake, command: [\"echo\", \"when\"], depends_on: [a] }\n  \
+            - { name: gated_yes, command: [\"true\"], depends_on: [a], when: \"{{ tasks.a.output }} == go\" }\n  \
+            - { name: gated_no, command: [\"true\"], depends_on: [a], when: \"{{ tasks.a.output }} == stop\" }\n  \
+            - { name: downstream, command: [\"true\"], depends_on: [gated_no] }\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let run_id = create_run(&pool, &dag, yaml).await.unwrap();
+
+        advance_ready_tasks(&pool).await.unwrap();
+        let a = claim_ready(&pool, "w", 10).await.unwrap().into_iter().find(|t| t.name == "a").unwrap();
+        assert!(mark_task_succeeded(&pool, &a.id, "w", a.version + 1, Some("go".into())).await.unwrap());
+
+        for _ in 0..4 {
+            advance_ready_tasks(&pool).await.unwrap();
+        }
+        let status = |name: &str| {
+            let pool = pool.clone();
+            let run_id = run_id.clone();
+            let name = name.to_string();
+            async move {
+                let s: String = sqlx::query_scalar(
+                    "SELECT status FROM task_runs WHERE run_id = ? AND name = ?",
+                )
+                .bind(&run_id)
+                .bind(&name)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                s.parse::<TaskStatus>().unwrap()
+            }
+        };
+        assert_eq!(status("fake").await, TaskStatus::Ready, "LIKE false positive still advances");
+        assert_eq!(status("gated_yes").await, TaskStatus::Ready, "when true → ready");
+        assert_eq!(status("gated_no").await, TaskStatus::Skipped, "when false → skipped");
+        assert_eq!(status("downstream").await, TaskStatus::Skipped, "skip cascades");
 
         pool.close().await;
         let _ = std::fs::remove_file(&path);

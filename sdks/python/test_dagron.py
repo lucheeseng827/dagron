@@ -280,6 +280,49 @@ class ClientRunTests(GatewayTestCase):
         self.client.submit_run("name: y\ntasks: []\n")
         self.assertEqual(self.last_request()["body"], json.dumps({"yaml": "name: y\ntasks: []\n"}))
 
+    def test_submit_run_sends_parameters_only_when_given(self):
+        self.respond("POST", "/api/runs", 201, {"run_id": "r-4"})
+        self.client.submit_run("name: y\ntasks: []\n", parameters={"date": "2026-08-18"})
+        body = json.loads(self.last_request()["body"])
+        self.assertEqual(body["parameters"], {"date": "2026-08-18"})
+
+        # Omitted (and empty) parameters must not appear at all: the gateway's
+        # pre-existing body shape is {"yaml": ...} and every older server has
+        # to keep accepting exactly that.
+        self.respond("POST", "/api/runs", 201, {"run_id": "r-5"})
+        self.client.submit_run("name: y\ntasks: []\n", parameters={})
+        self.assertEqual(set(json.loads(self.last_request()["body"])), {"yaml"})
+
+    def test_submit_run_sends_the_idempotency_key_as_a_header(self):
+        self.respond("POST", "/api/runs", 201, {"run_id": "r-6"})
+        self.client.submit_run("name: y\ntasks: []\n", idempotency_key="job-42")
+        headers = {k.lower(): v for k, v in self.last_request()["headers"].items()}
+        self.assertEqual(headers.get("idempotency-key"), "job-42")
+
+        # No key, no header — the endpoint stays non-idempotent by default and
+        # an empty key is a 400 server-side, so one must never be invented here.
+        self.respond("POST", "/api/runs", 201, {"run_id": "r-7"})
+        self.client.submit_run("name: y\ntasks: []\n")
+        headers = {k.lower(): v for k, v in self.last_request()["headers"].items()}
+        self.assertNotIn("idempotency-key", headers)
+
+    def test_an_explicit_empty_idempotency_key_is_rejected_locally(self):
+        # An empty string is a 400 server-side. The old ``if idempotency_key``
+        # dropped it silently (``""`` is falsy), handing back a non-idempotent
+        # submit the caller thinks is retry-safe. Reject it before the request,
+        # so the caller learns loudly rather than after a duplicate has run.
+        with self.assertRaises(ValueError):
+            self.client.submit_run("name: y\ntasks: []\n", idempotency_key="")
+        with self.assertRaises(ValueError):
+            self.client.submit_run("name: y\ntasks: []\n", idempotency_key="   ")
+
+    def test_a_caller_header_cannot_displace_authorization(self):
+        self.respond("POST", "/api/runs", 201, {"run_id": "r-8"})
+        self.client._request(
+            "POST", "/api/runs", body={"yaml": "x"}, headers={"Authorization": "Bearer stolen"}
+        )
+        self.assertEqual(self.last_request()["headers"].get("Authorization"), "Bearer tok")
+
     def test_list_runs_builds_query_string(self):
         self.respond("GET", "/api/runs", 200, [{"id": "r-1"}])
         rows = self.client.list_runs(status="failed", limit=10, offset=20)
@@ -399,7 +442,7 @@ class ClientWorkflowTests(GatewayTestCase):
         self.assertIsNone(self.client.delete_workflow("wf-1"))
 
     def test_run_workflow(self):
-        self.respond("POST", "/api/workflows/wf-1/run", 200, {"run_id": "r-1", "workflow_id": "wf-1"})
+        self.respond("POST", "/api/workflows/wf-1/run", 201, {"run_id": "r-1", "workflow_id": "wf-1"})
         self.assertEqual(self.client.run_workflow("wf-1")["run_id"], "r-1")
 
     def test_create_schedule(self):

@@ -4,6 +4,8 @@
 //! SSE client subscribes to (and filters by run_id). This is the N-replica-safe
 //! fan-out — a per-client listener would burn one DB connection per browser tab.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::postgres::{PgListener, PgPool};
@@ -21,17 +23,24 @@ const EVENT_CHANNEL: &str = "task_events";
 /// Resilient: `PgListener` auto-reconnects on transient drops; on a hard error
 /// we log, back off briefly, and rebuild the listener. A zero-receiver broadcast
 /// just drops sends, so it is safe to run with no clients connected.
-pub fn spawn_listener(pool: PgPool, tx: broadcast::Sender<TaskEvent>) {
+pub fn spawn_listener(pool: PgPool, tx: broadcast::Sender<TaskEvent>, ready: Arc<AtomicBool>) {
     tokio::spawn(async move {
         loop {
-            match run_listener(&pool, &tx).await {
+            match run_listener(&pool, &tx, &ready).await {
                 Ok(()) => {
                     // run_listener only returns Ok on a clean shutdown path; in
-                    // practice it loops forever. Treat as a signal to stop.
+                    // practice it loops forever. Treat as a signal to stop —
+                    // and the bridge is dark from here on, so the flag must
+                    // not keep advertising it as live.
+                    ready.store(false, Ordering::Release);
                     info!("task_events listener stopped");
                     return;
                 }
                 Err(err) => {
+                    // The flag comes down for the whole reconnect window, so
+                    // /readyz reports the replica unready while its live-event
+                    // bridge is dark (LOW_LATENCY R-1).
+                    ready.store(false, Ordering::Release);
                     warn!(error = ?err, "task_events listener errored; reconnecting in 1s");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
@@ -40,7 +49,11 @@ pub fn spawn_listener(pool: PgPool, tx: broadcast::Sender<TaskEvent>) {
     });
 }
 
-async fn run_listener(pool: &PgPool, tx: &broadcast::Sender<TaskEvent>) -> anyhow::Result<()> {
+async fn run_listener(
+    pool: &PgPool,
+    tx: &broadcast::Sender<TaskEvent>,
+    ready: &AtomicBool,
+) -> anyhow::Result<()> {
     // DATABASE_LISTEN_URL: on a shared state-store cell the query pools point
     // at PgBouncer (transaction mode), which cannot serve a session-scoped
     // LISTEN — this listener must hit the direct Postgres endpoint
@@ -50,6 +63,7 @@ async fn run_listener(pool: &PgPool, tx: &broadcast::Sender<TaskEvent>) -> anyho
         _ => PgListener::connect_with(pool).await?,
     };
     listener.listen(EVENT_CHANNEL).await?;
+    ready.store(true, Ordering::Release);
     info!(channel = EVENT_CHANNEL, "SSE listener subscribed");
 
     loop {

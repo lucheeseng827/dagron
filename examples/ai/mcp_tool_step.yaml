@@ -1,0 +1,75 @@
+# dagron calling an MCP tool — the inverse of `dagron-mcp`.
+#
+# `dagron-mcp` lets an agent drive dagron. `dagron-step-mcp` lets a dagron DAG
+# drive an agent's tools: each tool call becomes a task, so it gets retries with
+# backoff, a timeout, captured output, artifacts to hand to the next step, and a
+# place in the run's history. A tool call inside an agent's own loop has none of
+# that — when it fails halfway there is nothing to resume.
+#
+# The binary must be on the task's PATH (`cargo build -p dagron-step-mcp`), and
+# so must whatever MCP server it spawns.
+#
+#   dagron submit examples/ai/mcp_tool_step.yaml
+name: mcp-tool-step
+parameters:
+  # The document to work on. Overridable per run:
+  #   POST /api/runs {"yaml": "...", "parameters": {"doc": "/data/other.md"}}
+  doc: "/data/report.md"
+
+tasks:
+  # 1. Read a file through an MCP server rather than with `cat`.
+  #
+  # The point is not the reading — it is that the *same* server an agent talks
+  # to is the one the pipeline talks to, so both see one set of tools under one
+  # set of permissions, instead of the workflow quietly growing its own.
+  - name: fetch
+    command: ["dagron-step-mcp"]
+    env:
+      - { name: DAGRON_MCP_STEP_SERVER, value: "npx" }
+      # A JSON array, not a shell string: a whitespace split would break on any
+      # argument containing a space, and it would do so silently.
+      - name: DAGRON_MCP_STEP_SERVER_ARGS
+        value: '["-y", "@modelcontextprotocol/server-filesystem", "/data"]'
+      - { name: DAGRON_MCP_STEP_TOOL, value: "read_file" }
+      - { name: DAGRON_MCP_STEP_ARGS, value: '{"path": "{{ doc }}"}' }
+      # Write to a file so the next task can read it — and so a retry that
+      # follows a crash finds the result already there and does not call the
+      # tool a second time.
+      - { name: DAGRON_MCP_STEP_OUTPUT, value: "/artifacts/doc.txt" }
+      - { name: DAGRON_MCP_STEP_TIMEOUT_SECS, value: "60" }
+    # An MCP server can be slow, flaky, or rate-limited. This is exactly what a
+    # task gets for free and an in-loop tool call does not.
+    max_attempts: 3
+    retry_delay_secs: 5
+
+  # 2. Do something with it. Any ordinary task — the MCP result is just output.
+  - name: word_count
+    command: ["sh", "-c", "wc -w < /artifacts/doc.txt | tr -d ' ' > /artifacts/count.txt"]
+    depends_on: [fetch]
+
+  # 3. Hand the count to another MCP tool. The arguments come from a file
+  #    because an upstream task produced them — an environment variable is the
+  #    wrong channel for something computed during the run.
+  #
+  #    This uses the filesystem server's `write_file` so the example runs end to
+  #    end with nothing you have to supply — swap in any server and tool (a
+  #    Slack poster, a webhook) and the shape is identical: an MCP result is just
+  #    task output, and a task's output is just an argument to the next thing.
+  - name: record
+    command:
+      - sh
+      - -c
+      - >-
+        printf '{"path": "/data/word-count.txt", "content": "%s words"}'
+        "$(cat /artifacts/count.txt)" > /artifacts/args.json
+        && dagron-step-mcp
+    depends_on: [word_count]
+    env:
+      - { name: DAGRON_MCP_STEP_SERVER, value: "npx" }
+      - name: DAGRON_MCP_STEP_SERVER_ARGS
+        value: '["-y", "@modelcontextprotocol/server-filesystem", "/data"]'
+      - { name: DAGRON_MCP_STEP_TOOL, value: "write_file" }
+      - { name: DAGRON_MCP_STEP_ARGS_FILE, value: "/artifacts/args.json" }
+      # Persist the result: a retry after a crash finds it already done and does
+      # not run the tool — and its side effect — a second time.
+      - { name: DAGRON_MCP_STEP_OUTPUT, value: "/artifacts/record.txt" }

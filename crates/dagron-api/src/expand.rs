@@ -31,6 +31,7 @@
 //! cross-workflow cycles, runaway nesting, and reference explosions fail loudly
 //! with a 400 rather than looping or exhausting memory.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 
 use axum::http::StatusCode;
@@ -51,21 +52,23 @@ fn bad(msg: impl Into<String>) -> ApiError {
     (StatusCode::BAD_REQUEST, msg.into())
 }
 
-/// Resolve every `workflow_ref` in `yaml`, returning the flattened spec YAML.
+/// Resolve every `workflow_ref` in the already-parsed `root` (the caller's one
+/// Value parse of `yaml` — LOW_LATENCY R-3), returning the flattened spec YAML.
 ///
-/// Returns the input untouched when nothing chains, so the common path pays only
-/// one parse and no database work.
-pub(crate) async fn expand_workflow_refs(
+/// Borrows the input untouched when nothing chains, so the common path pays no
+/// parse, no re-serialization, and no database work here.
+pub(crate) async fn expand_workflow_refs<'y>(
     state: &AppState,
-    yaml: &str,
-) -> Result<String, ApiError> {
-    let root: Value = serde_yaml::from_str(yaml).map_err(|e| bad(format!("invalid spec: {e}")))?;
+    root: Value,
+    yaml: &'y str,
+) -> Result<Cow<'y, str>, ApiError> {
     if direct_refs(&root).is_empty() {
-        return Ok(yaml.to_string());
+        return Ok(Cow::Borrowed(yaml));
     }
     let refs = collect_referenced_specs(state, &root).await?;
     let expanded = expand_pure(root, &refs)?;
     serde_yaml::to_string(&expanded)
+        .map(Cow::Owned)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("re-serializing spec: {e}")))
 }
 
@@ -100,41 +103,54 @@ async fn collect_referenced_specs(
     root: &Value,
 ) -> Result<HashMap<String, Value>, ApiError> {
     let mut out: HashMap<String, Value> = HashMap::new();
-    let mut stack: Vec<String> = direct_refs(root);
-    while let Some(name) = stack.pop() {
-        if out.contains_key(&name) {
-            continue;
+    // Fetch one nesting LEVEL per query — `WHERE name = ANY(...)` — instead of
+    // the old one-query-per-reference loop (LOW_LATENCY R-3): a spec chaining
+    // ten siblings paid ten serial round trips; now it pays one, and depth
+    // alone (bounded by MAX_DEPTH, in practice one or two) adds queries.
+    let mut frontier: Vec<String> = direct_refs(root);
+    while !frontier.is_empty() {
+        frontier.sort();
+        frontier.dedup();
+        frontier.retain(|n| !out.contains_key(n));
+        if frontier.is_empty() {
+            break;
         }
-        let yaml: Option<String> = sqlx::query_scalar("SELECT spec FROM workflows WHERE name = $1")
-            .bind(&name)
-            .fetch_optional(&state.read_pool)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = ?e, "loading referenced workflow");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT name, spec FROM workflows WHERE name = ANY($1)")
+                .bind(&frontier)
+                .fetch_all(&state.read_pool)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = ?e, "loading referenced workflows");
+                    (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())
+                })?;
+        let mut by_name: HashMap<String, String> = rows.into_iter().collect();
+        let mut next: Vec<String> = Vec::new();
+        for name in frontier.drain(..) {
+            let yaml = by_name.remove(&name).ok_or_else(|| {
+                bad(format!("references unknown workflow '{name}' — save that workflow first"))
             })?;
-        let yaml = yaml.ok_or_else(|| {
-            bad(format!("references unknown workflow '{name}' — save that workflow first"))
-        })?;
-        let child: Value = serde_yaml::from_str(&yaml)
-            .map_err(|e| bad(format!("referenced workflow '{name}' has an invalid spec: {e}")))?;
+            let child: Value = serde_yaml::from_str(&yaml)
+                .map_err(|e| bad(format!("referenced workflow '{name}' has an invalid spec: {e}")))?;
         // Inlining copies a child's `tasks:` into the root but not its
         // `templates:` block, so a child that calls its own templates would land
         // in the root with nothing to resolve against — the engine would then
         // fail with a bare "unknown template". Say so here, where the cause is
         // still visible.
-        if child.get("templates").and_then(Value::as_sequence).is_some_and(|t| !t.is_empty()) {
-            return Err(bad(format!(
-                "referenced workflow '{name}' declares `templates:` — a chained workflow is \
-                 inlined task-by-task, so its templates would not come with it. Move those \
-                 templates into this workflow and call them with `template:`, or drop the \
-                 `workflow_ref` and inline the steps directly."
-            )));
+            if child.get("templates").and_then(Value::as_sequence).is_some_and(|t| !t.is_empty()) {
+                return Err(bad(format!(
+                    "referenced workflow '{name}' declares `templates:` — a chained workflow is \
+                     inlined task-by-task, so its templates would not come with it. Move those \
+                     templates into this workflow and call them with `template:`, or drop the \
+                     `workflow_ref` and inline the steps directly."
+                )));
+            }
+            for r in direct_refs(&child) {
+                next.push(r);
+            }
+            out.insert(name, child);
         }
-        for r in direct_refs(&child) {
-            stack.push(r);
-        }
-        out.insert(name, child);
+        frontier = next;
     }
     Ok(out)
 }

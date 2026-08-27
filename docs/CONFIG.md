@@ -13,6 +13,7 @@ change.
 
 ```text
 dagron [dev] [DAG_PATH] [DB_TARGET]
+dagron config [--json]
 dagron validate <file|dir>... [--json]
 dagron archive-compact [DB_TARGET]
 ```
@@ -20,6 +21,7 @@ dagron archive-compact [DB_TARGET]
 | Arg | Default | Meaning |
 | --- | --- | --- |
 | `dev` (literal) | — | Zero-infra local quickstart: SQLite + the management API/Swagger on `127.0.0.1:8787` (sets `API_ADDR` if unset), stays resident. With no DAG file present it starts idle and waits for `POST /runs`. Requires the (default) `ops` feature. **`dev` consumes the first positional, so the others shift right — `dagron dev [DAG_PATH] [DB_TARGET]`.** `dagron dev foo.db` therefore reads `foo.db` as the *workflow* and still writes to `workflow.db`; the datastore is the **third** token (`dagron dev my.yaml my.db`), or — on a Postgres build only — `$DATABASE_URL` when that token is absent. The startup line prints the datastore actually in use; check it when a run seems to vanish. |
+| `config` (literal) | — | Print every knob's effective value, its source (env / file / profile / default), and the fleet fingerprint — exactly what a daemon started in this environment would run with. `--json` for machines. |
 | `validate` (literal) | — | Offline spec lint: parses, template-expands, and graph-validates each `*.yaml`/`*.yml` (directories walked recursively; hidden dirs skipped) through the same pipeline every submit path uses. `--json` emits one JSON object per file; exits non-zero if any file fails. No datastore, no server, works in every build. |
 | `DAG_PATH` | `examples/simple_dag.yaml` | Workflow YAML for the `file` source. **There is no `run` subcommand** — the first positional *is* the DAG path (the *second* under `dagron dev`, which consumes one token itself). |
 | `DB_TARGET` | `workflow.db` (sqlite build) / `$DATABASE_URL` → `postgres://localhost/workflow` (postgres build) | SQLite file path, or Postgres connection string. Second positional — third under `dagron dev`. |
@@ -50,8 +52,13 @@ All read in `crates/dagron-engine/src/lib.rs` unless noted.
 
 | Variable | Type / values | Default | What it does |
 | --- | --- | --- | --- |
+| `DAGRON_CONFIG` | path to YAML | unset | Configuration **file** layered UNDER the environment — see [the section below](#configuration-file--profiles-dagron_config). |
+| `DAGRON_CONFIG_NO_WARN` | set/unset | unset | Silence the startup typo scan (an env var that looks like a dagron knob but isn't one draws a warning). |
 | `EXECUTOR` | `local` \| `docker` \| `kubernetes`/`k8s` | `local` | Task execution backend. Unrecognized values warn and fall back to `local`; `kubernetes` without the feature is a startup error. |
 | `WORKER_COUNT` | usize | `16` (min 1) | Worker-pool size = max concurrently running tasks. |
+| `POLL_INTERVAL_MS` | u64 (ms) | `500` (floor 10) | Reconcile-loop timer bound — the longest the loop may sleep with work outstanding. The loop also wakes the moment a local task completes and (Postgres) on any `LISTEN/NOTIFY` event, so this timer is a safety net there; on SQLite it additionally paces time-based retries and parked sensors. Part of the low-latency profile ([docs/LOW_LATENCY.md](LOW_LATENCY.md)). |
+| `SWEEP_INTERVAL_MS` | u64 (ms) | = `POLL_INTERVAL_MS` (floor 10) | Cadence of the maintenance sweeps (expired-lease recovery, run deadlines, SLA alerts, approval expiry, sub-workflow / wait-sensor / dataset reconciliation). At the default this matches the old every-tick behaviour; profiles that shrink `POLL_INTERVAL_MS` set this back to ~`500` so faster ticks don't multiply sweep load. Sweeps only run when a tick runs, so the effective cadence is at least the time between ticks. |
+| `LEASE_SECS` | i64 | `30` (floor 3) | Claim-time task lease window, shared by both backends and by the heartbeat's renewals. A crashed scheduler's tasks wait out this window before any peer reclaims them, so shortening it shortens crash recovery; the worker heartbeat renews every ⌊lease/3⌋ s (floor 1 s), keeping the two-missed-renewals headroom at any setting. With `TASK_LEASE_HEARTBEAT=false`, tasks must finish inside one window — keep it above your longest `timeout_secs`. |
 | `SOURCE` | `file` \| `stream` | `file` | Workflow ingestion source. `file` = one-shot DAG file; `stream` = follow an NDJSON event file / named pipe ([docs/STREAMING.md](STREAMING.md)). Managed broker connectors (`redis`/`sqs`/`kafka`/`nats`/`events`) are part of dagron Enterprise and error at startup here with a pointer (`dagron-source/src/source.rs`). |
 | `STREAM_PATH` | path | — (required for `SOURCE=stream`) | NDJSON file or FIFO to follow; one workflow spec per line. A **directory** switches to sharded multi-consumer mode: each `*.ndjson` file is a partition, split across engines via per-partition leases (`source_partitions`), each shard with its own exactly-once cursor. |
 | `STREAM_MODE` | `auto` \| `file` \| `sharded` | `auto` | How `STREAM_PATH` is interpreted. `auto` inspects the path at startup (dir → sharded, file/FIFO → single-stream) and **errors when the path does not exist** — mode is fixed at startup, so it is never guessed. `file` waits for a single stream file to appear; `sharded` requires the shard directory. |
@@ -61,7 +68,7 @@ All read in `crates/dagron-engine/src/lib.rs` unless noted.
 | `STREAM_POLL_MS` | u64 (ms) | `500` | Poll interval while waiting at end-of-file. |
 | `STREAM_OFFSET_PATH` | path | `<STREAM_PATH>.offset` | Committed-offset checkpoint (written atomically on ack; delete to replay). |
 | `STREAM_DLQ_PATH` | path | `<STREAM_PATH>.dlq` | Poison-line mirror (NDJSON), alongside the durable `dead_letters` rows. |
-| `TASK_LEASE_HEARTBEAT` | bool | `true` | Workers renew a running task's lease every 10 s (+30 s), so long tasks (training, consumers) are never reclaimed mid-run. `false` restores the old finish-inside-one-lease behaviour. |
+| `TASK_LEASE_HEARTBEAT` | bool | `true` | Workers renew a running task's lease every ⌊`LEASE_SECS`/3⌋ s (+`LEASE_SECS`, so 10 s +30 s at defaults) while it executes, so long tasks (training, consumers) are never reclaimed mid-run. `false` restores the old finish-inside-one-lease behaviour. |
 | `RUNNER_GANGS` | `1`/`true` | off | Gang co-scheduling ([docs/AI_WORKLOADS.md](AI_WORKLOADS.md)): claim `gang:` tasks all-or-nothing and cancel a failed member's siblings. Requires a scheduler built with the `enterprise` feature; inert otherwise. Composes with `POOLS` and `priority`: gang members inherit the task's `pool`, and a pooled gang is claimed only when its pool can seat **every** member at once (never partially, never over the cap); ordinary claims on this path keep the same priority ordering. |
 | `MAX_INFLIGHT_RUNS` | i64 | `64` | Admission valve: cap on simultaneously active runs; overflow stays buffered at the source. The ops API answers `429` + `Retry-After` above it. **`0` disables the cap** on both admission paths (the API check and the ingest actor's throttle); a negative value is normalized to `0`. |
 | `MAX_INFLIGHT_TASKS` | i64 | `0` (off) | Second admission dimension, on TASKS. Runs are the wrong unit on their own: a run of 100,000 tasks and a run of four both count as one against `MAX_INFLIGHT_RUNS`, so a fleet comfortably under the run cap can be far past what the scheduler and datastore carry. Counts `task_runs` in `pending`/`ready`/`running` (a task parked on an approval is not pressure and is excluded). Only queried when set, so the default path pays no extra round trip. |
@@ -69,6 +76,7 @@ All read in `crates/dagron-engine/src/lib.rs` unless noted.
 | `DEAD_LETTER_MAX_ATTEMPTS` | i64 | `3` (min 1) | Transient `create_run` failures retried before a submission is dead-lettered (parse failures dead-letter immediately). |
 | `DATABASE_URL` | conn string | `postgres://localhost/workflow` | Postgres builds only; positional `DB_TARGET` wins. Redacted before logging. |
 | `API_ADDR` | `host:port` | unset = ops API **disabled** (`dagron dev` sets `127.0.0.1:8787`) | Bind address of the engine's unauthenticated ops API; also keeps the process resident. Invalid values warn and disable the API. |
+| `DAGRON_READY_TIMEOUT_MS` | u64 ≥ 50 | `500` | Budget for the ops API's `/readyz` datastore ping — 503 `datastore probe timed out` past it, so a wedged pool never hangs the probe past the kubelet's `timeoutSeconds`. Same knob (name and semantics) as dagron-api's. |
 | `DOCKER_IMAGE` | image ref | `alpine:latest` | Default image for `EXECUTOR=docker` (also k8s fallback). |
 | `K8S_IMAGE` | image ref | `$DOCKER_IMAGE` → `alpine:latest` | Image for KubeExecutor. |
 | `K8S_NAMESPACE` | string | `default` | KubeExecutor namespace. |
@@ -93,7 +101,7 @@ All read in `crates/dagron-engine/src/lib.rs` unless noted.
 | `READY_AGE_ALERT_SECS` | i64 | `300` (`0` = off) | Stale-ready (unclaimable-class) alert: WARN when a runner class's oldest `ready` task has waited longer than this — catches a class no live scheduler serves. Leadership-gated; runs in any resident daemon. Same signal exported as `scheduler_ready_oldest_age_seconds{runner_class=…}`. |
 | `READY_AGE_CHECK_INTERVAL_SECS` | u64 | `60` | How often the stale-ready alert loop checks. |
 | `WAIT_POLL_SECS` | u64 > 0 | `15` | Poll interval for `type: wait` HTTP sensors (`wait.url`, #27 follow-on): a parked sensor is GETed at most once per interval and succeeds on the first `2xx`. **Redirects are not followed** — the sensor reads the origin's own status, and following a 3xx would let an external URL pivot the *scheduler's* network position toward internal/metadata addresses; a 3xx simply reads as "not ready". Note `wait.url` polls run from the **scheduler**, not the task sandbox: treat workflow authorship as trusted with respect to the scheduler's network reachability, or set `WAIT_URL_DENY_PRIVATE` below. Time/dataset sensors ignore this. |
-| `SUBWORKFLOW_MAX_DEPTH` | i64 > 0 | `8` | How deep `type: workflow` tasks may nest. A workflow that names itself — directly or through a cycle of workflows — would otherwise spawn child runs without end, each leaving a parked parent row behind; there is no stack to overflow, so nothing stops it on its own. A trigger at or past the cap **fails that task** with a message naming the depth, leaving the rest of the run to proceed under normal failure handling. Depth is read by walking `task_runs.sub_run_id` up from the triggering task's own run (no `parent_run_id` column; SQLite migration 034 / Postgres 041 index it), and the walk stops at the cap — so the check costs at most `SUBWORKFLOW_MAX_DEPTH` indexed lookups, on sub-workflow dispatch only. |
+| `SUBWORKFLOW_MAX_DEPTH` | i64 > 0 | `8` | How deep `type: workflow` tasks may nest. **Depth is not breadth**: a `repeat:` on a trigger creates one child run per iteration at the *same* depth, so this cap does not bound a loop — `repeat.max_iterations` does, and it is required. See [Loops over sub-workflows](#loops-over-sub-workflows). A workflow that names itself — directly or through a cycle of workflows — would otherwise spawn child runs without end, each leaving a parked parent row behind; there is no stack to overflow, so nothing stops it on its own. A trigger at or past the cap **fails that task** with a message naming the depth, leaving the rest of the run to proceed under normal failure handling. Depth is read by walking `task_runs.sub_run_id` up from the triggering task's own run (no `parent_run_id` column; SQLite migration 034 / Postgres 041 index it), and the walk stops at the cap — so the check costs at most `SUBWORKFLOW_MAX_DEPTH` indexed lookups, on sub-workflow dispatch only. |
 | `WAIT_URL_DENY_PRIVATE` | `1`/`true`/`on`/`yes` = on | off | Restrict `wait.url` polls to **globally-routable** addresses. Off by default because the common `wait.url` *is* an internal address (`http://svc.default.svc/ready`) — turn it on when you run untrusted workflow specs and the scheduler's network position is wider than a task pod's (realistically `EXECUTOR=kubernetes` with a differentiated NetworkPolicy). When on, private/loopback/link-local (incl. `169.254.169.254`), `0.0.0.0/8`, CGNAT, multicast and reserved ranges are refused, for IPv4, IPv6, and IPv4-mapped IPv6 alike. Enforced in two places: IP-literal hosts are checked before the request (a literal never reaches a resolver — and the check parses the URL with the *same* parser reqwest uses, so legacy spellings like `http://2130706433/` and `http://127.1/` are normalized before they are judged), and hostnames are filtered **inside the client's DNS resolver**, so the addresses dialed are the ones that passed — a DNS rebind has no check-to-connect window. Proxies are also bypassed while the policy is on: with `HTTP_PROXY`/`HTTPS_PROXY` set, the resolver would only ever judge the *proxy's* address while the proxy dialed the blocked target. A refused URL logs a WARN and re-parks as "not ready"; it does not fail the task, so turning the policy back off resolves parked sensors in place. Editing the spec does not — `wait.url` is materialized into `task_runs.wait_url` when the task row is created, so a spec fix applies to the next run, not to an already-parked task. |
 | `DATASET_TRIGGERS` | `0`/`false` = off | on | Dataset-triggered scheduling sweep ([docs/DATASETS.md](DATASETS.md)): sync `on_datasets:` subscriptions from the workflow registry and fire runs when subscribed datasets update (~5 s cadence; HA-safe CAS claims, so every scheduler may sweep). Disabling only stops this scheduler's sweeping — `produces:` recording and dataset sensors are run-local and stay on. |
 | `DB_SCHEDULES` | `1`/`true` | off | Fire DB-backed UI schedules (the ones `dagron-api` manages). Leadership-gated; resident. |
@@ -115,6 +123,36 @@ All read in `crates/dagron-engine/src/lib.rs` unless noted.
 | `DAGRON_GIT_TRUSTED_HOSTS` | comma-list | unset | Extra hosts (and their subdomains) the **fallback** token may be sent to — add your GHE / self-managed GitLab host. Built-ins (`github.com`, `gitlab.com`, `bitbucket.org` + `*.github.com`, `*.gitlab.com`) always apply. A repo on any other host is cloned without the token — unless it has a per-repository credential, which is not host-filtered because it was bound to that repo deliberately. |
 | `DAGRON_GIT_SSH_STRICT` | bool | `false` | Refuse to sync an SSH repository whose credential has no `known_hosts` entries, instead of accepting whatever host key answers. Off by default so repos connected without host keys keep syncing; turn it on to require the forge's host key be pinned. Read by the `dagron-gitops` worker. |
 | `DAGRON_GIT_ALLOW_INSECURE` | bool | `false` | Allow `http://`, `git://`, and `file://` clone URLs for the GitOps sync. Off by default (only `https://` / `ssh://`) to avoid plaintext fetches, SSRF, and local-path reads; set `1` for `file://` in tests / air-gapped dev. |
+
+## Configuration file & profiles (`DAGRON_CONFIG`)
+
+The engine's knobs can come from a **reviewed YAML file** instead of loose env
+vars (docs/LOW_LATENCY.md §5). Keys are the exact env var names; an optional
+`profile:` applies a named preset underneath. Precedence, highest first:
+**environment → file → profile → compiled default** — an explicit env var
+always wins, so a container override still works.
+
+```yaml
+# /etc/dagron/dagron.yaml   (DAGRON_CONFIG=/etc/dagron/dagron.yaml)
+profile: low-latency        # POLL_INTERVAL_MS=25 · SWEEP_INTERVAL_MS=500 · LEASE_SECS=5
+WORKER_COUNT: 64
+MAX_INFLIGHT_RUNS: 256
+```
+
+| Profile | Presets | Intent |
+| --- | --- | --- |
+| `low-latency` | `POLL_INTERVAL_MS=25`, `SWEEP_INTERVAL_MS=500`, `LEASE_SECS=5` | The trading-desk engine tuning ([docs/LOW_LATENCY.md §6](LOW_LATENCY.md)); pair with `RUNNER_CLASSES` pulse segmentation and a same-AZ Postgres. |
+| `throughput` | *(none — stock defaults)* | Declares the intent in a reviewed file without changing anything. |
+
+An unknown key or unknown profile in the file is a **startup error** (a
+reviewed file has no excuse for a typo); an env var that merely *looks* like a
+knob warns instead. Introspection: `dagron config [--json]` prints every
+knob's effective value (secrets redacted) with its source
+(`env`/`file`/`profile`/`default`) and the **fleet fingerprint**; the ops API
+serves the same at `GET /config`, and startup logs the fingerprint — two
+replicas with the same fingerprint run the same knob values. Deliberately no
+hot reload: settings are boot-immutable (the audit story); the short runtime
+allow-list stays proposed (LOW_LATENCY S-5).
 
 ## S3-compatible object storage (MinIO / Ceph) — air-gapped archive tier
 
@@ -159,6 +197,13 @@ Postgres-only service (SSE needs `LISTEN/NOTIFY`).
 | `GC_ARCHIVE_DIR` / `GC_ARCHIVE_URL` | path / `s3://` \| `gs://` \| `az://` \| `azure://`… | unset = `/api/archive/runs/{id}` answers 502 | Where the `/api/archive` endpoints fetch archived run documents — the **same values the engine's GC uses**. A cloud URL needs dagron-api built with the matching feature (`archive-s3` / `archive-gcs` / `archive-azure`). The list endpoint reads only the `archived_runs` index and needs neither. |
 | `DAGRON_JWT_SECRET` | string, **≥ 32 chars** | **required** (startup error if unset/short) | HS256 key that signs and validates session JWTs. |
 | `PORT` | u16 | `8080` | Listen port. |
+| `DAGRON_DB_MAX_CONNECTIONS` | u32 ≥ 1 | `8` | Postgres pool ceiling (was hard-coded). |
+| `DAGRON_DB_MIN_CONNECTIONS` | u32 | `0` | Warm floor: the pool keeps this many connections open, and startup acquires them **eagerly** before the process reports Ready — market open never pays TLS + auth handshakes on the first requests (docs/LOW_LATENCY.md R-2). |
+| `DAGRON_DB_ACQUIRE_TIMEOUT_MS` | u64 ≥ 50 | `10000` | How long a request may queue for a pooled connection. The low-latency profile sets ~`250`: a saturated pool should fail fast, not hold callers for ten seconds. |
+| `DAGRON_DB_TEST_BEFORE_ACQUIRE` | bool | `true` | sqlx's per-checkout liveness round trip. `false` removes one round trip per checkout and lets the query itself surface a dead connection. |
+| `DAGRON_READY_TIMEOUT_MS` | u64 ≥ 50 | `500` | `/readyz`'s own budget for the pooled `SELECT 1`, independent of the acquire timeout so the probe never outlasts the kubelet's patience — keep any probe `timeoutSeconds` **above** this budget so the app answers 503-with-reason instead of the kubelet cutting the probe. `/readyz` answers 503 on a failed acquire or a failed query; `/healthz` stays the bare liveness probe. (The engine's ops API reads the same knob for its `/readyz` datastore ping.) |
+| `DAGRON_READY_REQUIRE_LISTENER` | bool | `false` | Make `/readyz` also 503 while the SSE listener is not subscribed. Off by default: the listener watches **one shared** direct endpoint (`DATABASE_LISTEN_URL`), so its failure hits every replica at once — gating on it cannot reroute, it can only empty the Service while login/listing/submit still work. Degraded live events are visible as `event_listener` in `GET /api/health` and in `/readyz`'s body. Opt in only with per-replica listen endpoints, where eviction genuinely reroutes. |
+| `DAGRON_SHUTDOWN_DRAIN_MS` | u64 | `15000` | Bound on the graceful-shutdown drain: after SIGTERM/ctrl-c, in-flight requests get this long to finish before remaining connections (idle keep-alives, open SSE streams, `/wait` long-polls — which never end on their own) are closed. Keep it under the pod's `terminationGracePeriodSeconds` (default 30 s) so the orderly close always beats the SIGKILL. |
 | `DAGRON_COOKIE_SECURE` | bool | `true` | `Secure` flag on the `dagron_session` cookie. Set `false`/`0`/`no` only for plain-HTTP local dev — a Secure cookie is not stored over `http://`. |
 | `DAGRON_SESSION_TTL_SECS` | i64 > 0 | `604800` (7 days) | Session/JWT lifetime. |
 | `DAGRON_ADMIN_EMAIL` / `DAGRON_ADMIN_PASSWORD` | string / string ≥ 8 | unset = no bootstrap | Idempotently seed a first admin at startup (never resets an existing user). |
@@ -173,6 +218,14 @@ Postgres-only service (SSE needs `LISTEN/NOTIFY`).
 | `GIT_BASE` | branch | `main` | Base branch for sync PRs. |
 | `GIT_PATH_PREFIX` | path prefix | `dags/` | Where synced specs are committed. |
 | `GIT_API_BASE` | URL | `https://api.github.com` | GitHub API root (GHE). |
+| `DAGRON_GIT_ALLOW_INSECURE` | bool | `false` | Permit `http`/`git`/`file` clone transports for registered GitOps repos (tests / air-gapped dev only — off so a server-side clone can't be pointed at plaintext, an internal host, or a local path). |
+| `DAGRON_ARTIFACT_MAX_BYTES` | usize | `134217728` (128 MiB) | Body cap for artifact PUTs (separately from the 1 MiB core cap). |
+| `DAGRON_AUDIT_SINK_URL` / `DAGRON_AUDIT_SINK_TOKEN` | URL / bearer | unset = local audit table only | Enterprise builds: forward each audit record to a central sink (fire-and-forget). |
+
+Every knob above is registered in `crates/dagron-api/src/config.rs`: startup
+logs each explicitly-set value (secrets redacted) plus a **configuration
+fingerprint** (also in `GET /api/health` as `config_fingerprint`) so a fleet
+can alert when one replica's settings drift from the reviewed deployment.
 
 ## Artifact encryption at rest (envelope / BYOK-KMS) & key rotation
 
@@ -357,3 +410,39 @@ rebuild; the service name is reported as `dagron-<service>`. The transport is fi
 HTTP/protobuf — `OTEL_EXPORTER_OTLP_PROTOCOL` is **not** honored (the gRPC/tonic
 stack is deliberately not compiled in). Dashboards, sampling policy, and
 retention are left to the observability stack you export to.
+
+<a id="loops-over-sub-workflows"></a>
+
+## Loops over sub-workflows
+
+A `repeat:` on a `type: workflow` task runs the child workflow once per
+iteration — one **child run per turn**. That is the point (each turn is
+separately inspectable, retryable and attributable), and it is also the thing to
+size before turning it on.
+
+**What bounds it, in order:**
+
+| Control | Bounds | Notes |
+|---|---|---|
+| `repeat.max_iterations` | turns per loop | **Required**, and exhausting it *fails* the task. This is the only hard stop on the number of child runs one submission creates. |
+| `max_active_runs` on the child workflow | concurrent runs of that workflow | Across all loops. A second conversation waits rather than doubling the load. |
+| `budget: { tasks: N }` on the child | how big one turn may get | Per run, so it caps a turn, **not** the conversation. |
+| `MAX_INFLIGHT_RUNS` / `MAX_INFLIGHT_TASKS` | the whole engine | The backstop when everything else is set too high. |
+
+**What does *not* bound it:**
+
+- `SUBWORKFLOW_MAX_DEPTH` — every iteration is a sibling at the same depth, not a
+  deeper nesting. The cap catches a workflow that names itself; it does not
+  notice one that runs forty times.
+- `budget:` on the **parent** — a budget counts the tasks that run creates, and
+  the child runs are their own runs with their own tasks. A parent whose only
+  task is the trigger is one task, however many turns it drives.
+
+The practical sizing question is `max_iterations × tasks-per-turn`. A 40-turn
+loop over a 6-task turn is 240 tasks and 40 runs from a single submission —
+which is fine if that is what you meant, and is the first thing to look at when
+a queue fills up unexpectedly.
+
+Delay between turns is `repeat.delay_secs`. Set it above zero when a turn polls
+something that needs time to change; leaving it at zero when each turn is real
+work is correct and costs nothing.

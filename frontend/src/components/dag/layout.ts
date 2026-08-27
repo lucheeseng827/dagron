@@ -4,25 +4,62 @@ import { Position, type Edge, type Node } from "@xyflow/react";
 import type { LayoutDirection } from "./direction";
 
 export const NODE_W = 190;
+
+/// Row metrics for a StatusNode, shared with the component so the height React
+/// Flow *declares* and the height the content *renders* to are computed from one
+/// source.
+///
+/// They have to agree. React Flow sizes the node wrapper from the declaration,
+/// and StatusNode is a fixed-height flex column — so when the rows need more
+/// room than was declared, the difference is taken out of the flex items rather
+/// than overflowing. The name row is the one that shrinks visibly: it carries
+/// `overflow: hidden`, so a squeezed line box crops the glyphs mid-letter
+/// instead of spilling. That is what clipped the task names, and it is why
+/// these are constants rather than numbers picked to look right: a hardcoded
+/// height silently under-reserves as soon as a font or a row changes.
+export const NODE_PAD_Y = 8;
+export const NODE_BORDER = 1;
+/// Name row — 13px/600. Explicit, because `line-height: normal` resolves from
+/// font metrics and differs across the fallback stack.
+export const NODE_TITLE_LH = 18;
+/// Status row and middle row — 11px.
+export const NODE_ROW_LH = 14;
+/// `marginTop` on the status row, and on the middle row when present.
+export const NODE_ROW_GAP = 4;
+export const NODE_MID_GAP = 2;
+
+const NODE_CHROME = 2 * NODE_PAD_Y + 2 * NODE_BORDER;
+
 /// A plain task node: name row + status row.
-export const NODE_H = 52;
-/// A node carrying a middle row as well — a sub-DAG/sub-workflow call showing
-/// what it calls, or a step showing its container image. These were declared at
-/// NODE_H like everything else, but React Flow applies a declared height to the
-/// node wrapper, so the third row overflowed the box: the bottom handle sat
-/// mid-node and the status line spilled past the border.
-export const NODE_H_TALL = 68;
+export const NODE_H = NODE_CHROME + NODE_TITLE_LH + NODE_ROW_GAP + NODE_ROW_LH;
+/// One middle row's cost: its own line box plus the gap above it. A node can
+/// carry more than one — a task with both a `workflow_ref` and a `template:`
+/// renders a subtitle for each, since StatusNode gates them independently — so
+/// the height counts rows rather than adding a single fixed bump. These rows
+/// were once declared at NODE_H like everything else, but React Flow applies a
+/// declared height to the node wrapper, so any extra row overflowed the box: the
+/// bottom handle sat mid-node and the status line spilled past the border.
+export const NODE_MID_ROW = NODE_MID_GAP + NODE_ROW_LH;
+/// Height of a node carrying exactly one middle row.
+export const NODE_H_TALL = NODE_H + NODE_MID_ROW;
 
 /// Height a StatusNode will actually render at, from the same data the node
 /// renders. Both the graph and the editor build nodes through this so dagre
-/// reserves the space the node really occupies.
+/// reserves the space the node really occupies. The middle-row count mirrors
+/// StatusNode exactly: the sub-workflow row and the template row are independent
+/// and can both show, while the image row shows only when neither reference does.
 export function statusNodeHeight(d: {
   templateRef?: string | null;
   workflowRef?: string | null;
   dockerImage?: string | null;
 }): number {
-  const hasMiddleRow = Boolean(d.templateRef || d.workflowRef || d.dockerImage);
-  return hasMiddleRow ? NODE_H_TALL : NODE_H;
+  const isWorkflowRef = Boolean(d.workflowRef);
+  const isTemplate = Boolean(d.templateRef);
+  const midRows =
+    Number(isWorkflowRef) +
+    Number(isTemplate) +
+    Number(!isWorkflowRef && !isTemplate && Boolean(d.dockerImage));
+  return NODE_H + midRows * NODE_MID_ROW;
 }
 
 // "DG" (diagonal cascade) shears the top-down layout: every pixel a node sits

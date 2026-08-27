@@ -1,0 +1,27 @@
+[package]
+name = "dagron-step-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "dagron MCP-tool step — a workflow task that calls a tool on an MCP server over stdio, so a DAG can drive an agent's tools with dagron's retries, artifacts and audit around each call."
+
+[[bin]]
+name = "dagron-step-mcp"
+path = "src/main.rs"
+
+[lib]
+name = "dagron_step_mcp"
+path = "src/lib.rs"
+
+[dependencies]
+# `process` for spawning the MCP server, `io-util` for its stdio pipes, `time`
+# for the exchange deadline. No HTTP stack: this speaks stdio JSON-RPC, which is
+# the transport every MCP server supports.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "process", "time"] }
+# serde_json only: nothing here derives, so a direct `serde` dependency would
+# be a line in a manifest doing no work.
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+# Shared, env-tunable logging bootstrap — the same one every other dagron binary
+# uses, so a step's diagnostics filter like everything else in the run.
+dagron-logging = { path = "../dagron-logging" }

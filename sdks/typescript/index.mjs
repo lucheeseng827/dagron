@@ -260,8 +260,22 @@ export class Client {
 
   // ── runs ────────────────────────────────────────────────────────────────────
 
-  async submitRun(spec) {
-    return (await this._request("POST", "/api/runs", { body: { yaml: specToStr(spec) } })).run_id;
+  async submitRun(spec, { parameters, idempotencyKey } = {}) {
+    const body = { yaml: specToStr(spec) };
+    if (parameters && Object.keys(parameters).length) body.parameters = { ...parameters };
+    // With an idempotency key, repeating this call returns the same run_id
+    // instead of creating a second run. Reusing a key for a different spec or
+    // different parameters throws a 409 rather than returning the first run.
+    //
+    // Distinguish an omitted key from an explicit empty string: `""` is a 400
+    // server-side, so forwarding it surfaces the error, whereas dropping it (a
+    // truthiness check would) hands back a non-idempotent submit the caller
+    // believes is retry-safe. Only `undefined`/`null` means "no key".
+    const headers =
+      idempotencyKey !== undefined && idempotencyKey !== null
+        ? { "idempotency-key": idempotencyKey }
+        : undefined;
+    return (await this._request("POST", "/api/runs", { body, headers })).run_id;
   }
 
   async listRuns({ status, limit, offset } = {}) {
@@ -564,7 +578,7 @@ export class Client {
   // ── transport ───────────────────────────────────────────────────────────────
 
   /** Issue one request; resolve to parsed JSON (or text/null), or throw {@link DagronError}. */
-  async _request(method, path, { body, params, parseJson = true, auth = true } = {}) {
+  async _request(method, path, { body, params, headers: extraHeaders, parseJson = true, auth = true } = {}) {
     let url = this.baseUrl + path;
     if (params) {
       const usp = new URLSearchParams();
@@ -582,6 +596,12 @@ export class Client {
       headers["content-type"] = "application/json";
     }
     if (auth && this.token) headers.authorization = `Bearer ${this.token}`;
+    // Caller headers last, but they cannot displace auth or content-type: a
+    // per-call header is for things like Idempotency-Key, not for quietly
+    // re-pointing the request's identity or encoding.
+    for (const [k, v] of Object.entries(extraHeaders ?? {})) {
+      if (!["authorization", "content-type"].includes(k.toLowerCase())) headers[k] = v;
+    }
 
     const ctrl = new AbortController();
     const timer = this.timeout ? setTimeout(() => ctrl.abort(), this.timeout) : null;

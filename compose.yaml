@@ -57,6 +57,17 @@ services:
       # the engine writing to its own container filesystem would leave the API
       # reading an empty directory.
       - dagron-artifacts:/artifacts
+    # The ops API binds only after init_pool() has run every migration, so a
+    # successful connect proves the schema is committed — which is what
+    # dagron-api waits on below to avoid racing the migrator on a clean volume.
+    # bash's /dev/tcp keeps this dependency-free: the localdev image is
+    # debian-slim, with no curl, wget or nc to call.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8787"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
     depends_on:
       postgres:
         condition: service_healthy
@@ -106,8 +117,15 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      # `service_started` is not enough on its own: the engine runs its sqlx
+      # migrations *after* the process starts, and four of the tables it creates
+      # (users/008, git_repos/009, environments + environment_secrets/026) are
+      # ones dagron-api also ensures at boot. Two concurrent `CREATE TABLE IF NOT
+      # EXISTS` for the same table do not serialize — the loser dies on
+      # "duplicate key value violates unique constraint pg_type_typname_nsp_index".
+      # Waiting for the engine's management API means its migrations are durable.
       engine:
-        condition: service_started
+        condition: service_healthy
 
   # GitOps worker — the only image that carries a `git` binary, and the only one
   # you need if you connect repositories. Opt in with:

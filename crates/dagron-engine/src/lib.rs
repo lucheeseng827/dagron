@@ -50,6 +50,10 @@ mod objstore;
 mod archive_compact;
 // Offline spec validation (`dagron validate`) — pure dagron-core, no ops needed.
 mod validate;
+// Central server-settings management (LOW_LATENCY §5): the knob registry, the
+// DAGRON_CONFIG file/profile layer, typo warnings, the fleet fingerprint, and
+// `dagron config` introspection.
+mod config;
 
 // Network policy for `wait.url` sensors: the opt-in `WAIT_URL_DENY_PRIVATE`
 // guard that keeps a scheduler-issued poll from reaching addresses the task
@@ -97,12 +101,6 @@ fn new_traceparent() -> (String, String) {
     (format!("00-{trace_id}-{span_id}-01"), trace_id)
 }
 
-/// How far each worker heartbeat pushes a running task's lease. Matches the
-/// claim-time lease window (30 s): with a 10 s renew interval, a healthy task's
-/// lease is always 20–30 s in the future, and a dead worker's task is reclaimed
-/// on the same timeline as before heartbeats existed.
-const TASK_LEASE_EXTEND_SECS: i64 = 30;
-
 /// The worker heartbeat over the datastore — renews the claim lease while a
 /// task executes, guarded by the claim triple so a reclaimed task can never be
 /// resurrected. This is what lets one task run for hours (training, stream
@@ -114,7 +112,11 @@ struct DbLeaseKeeper {
 #[async_trait::async_trait]
 impl worker::LeaseKeeper for DbLeaseKeeper {
     async fn renew(&self, task_id: &str, worker_id: &str, fence: i64) -> Result<bool> {
-        db::renew_task_lease(&self.pool, task_id, worker_id, fence, TASK_LEASE_EXTEND_SECS).await
+        // Renew by the same window claims use (`LEASE_SECS`, default 30 s), so
+        // a healthy task's lease always sits between ⅔ and one full window in
+        // the future and a dead worker's task is reclaimed on the configured
+        // timeline — shortening the window shortens crash recovery to match.
+        db::renew_task_lease(&self.pool, task_id, worker_id, fence, db::lease_secs()).await
     }
 }
 
@@ -297,6 +299,11 @@ async fn post_forge_status(
 /// selects the extension behaviour; pass `Seams::default()` for the built-in
 /// configuration.
 pub async fn run(seams: Seams) -> Result<()> {
+    // The DAGRON_CONFIG file/profile layer lands FIRST — it may set LOG_LEVEL
+    // and any other knob, so it must be applied before anything (including
+    // logging) reads the environment. Env always wins over file over profile.
+    let cfg_layer = config::apply_file_layer()?;
+
     // Tunable, structured logging for the workflow controller (and the worker
     // pool it spawns). Verbosity/format are env-driven — see the shared
     // `dagron_logging` crate for the full knob list (RUST_LOG / LOG_LEVEL /
@@ -342,6 +349,33 @@ pub async fn run(seams: Seams) -> Result<()> {
             );
         }
     }
+
+    // `dagron config [--json]` — print every knob's effective value, source
+    // (env / file / profile / default), and the fleet fingerprint, exactly as
+    // a daemon started in this environment would resolve them. Like
+    // `validate`: handled before any daemon setup, side-effect free.
+    if args.get(1).map(String::as_str) == Some("config") {
+        // Surface the same typo warnings a daemon boot would (to stderr, so
+        // the table on stdout stays parseable): the operator asking "what am
+        // I running with" is exactly who needs to hear "…and this var you set
+        // does nothing".
+        config::warn_unknown_vars();
+        let result = config::run_cli(&args[2..]);
+        dagron_logging::shutdown();
+        return result;
+    }
+
+    // One line that pins what this process is actually running with — the
+    // fingerprint is the fleet-drift check (two replicas, same fingerprint =
+    // same knob values), and the typo scan flags look-alike vars that would
+    // otherwise silently do nothing (LOW_LATENCY §5).
+    info!(
+        fingerprint = %config::fingerprint(),
+        config_file = cfg_layer.path.as_deref().unwrap_or("—"),
+        profile = cfg_layer.profile.as_deref().unwrap_or("—"),
+        "configuration resolved"
+    );
+    config::warn_unknown_vars();
 
     // GitOps init: seed /workflows from the image's bundled examples if empty.
     // (Was docker-entrypoint.sh; in-binary now so the image needs no shell.)
@@ -559,9 +593,23 @@ pub async fn run(seams: Seams) -> Result<()> {
         None
     };
 
-    let workers =
-        WorkerPool::with_lease_keeper(worker_count, executor, Arc::clone(&metrics), lease_keeper)
-            .await?;
+    // Heartbeat cadence derives from the lease window: floor(lease/3), floor
+    // 1 s. Floor — not ceiling — division, so the interval can only shrink
+    // relative to lease/3: at any `LEASE_SECS` (floored at 3 s), two missed
+    // renewals still land the third attempt at or before expiry, and the
+    // default window keeps today's exact 10 s cadence (30/3). Ceiling division
+    // would break that: lease 5 → 2 s beats, putting the post-miss renewal at
+    // t+6 against an expiry of t+5.
+    let heartbeat_every =
+        std::time::Duration::from_secs((db::lease_secs() / 3).max(1) as u64);
+    let workers = WorkerPool::with_lease_keeper(
+        worker_count,
+        executor,
+        Arc::clone(&metrics),
+        lease_keeper,
+        heartbeat_every,
+    )
+    .await?;
     info!(size = workers.size(), "worker pool ready");
 
     // When an ops time-source / API is active the process must stay up after the
@@ -767,10 +815,47 @@ pub async fn run(seams: Seams) -> Result<()> {
     // before the task's terminal result arrives.
     let (log_tx, mut log_rx) = mpsc::unbounded_channel::<dagron_executor::executor::LogChunk>();
 
-    let poll_interval = std::time::Duration::from_millis(500);
+    // Tick pacing (docs/LOW_LATENCY.md A-2/A-4). `POLL_INTERVAL_MS` bounds how
+    // long the loop may sleep with work outstanding: on Postgres the timer is a
+    // safety net behind LISTEN/NOTIFY and the completion wake below; on SQLite
+    // it is the only timer-based wake source, so it also paces time-based
+    // retries and parked sensors. Floor 10 ms — below that the tick's own query
+    // work dominates and the loop degrades into a busy poll.
+    let poll_interval_ms: u64 = std::env::var("POLL_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(500)
+        .max(10);
+    let poll_interval = std::time::Duration::from_millis(poll_interval_ms);
+    // Maintenance sweeps (lease recovery, deadlines, approvals, sensors, …) run
+    // on their own cadence instead of on every tick, so a completion- or
+    // NOTIFY-woken tick pays only the hot path (advance → claim → dispatch →
+    // drain → reap). Defaults to the poll interval — at stock settings that is
+    // today's behaviour exactly; profiles that shrink `POLL_INTERVAL_MS` set
+    // this back to ~500 ms so faster ticks don't multiply sweep load.
+    let sweep_interval_ms: u64 = std::env::var("SWEEP_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(poll_interval_ms)
+        .max(10);
+    let sweep_interval = std::time::Duration::from_millis(sweep_interval_ms);
+    info!(
+        poll_interval_ms,
+        sweep_interval_ms,
+        lease_secs = db::lease_secs(),
+        heartbeat_secs = heartbeat_every.as_secs(),
+        "tick pacing configured"
+    );
+    // None → the first tick always sweeps (recovery must not wait a window).
+    let mut last_sweep: Option<std::time::Instant> = None;
 
     // Simple counter: how many tasks are currently in-flight inside the worker pool.
     let mut in_flight: usize = 0;
+
+    // Results the completion wake (A-1) pulled out of the channel while the
+    // loop was between ticks; drained ahead of the channel in step 4 so
+    // arrival order is preserved.
+    let mut pending_results: Vec<worker::TaskResult> = Vec::new();
 
     // Optional OpenLineage emitter (data lineage parity). Off unless
     // OPENLINEAGE_URL is set; emits a terminal RunEvent per finalized run.
@@ -892,247 +977,270 @@ pub async fn run(seams: Seams) -> Result<()> {
         // upper buckets filling. Excludes the wait below (idle, not work).
         let tick_start = std::time::Instant::now();
 
-        // ── Step 1: crash recovery ──────────────────────────────────────────
-        let recovered = db::recover_expired_leases(&pool).await?;
-        if recovered > 0 {
-            info!(recovered, "reclaimed expired leases");
-        }
+        // Set when this tick lands a fenced terminal mark (a drained result's
+        // success/terminal failure, or a memoization hit) — not for a failure
+        // that was merely rescheduled for a future retry, which unblocks
+        // nothing now. A terminal mark decremented dependents, so
+        // re-enter the tick immediately instead of sleeping — on SQLite there
+        // is no NOTIFY to wake us, and on Postgres this skips a listener round
+        // trip for work we already know exists.
+        let mut newly_terminal = false;
 
-        // ── Step 1b: run-level deadlines ────────────────────────────────────
-        // Fail any run past its `run_timeout_secs` budget and cancel its
-        // remaining tasks. Idempotent, so every scheduler may sweep; an executor
-        // finishing after the sweep is rejected by the fence guard.
-        for run_id in db::cancel_overdue_runs(&pool).await? {
-            tracing::warn!(%run_id, "run deadline exceeded (run_timeout_secs) — run failed, tasks cancelled");
-            metrics.inc_runs_deadline_exceeded();
-        }
-
-        // ── Step 1c: soft SLA deadline alerts ───────────────────────────────
-        // Emit a `run.deadline_exceeded` outbox event (once) for a run past its
-        // `deadline` — the run keeps running. Fire-once + winner-take-all in SQL.
-        for run_id in db::fire_deadline_alerts(&pool).await? {
-            tracing::warn!(%run_id, "run exceeded its soft deadline — SLA alert emitted");
-            metrics.inc_deadline_alerts();
-            // Push the SLA breach to any notify.webhook / notify.slack targets
-            // (fire-once is guaranteed by fire_deadline_alerts above). Spawned
-            // so a slow target can't stall the reconcile tick.
-            {
-                let pool = pool.clone();
-                tokio::spawn(async move {
-                    notify::notify_run_event(&pool, &run_id, "deadline_exceeded").await;
-                });
+        // ── Maintenance sweeps (docs/LOW_LATENCY.md A-4) ────────────────────
+        // Crash recovery, run deadlines, SLA alerts, approval expiry, and the
+        // sub-workflow / wait-sensor / dataset reconciliations are time-based,
+        // idempotent sweeps — none of them needed to run at the moment a
+        // dependency finished. They run at `SWEEP_INTERVAL_MS` cadence so a
+        // completion- or NOTIFY-woken tick goes straight to advance → claim.
+        let run_sweeps =
+            last_sweep.is_none_or(|t: std::time::Instant| t.elapsed() >= sweep_interval);
+        if run_sweeps {
+            last_sweep = Some(std::time::Instant::now());
+            // ── Step 1: crash recovery ──────────────────────────────────────────
+            let recovered = db::recover_expired_leases(&pool).await?;
+            if recovered > 0 {
+                info!(recovered, "reclaimed expired leases");
             }
-        }
 
-        // ── Step 1d: expire human approval gates (#19) ──────────────────────
-        // Auto-resolve any `awaiting_approval` task past its `approval_timeout_secs`
-        // per its `approval_on_timeout` default. Idempotent (guarded resolve), so
-        // every scheduler may sweep.
-        for (task_id, approved) in db::resolve_expired_approvals(&pool).await? {
-            tracing::info!(%task_id, approved, "approval gate timed out — auto-resolved");
-        }
-
-        // Resolve any `type: workflow` trigger whose child run has finished (#23):
-        // the parent succeeds/fails with the child and its dependents advance.
-        // Idempotent (guarded resolve), so every scheduler may sweep.
-        for (task_id, succeeded) in db::reconcile_subworkflows(&pool).await? {
-            tracing::info!(%task_id, succeeded, "sub-workflow finished — resolved trigger task");
-        }
-
-        // Resolve any deferred `type: wait` sensor whose deadline has passed (#27):
-        // the task succeeds and its dependents advance. Idempotent, HA-safe.
-        for task_id in db::reconcile_waits(&pool).await? {
-            tracing::info!(%task_id, "wait sensor elapsed — resolved");
-        }
-
-        // Poll any parked `wait.url` HTTP sensor (#27 follow-on) that is due: a 2xx
-        // resolves the task (dependents advance); anything else re-parks it for the
-        // next WAIT_POLL_SECS window. The parked-shape guards keep this idempotent
-        // and HA-safe. A hung endpoint is bounded by the client's request timeout.
-        // Probe the due batch CONCURRENTLY. Polled serially, N parked sensors
-        // pointed at a black-holed endpoint would hold the tick for N × the
-        // request timeout — the per-request timeout bounds one poll, not the
-        // tick — stalling claim, dispatch, log drain, and run reaping behind
-        // them. `WAIT_URL_BATCH` additionally caps the batch in SQL, so the work
-        // one tick can take on is bounded from both ends; anything not polled
-        // this tick is simply picked up by the next.
-        let due = db::due_url_waits(&pool, WAIT_URL_BATCH).await?;
-        if !due.is_empty() {
-            let mut probes = tokio::task::JoinSet::new();
-            for (task_id, url) in due {
-                let client = wait_http.clone(); // Client is an Arc handle — cheap
-                let deny_private = wait_url_deny_private;
-                probes.spawn(async move {
-                    // An IP-literal host never reaches the resolver, so the
-                    // deny-private policy has to be applied here as well. This
-                    // reads as "not ready" and re-parks rather than failing the
-                    // task: the warning is the signal, and relaxing the policy
-                    // resolves the parked sensor in place. (Editing the spec
-                    // would not — `wait_url` was materialized onto this row when
-                    // the task was created, so a spec fix lands on the next run.)
-                    if deny_private && wait_url::literal_host_blocked(&url) {
-                        tracing::warn!(
-                            %task_id, %url,
-                            "wait.url names a non-global address — refusing to poll (WAIT_URL_DENY_PRIVATE)"
-                        );
-                        return (task_id, url, false);
-                    }
-                    let ready = match client.get(&url).send().await {
-                        Ok(resp) => resp.status().is_success(),
-                        Err(e) => {
-                            tracing::debug!(%task_id, %url, error = %e, "http wait sensor poll errored");
-                            false
-                        }
-                    };
-                    (task_id, url, ready)
-                });
+            // ── Step 1b: run-level deadlines ────────────────────────────────────
+            // Fail any run past its `run_timeout_secs` budget and cancel its
+            // remaining tasks. Idempotent, so every scheduler may sweep; an executor
+            // finishing after the sweep is rejected by the fence guard.
+            for run_id in db::cancel_overdue_runs(&pool).await? {
+                tracing::warn!(%run_id, "run deadline exceeded (run_timeout_secs) — run failed, tasks cancelled");
+                metrics.inc_runs_deadline_exceeded();
             }
-            while let Some(joined) = probes.join_next().await {
-                let Ok((task_id, url, ready)) = joined else { continue }; // task panicked
-                if ready {
-                    if db::resolve_url_wait(&pool, &task_id).await? {
-                        tracing::info!(%task_id, %url, "http wait sensor endpoint ready (2xx) — resolved");
-                    }
-                } else {
-                    let next_poll = (chrono::Utc::now()
-                        + chrono::TimeDelta::seconds(wait_poll_secs as i64))
-                    .to_rfc3339();
-                    db::repark_url_wait(&pool, &task_id, &next_poll).await?;
+
+            // ── Step 1c: soft SLA deadline alerts ───────────────────────────────
+            // Emit a `run.deadline_exceeded` outbox event (once) for a run past its
+            // `deadline` — the run keeps running. Fire-once + winner-take-all in SQL.
+            for run_id in db::fire_deadline_alerts(&pool).await? {
+                tracing::warn!(%run_id, "run exceeded its soft deadline — SLA alert emitted");
+                metrics.inc_deadline_alerts();
+                // Push the SLA breach to any notify.webhook / notify.slack targets
+                // (fire-once is guaranteed by fire_deadline_alerts above). Spawned
+                // so a slow target can't stall the reconcile tick.
+                {
+                    let pool = pool.clone();
+                    tokio::spawn(async move {
+                        notify::notify_run_event(&pool, &run_id, "deadline_exceeded").await;
+                    });
                 }
             }
-        }
 
-        // Resolve any parked `wait.dataset` sensor whose dataset recorded an
-        // update after the park: the task succeeds and its dependents advance.
-        // Idempotent, HA-safe (guarded UPDATE).
-        for (task_id, uri) in db::reconcile_dataset_waits(&pool).await? {
-            tracing::info!(%task_id, dataset = %uri, "dataset sensor saw a new update — resolved");
-        }
+            // ── Step 1d: expire human approval gates (#19) ──────────────────────
+            // Auto-resolve any `awaiting_approval` task past its `approval_timeout_secs`
+            // per its `approval_on_timeout` default. Idempotent (guarded resolve), so
+            // every scheduler may sweep.
+            for (task_id, approved) in db::resolve_expired_approvals(&pool).await? {
+                tracing::info!(%task_id, approved, "approval gate timed out — auto-resolved");
+            }
 
-        // Dataset-triggered scheduling: sync `on_datasets:` subscriptions from
-        // the workflow registry, then claim-and-fire triggers whose datasets
-        // recorded new updates. HA-safe with no leadership — claiming is a CAS
-        // cursor advance, so exactly one scheduler creates each run; every
-        // scheduler may sweep. Throttled: registry parsing every tick would be
-        // wasted work at a 500 ms cadence.
-        if dataset_triggers_on
-            && dataset_trigger_sweep
-                .is_none_or(|t: std::time::Instant| t.elapsed().as_secs() >= 5)
-        {
-            dataset_trigger_sweep = Some(std::time::Instant::now());
+            // Resolve any `type: workflow` trigger whose child run has finished (#23):
+            // the parent succeeds/fails with the child and its dependents advance.
+            // Idempotent (guarded resolve), so every scheduler may sweep.
+            // Also where a `repeat:` on a trigger is evaluated: an iteration that
+            // continues re-arms the task and is *not* reported here, so a quiet tick
+            // during a long conversation is the loop working, not the loop stalled.
+            for (task_id, succeeded) in db::reconcile_subworkflows(&pool).await? {
+                tracing::info!(%task_id, succeeded, "sub-workflow finished — resolved trigger task");
+            }
 
-            // 1. Sync subscriptions for workflows that declare any. A spec with
-            //    no `on_datasets:` is skipped entirely rather than issuing a
-            //    per-workflow DELETE every sweep — with a few hundred registered
-            //    workflows that would be a few hundred pointless writes a minute,
-            //    forever. `subscribed` remembers who we synced, so a workflow that
-            //    *drops* its `on_datasets:` still gets its rows cleared exactly
-            //    once (and the orphan prune below is the backstop for the rest).
-            //    Multi-dataset / all-of composition is the Enterprise data-aware
-            //    scheduler — an open build skips such specs with a signpost
-            //    instead of silently subscribing to a subset, warning once per
-            //    workflow rather than on every sweep.
-            match db::list_registered_workflows(&pool).await {
-                Ok(wfs) => {
-                    let mut still_subscribed: std::collections::HashSet<String> =
-                        std::collections::HashSet::new();
-                    for (name, spec) in wfs {
-                        match dag::dataset_subscriptions(&spec) {
-                            Some((uris, mode)) => {
-                                if !cfg!(feature = "enterprise")
-                                    && (uris.len() > 1 || mode == "all")
-                                {
-                                    if warned_dataset_composition.insert(name.clone()) {
-                                        tracing::warn!(
-                                            workflow = %name, datasets = uris.len(), mode = %mode,
-                                            "multi-dataset trigger composition ships with dagron Enterprise — subscription skipped (docs/DATASETS.md#enterprise)"
-                                        );
+            // Resolve any deferred `type: wait` sensor whose deadline has passed (#27):
+            // the task succeeds and its dependents advance. Idempotent, HA-safe.
+            for task_id in db::reconcile_waits(&pool).await? {
+                tracing::info!(%task_id, "wait sensor elapsed — resolved");
+            }
+
+            // Poll any parked `wait.url` HTTP sensor (#27 follow-on) that is due: a 2xx
+            // resolves the task (dependents advance); anything else re-parks it for the
+            // next WAIT_POLL_SECS window. The parked-shape guards keep this idempotent
+            // and HA-safe. A hung endpoint is bounded by the client's request timeout.
+            // Probe the due batch CONCURRENTLY. Polled serially, N parked sensors
+            // pointed at a black-holed endpoint would hold the tick for N × the
+            // request timeout — the per-request timeout bounds one poll, not the
+            // tick — stalling claim, dispatch, log drain, and run reaping behind
+            // them. `WAIT_URL_BATCH` additionally caps the batch in SQL, so the work
+            // one tick can take on is bounded from both ends; anything not polled
+            // this tick is simply picked up by the next.
+            let due = db::due_url_waits(&pool, WAIT_URL_BATCH).await?;
+            if !due.is_empty() {
+                let mut probes = tokio::task::JoinSet::new();
+                for (task_id, url) in due {
+                    let client = wait_http.clone(); // Client is an Arc handle — cheap
+                    let deny_private = wait_url_deny_private;
+                    probes.spawn(async move {
+                        // An IP-literal host never reaches the resolver, so the
+                        // deny-private policy has to be applied here as well. This
+                        // reads as "not ready" and re-parks rather than failing the
+                        // task: the warning is the signal, and relaxing the policy
+                        // resolves the parked sensor in place. (Editing the spec
+                        // would not — `wait_url` was materialized onto this row when
+                        // the task was created, so a spec fix lands on the next run.)
+                        if deny_private && wait_url::literal_host_blocked(&url) {
+                            tracing::warn!(
+                                %task_id, %url,
+                                "wait.url names a non-global address — refusing to poll (WAIT_URL_DENY_PRIVATE)"
+                            );
+                            return (task_id, url, false);
+                        }
+                        let ready = match client.get(&url).send().await {
+                            Ok(resp) => resp.status().is_success(),
+                            Err(e) => {
+                                tracing::debug!(%task_id, %url, error = %e, "http wait sensor poll errored");
+                                false
+                            }
+                        };
+                        (task_id, url, ready)
+                    });
+                }
+                while let Some(joined) = probes.join_next().await {
+                    let Ok((task_id, url, ready)) = joined else { continue }; // task panicked
+                    if ready {
+                        if db::resolve_url_wait(&pool, &task_id).await? {
+                            tracing::info!(%task_id, %url, "http wait sensor endpoint ready (2xx) — resolved");
+                        }
+                    } else {
+                        let next_poll = (chrono::Utc::now()
+                            + chrono::TimeDelta::seconds(wait_poll_secs as i64))
+                        .to_rfc3339();
+                        db::repark_url_wait(&pool, &task_id, &next_poll).await?;
+                    }
+                }
+            }
+
+            // Resolve any parked `wait.dataset` sensor whose dataset recorded an
+            // update after the park: the task succeeds and its dependents advance.
+            // Idempotent, HA-safe (guarded UPDATE).
+            for (task_id, uri) in db::reconcile_dataset_waits(&pool).await? {
+                tracing::info!(%task_id, dataset = %uri, "dataset sensor saw a new update — resolved");
+            }
+
+            // Dataset-triggered scheduling: sync `on_datasets:` subscriptions from
+            // the workflow registry, then claim-and-fire triggers whose datasets
+            // recorded new updates. HA-safe with no leadership — claiming is a CAS
+            // cursor advance, so exactly one scheduler creates each run; every
+            // scheduler may sweep. Throttled: registry parsing every tick would be
+            // wasted work at a 500 ms cadence.
+            if dataset_triggers_on
+                && dataset_trigger_sweep
+                    .is_none_or(|t: std::time::Instant| t.elapsed().as_secs() >= 5)
+            {
+                dataset_trigger_sweep = Some(std::time::Instant::now());
+
+                // 1. Sync subscriptions for workflows that declare any. A spec with
+                //    no `on_datasets:` is skipped entirely rather than issuing a
+                //    per-workflow DELETE every sweep — with a few hundred registered
+                //    workflows that would be a few hundred pointless writes a minute,
+                //    forever. `subscribed` remembers who we synced, so a workflow that
+                //    *drops* its `on_datasets:` still gets its rows cleared exactly
+                //    once (and the orphan prune below is the backstop for the rest).
+                //    Multi-dataset / all-of composition is the Enterprise data-aware
+                //    scheduler — an open build skips such specs with a signpost
+                //    instead of silently subscribing to a subset, warning once per
+                //    workflow rather than on every sweep.
+                match db::list_registered_workflows(&pool).await {
+                    Ok(wfs) => {
+                        let mut still_subscribed: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
+                        for (name, spec) in wfs {
+                            match dag::dataset_subscriptions(&spec) {
+                                Some((uris, mode)) => {
+                                    if !cfg!(feature = "enterprise")
+                                        && (uris.len() > 1 || mode == "all")
+                                    {
+                                        if warned_dataset_composition.insert(name.clone()) {
+                                            tracing::warn!(
+                                                workflow = %name, datasets = uris.len(), mode = %mode,
+                                                "multi-dataset trigger composition ships with dagron Enterprise — subscription skipped (docs/DATASETS.md#enterprise)"
+                                            );
+                                        }
+                                        if subscribed_workflows.contains(&name) {
+                                            let _ = db::sync_dataset_triggers(&pool, &name, &[], "any").await;
+                                        }
+                                        continue;
                                     }
+                                    warned_dataset_composition.remove(&name);
+                                    still_subscribed.insert(name.clone());
+                                    if let Err(e) =
+                                        db::sync_dataset_triggers(&pool, &name, &uris, &mode).await
+                                    {
+                                        tracing::warn!(workflow = %name, error = %e, "dataset trigger sync failed");
+                                        still_subscribed.remove(&name);
+                                    }
+                                }
+                                None => {
+                                    // Only clear when this scheduler previously synced
+                                    // rows for it — otherwise this is a no-op workflow.
                                     if subscribed_workflows.contains(&name) {
                                         let _ = db::sync_dataset_triggers(&pool, &name, &[], "any").await;
                                     }
-                                    continue;
+                                    warned_dataset_composition.remove(&name);
                                 }
-                                warned_dataset_composition.remove(&name);
-                                still_subscribed.insert(name.clone());
-                                if let Err(e) =
-                                    db::sync_dataset_triggers(&pool, &name, &uris, &mode).await
-                                {
-                                    tracing::warn!(workflow = %name, error = %e, "dataset trigger sync failed");
-                                    still_subscribed.remove(&name);
-                                }
-                            }
-                            None => {
-                                // Only clear when this scheduler previously synced
-                                // rows for it — otherwise this is a no-op workflow.
-                                if subscribed_workflows.contains(&name) {
-                                    let _ = db::sync_dataset_triggers(&pool, &name, &[], "any").await;
-                                }
-                                warned_dataset_composition.remove(&name);
                             }
                         }
+                        subscribed_workflows = still_subscribed;
                     }
-                    subscribed_workflows = still_subscribed;
+                    Err(e) => tracing::warn!(error = %e, "dataset trigger sweep: workflow listing failed"),
                 }
-                Err(e) => tracing::warn!(error = %e, "dataset trigger sweep: workflow listing failed"),
-            }
-            if let Err(e) = db::prune_dataset_triggers(&pool).await {
-                tracing::warn!(error = %e, "dataset trigger prune failed");
-            }
+                if let Err(e) = db::prune_dataset_triggers(&pool).await {
+                    tracing::warn!(error = %e, "dataset trigger prune failed");
+                }
 
-            // 2. Claim + fire. The triggering dataset is injected as the
-            //    `{{ trigger_dataset }}` parameter so the fired run can reference
-            //    what woke it. A fire refused at the workflow's max_active_runs
-            //    cap rolls its cursors back and retries on a later sweep; a spec
-            //    that no longer parses keeps its advanced cursor (skipping the
-            //    fire) so a broken spec can't warn-loop forever.
-            for fire in db::claim_due_dataset_triggers(&pool).await? {
-                let Some(spec_yaml) =
-                    db::workflow_spec_by_name(&pool, &fire.workflow_name).await?
-                else {
-                    continue; // deregistered between sync and claim — prune gets it
-                };
-                let mut params = std::collections::BTreeMap::new();
-                params.insert("trigger_dataset".to_string(), fire.trigger_uri.clone());
-                let parsed = match environments::template_params(&pool, &spec_yaml).await {
-                    Ok(extra) => {
-                        params.extend(extra);
-                        dag::DagGraph::from_yaml_with_params(&spec_yaml, &params)
-                    }
-                    Err(e) => Err(e),
-                };
-                match parsed {
-                    Ok(child_dag) => match db::create_run(&pool, &child_dag, &spec_yaml).await {
-                        Ok(run_id) => {
-                            metrics.inc_runs_created();
-                            metrics.inc_dataset_fires();
-                            if let Err(e) =
-                                db::stamp_dataset_trigger_fired(&pool, &fire.workflow_name, &run_id)
-                                    .await
-                            {
-                                tracing::warn!(workflow = %fire.workflow_name, error = %e, "dataset trigger stamp failed");
+                // 2. Claim + fire. The triggering dataset is injected as the
+                //    `{{ trigger_dataset }}` parameter so the fired run can reference
+                //    what woke it. A fire refused at the workflow's max_active_runs
+                //    cap rolls its cursors back and retries on a later sweep; a spec
+                //    that no longer parses keeps its advanced cursor (skipping the
+                //    fire) so a broken spec can't warn-loop forever.
+                for fire in db::claim_due_dataset_triggers(&pool).await? {
+                    let Some(spec_yaml) =
+                        db::workflow_spec_by_name(&pool, &fire.workflow_name).await?
+                    else {
+                        continue; // deregistered between sync and claim — prune gets it
+                    };
+                    let mut params = std::collections::BTreeMap::new();
+                    params.insert("trigger_dataset".to_string(), fire.trigger_uri.clone());
+                    let parsed = match environments::template_params(&pool, &spec_yaml).await {
+                        Ok(extra) => {
+                            params.extend(extra);
+                            dag::DagGraph::from_yaml_with_params(&spec_yaml, &params)
+                        }
+                        Err(e) => Err(e),
+                    };
+                    match parsed {
+                        Ok(child_dag) => match db::create_run(&pool, &child_dag, &spec_yaml).await {
+                            Ok(run_id) => {
+                                metrics.inc_runs_created();
+                                metrics.inc_dataset_fires();
+                                if let Err(e) =
+                                    db::stamp_dataset_trigger_fired(&pool, &fire.workflow_name, &run_id)
+                                        .await
+                                {
+                                    tracing::warn!(workflow = %fire.workflow_name, error = %e, "dataset trigger stamp failed");
+                                }
+                                info!(
+                                    workflow = %fire.workflow_name, %run_id, dataset = %fire.trigger_uri,
+                                    "dataset trigger fired run"
+                                );
                             }
-                            info!(
-                                workflow = %fire.workflow_name, %run_id, dataset = %fire.trigger_uri,
-                                "dataset trigger fired run"
-                            );
-                        }
-                        Err(e)
-                            if e.downcast_ref::<dagron_core::models::MaxActiveRunsReached>()
-                                .is_some() =>
-                        {
-                            db::unclaim_dataset_trigger(&pool, &fire.workflow_name, &fire.advanced)
-                                .await?;
-                            info!(workflow = %fire.workflow_name, "dataset fire at max_active_runs — will retry");
-                        }
+                            Err(e)
+                                if e.downcast_ref::<dagron_core::models::MaxActiveRunsReached>()
+                                    .is_some() =>
+                            {
+                                db::unclaim_dataset_trigger(&pool, &fire.workflow_name, &fire.advanced)
+                                    .await?;
+                                info!(workflow = %fire.workflow_name, "dataset fire at max_active_runs — will retry");
+                            }
+                            Err(e) => {
+                                db::unclaim_dataset_trigger(&pool, &fire.workflow_name, &fire.advanced)
+                                    .await?;
+                                tracing::warn!(workflow = %fire.workflow_name, error = %e, "dataset fire create_run failed — will retry");
+                            }
+                        },
                         Err(e) => {
-                            db::unclaim_dataset_trigger(&pool, &fire.workflow_name, &fire.advanced)
-                                .await?;
-                            tracing::warn!(workflow = %fire.workflow_name, error = %e, "dataset fire create_run failed — will retry");
+                            tracing::warn!(workflow = %fire.workflow_name, error = %e, "dataset-triggered workflow no longer parses — fire skipped");
                         }
-                    },
-                    Err(e) => {
-                        tracing::warn!(workflow = %fire.workflow_name, error = %e, "dataset-triggered workflow no longer parses — fire skipped");
                     }
                 }
             }
@@ -1209,15 +1317,26 @@ pub async fn run(seams: Seams) -> Result<()> {
                 )
                 .await?
             };
+            if !claimed.is_empty() {
+                metrics.observe_claim_batch(claimed.len());
+            }
             for task in claimed {
-                let (mut ctx, max_attempts, retry_delay_secs, retry_max_delay_secs, retry_on_timeout, cache, sub_workflow, wait, gang_member, produces) = match &task.input {
+                let (mut ctx, max_attempts, retry_delay_secs, retry_max_delay_secs, retry_on_timeout, cache, sub_workflow, wait, gang_member, produces, carried_spec) = match &task.input {
                     Some(json) => match serde_json::from_str::<dag::TaskSpec>(json) {
                         Ok(spec) => {
+                            // Carried through dispatch and echoed back in the
+                            // TaskResult (B-4), so the result path never
+                            // re-reads and re-parses this row's input JSON.
+                            let carried_spec = Box::new(spec.clone());
                             // Sub-workflow trigger target (#23) and wait-sensor
                             // config (#27), captured before `spec`'s fields are
                             // moved into the exec context below.
+                            // The trigger's target *and* its arguments: the
+                            // arguments are the child run's parameters, so they
+                            // travel together or the child is created without
+                            // them and every conversation looks the same.
                             let sub_workflow = if spec.task_type.as_deref() == Some("workflow") {
-                                spec.workflow.clone()
+                                spec.workflow.clone().map(|w| (w, spec.arguments.clone()))
                             } else {
                                 None
                             };
@@ -1283,6 +1402,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                                 // Carried so a cache hit can record the same
                                 // dataset updates a normal success would.
                                 spec.produces,
+                                Some(carried_spec),
                             )
                         }
                         Err(e) => {
@@ -1305,7 +1425,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                             continue;
                         }
                     },
-                    None => (ExecContext::new(vec!["true".to_string()], None, None), 1, 0, None, true, None, None, None, None, Vec::new()),
+                    None => (ExecContext::new(vec!["true".to_string()], None, None), 1, 0, None, true, None, None, None, None, Vec::new(), None),
                 };
 
                 // Deferrable wait sensor (#27): park this task with no worker held
@@ -1366,7 +1486,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                 // Sub-workflow trigger (#23): submit the named registered workflow
                 // as a child run and park this task until the child is terminal —
                 // no worker is dispatched. The parent succeeds/fails with the child.
-                if let Some(child_name) = &sub_workflow {
+                if let Some((child_name, child_args)) = &sub_workflow {
                     let fence = task.version.saturating_add(1);
                     // Recursion guard: nothing stops a workflow from naming
                     // itself (directly or through a cycle of workflows), and
@@ -1402,7 +1522,16 @@ pub async fn run(seams: Seams) -> Result<()> {
                             tracing::error!(task = %task.name, workflow = %child_name, "type: workflow names an unknown workflow — failing task");
                             db::mark_task_failed(&pool, &task.id, &worker_id, fence, Some(format!("unknown workflow '{child_name}'"))).await?;
                         }
-                        Some(child_yaml) => match dag::DagGraph::from_yaml(&child_yaml) {
+                        // Built *with* the trigger's arguments as parameters, the
+                        // same call `POST /api/runs` makes for a caller-supplied
+                        // `parameters` map. The stored spec below is still the
+                        // child's own YAML — parameters are applied to the graph,
+                        // not written into the definition, so the workflow keeps
+                        // one definition however many ways it is called.
+                        Some(child_yaml) => match dag::DagGraph::from_yaml_with_params(
+                            &child_yaml,
+                            child_args,
+                        ) {
                             Err(e) => {
                                 tracing::error!(task = %task.name, workflow = %child_name, error = %e, "child workflow spec no longer parses — failing task");
                                 db::mark_task_failed(&pool, &task.id, &worker_id, fence, Some(format!("child workflow '{child_name}' invalid: {e}"))).await?;
@@ -1463,6 +1592,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                         // otherwise a downstream sensor or `on_datasets:` consumer
                         // would park forever whenever the producer hits its cache.
                         if marked {
+                            newly_terminal = true;
                             record_produces(
                                 &pool,
                                 &metrics,
@@ -1632,6 +1762,22 @@ pub async fn run(seams: Seams) -> Result<()> {
                     continue;
                 }
 
+                // Became-claimable → dispatched (A-5). `scheduled_at` is the
+                // readiness stamp (advance sets it on the ready flip; retries
+                // set it to the due time), so this is the scheduler's own
+                // queueing latency — the low-latency profile's SLO metric. A
+                // NULL stamp (a UI retry) just skips the observation.
+                if let Some(ready_at) = task
+                    .scheduled_at
+                    .as_deref()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                {
+                    let waited = chrono::Utc::now() - ready_at.with_timezone(&chrono::Utc);
+                    if let Some(us) = waited.num_microseconds().filter(|&us| us >= 0) {
+                        metrics.observe_dispatch_latency(us as f64 / 1_000_000.0);
+                    }
+                }
+
                 // Per-task dispatch span (#28): groups the trace-context
                 // propagation and the enqueue under one `tracing` span, so an OTLP
                 // exporter (`--features otel` + `OTEL_EXPORTER_OTLP_ENDPOINT`)
@@ -1699,6 +1845,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                         task_id: task.id.clone(),
                         worker_id: worker_id.clone(),
                         ctx,
+                        spec: carried_spec,
                         attempt: task.attempt,
                         max_attempts,
                         retry_delay_secs,
@@ -1733,7 +1880,15 @@ pub async fn run(seams: Seams) -> Result<()> {
         }
 
         // ── Step 4: collect finished tasks ──────────────────────────────────
+        let mut results = std::mem::take(&mut pending_results);
         while let Ok(result) = rx.try_recv() {
+            results.push(result);
+        }
+        for mut result in results {
+            // Executor finished → drained here (A-5). Before the completion
+            // wake this sat at "remainder of the poll interval" for every
+            // locally-run task; it should now track tick cost alone.
+            metrics.observe_result_wait(result.finished.elapsed().as_secs_f64());
             in_flight = in_flight.saturating_sub(1);
 
             if result.success {
@@ -1743,35 +1898,34 @@ pub async fn run(seams: Seams) -> Result<()> {
                 // scheduled_at delay; `attempt` doubles as the iteration count),
                 // and after max_iterations the loop fails loudly — a condition
                 // that never came true is an error, not a success.
-                // Parse the task spec once here; `repeat` (below) and `cache`
-                // (the memo write after success) both read from it, so a
-                // non-repeating, uncached task costs no extra work.
-                let task_spec: Option<dag::TaskSpec> =
-                    match db::task_input_json(&pool, &result.task_id).await {
-                        Ok(Some(json)) => serde_json::from_str::<dag::TaskSpec>(&json).ok(),
-                        _ => None,
-                    };
+                // The spec rode the dispatch payload and came back on the
+                // result (B-4) — `repeat` (below) and `cache` (the memo write
+                // after success) read from it with no DB round trip and no
+                // re-parse per completion.
+                let task_spec: Option<dag::TaskSpec> = result.spec.take().map(|b| *b);
                 let repeat = task_spec.as_ref().and_then(|s| s.repeat.clone());
                 if let Some(rep) = repeat {
                     let iteration = result.attempt + 1; // the iteration that just ran
                     let output = result.output.clone().unwrap_or_default();
-                    let mut ctx = std::collections::BTreeMap::new();
-                    ctx.insert("output".to_string(), output.trim().to_string());
-                    ctx.insert("attempt".to_string(), iteration.to_string());
-                    let done = dagron_core::expand::eval_when(&dagron_core::expand::substitute(
-                        &rep.until, &ctx,
-                    ));
-                    match done {
-                        Ok(true) => {} // condition met — fall through to success
-                        Ok(false) if iteration < rep.max_iterations as i64 => {
-                            let delay = i64::try_from(rep.delay_secs).unwrap_or(i64::MAX);
-                            let retry_at =
-                                (chrono::Utc::now() + chrono::TimeDelta::seconds(delay)).to_rfc3339();
+                    // One decision function, two callers: this path, and the
+                    // sub-workflow sweep in `db::reconcile_subworkflows`. They
+                    // share no machinery — this one holds a worker claim and a
+                    // fence, that one holds a parked row nobody owns — so the
+                    // decision is the only thing that *can* be shared, and two
+                    // copies of a loop operator is how the two come to disagree
+                    // about when a loop is over.
+                    match rep.decide(&output, iteration) {
+                        dag::RepeatDecision::Done => {} // fall through to success
+                        dag::RepeatDecision::Again { delay_secs } => {
+                            // Shared, panic-free retry-time computation: an
+                            // unbounded `delay_secs` would otherwise panic
+                            // `TimeDelta::seconds`.
+                            let retry_at = dag::delayed_retry_at(delay_secs);
                             info!(
                                 task_id = %result.task_id,
                                 iteration,
                                 max_iterations = rep.max_iterations,
-                                delay_secs = rep.delay_secs,
+                                delay_secs,
                                 "repeat.until not yet satisfied — re-queueing iteration"
                             );
                             db::retry_task(
@@ -1785,34 +1939,21 @@ pub async fn run(seams: Seams) -> Result<()> {
                             .await?;
                             continue;
                         }
-                        Ok(false) => {
-                            info!(task_id = %result.task_id, iteration, "repeat.until never satisfied — failing task");
+                        dag::RepeatDecision::Fail { reason } => {
+                            info!(task_id = %result.task_id, iteration, %reason, "repeat loop failed");
                             metrics.inc_failed();
                             seams.meter.on_task_completed(false).await;
-                            db::mark_task_failed(
+                            if db::mark_task_failed(
                                 &pool,
                                 &result.task_id,
                                 &result.worker_id,
                                 result.fence,
-                                Some(format!(
-                                    "repeat.until '{}' not satisfied after {} iterations; last output:\n{}",
-                                    rep.until, iteration, output
-                                )),
+                                Some(reason),
                             )
-                            .await?;
-                            continue;
-                        }
-                        Err(e) => {
-                            metrics.inc_failed();
-                            seams.meter.on_task_completed(false).await;
-                            db::mark_task_failed(
-                                &pool,
-                                &result.task_id,
-                                &result.worker_id,
-                                result.fence,
-                                Some(format!("repeat.until '{}' failed to evaluate: {e}", rep.until)),
-                            )
-                            .await?;
+                            .await?
+                            {
+                                newly_terminal = true;
+                            }
                             continue;
                         }
                     }
@@ -1843,6 +1984,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                 // lineage. Both are best-effort: a failure here never fails the
                 // run. Only tasks that use a feature pay for the name lookup.
                 if marked {
+                    newly_terminal = true;
                     let needs_wf = task_spec
                         .as_ref()
                         .is_some_and(|s| s.cache.is_some() || !s.produces.is_empty());
@@ -1935,14 +2077,17 @@ pub async fn run(seams: Seams) -> Result<()> {
                     );
                     metrics.inc_failed();
                     seams.meter.on_task_completed(false).await; // extension seam (usage accounting)
-                    db::mark_task_failed(
+                    if db::mark_task_failed(
                         &pool,
                         &result.task_id,
                         &result.worker_id,
                         result.fence,
                         result.output,
                     )
-                    .await?;
+                    .await?
+                    {
+                        newly_terminal = true;
+                    }
                     // Die-together: a failed gang member takes its siblings
                     // with it (their heartbeats lose the fenced claim and
                     // abort). The gang retries as a unit via run-level rerun.
@@ -2012,9 +2157,41 @@ pub async fn run(seams: Seams) -> Result<()> {
 
         metrics.observe_reconcile_tick(tick_start.elapsed().as_secs_f64());
 
-        // Wake on the next task-readiness event (Postgres) or after the poll
-        // interval (SQLite / safety net for time-based retries), whichever first.
-        waker.wait(poll_interval).await?;
+        // This tick marked something terminal, so dependents' counters just hit
+        // zero: advance/claim them NOW instead of sleeping. Without this, SQLite
+        // (no NOTIFY) parks a ready dependent for a full poll interval, and
+        // Postgres burns a listener round trip on its own self-NOTIFY.
+        if newly_terminal {
+            continue;
+        }
+
+        // ── Wake sources, in priority order (docs/LOW_LATENCY.md A-1) ───────
+        // 1. A worker finished a task — the completion wake. Before this
+        //    existed, a locally-finished task sat undrained in the mpsc channel
+        //    for the remainder of the poll interval (up to 500 ms per
+        //    dependency hop, measured in docs/LOW_LATENCY.md §1); the loop's
+        //    only wake sources were the NOTIFY listener and the timer, and
+        //    nothing NOTIFYs between dispatch and the mark.
+        // 2. The datastore waker: Postgres LISTEN/NOTIFY (a peer changed task
+        //    readiness) with the poll timer as the safety net; on SQLite the
+        //    timer alone. The timer also paces time-based retries and parked
+        //    sensors, and covers the (rare) notification a cancelled listener
+        //    poll could drop — the timer has always been that safety net.
+        // Live-log chunks are deliberately NOT a wake source: tailing has no
+        // latency SLO, and waking per chunk would let one chatty task spin the
+        // loop at its output rate. Chunks keep draining at tick cadence.
+        // Both futures are cancel-safe to drop mid-wait: an mpsc message stays
+        // queued until actually received.
+        tokio::select! {
+            biased;
+            result = rx.recv() => match result {
+                Some(r) => pending_results.push(r),
+                // Unreachable while the loop owns `tx` (it lives to fn end),
+                // but a closed channel must degrade to timer pacing, not spin.
+                None => tokio::time::sleep(poll_interval).await,
+            },
+            _ = waker.wait(poll_interval) => {}
+        }
     }
 
     pool.close().await;

@@ -3,6 +3,7 @@
 //! `AppState` is cheap to clone (PgPool and broadcast::Sender are Arc-backed),
 //! so it is handed to every handler via axum's `State` extractor.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use dagron_identity::IdentityProvider;
@@ -52,4 +53,8 @@ pub struct AppState {
     /// Per-client budget for `POST /api/login` — the one unauthenticated route
     /// that costs an Argon2 verify per call. See [`crate::ratelimit`].
     pub login_limiter: Arc<crate::ratelimit::RateLimiter>,
+    /// True while the shared `task_events` listener is subscribed. `/readyz`
+    /// folds it in: a replica whose LISTEN session is down serves stale SSE
+    /// and long-polls, so it should not be routed new traffic (LOW_LATENCY R-1).
+    pub listener_ready: Arc<AtomicBool>,
 }

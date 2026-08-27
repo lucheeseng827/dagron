@@ -5,7 +5,7 @@
 //! create_run path the submit endpoint uses, producing an ordinary run. The
 //! engine never reads this table.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -423,12 +423,54 @@ pub async fn delete_workflow(
     }
 }
 
-/// `POST /api/workflows/:id/run` — submit the stored spec as a new run.
+/// Optional body for [`run_workflow`].
+#[derive(Deserialize, Default)]
+pub struct RunWorkflowBody {
+    /// Arguments for the stored spec's declared `parameters:`.
+    #[serde(default)]
+    pub parameters: BTreeMap<String, String>,
+}
+
+#[cfg(test)]
+mod run_workflow_body_tests {
+    use super::RunWorkflowBody;
+
+    /// The route took no body at all until parameters were added, so an absent
+    /// body must stay valid. `Option<Json<_>>` covers the no-`Content-Type`
+    /// case; this covers a client that sends `{}` instead.
+    #[test]
+    fn empty_object_body_means_no_parameters() {
+        let b: RunWorkflowBody = serde_json::from_str("{}").unwrap();
+        assert!(b.parameters.is_empty());
+    }
+
+    #[test]
+    fn parameters_are_read_when_present() {
+        let b: RunWorkflowBody =
+            serde_json::from_str(r#"{"parameters":{"region":"ap-southeast-1"}}"#).unwrap();
+        assert_eq!(b.parameters.get("region").map(String::as_str), Some("ap-southeast-1"));
+    }
+}
+
+/// `POST /api/workflows/:id/run` — submit the stored spec as a new run, with
+/// optional `{ "parameters": { … } }`.
+///
+/// The body is optional (`Option<Json<_>>` yields `None` when the request
+/// carries no `Content-Type`), so the pre-existing bodyless call is unchanged.
+/// That matters: this route took no body at all until now, and every existing
+/// caller sends none.
+///
+/// Being able to pass arguments here is what makes a *stored* workflow callable
+/// as a function. Without it a caller that needs to vary anything has to read
+/// the spec, splice values in itself, and submit the result as new YAML —
+/// which is a different and much broader operation than "run this workflow",
+/// both to reason about and to authorize.
 pub async fn run_workflow(
     _auth: AuthUser,
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    body: Option<Json<RunWorkflowBody>>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
     // A paused or retired workflow refuses to run here as well as in the
     // scheduler. Enforcing it in only one of the two would mean "paused" stops
     // cron but not a button, which is not what anyone reads it to mean.
@@ -452,9 +494,21 @@ pub async fn run_workflow(
 
     control::parse_and_validate(&spec_yaml)?;
     // Same pipeline as `POST /api/runs`: `workflow_ref` chains inlined, then the
-    // engine's own parser and run writer.
-    let run_id = control::submit_yaml(&state, &spec_yaml, &spec_yaml).await?;
-    Ok(Json(serde_json::json!({ "run_id": run_id, "workflow_id": id })))
+    // engine's own parser and run writer — now with the caller's arguments fed
+    // in as parameter overrides, so substitution happens once, in the engine.
+    let params = body.map(|Json(b)| b.parameters).unwrap_or_default();
+    let run_id =
+        control::submit_yaml_with_params(&state, &spec_yaml, &spec_yaml, &params).await?;
+    // `201`, not `200`. This route creates a run, and every other route that
+    // creates one already says so — `POST /api/runs`, `/resubmit`. The odd one
+    // out was not merely inconsistent: a layer in front that counts created
+    // runs by status (a proxy, a quota, a meter) saw a creation it could not
+    // distinguish from a read, so runs submitted by name went uncounted.
+    // Clients check 2xx, so nothing that works today stops working.
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "run_id": run_id, "workflow_id": id })),
+    ))
 }
 
 #[derive(Deserialize)]

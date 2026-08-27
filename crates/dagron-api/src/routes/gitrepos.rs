@@ -743,9 +743,24 @@ async fn write_auth(state: &AppState, id: &str, auth: &StoredAuth) -> Result<Git
 /// fetch, an internal host (SSRF), or a local path; opt in with
 /// `DAGRON_GIT_ALLOW_INSECURE=1` (e.g. for `file://` in tests / air-gapped dev).
 fn allow_insecure_git() -> bool {
-    std::env::var("DAGRON_GIT_ALLOW_INSECURE")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    fn read() -> bool {
+        std::env::var("DAGRON_GIT_ALLOW_INSECURE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+    // Read once in production (LOW_LATENCY §5): boot-immutable like every
+    // other knob. Tests read live — `url_scheme_validation` toggles the var to
+    // exercise both branches of the scheme policy, which is the logic under
+    // test; the memoization is plumbing.
+    #[cfg(test)]
+    {
+        read()
+    }
+    #[cfg(not(test))]
+    {
+        static ALLOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ALLOW.get_or_init(read)
+    }
 }
 
 /// Which transport a registered URL resolves to. Decides both what `git` will be

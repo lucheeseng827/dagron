@@ -1,5 +1,5 @@
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 
@@ -12,6 +12,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::Instrument;
 
 use crate::executor::{ExecContext, Executor, LogChunk, LogSink};
+use dagron_core::dag::TaskSpec;
 use dagron_core::metrics::Metrics;
 
 // ── Lease heartbeat (long-running tasks) ──────────────────────────────────────
@@ -32,9 +33,11 @@ pub trait LeaseKeeper: Send + Sync + 'static {
     async fn renew(&self, task_id: &str, worker_id: &str, fence: i64) -> Result<bool>;
 }
 
-/// How often a worker heartbeats a running task's lease. A third of the 30 s
-/// claim-time lease: two consecutive misses still leave headroom before the
-/// reconcile loop's expired-lease sweep can reclaim the task.
+/// Default heartbeat interval — a third of the default 30 s claim-time lease:
+/// two consecutive misses still leave headroom before the reconcile loop's
+/// expired-lease sweep can reclaim the task. The engine passes the real value
+/// (lease/3, from `LEASE_SECS`) into [`WorkerPool::with_lease_keeper`]; this
+/// constant only backs [`WorkerPool::new`], which runs without a keeper anyway.
 const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 
 // ── Result type (produced by workers, consumed by the reconcile loop) ─────────
@@ -63,6 +66,16 @@ pub struct TaskResult {
     /// if the row still carries this version, so a stale attempt whose lease was
     /// reclaimed — even by this same process — cannot overwrite a newer attempt.
     pub fence: i64,
+    /// When the executor finished, stamped just before this result is sent.
+    /// The reconcile loop observes `finished.elapsed()` at drain time as
+    /// `scheduler_result_wait_seconds` — the direct measure of the
+    /// wake-on-completion path (docs/LOW_LATENCY.md F1/A-5).
+    pub finished: Instant,
+    /// The task's parsed spec, echoed from [`DispatchPayload::spec`] so the
+    /// reconcile loop's result handling (repeat / memoization / `produces:`)
+    /// never re-reads and re-parses the row's input JSON per completion
+    /// (docs/LOW_LATENCY.md B-4). `None` for a task with no stored input.
+    pub spec: Option<Box<TaskSpec>>,
 }
 
 // ── Dispatch payload ──────────────────────────────────────────────────────────
@@ -83,6 +96,10 @@ pub struct DispatchPayload {
     pub retry_on_timeout: bool,
     /// Per-claim fencing token (post-claim `version`); echoed back in TaskResult.
     pub fence: i64,
+    /// The task's parsed spec, carried through execution and echoed back in
+    /// [`TaskResult::spec`] — see there. The claim loop already paid the parse;
+    /// this keeps the result path from paying a DB read plus a second parse.
+    pub spec: Option<Box<TaskSpec>>,
     /// Channel back to the reconcile loop — the worker sends its result here.
     pub result_tx: UnboundedSender<TaskResult>,
     /// Optional live-log channel (#17). When set, the worker wires a per-task
@@ -104,28 +121,57 @@ pub enum WorkerMsg {
 
 struct WorkerActor;
 
+/// Spawn arguments for one worker actor — grew past a readable tuple.
+struct WorkerInit {
+    executor: Arc<dyn Executor>,
+    metrics: Arc<Metrics>,
+    lease_keeper: Option<Arc<dyn LeaseKeeper>>,
+    /// How often to renew a running task's lease (the engine passes lease/3).
+    heartbeat: Duration,
+    /// This worker's index into the pool's shared busy flags.
+    slot: usize,
+    busy: Arc<Vec<AtomicBool>>,
+}
+
 struct WorkerState {
     executor: Arc<dyn Executor>,
     metrics: Arc<Metrics>,
     lease_keeper: Option<Arc<dyn LeaseKeeper>>,
+    heartbeat: Duration,
+    slot: usize,
+    busy: Arc<Vec<AtomicBool>>,
+}
+
+/// Clears a worker's busy flag on drop, so the flag comes down on every exit
+/// path from a task — including an unwinding panic inside an executor backend.
+/// A flag that somehow never cleared would only degrade that slot to the old
+/// round-robin fallback in [`WorkerPool::dispatch`], never deadlock it.
+struct SlotFree(Arc<Vec<AtomicBool>>, usize);
+impl Drop for SlotFree {
+    fn drop(&mut self) {
+        self.0[self.1].store(false, Ordering::Release);
+    }
 }
 
 #[async_trait]
 impl Actor for WorkerActor {
     type Msg = WorkerMsg;
     type State = WorkerState;
-    type Arguments = (Arc<dyn Executor>, Arc<Metrics>, Option<Arc<dyn LeaseKeeper>>);
+    type Arguments = WorkerInit;
 
     async fn pre_start(
         &self,
         _myself: ActorRef<WorkerMsg>,
-        (executor, metrics, lease_keeper): (
-            Arc<dyn Executor>,
-            Arc<Metrics>,
-            Option<Arc<dyn LeaseKeeper>>,
-        ),
+        init: WorkerInit,
     ) -> Result<WorkerState, ActorProcessingErr> {
-        Ok(WorkerState { executor, metrics, lease_keeper })
+        Ok(WorkerState {
+            executor: init.executor,
+            metrics: init.metrics,
+            lease_keeper: init.lease_keeper,
+            heartbeat: init.heartbeat,
+            slot: init.slot,
+            busy: init.busy,
+        })
     }
 
     async fn handle(
@@ -153,7 +199,13 @@ impl Actor for WorkerActor {
         let executor = Arc::clone(&state.executor);
         let metrics = Arc::clone(&state.metrics);
         let lease_keeper = state.lease_keeper.clone();
+        let heartbeat_every = state.heartbeat;
+        // Busy flag (idle-first dispatch, LOW_LATENCY B-5): `dispatch` set it
+        // before casting; this guard clears it once the task — and its result
+        // send — are done, on every exit path.
+        let free_on_exit = SlotFree(Arc::clone(&state.busy), state.slot);
         async move {
+            let _free_on_exit = free_on_exit;
             tracing::debug!(
                 cmd = %p.ctx.command.first().map(String::as_str).unwrap_or("<empty>"),
                 "task starting",
@@ -191,7 +243,7 @@ impl Actor for WorkerActor {
                 Some(keeper) => {
                     let exec_fut = executor.execute(&p.ctx);
                     tokio::pin!(exec_fut);
-                    let mut heartbeat = tokio::time::interval(LEASE_RENEW_INTERVAL);
+                    let mut heartbeat = tokio::time::interval(heartbeat_every);
                     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     heartbeat.tick().await; // the immediate first tick — skip it
                     loop {
@@ -255,6 +307,8 @@ impl Actor for WorkerActor {
                 retry_max_delay_secs: p.retry_max_delay_secs,
                 retry_on_timeout: p.retry_on_timeout,
                 fence: p.fence,
+                finished: Instant::now(),
+                spec: p.spec,
             }).is_err() {
                 tracing::warn!("result channel closed — reconcile loop may have exited");
             }
@@ -277,7 +331,11 @@ pub struct WorkerPool {
     workers: Vec<ActorRef<WorkerMsg>>,
     // Keep join handles alive so the runtime does not drop the actors.
     _handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Round-robin rotor — the fallback when no verified-idle worker is found.
     next: AtomicUsize,
+    /// Per-slot busy flags: set by [`Self::dispatch`], cleared by the worker
+    /// when its task (and result send) finish. Basis of idle-first dispatch.
+    busy: Arc<Vec<AtomicBool>>,
 }
 
 impl WorkerPool {
@@ -286,44 +344,77 @@ impl WorkerPool {
         executor: Arc<dyn Executor>,
         metrics: Arc<Metrics>,
     ) -> Result<Self> {
-        Self::with_lease_keeper(size, executor, metrics, None).await
+        Self::with_lease_keeper(size, executor, metrics, None, LEASE_RENEW_INTERVAL).await
     }
 
     /// [`WorkerPool::new`] with a lease heartbeat: while a task executes, its
-    /// worker renews the claim lease through `keeper` so long-running tasks are
-    /// never reclaimed mid-run. `None` = no heartbeat (the pre-heartbeat
-    /// behaviour: tasks must finish inside the claim-time lease window).
+    /// worker renews the claim lease through `keeper` every `heartbeat` so
+    /// long-running tasks are never reclaimed mid-run. The engine derives
+    /// `heartbeat` from the configured lease window (lease/3) so shortening
+    /// `LEASE_SECS` keeps the two-missed-renewals headroom. `None` keeper = no
+    /// heartbeat (the pre-heartbeat behaviour: tasks must finish inside the
+    /// claim-time lease window; `heartbeat` is unused).
     pub async fn with_lease_keeper(
         size: usize,
         executor: Arc<dyn Executor>,
         metrics: Arc<Metrics>,
         lease_keeper: Option<Arc<dyn LeaseKeeper>>,
+        heartbeat: Duration,
     ) -> Result<Self> {
         if size == 0 {
             anyhow::bail!("worker pool size must be at least 1");
         }
+        // `tokio::time::interval` panics on a zero period, and it would only
+        // fire mid-task, long after the misconfiguration happened — clamp to
+        // the compiled default instead of arming a delayed panic.
+        let heartbeat = if heartbeat.is_zero() { LEASE_RENEW_INTERVAL } else { heartbeat };
+        let busy: Arc<Vec<AtomicBool>> =
+            Arc::new((0..size).map(|_| AtomicBool::new(false)).collect());
         let mut workers = Vec::with_capacity(size);
         let mut handles = Vec::with_capacity(size);
         for i in 0..size {
             let (actor_ref, handle) = WorkerActor::spawn(
                 Some(format!("worker-{i}")),
                 WorkerActor,
-                (Arc::clone(&executor), Arc::clone(&metrics), lease_keeper.clone()),
+                WorkerInit {
+                    executor: Arc::clone(&executor),
+                    metrics: Arc::clone(&metrics),
+                    lease_keeper: lease_keeper.clone(),
+                    heartbeat,
+                    slot: i,
+                    busy: Arc::clone(&busy),
+                },
             )
             .await
             .map_err(|e| anyhow::anyhow!("spawn worker-{i}: {e}"))?;
             workers.push(actor_ref);
             handles.push(handle);
         }
-        Ok(Self { workers, _handles: handles, next: AtomicUsize::new(0) })
+        Ok(Self { workers, _handles: handles, next: AtomicUsize::new(0), busy })
     }
 
-    /// Round-robin dispatch: send a task to the next worker actor.
+    /// Idle-first dispatch (LOW_LATENCY B-5): send the task to a worker whose
+    /// mailbox is verifiably empty, so a short task can never queue behind a
+    /// long-running one — the head-of-line blocking blind round-robin had.
+    ///
+    /// The scan-then-set is race-free for its one real caller, the reconcile
+    /// loop (a single task): only `dispatch` sets flags, and each worker only
+    /// clears its own. Under the loop's capacity accounting an idle worker
+    /// always exists at dispatch time; the round-robin rotor remains as the
+    /// fallback for the small window where a just-finished worker's clear is
+    /// not yet visible — degrading to the old behaviour, never dropping work.
     pub fn dispatch(&self, payload: DispatchPayload) -> Result<()> {
-        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
-        self.workers[idx]
-            .cast(WorkerMsg::Execute(payload))
-            .map_err(|_| anyhow::anyhow!("worker-{idx} mailbox closed"))?;
+        let idx = (0..self.workers.len())
+            .find(|&i| !self.busy[i].load(Ordering::Acquire))
+            .unwrap_or_else(|| self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len());
+        self.busy[idx].store(true, Ordering::Release);
+        if self.workers[idx].cast(WorkerMsg::Execute(payload)).is_err() {
+            // The actor never received the task, so its SlotFree guard will
+            // never run — clear the flag here or the slot is dead to the
+            // idle-first scan forever.
+            self.busy[idx].store(false, Ordering::Release);
+            anyhow::bail!("worker-{idx} mailbox closed");
+        }
         Ok(())
     }
 

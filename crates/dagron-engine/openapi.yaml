@@ -50,6 +50,66 @@ paths:
             text/plain:
               schema: { type: string, example: ok }
 
+  /readyz:
+    get:
+      tags: [ops]
+      summary: Readiness probe
+      description: >
+        Returns `ready` only when the datastore answers a probe inside the
+        `DAGRON_READY_TIMEOUT_MS` budget (default 500 ms, floor 50 ms) —
+        `503` with a reason otherwise. Unlike `/healthz`, this is the endpoint
+        an orchestrator should gate traffic on (docs/LOW_LATENCY.md R-1).
+      operationId: readyz
+      responses:
+        "200":
+          description: Datastore reachable — safe to route work here
+          content:
+            text/plain:
+              schema: { type: string, example: ready }
+        "503":
+          description: Datastore unreachable, or the probe timed out
+          content:
+            text/plain:
+              schema: { type: string, example: datastore unreachable }
+
+  /config:
+    get:
+      tags: [ops]
+      summary: Effective configuration
+      description: >
+        Every registered knob's effective value (secrets redacted), its source
+        (env / file / profile / default), the `DAGRON_CONFIG` file and profile
+        in use (null when none), and the fleet-drift fingerprint — the same
+        view `dagron config --json` prints (docs/LOW_LATENCY.md S-2/S-4).
+      operationId: configEffective
+      responses:
+        "200":
+          description: The effective configuration
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  fingerprint: { type: string, example: "9f86d081884c7d65" }
+                  config_file:
+                    type: string
+                    nullable: true
+                    example: /etc/dagron/dagron.yaml
+                  profile:
+                    type: string
+                    nullable: true
+                    example: low-latency
+                  knobs:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string, example: POLL_INTERVAL_MS }
+                        value: { type: string, example: "25" }
+                        source:
+                          type: string
+                          enum: [env, file, profile, default]
+
   /metrics:
     get:
       tags: [ops]

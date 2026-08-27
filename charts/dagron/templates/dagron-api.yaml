@@ -107,9 +107,29 @@ spec:
             {{- end }}
           ports:
             - containerPort: {{ .Values.dagronApi.port }}
+          # /readyz is the truthful gate (a bounded DB round trip); /healthz
+          # stays pure liveness. The SSE listener's state is advisory — it
+          # watches ONE shared direct endpoint, so its failure hits every
+          # replica at once and gating on it would empty the Service rather
+          # than reroute (set DAGRON_READY_REQUIRE_LISTENER=1 via extraEnv to
+          # opt into strict gating with per-replica listen endpoints). The
+          # startupProbe absorbs first-boot schema work so a slow migration
+          # never trips the liveness restart loop. timeoutSeconds must stay
+          # ABOVE the app's own DAGRON_READY_TIMEOUT_MS budget (default 500 ms)
+          # or the kubelet cuts the probe before the app can answer 503 with a
+          # reason. (docs/LOW_LATENCY.md R-1)
+          startupProbe:
+            httpGet: { path: /readyz, port: {{ .Values.dagronApi.port }} }
+            periodSeconds: 2
+            timeoutSeconds: {{ .Values.dagronApi.probeTimeoutSeconds | default 3 }}
+            failureThreshold: 60
           readinessProbe:
-            httpGet: { path: /healthz, port: {{ .Values.dagronApi.port }} }
+            httpGet: { path: /readyz, port: {{ .Values.dagronApi.port }} }
             periodSeconds: 5
+            timeoutSeconds: {{ .Values.dagronApi.probeTimeoutSeconds | default 3 }}
+            # A blip should not evict the replica from the Service between one
+            # probe and the next: 5 × 5s of sustained failure before removal.
+            failureThreshold: {{ .Values.dagronApi.readinessFailureThreshold | default 5 }}
           livenessProbe:
             httpGet: { path: /healthz, port: {{ .Values.dagronApi.port }} }
             periodSeconds: 15

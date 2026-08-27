@@ -72,7 +72,7 @@ podman compose   -f compose.quickstart.yaml up -d   # podman ≥ 4.7, provider i
 podman-compose   -f compose.quickstart.yaml up -d   # standalone provider, older podman too
 ```
 
-The images are pinned; override with `DAGRON_VERSION=0.7.0`. Floating `:latest`
+The images are pinned; override with `DAGRON_VERSION=0.8.0`. Floating `:latest`
 is deliberately not the default — a quickstart that silently changes under you
 is worse than one you have to bump.
 
@@ -84,11 +84,30 @@ Success looks like (`… logs -f engine dagron-api`, since `-d` detaches; trimme
 Postgres + frontend logs elided):
 
 ```text
+schema-gate-1 | schema-gate: engine migrations committed; releasing dagron-api
 engine-1      | INFO dagron_engine: scheduler starting worker_id=worker-… db=postgres://<redacted>@postgres:5432/workflow executor_kind=local worker_count=16 source_kind=file max_inflight_runs=64
 engine-1      | INFO dagron_engine: worker pool ready size=16
 engine-1      | INFO dagron_engine: reconcile loop running (multi-run, queue-driven daemon)
 dagron-api-1  | INFO dagron_api: dagron-api listening addr=0.0.0.0:8080
 ```
+
+The `schema-gate` container runs once and exits 0; that is what it is meant to
+do, not a failed service. It holds `dagron-api` back until the engine's migrator
+has committed, because both create some of the same tables and two concurrent
+`CREATE TABLE IF NOT EXISTS` for one table do not serialize — the loser exits on
+`duplicate key value violates unique constraint "pg_type_typname_nsp_index"`
+instead of taking the no-op path. Without the gate that race is the *default* on
+a clean volume: `dagron-api` dies before it listens, and `frontend` — which
+joins its network namespace — cannot start at all.
+
+The gate is *bounded*: if the engine never opens its management port within
+~60s it releases `dagron-api` anyway rather than deadlock the whole stack on an
+engine that is already failing for its own reasons. That is a deliberate trade —
+a current `dagron-api` retries the create-table race internally, so a degraded
+start still converges — but it means the gate's exit does **not** guarantee the
+engine finished migrating, only that it is worth letting the API try. On an
+unusually slow host a first boot can still lose the race; if it does, bring the
+stack `up` again once the engine is past its migrations.
 
 Open <http://localhost:3000> and sign in with the seeded dev admin
 (`admin@local` / `dagron-admin` — from the compose file; seeded on first start
@@ -473,6 +492,14 @@ agent event-call sequence is diagrammed in
 [`docs/ARCHITECTURE.md#5.8`](docs/ARCHITECTURE.md#58-mcp-agent-event-call--submit--bounded-sse-event-poll).
 
 ## Architecture
+
+[![dagron system context](docs/images/architecture-system-context.png)](docs/ARCHITECTURE.md#1-system-context)
+
+Three ways in — the browser, an AI agent over MCP, and a plain YAML file — one
+datastore that *is* the source of truth, and N identical scheduler processes that
+claim work out of it with no coordinator, no leader election and no heartbeat
+table. Every scheduling decision is a SQL transition, so a scheduler can be
+killed at any point and the survivors reconstruct state from the rows alone.
 
 dagron is a Cargo workspace: a thin `dagron` binary over the **`dagron-engine`**
 reconcile-loop library, which wires together `dagron-core` (DAG model + the

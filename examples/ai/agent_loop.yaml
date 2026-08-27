@@ -1,0 +1,89 @@
+# The durable agent loop — a conversation whose every turn is a run.
+#
+#   # 1. register the turn (see the header of agent_turn.yaml)
+#   # 2. run the conversation
+#   dagron submit examples/ai/agent_loop.yaml
+#
+# One task. Everything that makes this durable is already in the engine:
+#
+#   * `type: workflow` triggers `agent-turn` as a **child run** and parks —
+#     holding no worker slot while the turn works.
+#   * `repeat:` evaluates `until` against the child's result when it finishes.
+#     Not satisfied → the trigger is re-armed and the next turn starts as a new
+#     child run. Satisfied → the loop is over and `summarise` runs.
+#   * There is no loop state in any process. The iteration count is the task's
+#     `attempt` column, the conversation is files, and the whole thing is rows
+#     in Postgres. Kill the engine mid-conversation and the next reconcile tick
+#     picks it up where it was — that is the claim, and it is worth testing:
+#
+#       docker compose restart engine   # mid-run
+#
+# `until` compares against the *turn's* return value: `agent-turn` declares
+# `result_from: verdict`, so the child run's output is its verdict task's
+# output, and the parent reads that. A sub-workflow is a function.
+name: agent-conversation
+
+parameters:
+  # Which conversation this is. Override it per run and two conversations run
+  # side by side without touching each other's state:
+  #
+  #   POST /api/runs {"yaml": "...", "parameters": {"conversation": "c-2"}}
+  conversation: "c-1"
+
+tasks:
+  # `conversation` is caller-supplied (see parameters) and is interpolated into
+  # `state_dir` and shell commands below, and — via the child's arguments — into
+  # the paths `agent-turn` hands to `sh -c` and the MCP filesystem server. A
+  # value with shell metacharacters could inject syntax, `..` could climb out of
+  # the state directory, and the bare `.` would resolve `state_dir` to the shared
+  # `/tmp/dagron-agent` root and collide every conversation's state. Reject
+  # anything that is not a plain identifier before it reaches any of those. The
+  # value is carried in an env var (never re-parsed by the shell) and matched
+  # against an allow-list; the whole loop is gated on this passing.
+  - name: validate
+    command:
+      - sh
+      - -c
+      - >-
+        case "$CONVERSATION" in
+        "" | "." | *[!A-Za-z0-9._-]* | *..*)
+        echo "refusing unsafe conversation id: '$CONVERSATION'" >&2; exit 1 ;;
+        esac;
+        echo "conversation id ok: $CONVERSATION"
+    env:
+      - { name: CONVERSATION, value: "{{ conversation }}" }
+
+  - name: turn
+    type: workflow
+    workflow: agent-turn
+    depends_on: [validate]
+    # The child run's parameters. Without these a trigger can only hand the
+    # child constants, so every turn of every conversation would read and write
+    # the same state — which is what made this example single-conversation
+    # until `arguments:` reached `type: workflow`. Safe to interpolate here:
+    # `validate` has already rejected any `conversation` that is not a plain
+    # identifier.
+    arguments:
+      state_dir: "/tmp/dagron-agent/{{ conversation }}"
+      goal_turns: "3"
+    repeat:
+      until: "{{ output }} == done"
+      # The ceiling on the conversation, and it is not optional. A loop that
+      # spawns a run per turn is an amplifier: without a bound, one submission
+      # is an unbounded run factory. Exhausting it **fails** the task — a
+      # conversation that never reached its goal did not succeed at it.
+      max_iterations: 10
+      # Between turns. Non-zero when a turn polls something that needs time to
+      # change; 0 when each turn is real work.
+      delay_secs: 1
+
+  # Downstream stays blocked for the whole conversation and runs once, at the
+  # end. A continuing iteration is not a completion, so it never releases this.
+  - name: summarise
+    command:
+      - sh
+      - -c
+      - echo "conversation {{ conversation }} finished:"; ls "/tmp/dagron-agent/{{ conversation }}"
+    depends_on: [turn]
+
+result_from: summarise

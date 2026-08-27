@@ -29,6 +29,39 @@ impl std::fmt::Display for MaxActiveRunsReached {
 
 impl std::error::Error for MaxActiveRunsReached {}
 
+/// A run was refused because the spec's declared `budget.tasks` is smaller than
+/// the number of tasks the run would create (G-AG3).
+///
+/// A typed error so a caller can tell "this spec asked for more than it
+/// budgeted" from "this spec is malformed" — the first is a deliberate,
+/// informative refusal and the second is a mistake, and collapsing them into
+/// one 400 makes the budget look like a parse failure.
+///
+/// Unlike [`MaxActiveRunsReached`] this is **not** transient: the same
+/// submission will be refused identically forever, so retrying is wrong and the
+/// API answers 400 rather than 429.
+#[derive(Debug, Clone)]
+pub struct TaskBudgetExceeded {
+    /// The workflow whose budget was exceeded.
+    pub name: String,
+    /// The declared `budget.tasks`.
+    pub max: u32,
+    /// How many tasks the run would actually have created.
+    pub planned: u64,
+}
+
+impl std::fmt::Display for TaskBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "workflow '{}' would create {} tasks, over its budget.tasks of {}",
+            self.name, self.planned, self.max
+        )
+    }
+}
+
+impl std::error::Error for TaskBudgetExceeded {}
+
 /// The trigger rules a task may declare (`trigger_rule:`), deciding whether it
 /// runs once all its dependencies are terminal. `all_success` is the default
 /// (and the historical behavior). Unknown values are rejected at validation.

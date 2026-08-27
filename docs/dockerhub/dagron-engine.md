@@ -15,9 +15,10 @@ dagron is a lightweight workflow scheduler in Rust. The engine parses a YAML DAG
 | Tag | Notes |
 |---|---|
 | `latest` | newest release |
-| `0.5.0` | pinned version (= current `latest`) |
+| `0.7.0` | pinned version (= current `latest`) |
+| `0.7` | floating minor — newest `0.7.x` |
 
-Pin in production: `mancube/dagron-engine:0.5.0`.
+Pin in production: `mancube/dagron-engine:0.7.0`.
 
 ## Run
 
@@ -26,7 +27,7 @@ docker run \
   -e DATABASE_URL=postgres://dagron:dagron@postgres:5432/workflow \
   -e API_ADDR=0.0.0.0:8787 \
   -e EXECUTOR=local \
-  mancube/dagron-engine:0.5.0
+  mancube/dagron-engine:0.7.0
 ```
 
 ## Configuration (env)

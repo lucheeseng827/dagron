@@ -311,12 +311,41 @@ class Client:
 
     # ── runs ──────────────────────────────────────────────────────────────────
 
-    def submit_run(self, spec: SpecLike) -> str:
+    def submit_run(
+        self,
+        spec: SpecLike,
+        *,
+        parameters: Optional[Mapping[str, str]] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> str:
         """Submit a DAG as an ad-hoc run; returns the new ``run_id``.
 
         ``spec`` may be a :class:`Dag`, a spec mapping, or a YAML/JSON string.
+
+        ``parameters`` supply arguments for the spec's declared ``parameters:``;
+        keys the spec never references are ignored, and a declared
+        ``environment:`` still wins over any key it also sets.
+
+        ``idempotency_key`` makes the submit safe to retry: repeating the same
+        call with the same key returns the **same** ``run_id`` instead of
+        creating a second run. Reusing a key for a *different* spec or different
+        parameters raises :class:`DagronError` with status 409 rather than
+        quietly handing back the first run — the wrong answer would be a run id
+        for work that never ran.
         """
-        resp = self._request("POST", "/api/runs", body={"yaml": _spec_to_str(spec)})
+        body: Dict[str, Any] = {"yaml": _spec_to_str(spec)}
+        if parameters:
+            body["parameters"] = dict(parameters)
+        headers = None
+        if idempotency_key is not None:
+            # An empty key is a 400 server-side. Dropping it silently — the old
+            # ``if idempotency_key`` did, since ``""`` is falsy — would hand back
+            # a non-idempotent submit the caller believes is retry-safe, which is
+            # the exact failure the key exists to remove. Reject it here, loudly.
+            if not idempotency_key.strip():
+                raise ValueError("idempotency_key must not be empty")
+            headers = {"idempotency-key": idempotency_key}
+        resp = self._request("POST", "/api/runs", body=body, headers=headers)
         return resp["run_id"]
 
     def list_runs(
@@ -656,6 +685,7 @@ class Client:
         *,
         body: Optional[Any] = None,
         params: Optional[Mapping[str, Any]] = None,
+        headers: Optional[Mapping[str, str]] = None,
         parse_json: bool = True,
         auth: bool = True,
     ) -> Any:
@@ -667,14 +697,20 @@ class Client:
                 url += "?" + urllib.parse.urlencode(query)
 
         data = None
-        headers: Dict[str, str] = {"accept": "application/json"}
+        hdrs: Dict[str, str] = {"accept": "application/json"}
         if body is not None:
             data = json.dumps(body).encode("utf-8")
-            headers["content-type"] = "application/json"
+            hdrs["content-type"] = "application/json"
         if auth and self.token:
-            headers["authorization"] = f"Bearer {self.token}"
+            hdrs["authorization"] = f"Bearer {self.token}"
+        # Caller headers last, but they cannot displace auth or content-type:
+        # a per-call header is for things like Idempotency-Key, not for
+        # quietly re-pointing the request's identity or encoding.
+        for k, v in (headers or {}).items():
+            if k.lower() not in ("authorization", "content-type"):
+                hdrs[k] = v
 
-        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        req = urllib.request.Request(url, data=data, method=method, headers=hdrs)
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # noqa: S310 (scheme checked)
                 raw = resp.read()

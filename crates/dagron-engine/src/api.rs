@@ -9,7 +9,9 @@
 //!
 //! | Method & path        | Purpose                                            |
 //! |----------------------|----------------------------------------------------|
-//! | `GET  /healthz`      | liveness probe                                     |
+//! | `GET  /healthz`      | liveness probe (static)                            |
+//! | `GET  /readyz`       | readiness probe (datastore round trip)             |
+//! | `GET  /config`       | effective configuration + fleet fingerprint        |
 //! | `GET  /metrics`      | Prometheus exposition (process counters + DB gauges)|
 //! | `GET  /runs`         | list runs (`?status=`, `?limit=`)                  |
 //! | `POST /runs`         | submit a DAG (YAML/JSON body) → `{ run_id }`        |
@@ -86,6 +88,8 @@ pub async fn serve(addr: SocketAddr, state: ApiState) -> Result<()> {
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/config", get(config_effective))
         .route("/metrics", get(metrics))
         .route("/openapi.yaml", get(openapi_yaml))
         .route("/openapi.json", get(openapi_json))
@@ -117,6 +121,61 @@ pub fn router(state: ApiState) -> Router {
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+/// Effective configuration: every registered knob's value (secrets redacted),
+/// its source (env / file / profile / default), and the fleet-drift
+/// fingerprint — the same view `dagron config` prints, served where a fleet
+/// dashboard can diff replicas (LOW_LATENCY S-2/S-4). Cluster-private like the
+/// rest of this API.
+async fn config_effective() -> Json<serde_json::Value> {
+    let knobs: Vec<serde_json::Value> = crate::config::effective()
+        .into_iter()
+        .map(|(name, value, source)| {
+            serde_json::json!({ "name": name, "value": value, "source": source.as_str() })
+        })
+        .collect();
+    let (config_file, profile) = crate::config::layer_info();
+    Json(serde_json::json!({
+        "fingerprint": crate::config::fingerprint(),
+        "config_file": config_file,
+        "profile": profile,
+        "knobs": knobs,
+    }))
+}
+
+/// Readiness probe — unlike `/healthz` (pure liveness), this answers 200 only
+/// when the datastore actually responds, so an orchestrator stops routing to a
+/// process whose pool or database is gone instead of trusting a static "ok"
+/// (LOW_LATENCY R-1). The probe carries its own budget
+/// (`DAGRON_READY_TIMEOUT_MS`, floor 50 ms) so a wedged pool acquire makes the
+/// probe answer 503 inside the kubelet's `timeoutSeconds` instead of hanging
+/// past it — an unanswered probe and a truthful 503 are the same verdict, but
+/// only one of them shows up in the logs with a reason. Kept unauthenticated
+/// like `/healthz`: this API is cluster-private by contract.
+async fn readyz(State(st): State<ApiState>) -> Response {
+    static BUDGET: OnceLock<std::time::Duration> = OnceLock::new();
+    let budget = *BUDGET.get_or_init(|| {
+        let ms: u64 = std::env::var("DAGRON_READY_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(500);
+        std::time::Duration::from_millis(ms.max(50))
+    });
+    match tokio::time::timeout(budget, crate::db::ping(&st.pool)).await {
+        Ok(Ok(())) => (StatusCode::OK, "ready").into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "readiness probe failed");
+            (StatusCode::SERVICE_UNAVAILABLE, "datastore unreachable").into_response()
+        }
+        Err(_) => {
+            tracing::warn!(
+                budget_ms = budget.as_millis() as u64,
+                "readiness probe timed out"
+            );
+            (StatusCode::SERVICE_UNAVAILABLE, "datastore probe timed out").into_response()
+        }
+    }
 }
 
 /// Serve the embedded OpenAPI document as YAML.
@@ -997,6 +1056,8 @@ mod tests {
         let paths = spec["paths"].as_object().expect("paths object");
         for route in [
             "/healthz",
+            "/readyz",
+            "/config",
             "/metrics",
             "/openapi.yaml",
             "/openapi.json",

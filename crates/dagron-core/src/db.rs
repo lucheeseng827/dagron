@@ -29,3 +29,31 @@ pub use sqlite::*;
 mod postgres;
 #[cfg(feature = "postgres")]
 pub use postgres::*;
+
+/// The claim-time task lease window, in seconds: `LEASE_SECS` (default 30,
+/// floor 3). Read once and cached — the claim path runs every tick. The floor
+/// is 3 — not 1 — because the worker heartbeat renews every floor(lease/3) s
+/// with a 1 s minimum: below a 3 s window that minimum interval could no
+/// longer fit two missed renewals inside the lease, and the crash-recovery
+/// sweep would race healthy tasks.
+///
+/// This was the hard-coded `+30 seconds` in both backends' claim SQL
+/// (docs/HA.md planned the knob; the low-latency profile needs it: a crashed
+/// scheduler's task waits out this window before any peer reclaims it, and 30 s
+/// is an outage at market open). The lease heartbeat renews by this same value,
+/// and the engine derives its renew interval as a third of it, so shortening
+/// the window keeps the healthy-task contract: a live task's lease always sits
+/// between ⅔ and one full window in the future, and two consecutive missed
+/// renewals still leave headroom before the expired-lease sweep can reclaim it.
+///
+/// Shared by both backends so they can never drift.
+pub fn lease_secs() -> i64 {
+    static LEASE_SECS: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *LEASE_SECS.get_or_init(|| {
+        std::env::var("LEASE_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(30)
+            .max(3)
+    })
+}

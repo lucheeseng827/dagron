@@ -23,11 +23,19 @@ use std::fmt::Write as _;
 use crate::models::MetricsSnapshot;
 
 /// Upper bounds (seconds) for the latency histograms. Spans sub-millisecond
-/// reconcile ticks through minutes-long ETL tasks so one bucket set serves both
-/// `reconcile_tick` and `task_duration`. A `+Inf` bucket is appended at render.
+/// scheduling latencies through minutes-long ETL tasks so one bucket set serves
+/// `reconcile_tick`, `task_duration`, and the dispatch-path histograms. A
+/// `+Inf` bucket is appended at render. The sub-5 ms bounds exist for the
+/// low-latency profile (docs/LOW_LATENCY.md A-5): hop-level SLOs are single-digit
+/// milliseconds, which the old 5 ms floor could not resolve.
 const DURATION_BUCKETS: &[f64] = &[
-    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+    0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+    10.0, 30.0, 60.0, 120.0, 300.0,
 ];
+
+/// Bucket bounds for the claim batch-size histogram — counts, not seconds.
+/// Sized to worker-pool scales (`WORKER_COUNT` defaults 16, profiles run 64+).
+const BATCH_BUCKETS: &[f64] = &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0];
 
 /// Max distinct `runner_class` label values exported per scrape. The class
 /// comes from workflow specs (only syntax-validated), so without a cap a
@@ -144,6 +152,19 @@ pub struct Metrics {
     pub task_duration: Histogram,
     /// Reconcile-loop tick duration — the CPU-pegging signal load testing surfaced.
     pub reconcile_tick: Histogram,
+    // ── Dispatch-path latency (docs/LOW_LATENCY.md A-5) ─────────────────────
+    /// Became-claimable → handed to a worker. `scheduled_at` is stamped when a
+    /// task flips `pending → ready` (and set to the due time on retries), so
+    /// this is the scheduler's own queueing latency: claim wait + tick pacing +
+    /// per-task dispatch prep. The SLO metric for the low-latency profile.
+    pub dispatch_latency: Histogram,
+    /// Executor finished → reconcile loop drained the result. Measures the
+    /// wake-on-completion path directly: before it existed this sat at
+    /// "remainder of the poll interval" (up to 500 ms) for every task.
+    pub result_wait: Histogram,
+    /// Tasks claimed per non-empty claim call — batch-shape signal for tuning
+    /// `WORKER_COUNT` against the ready backlog. Unit: tasks, not seconds.
+    pub claim_batch: Histogram,
     // ── QW3 auto-catchup self-healing state gauges ──────────────────────────────────
     // Unlike the counters above (monotonic, bumped on the hot path) these are
     // *current state* re-published by the auto-backfill loop on every sweep: the
@@ -184,6 +205,9 @@ impl Default for Metrics {
             auto_reruns: AtomicU64::new(0),
             task_duration: Histogram::new(DURATION_BUCKETS),
             reconcile_tick: Histogram::new(DURATION_BUCKETS),
+            dispatch_latency: Histogram::new(DURATION_BUCKETS),
+            result_wait: Histogram::new(DURATION_BUCKETS),
+            claim_batch: Histogram::new(BATCH_BUCKETS),
             #[cfg(feature = "enterprise")]
             overdue_schedules: AtomicU64::new(0),
             #[cfg(feature = "enterprise")]
@@ -279,6 +303,21 @@ impl Metrics {
     /// Record one reconcile-loop tick duration, in seconds.
     pub fn observe_reconcile_tick(&self, secs: f64) {
         self.reconcile_tick.observe(secs);
+    }
+
+    /// Record one task's became-claimable → dispatched latency, in seconds.
+    pub fn observe_dispatch_latency(&self, secs: f64) {
+        self.dispatch_latency.observe(secs);
+    }
+
+    /// Record one result's executor-finished → drained-by-the-loop wait, in seconds.
+    pub fn observe_result_wait(&self, secs: f64) {
+        self.result_wait.observe(secs);
+    }
+
+    /// Record the size of one non-empty claim batch (unit: tasks).
+    pub fn observe_claim_batch(&self, claimed: usize) {
+        self.claim_batch.observe(claimed as f64);
     }
 
     /// Render the Prometheus text exposition format (version 0.0.4) for the
@@ -437,6 +476,21 @@ impl Metrics {
             "scheduler_reconcile_tick_seconds",
             "Reconcile-loop tick duration (recover→advance→dispatch→collect→reap).",
         );
+        self.dispatch_latency.render_into(
+            &mut out,
+            "scheduler_dispatch_latency_seconds",
+            "Task became-claimable (scheduled_at) to handed-to-a-worker.",
+        );
+        self.result_wait.render_into(
+            &mut out,
+            "scheduler_result_wait_seconds",
+            "Executor finished to result drained by the reconcile loop.",
+        );
+        self.claim_batch.render_into(
+            &mut out,
+            "scheduler_claim_batch_size",
+            "Tasks claimed per non-empty claim call (unit: tasks).",
+        );
 
         // DB connection-pool saturation (in-use / idle / max).
         if let Some(p) = pool {
@@ -469,6 +523,9 @@ mod tests {
         m.inc_dead_letters();
         m.observe_task_duration(0.3);
         m.observe_reconcile_tick(0.002);
+        m.observe_dispatch_latency(0.0004);
+        m.observe_result_wait(0.0009);
+        m.observe_claim_batch(12);
         let snap = MetricsSnapshot {
             runs_by_status: vec![("running".into(), 2), ("succeeded".into(), 5)],
             tasks_by_status: vec![("succeeded".into(), 10), ("ready".into(), 7)],
@@ -504,6 +561,16 @@ mod tests {
         assert!(text.contains("scheduler_task_duration_seconds_bucket{le=\"+Inf\"} 1"));
         assert!(text.contains("scheduler_task_duration_seconds_count 1"));
         assert!(text.contains("scheduler_reconcile_tick_seconds_count 1"));
+        // Dispatch-path histograms (LOW_LATENCY A-5): a 400 µs dispatch latency
+        // must resolve below the old 5 ms floor — the sub-millisecond buckets
+        // are the point of these series.
+        assert!(text.contains("scheduler_dispatch_latency_seconds_bucket{le=\"0.0005\"} 1"));
+        assert!(text.contains("scheduler_dispatch_latency_seconds_count 1"));
+        assert!(text.contains("scheduler_result_wait_seconds_bucket{le=\"0.001\"} 1"));
+        assert!(text.contains("scheduler_result_wait_seconds_count 1"));
+        // Claim batch of 12 lands in the le="16" count bucket.
+        assert!(text.contains("scheduler_claim_batch_size_bucket{le=\"16\"} 1"));
+        assert!(text.contains("scheduler_claim_batch_size_count 1"));
         // DB pool saturation: in_use = connections - idle.
         assert!(text.contains("scheduler_db_pool_connections 5"));
         assert!(text.contains("scheduler_db_pool_in_use 3"));

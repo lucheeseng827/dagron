@@ -1,0 +1,96 @@
+# One turn of a durable agent loop — register this, then run `agent_loop.yaml`.
+#
+#   curl -sX POST localhost:8080/api/workflows \
+#     -H 'content-type: application/json' \
+#     --data "$(jq -Rn --rawfile s examples/ai/agent_turn.yaml '{name:"agent-turn",spec:$s}')"
+#
+# This is a *registered* workflow because `agent_loop.yaml` triggers it by name.
+# Each iteration of that loop creates one fresh run of this workflow, so a
+# conversation is a stack of runs you can open one at a time — turn 7 is a run
+# with its own tasks, logs, timings and failures, not a line in a log file.
+#
+# The "model" here is a shell stand-in, the way the GPU work in the other case
+# studies is. What is real is the orchestration: the turn is durable, its tool
+# call is a retried task, and the loop resumes after the engine is killed. Swap
+# `think` for a real LLM step and nothing else changes.
+name: agent-turn
+
+parameters:
+  # Where the conversation lives — one file per turn.
+  #
+  # These are *defaults*. The trigger in `agent_loop.yaml` overrides them with
+  # `arguments:`, which become this run's parameters — so each conversation gets
+  # its own directory and two can run at once. Running this workflow on its own
+  # uses the defaults below.
+  state_dir: "/tmp/dagron-agent/default"
+  goal_turns: "3"
+
+tasks:
+  # 1. Recall the conversation so far: how many turns have already happened.
+  #    Turn 1 finds nothing, which is not an error.
+  - name: recall
+    command:
+      - sh
+      - -c
+      - >-
+        mkdir -p "{{ state_dir }}";
+        ls "{{ state_dir }}" | wc -l | tr -d ' ' > /artifacts/turns.txt;
+        cat /artifacts/turns.txt
+
+  # 2. Decide what to do next. A real loop calls a model here; this one counts.
+  #    Written to an artifact because the next task consumes it — that is how a
+  #    task hands something to the one after it.
+  - name: think
+    command:
+      - sh
+      - -c
+      - >-
+        n=$(cat /artifacts/turns.txt);
+        echo "turn $((n + 1)) after $n prior turns" > /artifacts/thought.txt;
+        cat /artifacts/thought.txt
+    depends_on: [recall]
+
+  # 3. Act — through an MCP tool, which is what makes this an agent turn rather
+  #    than a shell script. Because it is a task it retries with backoff against
+  #    a flaky server, and its output is in the run's history afterwards.
+  - name: act
+    command:
+      - sh
+      - -c
+      - >-
+        n=$(cat /artifacts/turns.txt);
+        node -e 'const fs=require("fs"); fs.writeFileSync("/artifacts/args.json", JSON.stringify({ path: process.argv[1], content: fs.readFileSync("/artifacts/thought.txt", "utf8") }));' "{{ state_dir }}/turn-$((n + 1)).txt"
+        && dagron-step-mcp
+    depends_on: [think]
+    max_attempts: 3
+    retry_delay_secs: 2
+    env:
+      - { name: DAGRON_MCP_STEP_SERVER, value: "npx" }
+      # Rooted at the shared parent, not at this conversation's directory:
+      # the server is handed one sandbox, and the path in the arguments picks
+      # the conversation inside it.
+      - name: DAGRON_MCP_STEP_SERVER_ARGS
+        value: '["-y", "@modelcontextprotocol/server-filesystem", "/tmp/dagron-agent"]'
+      - { name: DAGRON_MCP_STEP_TOOL, value: "write_file" }
+      - { name: DAGRON_MCP_STEP_ARGS_FILE, value: "/artifacts/args.json" }
+      - { name: DAGRON_MCP_STEP_OUTPUT, value: "/artifacts/act.txt" }
+
+  # 4. The turn's verdict, and the only thing the loop reads. `result_from`
+  #    makes this the *run's* output, which the parent's `repeat.until` compares
+  #    against — a sub-workflow is a function, and this is its return value.
+  - name: verdict
+    command:
+      - sh
+      - -c
+      - >-
+        n=$(ls "{{ state_dir }}" | wc -l | tr -d ' ');
+        if [ "$n" -ge "{{ goal_turns }}" ]; then echo done; else echo continue; fi
+    depends_on: [act]
+
+result_from: verdict
+
+# A turn is small and bounded on purpose. This budget is the ceiling on a turn
+# that fans out unexpectedly; `max_iterations` on the parent is the ceiling on
+# the conversation. They are different failures and want different limits.
+budget:
+  tasks: 20

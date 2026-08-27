@@ -150,9 +150,14 @@ fn client_key(req: &Request) -> String {
 }
 
 fn trust_proxy_headers() -> bool {
-    std::env::var("DAGRON_TRUST_PROXY_HEADERS")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    // Read once (LOW_LATENCY §5): a process's environment is fixed after boot,
+    // and this sat on the hot path of every rate-limited request.
+    static TRUST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRUST.get_or_init(|| {
+        std::env::var("DAGRON_TRUST_PROXY_HEADERS")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-# AI-workload case studies — five live pipelines
+# AI-workload case studies — five live pipelines, and one in reverse
 
 Five end-to-end, laptop-runnable AI pipelines. Each stands in for a real
 production shape — spot-preempted training, GPU pool routing, sharded batch
@@ -19,6 +19,8 @@ resumes, what routes where) is the real thing.
 | [`03`](#03--sharded-batch-inference) | Batch inference | `with_param` fan-out + artifact gather |
 | [`04`](#04--llm-content-pipeline-with-sign-off) | LLM generation | durable LLM step + `type: approval` + `result_from` |
 | [`05`](#05--traineval-quality-gate) | Model promotion | `when:` on task output + `repeat:` convergence poll |
+| [`mcp`](#mcp--a-workflow-that-calls-an-agents-tools) | dagron driving MCP tools | `dagron-step-mcp` + retries + artifacts |
+| [`loop`](#loop--a-conversation-whose-every-turn-is-a-run) | Durable agent loop | `repeat:` on a `type: workflow` trigger |
 
 ## One-time setup
 
@@ -131,6 +133,109 @@ instead of wedging).
 $DAGRON 05_model_eval_gate.yaml           # eval scores "ship" → deploy runs
 THRESHOLD=99 $DAGRON 05_model_eval_gate.yaml   # unreachable bar → hold runs
 ```
+
+---
+
+## mcp — a workflow that calls an agent's tools
+
+[`mcp_tool_step.yaml`](mcp_tool_step.yaml) runs the relationship the other way
+round from the rest of this directory. `dagron-mcp` lets an agent drive dagron;
+`dagron-step-mcp` makes one MCP tool call into one dagron task.
+
+What that buys is everything a task already has. The tool call gets retries with
+backoff, a timeout, its output captured, an artifact to hand the next step, and a
+row in the run's history. The same call inside an agent's own loop has none of
+it: when it fails halfway there is nothing to resume, and nothing that records it
+was ever attempted.
+
+```bash
+# 1. Build the step binary and put it on the task's PATH.
+cargo build -p dagron-step-mcp
+export PATH="$(cargo metadata --format-version 1 --no-deps | jq -r .target_directory)/debug:$PATH"
+
+# 2. Create the directories the tasks use and the file the example reads.
+mkdir -p /data /artifacts
+echo "the quick brown fox jumps over the lazy dog" > /data/report.md
+
+# 3. Run it. The MCP servers are fetched on demand by npx (needs Node 18+ and
+#    network); nothing else to install.
+$DAGRON mcp_tool_step.yaml
+```
+
+The example reads `/data/report.md` through the filesystem MCP server, counts its
+words with an ordinary shell task, and writes the count back through the same
+server's `write_file` tool — so the interesting part is visible: an MCP result is
+just task output, and a task's output is just an argument to the next thing. Both
+MCP steps use `@modelcontextprotocol/server-filesystem`, so the flow runs with no
+server you have to supply; point either step at a different server and tool for
+the real thing.
+
+See [`docs/MCP.md`](../../docs/MCP.md) for the environment contract and the
+details worth knowing (server arguments are a JSON array, all-text results come
+back as plain text, and a tool reporting `isError` fails the task rather than
+writing an error file a retry would then skip).
+
+---
+
+## loop — a conversation whose every turn is a run
+
+[`agent_loop.yaml`](agent_loop.yaml) + [`agent_turn.yaml`](agent_turn.yaml) are
+the durable agent loop: a multi-turn conversation where **each turn is its own
+run**.
+
+```bash
+# The turn's `act` task spawns dagron-step-mcp, so put it on PATH.
+cargo build -p dagron-step-mcp
+export PATH="$(cargo metadata --format-version 1 --no-deps | jq -r .target_directory)/debug:$PATH"
+
+# One engine, one database, the API on the dev port (127.0.0.1:8787 — the
+# default is off). It runs the reconcile loop that drives the turns and serves
+# the API the registration needs; it also submits the conversation on start.
+# `agent_loop.yaml` names `workflow: agent-turn`, so register the turn against
+# this same engine and database, before the conversation's first turn dispatches.
+API_ADDR=127.0.0.1:8787 $DAGRON agent_loop.yaml agent.db &
+sleep 2
+curl -sX POST 127.0.0.1:8787/api/workflows -H 'content-type: application/json' \
+  --data "$(jq -Rn --rawfile s agent_turn.yaml '{name:"agent-turn",spec:$s}')"
+```
+
+The conversation is one task:
+
+```yaml
+- name: turn
+  type: workflow
+  workflow: agent-turn
+  repeat: { until: "{{ output }} == done", max_iterations: 10, delay_secs: 1 }
+```
+
+`type: workflow` starts the turn as a child run and parks — holding no worker
+slot while it works. When the child finishes, `repeat` compares its result
+against `until`: not satisfied and the trigger is re-armed, so the next turn
+starts as a new child run; satisfied and the loop is over and downstream
+proceeds. The child's result is its `result_from` task's output, which is what
+makes a sub-workflow a *function* the parent can branch on.
+
+**There is no loop state in any process.** The turn number is the task's
+`attempt` column, the conversation is files, and the rest is rows. That is the
+claim, and it is the one worth testing:
+
+```bash
+docker compose restart engine    # mid-conversation
+```
+
+The next reconcile tick picks the loop up where it was.
+
+**Two things to know before pointing this at real work**, both about scale
+rather than correctness:
+
+- **`max_iterations` is the only hard bound on how many runs one submission
+  creates.** `SUBWORKFLOW_MAX_DEPTH` does not help — every iteration is a
+  sibling at the same depth, not a deeper nesting — and a `budget:` on the
+  parent counts the parent's tasks, not the children's. See
+  [Loops over sub-workflows](../../docs/CONFIG.md#loops-over-sub-workflows).
+- **A turn cannot be told which conversation it belongs to.** A sub-workflow
+  trigger runs the child's stored spec as-is and passes no parameters down, so
+  the state path is fixed and one state path means one conversation at a time.
 
 ---
 

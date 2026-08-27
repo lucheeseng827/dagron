@@ -63,7 +63,8 @@ image ships `openssh-client` for the SSH transport.
 | Tag | Notes |
 |---|---|
 | `latest` | newest release |
-| `0.5.0` | pinned version (= current `latest`); first release of this image |
+| `0.7.0` | pinned version (= current `latest`) |
+| `0.7` | floating minor — newest `0.7.x` |
 
 ## Quick start
 

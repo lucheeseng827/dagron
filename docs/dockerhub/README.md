@@ -51,6 +51,12 @@ along that path.
 | [`mancube/dagron-frontend`](https://hub.docker.com/r/mancube/dagron-frontend) | [`dagron-frontend.md`](./dagron-frontend.md) | Next.js operator console |
 | [`mancube/dagron-mcp`](https://hub.docker.com/r/mancube/dagron-mcp) | [`dagron-mcp.md`](./dagron-mcp.md) | MCP server (drive dagron from an AI agent) |
 | [`mancube/dagron-gitops`](https://hub.docker.com/r/mancube/dagron-gitops) | [`dagron-gitops.md`](./dagron-gitops.md) | GitOps worker (repo → workflow definitions; the only image with `git`) |
+| [`mancube/dagron-engine-localdev`](https://hub.docker.com/r/mancube/dagron-engine-localdev) | [`dagron-engine-localdev.md`](./dagron-engine-localdev.md) | the engine on debian-slim — has a shell, so `EXECUTOR=local` tasks resolve |
 | `oci://registry-1.docker.io/mancube/dagron` | [`dagron-chart.md`](./dagron-chart.md) | Helm chart (the full stack) |
 
-All five images are published **`linux/amd64` + `linux/arm64`** at the release version + `latest`.
+All six images are published **`linux/amd64` + `linux/arm64`** at the release version + `latest`.
+
+Publish them with [`../../scripts/publish-dockerhub-descriptions.py`](../../scripts/publish-dockerhub-descriptions.py)
+rather than pasting: it carries UTF-8 through (hand-pasting once replaced every em
+dash on the live pages with `U+FFFD`) and reads each description back to prove
+what the page actually says.

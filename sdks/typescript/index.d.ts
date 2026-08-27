@@ -76,6 +76,49 @@ export interface StreamEvent {
   data: unknown;
 }
 
+/**
+ * Why a run failed, summarised in the run detail (`RunDetail.failure`) so an
+ * agent need not fetch task rows and their logs to learn it. `null` on the run
+ * detail when nothing failed.
+ */
+export interface RunFailure {
+  /** The failed task this summarises; `null` when the run failed with no task
+   *  failing (a `run_timeout_secs` overrun cancels its tasks). */
+  task_id: string | null;
+  task_name: string | null;
+  attempt: number | null;
+  /** How many tasks in this run are `failed`. */
+  failed_tasks: number;
+  /** The tail of the failure text, clipped — see `truncated`. */
+  message: string | null;
+  /** Whether `message` is a tail of something longer. */
+  truncated: boolean;
+}
+
+/** Run detail as returned by {@link Client.getRun}. */
+export interface RunDetail {
+  id: string;
+  definition_id: string;
+  status: string;
+  input: string | null;
+  output: string | null;
+  created_at: string;
+  finished_at: string | null;
+  /** Workflow/DAG name from the run's definition. */
+  name: string | null;
+  /** Derived trigger kind: `manual` | `schedule` | `backfill`. */
+  trigger_kind: string;
+  triage_state: string | null;
+  triage_note: string | null;
+  triaged_at: string | null;
+  triaged_by: string | null;
+  /** Why this run failed, when it did — `null` otherwise, so a caller can
+   *  branch on presence without inspecting `status`. */
+  failure: RunFailure | null;
+  /** Per-task rows (`{id, name, status, attempt, output, …}`). */
+  tasks: Array<Record<string, unknown>>;
+}
+
 /** Error thrown by {@link Client}. */
 export declare class DagronError extends Error {
   /** HTTP status code, or `0` for a transport-level failure. */
@@ -104,13 +147,16 @@ export declare class Client {
   ): Promise<Record<string, unknown>>;
 
   // runs
-  submitRun(spec: SpecLike): Promise<string>;
+  submitRun(
+    spec: SpecLike,
+    opts?: { parameters?: Record<string, string>; idempotencyKey?: string },
+  ): Promise<string>;
   listRuns(opts?: {
     status?: string;
     limit?: number;
     offset?: number;
   }): Promise<Array<Record<string, unknown>>>;
-  getRun(runId: string): Promise<Record<string, unknown>>;
+  getRun(runId: string): Promise<RunDetail>;
   getRunGraph(runId: string): Promise<Record<string, unknown>>;
   getTaskLogs(
     runId: string,

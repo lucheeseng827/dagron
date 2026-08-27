@@ -45,7 +45,7 @@ services:
     #
     # For docker/kubernetes execution the task runs in its own image and the
     # distroless engine is the right one. See docs/OPERATIONS.md.
-    image: docker.io/mancube/dagron-engine-localdev:${DAGRON_VERSION:-0.7.0}
+    image: docker.io/mancube/dagron-engine-localdev:${DAGRON_VERSION:-0.8.0}
     environment:
       DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
       API_ADDR: 0.0.0.0:8787
@@ -81,8 +81,53 @@ services:
       # connected repo into the workflows table in Postgres (DATABASE_URL).
       - dagron-workflows:/workflows
 
+  # Gate: hold dagron-api until the engine has finished migrating.
+  #
+  # Both processes create four of the same tables — `users` (migrations_pg/008),
+  # `git_repos` (009), `environments` + `environment_secrets` (026) on the engine
+  # side, and dagron-api's own ensure_schema on the other. `CREATE TABLE IF NOT
+  # EXISTS` does not serialize two sessions running it at once: both see the
+  # table missing, both create it, and the loser fails on the catalog constraint
+  # rather than taking the no-op path —
+  #     Error: ensuring users schema
+  #     Caused by: duplicate key value violates unique constraint "pg_type_typname_nsp_index"
+  # — so on a clean volume dagron-api exits before it ever listens, and `frontend`
+  # (which joins its network namespace) cannot start at all.
+  #
+  # Both sides depend only on `postgres: service_healthy`, so compose starts them
+  # in the same instant and the race is the default path, not a rare one.
+  #
+  # The engine opens its management API only after migrations commit, so a
+  # successful connect to 8787 means every migration it owns is durable. That is
+  # the whole condition, and it stays correct as migrations are added — unlike
+  # waiting for one named table.
+  #
+  # Bounded, not infinite: if the engine never comes up, the gate gives up and
+  # lets dagron-api start anyway. Newer builds retry the DDL race internally, so
+  # a degraded start beats blocking the stack forever on a dependency that is
+  # already broken for its own reasons.
+  schema-gate:
+    image: docker.io/library/postgres:16-alpine
+    command:
+      - sh
+      - -c
+      - |
+        i=0
+        until nc -z engine 8787 2>/dev/null; do
+          i=$$((i+1))
+          if [ $$i -ge 120 ]; then
+            echo "schema-gate: engine did not open :8787 within 60s — starting dagron-api anyway" >&2
+            exit 0
+          fi
+          sleep 0.5
+        done
+        echo "schema-gate: engine migrations committed; releasing dagron-api"
+    depends_on:
+      engine:
+        condition: service_started
+
   dagron-api:
-    image: docker.io/mancube/dagron-api:${DAGRON_VERSION:-0.7.0}
+    image: docker.io/mancube/dagron-api:${DAGRON_VERSION:-0.8.0}
     environment:
       DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
       # Dev credentials, seeded on first start. Change them for anything that
@@ -104,9 +149,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      # …and until the engine's migrator is done; see `schema-gate` above.
+      schema-gate:
+        condition: service_completed_successfully
 
   frontend:
-    image: docker.io/mancube/dagron-frontend:${DAGRON_VERSION:-0.7.0}
+    image: docker.io/mancube/dagron-frontend:${DAGRON_VERSION:-0.8.0}
     # Shares dagron-api's network namespace, which is what makes the published
     # image usable here at all.
     #
@@ -133,7 +181,7 @@ services:
   # is noise in the logs of someone still finding their way around.
   gitops:
     profiles: ["gitops"]
-    image: docker.io/mancube/dagron-gitops:${DAGRON_VERSION:-0.7.0}
+    image: docker.io/mancube/dagron-gitops:${DAGRON_VERSION:-0.8.0}
     environment:
       DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
       GITOPS_POLL_SECS: "60"

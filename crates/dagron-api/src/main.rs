@@ -11,6 +11,9 @@
 //! non-browser clients may instead send it as `Authorization: Bearer <jwt>`.
 
 mod auth;
+// Settings governance (LOW_LATENCY §5): the knob registry, effective-config
+// startup log, and the fleet-drift fingerprint (also surfaced by /api/health).
+mod config;
 mod expand;
 mod identity;
 // `{{ }}` templating mirror for the submit path (core semantics, no core dep).
@@ -46,6 +49,9 @@ async fn main() -> Result<()> {
     // Tunable, structured logging (RUST_LOG / LOG_LEVEL / LOG_FORMAT / …); see
     // the shared `dagron_logging` crate for the full env knob list.
     dagron_logging::init("api");
+    // One effective-config record per boot: every explicitly-set knob
+    // (secrets redacted) plus the fleet-drift fingerprint (LOW_LATENCY §5).
+    config::log_effective();
 
     let database_url = std::env::var("DATABASE_URL")
         .context("DATABASE_URL must be set (postgres connection string)")?;
@@ -66,12 +72,49 @@ async fn main() -> Result<()> {
 
     // One pool serves both read and write roles for now; a read replica can be
     // wired into read_pool later without changing handlers.
+    //
+    // Pool discipline (LOW_LATENCY R-2). Every knob defaults to the previous
+    // hard-coded behaviour; the low-latency profile is what changes them:
+    //  - DAGRON_DB_MAX_CONNECTIONS (default 8)
+    //  - DAGRON_DB_MIN_CONNECTIONS (default 0) — a floor of warm connections;
+    //    also acquired once at startup below, so a replica is never marked
+    //    Ready with a cold pool (market open must not pay TLS + auth
+    //    handshakes on the first N requests).
+    //  - DAGRON_DB_ACQUIRE_TIMEOUT_MS (default 10000) — the profile sets
+    //    ~250 so a saturated pool fails fast (503 + Retry-After via /readyz
+    //    flipping) instead of queueing requests for ten seconds.
+    //  - DAGRON_DB_TEST_BEFORE_ACQUIRE (default true) — sqlx's per-checkout
+    //    liveness round trip; the profile turns it off and lets the query
+    //    itself surface a dead connection.
+    let db_max: u32 = env_parse("DAGRON_DB_MAX_CONNECTIONS", 8).max(1);
+    let db_min: u32 = env_parse("DAGRON_DB_MIN_CONNECTIONS", 0).min(db_max);
+    let db_acquire_ms: u64 = env_parse("DAGRON_DB_ACQUIRE_TIMEOUT_MS", 10_000).max(50);
+    let db_test_before_acquire = std::env::var("DAGRON_DB_TEST_BEFORE_ACQUIRE")
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"))
+        .unwrap_or(true);
     let pool = PgPoolOptions::new()
-        .max_connections(8)
-        .acquire_timeout(Duration::from_secs(10))
+        .max_connections(db_max)
+        .min_connections(db_min)
+        .acquire_timeout(Duration::from_millis(db_acquire_ms))
+        .test_before_acquire(db_test_before_acquire)
         .connect(&database_url)
         .await
         .context("connecting to Postgres")?;
+    info!(
+        max = db_max,
+        min = db_min,
+        acquire_timeout_ms = db_acquire_ms,
+        test_before_acquire = db_test_before_acquire,
+        "db pool configured"
+    );
+    // Warm the floor eagerly: hold min_connections checkouts at once so the
+    // pool actually opens them, then release. Best-effort — a partially warmed
+    // pool is not a startup failure, and /readyz still gates on a live acquire.
+    if db_min > 0 {
+        let held: Vec<_> = futures::future::join_all((0..db_min).map(|_| pool.acquire())).await;
+        let warmed = held.iter().filter(|c| c.is_ok()).count();
+        info!(warmed, target = db_min, "db pool warmed");
+    }
 
     // Broadcast channel for live task events; the listener that feeds it is added in 01-04.
     let (tx, _rx) = broadcast::channel::<TaskEvent>(1024);
@@ -91,6 +134,7 @@ async fn main() -> Result<()> {
         info!(encrypted, "artifact API enabled (PUT/GET /api/runs/*/artifacts/*)");
     }
 
+    let listener_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let state = AppState {
         read_pool: pool.clone(),
         write_pool: pool.clone(),
@@ -101,36 +145,12 @@ async fn main() -> Result<()> {
         artifact_store,
         rotation_lock: Arc::new(tokio::sync::Mutex::new(())),
         login_limiter: Arc::new(ratelimit::RateLimiter::from_env()),
+        listener_ready: Arc::clone(&listener_ready),
     };
 
-    // dagron-api owns the users table; ensure it exists before serving login.
-    routes::login::ensure_schema(&pool)
-        .await
-        .context("ensuring users schema")?;
-    // dagron-api also owns the GitOps repo registry.
-    routes::gitrepos::ensure_schema(&pool)
-        .await
-        .context("ensuring git_repos schema")?;
-    // … and, on enterprise builds, the audit trail for control-plane mutations.
-    #[cfg(feature = "enterprise")]
-    routes::audit::ensure_schema(&pool)
-        .await
-        .context("ensuring audit_log schema")?;
-    // … and the UI-configurable instance settings (notification defaults).
-    routes::settings::ensure_schema(&pool)
-        .await
-        .context("ensuring ui_settings schema")?;
-    // … and environments (variable sets + encrypted secrets).
-    routes::environments::ensure_schema(&pool)
-        .await
-        .context("ensuring environments schema")?;
-    // Additive `description` column on the engine-owned `workflows` table (the UI
-    // owns this field). Idempotent + tolerant of the table not existing yet (the
-    // engine creates it on first migrate); mirrors migrations_pg/010.
-    sqlx::query("ALTER TABLE IF EXISTS workflows ADD COLUMN IF NOT EXISTS description TEXT")
-        .execute(&pool)
-        .await
-        .context("ensuring workflows.description column")?;
+    // Bring the tables dagron-api owns into existence, tolerating a concurrent
+    // migrator creating the same ones (see `ensure_schemas`).
+    ensure_schemas(&pool).await?;
     // Seed a first admin from env (idempotent) so the first login needs no manual
     // DB step. No-op when DAGRON_ADMIN_EMAIL / DAGRON_ADMIN_PASSWORD are unset.
     if let Err(e) = routes::login::bootstrap_admin(&pool).await {
@@ -138,10 +158,15 @@ async fn main() -> Result<()> {
     }
 
     // One shared listener fans task_events NOTIFY out to all SSE clients.
-    stream::spawn_listener(pool, tx);
+    stream::spawn_listener(pool, tx, listener_ready);
 
     let app = Router::new()
         .route("/healthz", get(healthz))
+        // Readiness: unlike /healthz (static liveness), 200 here means the
+        // pool answers within a bounded budget AND the SSE listener is
+        // subscribed. Point the orchestrator's readinessProbe at this
+        // (LOW_LATENCY R-1); keep /healthz for liveness.
+        .route("/readyz", get(readyz))
         // Self-contained auth: login + logout (public) + user management (admin-only).
         .route("/api/logout", post(routes::login::logout))
         .route(
@@ -352,20 +377,231 @@ async fn main() -> Result<()> {
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await.context("binding listener")?;
     info!(%addr, "dagron-api listening");
+    // Rolling restarts drain: on SIGTERM/ctrl-c axum stops accepting and lets
+    // in-flight requests finish instead of severing them mid-response
+    // (LOW_LATENCY R-1). The drain is BOUNDED (DAGRON_SHUTDOWN_DRAIN_MS,
+    // default 15 s): open SSE streams and long-polls never finish on their
+    // own, so an unbounded graceful shutdown would hang every rollout until
+    // the kubelet's SIGKILL — better to close the stragglers ourselves,
+    // on our schedule, after the real requests have drained. Keep the knob
+    // under the pod's terminationGracePeriodSeconds (default 30 s) so the
+    // orderly path always wins over the SIGKILL.
+    let drain_ms: u64 = env_parse("DAGRON_SHUTDOWN_DRAIN_MS", 15_000);
+    let (drained_tx, drained_rx) = tokio::sync::oneshot::channel::<()>();
     // with_connect_info so the login limiter can key on the socket peer — the
     // one client identifier a caller cannot forge (see `ratelimit::client_key`).
-    axum::serve(
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .await
-    .context("serving")?;
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = drained_tx.send(());
+    });
+    tokio::select! {
+        res = server => res.context("serving")?,
+        _ = async {
+            // Arms only once the signal has fired; dropping the server future
+            // closes the connections the drain window could not flush.
+            let _ = drained_rx.await;
+            tokio::time::sleep(Duration::from_millis(drain_ms)).await;
+        } => {
+            tracing::warn!(
+                drain_ms,
+                "shutdown drain deadline reached — closing remaining connections \
+                 (long-lived SSE/long-poll clients reconnect to the next replica)"
+            );
+        }
+    }
     Ok(())
+}
+
+/// Create the tables dagron-api owns, retrying past a concurrent migrator.
+///
+/// `CREATE TABLE IF NOT EXISTS` is not atomic against another session running
+/// the *same* statement: both check the catalog, both find nothing, and both
+/// create. The loser does not get the no-op the `IF NOT EXISTS` implies — it
+/// fails on a catalog constraint, because creating a table also inserts its row
+/// type into `pg_type`:
+///
+/// ```text
+/// Error: ensuring users schema
+/// Caused by: duplicate key value violates unique constraint "pg_type_typname_nsp_index"
+/// ```
+///
+/// That is reachable in the shipped quickstart: `users` is created both here and
+/// by the engine's sqlx migrator (dagron-core/migrations_pg/008_users.sql), and
+/// compose starts both processes the moment Postgres reports healthy. The
+/// migrator holds sqlx's own advisory lock, which serializes migrator against
+/// migrator but knows nothing about these statements — so on a clean volume the
+/// two collide and dagron-api exits before it ever listens.
+///
+/// Every step below is idempotent, so the whole sequence is simply replayed: by
+/// the retry the other side has committed, `IF NOT EXISTS` sees the object and
+/// the no-op path is taken. Retries are bounded — a race resolves on the first
+/// one, and anything still failing after that is a real error worth dying on.
+async fn ensure_schemas(pool: &sqlx::postgres::PgPool) -> Result<()> {
+    const MAX_ATTEMPTS: u32 = 4;
+    let mut attempt = 1;
+    loop {
+        match ensure_schemas_once(pool).await {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < MAX_ATTEMPTS && is_concurrent_ddl_race(&e) => {
+                tracing::warn!(
+                    attempt,
+                    error = format!("{e:#}"),
+                    "schema bootstrap raced a concurrent migrator; retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(250 * u64::from(attempt))).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// One pass of the schema bootstrap. Every statement is idempotent so the caller
+/// can replay it wholesale.
+async fn ensure_schemas_once(pool: &sqlx::postgres::PgPool) -> Result<()> {
+    // dagron-api owns the users table; ensure it exists before serving login.
+    routes::login::ensure_schema(pool)
+        .await
+        .context("ensuring users schema")?;
+    // dagron-api also owns the GitOps repo registry.
+    routes::gitrepos::ensure_schema(pool)
+        .await
+        .context("ensuring git_repos schema")?;
+    // … and, on enterprise builds, the audit trail for control-plane mutations.
+    #[cfg(feature = "enterprise")]
+    routes::audit::ensure_schema(pool)
+        .await
+        .context("ensuring audit_log schema")?;
+    // … and the UI-configurable instance settings (notification defaults).
+    routes::settings::ensure_schema(pool)
+        .await
+        .context("ensuring ui_settings schema")?;
+    // … and environments (variable sets + encrypted secrets).
+    routes::environments::ensure_schema(pool)
+        .await
+        .context("ensuring environments schema")?;
+    // Additive `description` column on the engine-owned `workflows` table (the UI
+    // owns this field). Idempotent + tolerant of the table not existing yet (the
+    // engine creates it on first migrate); mirrors migrations_pg/010.
+    sqlx::query("ALTER TABLE IF EXISTS workflows ADD COLUMN IF NOT EXISTS description TEXT")
+        .execute(pool)
+        .await
+        .context("ensuring workflows.description column")?;
+    Ok(())
+}
+
+/// Does this error mean "another session created the object first"?
+///
+/// Scoped deliberately to the schema bootstrap. `23505` is an ordinary
+/// application error elsewhere (a duplicate email on signup); what makes it a
+/// race *here* is that the only inserts in that path are Postgres' own catalog
+/// writes. The rest are the DDL-specific codes Postgres raises when an object
+/// appears between the existence check and the create.
+fn is_concurrent_ddl_race(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<sqlx::Error>())
+        .filter_map(|e| e.as_database_error())
+        .any(|db| {
+            matches!(
+                db.code().as_deref(),
+                // unique_violation on a pg_catalog index (e.g. pg_type_typname_nsp_index)
+                Some("23505")
+                // duplicate_table / duplicate_object / duplicate_column
+                    | Some("42P07")
+                    | Some("42710")
+                    | Some("42701")
+            )
+        })
+}
+
+/// Resolves on SIGTERM (Kubernetes stop) or ctrl-c (local dev).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = term => {}
+    }
+    tracing::info!("shutdown signal received — draining");
+}
+
+/// Parse a numeric env var with a default (invalid values fall back).
+fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
+    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
 }
 
 /// Liveness probe — no auth, no DB.
 async fn healthz() -> &'static str {
     "ok"
+}
+
+/// Readiness probe — no auth, one bounded DB round trip. 503 with a reason
+/// when the database is unreachable or the pool is exhausted, so an
+/// orchestrator stops routing to that replica (LOW_LATENCY R-1). The probe
+/// budget is its own knob (memoized: the environment is boot-immutable) so a
+/// long DAGRON_DB_ACQUIRE_TIMEOUT_MS never makes the probe itself hang past
+/// the kubelet's patience.
+///
+/// The SSE listener flag is ADVISORY by default — reported in the body and in
+/// `/api/health`, but not a 503. The listener watches one shared direct
+/// Postgres endpoint (`DATABASE_LISTEN_URL`), so its failure is correlated
+/// across every replica at once: gating readiness on it cannot route around
+/// the problem (no replica has a listener either), it can only empty the
+/// Service and take down every endpoint that still worked — login, listings,
+/// submits. Live events are a degradable feature (`/wait` falls back to its
+/// 5 s recheck; SSE clients reconnect), so degraded beats down.
+/// `DAGRON_READY_REQUIRE_LISTENER=1` opts into strict gating for deployments
+/// with per-replica listen endpoints, where eviction genuinely reroutes.
+async fn readyz(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    static BUDGET: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    static REQUIRE_LISTENER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let budget = *BUDGET
+        .get_or_init(|| Duration::from_millis(env_parse("DAGRON_READY_TIMEOUT_MS", 500).max(50)));
+    let probe = sqlx::query("SELECT 1").execute(&state.read_pool);
+    match tokio::time::timeout(budget, probe).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(error = ?e, "readiness probe: db query failed");
+            return (StatusCode::SERVICE_UNAVAILABLE, "database unreachable").into_response();
+        }
+        Err(_) => {
+            tracing::warn!(budget_ms = budget.as_millis() as u64, "readiness probe: acquire timed out");
+            return (StatusCode::SERVICE_UNAVAILABLE, "pool acquire timed out").into_response();
+        }
+    }
+    if !state.listener_ready.load(std::sync::atomic::Ordering::Acquire) {
+        let strict = *REQUIRE_LISTENER.get_or_init(|| {
+            std::env::var("DAGRON_READY_REQUIRE_LISTENER")
+                .map(|v| { let v = v.trim(); v == "1" || v.eq_ignore_ascii_case("true") })
+                .unwrap_or(false)
+        });
+        if strict {
+            return (StatusCode::SERVICE_UNAVAILABLE, "event listener not subscribed")
+                .into_response();
+        }
+        return (StatusCode::OK, "ready (event listener degraded)").into_response();
+    }
+    (StatusCode::OK, "ready").into_response()
 }
 
 /// Auth probe — returns the validated session claims, proving the shared-token

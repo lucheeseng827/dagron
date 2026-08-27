@@ -31,6 +31,16 @@ pub struct HealthResponse {
     /// Tasks parked in `awaiting_approval` — the sidebar approvals badge.
     pub awaiting_approvals: i64,
     pub dead_letters: i64,
+    /// Fleet-drift check: hash of this replica's effective configuration
+    /// (LOW_LATENCY S-4). Two replicas with different fingerprints are not
+    /// running the same reviewed settings.
+    pub config_fingerprint: String,
+    /// "ok" while the SSE listener holds its `task_events` subscription;
+    /// "down" during a reconnect window. Advisory for readiness — live events
+    /// degrade rather than gate traffic (see `/readyz` and
+    /// `DAGRON_READY_REQUIRE_LISTENER`) — so this is where the degradation is
+    /// visible to an operator.
+    pub event_listener: &'static str,
 }
 
 #[derive(sqlx::FromRow)]
@@ -45,6 +55,12 @@ struct LeaseRow {
 pub async fn health(_auth: AuthUser, State(state): State<AppState>) -> Json<HealthResponse> {
     let mut resp = HealthResponse {
         api: "ok".to_string(),
+        config_fingerprint: crate::config::fingerprint(),
+        event_listener: if state.listener_ready.load(std::sync::atomic::Ordering::Acquire) {
+            "ok"
+        } else {
+            "down"
+        },
         edition: if cfg!(feature = "enterprise") { "enterprise" } else { "oss" },
         db: "ok".to_string(),
         scheduler_leader: false,

@@ -24,8 +24,19 @@ pub struct TaskSpec {
     /// this task calls. Makes the workflow call another workflow inline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<String>,
-    /// Arguments passed to the called template — values may reference the caller's
-    /// scope via `{{ name }}`; inside the template they fill its parameters.
+    /// Arguments passed to whatever this task calls — values may reference the
+    /// caller's scope via `{{ name }}`.
+    ///
+    /// Two callees, one field, because it is one idea:
+    ///
+    ///   * with `template:` they fill the template's parameters, inline, and
+    ///     are consumed by the expander.
+    ///   * with `type: workflow` they become the **child run's** parameters
+    ///     (#23). Unlike the template case these *survive* expansion, because
+    ///     the child run does not exist until the engine dispatches the trigger.
+    ///     Without them a trigger can only hand the child constants, so every
+    ///     run of a child workflow is identical — which is what made a repeating
+    ///     trigger unable to tell one conversation from another.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub arguments: BTreeMap<String, String>,
     /// Fan-out: expand the call once per item. `{{ item }}` (and `{{ item.key }}`
@@ -243,6 +254,80 @@ pub struct RepeatSpec {
     /// Seconds to wait between iterations (default 0 = immediate).
     #[serde(default)]
     pub delay_secs: u64,
+}
+
+/// What `repeat:` decides after one successful iteration.
+///
+/// A value rather than inline control flow because **two paths now ask**: an
+/// executor reporting a finished command, and the reconcile sweep resolving a
+/// sub-workflow trigger whose child run has gone terminal. Those paths share no
+/// machinery at all — one holds a worker claim and a fence, the other holds a
+/// parked row nobody owns — so the only thing that can be shared is the
+/// decision itself. Two copies of a loop operator is how the two come to
+/// disagree about when a loop is over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepeatDecision {
+    /// `until` holds — this really was the task's success.
+    Done,
+    /// Not yet, and iterations remain. Re-queue after `delay_secs`.
+    Again { delay_secs: u64 },
+    /// Give up. `reason` is what the task's output should record.
+    Fail { reason: String },
+}
+
+impl RepeatSpec {
+    /// Decide what happens after the iteration numbered `iteration` (1-based)
+    /// produced `output`.
+    ///
+    /// `until` sees `{{ output }}` (trimmed) and `{{ attempt }}` (the iteration
+    /// number), the same two bindings it has always seen. Running out of
+    /// iterations is a **failure**, not a success: a condition that never came
+    /// true is an error, and reporting it as success would hand the next task a
+    /// result the loop never actually reached.
+    pub fn decide(&self, output: &str, iteration: i64) -> RepeatDecision {
+        let mut ctx = BTreeMap::new();
+        ctx.insert("output".to_string(), output.trim().to_string());
+        ctx.insert("attempt".to_string(), iteration.to_string());
+        match crate::expand::eval_when(&crate::expand::substitute(&self.until, &ctx)) {
+            Ok(true) => RepeatDecision::Done,
+            Ok(false) if iteration < i64::from(self.max_iterations) => {
+                RepeatDecision::Again { delay_secs: self.delay_secs }
+            }
+            Ok(false) => RepeatDecision::Fail {
+                reason: format!(
+                    "repeat.until '{}' not satisfied after {} iterations; last output:\n{}",
+                    self.until, iteration, output
+                ),
+            },
+            Err(e) => RepeatDecision::Fail {
+                reason: format!("repeat.until '{}' failed to evaluate: {e}", self.until),
+            },
+        }
+    }
+}
+
+/// The largest `repeat.delay_secs` accepted (one year). Validation rejects a
+/// larger delay at submit, and [`delayed_retry_at`] clamps to it — a backoff
+/// past this is a typo, and a truly enormous one would otherwise panic
+/// `chrono::TimeDelta::seconds`.
+pub const MAX_REPEAT_DELAY_SECS: u64 = 365 * 24 * 60 * 60;
+
+/// An RFC-3339 timestamp `delay_secs` from now, computed without panicking.
+///
+/// `chrono::TimeDelta::seconds` panics past ~`i64::MAX / 1000`, and even a valid
+/// but enormous delta can overflow `DateTime` addition. `delay_secs` originates
+/// in a user's `repeat.delay_secs`, so both are reachable from a spec. The value
+/// is clamped to [`MAX_REPEAT_DELAY_SECS`] (validation already rejects larger
+/// ones at submit; this guards any row that predates that check) and the
+/// addition is checked, so the worst case is a slightly-too-soon retry rather
+/// than a crashed reconcile tick.
+pub fn delayed_retry_at(delay_secs: u64) -> String {
+    let secs = delay_secs.min(MAX_REPEAT_DELAY_SECS) as i64;
+    let now = chrono::Utc::now();
+    chrono::TimeDelta::try_seconds(secs)
+        .and_then(|d| now.checked_add_signed(d))
+        .unwrap_or(now)
+        .to_rfc3339()
 }
 
 /// `wait:` — a deferrable time sensor for a `type: wait` task (fast-win #27 —
@@ -538,6 +623,23 @@ pub struct TemplateSpec {
     pub tasks: Vec<TaskSpec>,
 }
 
+/// A run's declared resource ceiling (`budget:` on the spec).
+///
+/// **Only `tasks` is enforceable today, and that is a statement about the data
+/// rather than about ambition.** `AGENT_SCHEDULER_PLAN.md` §G-S3 asks for a
+/// "spend/token/task budget per run". A task count is exact and knowable at
+/// creation — dagron expands `with_items` fan-out and templates at submit, so
+/// the number of rows a run will insert is already decided before anything
+/// runs. Spend and token counts are not: nothing in the engine meters currency
+/// or model tokens against a run, so a `spend:` field would be a promise with
+/// no measurement behind it, which is worse than no field.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RunBudget {
+    /// Maximum tasks this run may create. `None` = no cap. Must be >= 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<u32>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DagSpec {
     pub name: String,
@@ -572,6 +674,23 @@ pub struct DagSpec {
     /// run creation only — it caps concurrent runs, not per-task concurrency.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_active_runs: Option<u32>,
+    /// Per-run resource budget (G-AG3). A run that would exceed it is refused at
+    /// creation with a [`crate::models::TaskBudgetExceeded`] error, before
+    /// anything executes.
+    ///
+    /// This exists because a scheduler called by an agent is an unbounded
+    /// amplifier: one tool call can fan out to hundreds of tasks, and the first
+    /// place anyone notices is the invoice. `budget:` is the author's ceiling on
+    /// how big one run of this workflow is allowed to get.
+    ///
+    /// Distinct from [`Self::max_active_runs`], which caps how many runs of a
+    /// workflow are in flight; this caps how big *one* of them may be. Also
+    /// distinct from `DAGRON_MAX_TASKS_PER_RUN`, which is the operator's
+    /// process-wide ceiling against an OOM: that one protects the engine from
+    /// every workflow, this one lets a workflow's author say what *this* one is
+    /// supposed to cost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<RunBudget>,
     /// Soft SLA deadline. Unlike `run_timeout_secs`
     /// (which cancels), exceeding this only **emits an alert** — a
     /// `run.deadline_exceeded` outbox event + a metric — and leaves the run
@@ -772,6 +891,41 @@ impl DagGraph {
 
         if spec.run_timeout_secs == Some(0) {
             bail!("invalid run_timeout_secs=0 in DAG '{}'; expected >= 1 (or omit)", spec.name);
+        }
+        // The task budget is checked here rather than at dispatch, because here
+        // it can be exact. `from_spec` runs *after* expansion, so `spec.tasks`
+        // is the final list — templates inlined, `with_items` fanned out. A run
+        // that would break its budget is therefore refused before a single task
+        // exists, instead of being killed halfway through with work already
+        // spent. Enforcing later would cost more and know less.
+        if let Some(budget) = &spec.budget {
+            match budget.tasks {
+                Some(0) => {
+                    bail!("invalid budget.tasks=0 in DAG '{}'; expected >= 1 (or omit)", spec.name)
+                }
+                Some(max) => {
+                    // Count expanded task ROWS, not spec entries — the same
+                    // gang-aware count `DagGraph::task_row_count` uses for
+                    // admission. A `gang:` task is one spec that becomes `size`
+                    // rows, so counting it as one would admit a run of N gangs
+                    // against a budget of N while landing N × size tasks in the
+                    // datastore, exactly the amplification the budget exists to
+                    // cap.
+                    let planned: u64 = spec
+                        .tasks
+                        .iter()
+                        .map(|t| t.gang.as_ref().map(|g| g.size as u64).unwrap_or(1))
+                        .sum();
+                    if planned > u64::from(max) {
+                        return Err(anyhow::Error::new(crate::models::TaskBudgetExceeded {
+                            name: spec.name.clone(),
+                            max,
+                            planned,
+                        }));
+                    }
+                }
+                None => {}
+            }
         }
         if let Some(d) = &spec.deadline {
             parse_duration_secs(&d.within)
@@ -1074,13 +1228,54 @@ impl DagGraph {
                         spec.name
                     );
                 }
-                if task.is_approval() {
+                if rep.delay_secs > MAX_REPEAT_DELAY_SECS {
                     bail!(
-                        "task '{}' cannot combine `repeat` with an approval gate in DAG '{}'",
+                        "invalid repeat.delay_secs={} for task '{}' in DAG '{}'; expected <= {} (one year)",
+                        rep.delay_secs,
                         task.name,
+                        spec.name,
+                        MAX_REPEAT_DELAY_SECS
+                    );
+                }
+                // `repeat:` is only meaningful where something evaluates it
+                // after a success. Two paths do: an executor reporting a
+                // finished command, and the sub-workflow sweep resolving a
+                // trigger whose child run went terminal — the second is what
+                // makes a loop of child runs possible at all.
+                //
+                // The other two parked kinds have no iteration to speak of. An
+                // approval is resolved by a person, and re-asking them until
+                // they give the answer a condition wants is not a loop, it is
+                // pestering. A wait sensor's whole job is to resolve once at a
+                // deadline; `repeat` on it would mean "wait again", which is
+                // what a longer `for:` already says.
+                //
+                // The rejection is kept rather than narrowed away because it
+                // replaced a *silent* no-op: before the sweep learned `repeat`,
+                // a loop on any of these succeeded once and said nothing, which
+                // reads as a working workflow.
+                if !matches!(task.task_type.as_deref(), None | Some("task") | Some("workflow")) {
+                    bail!(
+                        "task '{}' cannot combine `repeat` with `type: {}` in DAG '{}' \
+                         — `repeat` applies to command tasks and sub-workflow triggers",
+                        task.name,
+                        task.task_type.as_deref().unwrap_or("task"),
                         spec.name
                     );
                 }
+            }
+            // `arguments` has exactly two callees, and after expansion only one
+            // of them can still be here: a template's are consumed inline, so
+            // anything left belongs to a `type: workflow` trigger. Arguments
+            // with nothing to pass them to are silently ignored otherwise, which
+            // is the failure mode of a parameter that looks configured and is
+            // not.
+            if !task.arguments.is_empty() && !task.is_workflow() {
+                bail!(
+                    "task '{}' sets `arguments` with no `template` or `type: workflow` to pass them to in DAG '{}'",
+                    task.name,
+                    spec.name
+                );
             }
             // After expansion every task must be a runnable leaf. A surviving
             // `template` or an empty `command` means expansion missed something.
@@ -1486,6 +1681,222 @@ tasks:
         .expect("run_timeout_secs=0 must be rejected")
         .to_string();
         assert!(err.contains("run_timeout_secs=0"), "got: {err}");
+    }
+
+    /// `repeat:` is evaluated only where an executor's result comes back. Every
+    /// other task kind succeeds through a sweep that never consults it, so a
+    /// `repeat:` there used to be a silent no-op — the workflow read as a loop
+    /// and ran once. Saying no out loud is the only honest answer until the
+    /// sweep paths learn the operator.
+    #[test]
+    fn repeat_is_rejected_on_task_kinds_that_never_evaluate_it() {
+        let cases = [
+            ("wait", "  - { name: a, type: wait, wait: { for: 5m }, repeat: { until: \"{{ output }} == done\", max_iterations: 3 } }"),
+            ("approval", "  - { name: a, type: approval, repeat: { until: \"{{ output }} == done\", max_iterations: 3 } }"),
+        ];
+        for (kind, task) in cases {
+            let err = DagGraph::from_yaml(&format!("name: w\ntasks:\n{task}\n"))
+                .err()
+                .unwrap_or_else(|| panic!("repeat on type: {kind} must be rejected"))
+                .to_string();
+            assert!(
+                err.contains("repeat") && err.contains(kind),
+                "the error should name both the operator and the kind, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_satisfied_condition_ends_the_loop() {
+        let rep = RepeatSpec {
+            until: "{{ output }} == done".into(),
+            max_iterations: 5,
+            delay_secs: 0,
+        };
+        assert_eq!(rep.decide("done", 1), RepeatDecision::Done);
+        // Trimmed before comparison — a command's output almost always ends in
+        // a newline, and a loop that never matched because of one would be
+        // maddening to debug.
+        assert_eq!(rep.decide("done\n", 3), RepeatDecision::Done);
+    }
+
+    #[test]
+    fn an_unsatisfied_condition_asks_for_another_iteration() {
+        let rep = RepeatSpec {
+            until: "{{ output }} == done".into(),
+            max_iterations: 5,
+            delay_secs: 7,
+        };
+        assert_eq!(rep.decide("continue", 1), RepeatDecision::Again { delay_secs: 7 });
+        assert_eq!(rep.decide("continue", 4), RepeatDecision::Again { delay_secs: 7 });
+    }
+
+    /// Running out of iterations is a **failure**. A condition that never came
+    /// true is an error, and calling it success hands the next task a result
+    /// the loop never reached.
+    #[test]
+    fn exhausting_the_iterations_fails_and_says_what_it_last_saw() {
+        let rep = RepeatSpec {
+            until: "{{ output }} == done".into(),
+            max_iterations: 5,
+            delay_secs: 0,
+        };
+        let RepeatDecision::Fail { reason } = rep.decide("still going", 5) else {
+            panic!("the last iteration must fail, not repeat forever");
+        };
+        assert!(reason.contains("not satisfied after 5 iterations"), "got: {reason}");
+        assert!(reason.contains("still going"), "the last output has to be in the reason");
+    }
+
+    /// A condition the grammar cannot evaluate fails the task rather than
+    /// looping until the budget runs out — the spec is wrong, and thirty-nine
+    /// more attempts will not make it right.
+    #[test]
+    fn an_unevaluable_condition_fails_immediately() {
+        let rep = RepeatSpec {
+            until: "{{ output }} >< done".into(),
+            max_iterations: 40,
+            delay_secs: 0,
+        };
+        let d = rep.decide("anything", 1);
+        assert!(
+            matches!(&d, RepeatDecision::Fail { reason } if reason.contains("failed to evaluate")),
+            "got: {d:?}"
+        );
+    }
+
+    /// A trigger's `arguments` survive expansion — they are the child run's
+    /// parameters, and the child does not exist until dispatch.
+    #[test]
+    fn sub_workflow_arguments_survive_expansion_and_resolve_the_callers_scope() {
+        let g = DagGraph::from_yaml(
+            "name: p\nparameters: { conversation: c-42 }\ntasks:\n  - { name: turn, type: workflow, workflow: agent-turn, arguments: { conversation: \"{{ conversation }}\", fixed: literal } }\n",
+        )
+        .expect("arguments on a trigger are allowed");
+        let args = &g.spec.tasks[0].arguments;
+        assert_eq!(
+            args.get("conversation").map(String::as_str),
+            Some("c-42"),
+            "the caller's scope resolves, or a trigger could only pass constants"
+        );
+        assert_eq!(args.get("fixed").map(String::as_str), Some("literal"));
+    }
+
+    /// A template's arguments are consumed inline, so nothing survives on the
+    /// leaf — the two callees share a field, not a lifetime.
+    #[test]
+    fn template_arguments_do_not_survive_expansion() {
+        let g = DagGraph::from_yaml(
+            "name: p\ntemplates:\n  - name: say\n    parameters: { who: world }\n    tasks:\n      - { name: hello, command: [\"echo\", \"{{ who }}\"] }\ntasks:\n  - { name: greet, template: say, arguments: { who: dagron } }\n",
+        )
+        .expect("a template call expands");
+        assert!(
+            g.spec.tasks.iter().all(|t| t.arguments.is_empty()),
+            "a template's arguments are consumed, not carried"
+        );
+    }
+
+    /// `arguments` with nothing to pass them to is a mistake, and a silent one
+    /// if it is allowed through: the values look configured and go nowhere.
+    #[test]
+    fn arguments_with_no_callee_are_rejected() {
+        let err = DagGraph::from_yaml(
+            "name: p\ntasks:\n  - { name: a, command: [\"true\"], arguments: { x: \"1\" } }\n",
+        )
+        .err()
+        .expect("arguments on a plain command task must be rejected")
+        .to_string();
+        assert!(err.contains("`arguments`"), "got: {err}");
+    }
+
+    /// The durable agent loop: a sub-workflow trigger that repeats. Each
+    /// iteration is a child run, which is what makes a conversation
+    /// inspectable turn by turn.
+    #[test]
+    fn repeat_is_allowed_on_a_sub_workflow_trigger() {
+        let g = DagGraph::from_yaml(
+            "name: conversation\ntasks:\n  - { name: turn, type: workflow, workflow: agent-turn, repeat: { until: \"{{ output }} == done\", max_iterations: 40 } }\n",
+        )
+        .expect("a loop over child runs is the whole point");
+        assert!(g.spec.tasks[0].repeat.is_some());
+        assert!(g.spec.tasks[0].is_workflow());
+    }
+
+    #[test]
+    fn repeat_is_still_allowed_on_an_ordinary_command_task() {
+        DagGraph::from_yaml(
+            "name: w\ntasks:\n  - { name: a, command: [\"true\"], repeat: { until: \"{{ output }} == done\", max_iterations: 3 } }\n",
+        )
+        .expect("the common case must keep working");
+    }
+
+    #[test]
+    fn a_run_over_its_task_budget_is_refused_before_anything_runs() {
+        // 3 tasks, budget of 2. The refusal happens at graph construction, which
+        // is after expansion and before a single row is written.
+        let err = DagGraph::from_yaml(
+            "name: w\nbudget: { tasks: 2 }\ntasks:\n  - { name: a, command: [\"true\"] }\n  - { name: b, command: [\"true\"] }\n  - { name: c, command: [\"true\"] }\n",
+        )
+        .err()
+        .expect("over budget must be refused");
+        let b = err
+            .downcast_ref::<crate::models::TaskBudgetExceeded>()
+            .expect("a budget refusal must be typed, not a generic parse error");
+        assert_eq!((b.max, b.planned), (2, 3));
+    }
+
+    /// The count is taken *after* expansion, which is the only place it is
+    /// honest: a two-line spec with `with_items` is one task on the page and
+    /// many in the database, and budgeting the page would budget nothing.
+    #[test]
+    fn the_budget_counts_expanded_fan_out_not_authored_tasks() {
+        let yaml = "name: w\nbudget: { tasks: 2 }\ntasks:\n  - { name: a, command: [\"echo\", \"{{ item }}\"], with_items: [1, 2, 3] }\n";
+        let err = DagGraph::from_yaml(yaml).err().expect("fan-out of 3 breaks a budget of 2");
+        let b = err.downcast_ref::<crate::models::TaskBudgetExceeded>().expect("typed");
+        assert_eq!(b.planned, 3, "the budget sees the tasks that would actually exist");
+    }
+
+    /// A `gang:` task is one line in the spec but `size` rows in the datastore,
+    /// exactly like `with_items`. The budget must count the rows — otherwise a
+    /// single gang spec of `size` sails past a budget of 1 and lands `size`
+    /// tasks. This is the case `task_row_count` already counts for admission.
+    #[test]
+    fn the_budget_counts_gang_members_not_the_gang_spec() {
+        let yaml = "name: w\nbudget: { tasks: 2 }\ntasks:\n  - { name: a, command: [\"true\"], gang: { size: 4 } }\n";
+        let err = DagGraph::from_yaml(yaml).err().expect("a 4-member gang breaks a budget of 2");
+        let b = err.downcast_ref::<crate::models::TaskBudgetExceeded>().expect("typed");
+        assert_eq!(b.planned, 4, "the budget sees the gang members that would actually exist");
+    }
+
+    #[test]
+    fn a_run_within_its_budget_is_built_normally() {
+        let g = DagGraph::from_yaml(
+            "name: w\nbudget: { tasks: 5 }\ntasks:\n  - { name: a, command: [\"true\"] }\n",
+        )
+        .expect("under budget");
+        assert_eq!(g.spec.tasks.len(), 1);
+    }
+
+    /// A budget of zero admits nothing, so it is a typo rather than a policy.
+    /// Rejecting it matches how `run_timeout_secs: 0` is treated.
+    #[test]
+    fn a_zero_task_budget_is_rejected_as_a_mistake() {
+        let err = DagGraph::from_yaml(
+            "name: w\nbudget: { tasks: 0 }\ntasks:\n  - { name: a, command: [\"true\"] }\n",
+        )
+        .err()
+        .expect("budget.tasks=0 must be rejected")
+        .to_string();
+        assert!(err.contains("budget.tasks=0"), "got: {err}");
+    }
+
+    /// No `budget:` is the overwhelmingly common case and must stay free of any
+    /// new behaviour at all.
+    #[test]
+    fn a_spec_without_a_budget_is_unaffected() {
+        let g = DagGraph::from_yaml("name: w\ntasks:\n  - { name: a, command: [\"true\"] }\n")
+            .expect("no budget declared");
+        assert!(g.spec.budget.is_none());
     }
 
     #[test]

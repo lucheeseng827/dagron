@@ -162,6 +162,50 @@ test("submit_run posts the spec under the yaml key", async () => {
   assert.deepEqual(JSON.parse(last().body), { yaml: "name: y\ntasks: []\n" });
 });
 
+test("submit_run sends parameters only when given", async () => {
+  respond("POST", "/api/runs", 200, { run_id: "r-10" });
+  await client().submitRun("name: y\n", { parameters: { date: "2026-08-18" } });
+  assert.deepEqual(JSON.parse(last().body).parameters, { date: "2026-08-18" });
+
+  // Omitted (and empty) parameters must not appear at all: the gateway's
+  // pre-existing body shape is { yaml } and every older server has to keep
+  // accepting exactly that.
+  respond("POST", "/api/runs", 200, { run_id: "r-11" });
+  await client().submitRun("name: y\n", { parameters: {} });
+  assert.deepEqual(Object.keys(JSON.parse(last().body)), ["yaml"]);
+});
+
+test("submit_run sends the idempotency key as a header, and none without one", async () => {
+  respond("POST", "/api/runs", 200, { run_id: "r-12" });
+  await client().submitRun("name: y\n", { idempotencyKey: "job-42" });
+  assert.equal(last().headers["idempotency-key"], "job-42");
+
+  // No key, no header — the endpoint stays non-idempotent by default, and an
+  // empty key is a 400 server-side, so one must never be invented here.
+  respond("POST", "/api/runs", 200, { run_id: "r-13" });
+  await client().submitRun("name: y\n");
+  assert.equal(last().headers["idempotency-key"], undefined);
+});
+
+test("an explicitly empty idempotency key is forwarded, not dropped", async () => {
+  // `""` is a 400 server-side. A truthiness check would drop it and submit
+  // without idempotency — a non-idempotent request the caller believes is
+  // retry-safe. An explicit empty string must reach the server as the header it
+  // is, so the 400 surfaces; only an absent key means "no header".
+  respond("POST", "/api/runs", 400, { error: "Idempotency-Key must not be empty" });
+  await assert.rejects(client().submitRun("name: y\n", { idempotencyKey: "" }));
+  assert.equal(last().headers["idempotency-key"], "");
+});
+
+test("a caller header cannot displace authorization", async () => {
+  respond("POST", "/api/runs", 200, { run_id: "r-14" });
+  await client()._request("POST", "/api/runs", {
+    body: { yaml: "x" },
+    headers: { Authorization: "Bearer stolen" },
+  });
+  assert.equal(last().headers.authorization, "Bearer tok");
+});
+
 // ── 0.3.0 surface: approvals ────────────────────────────────────────────────
 
 test("approve/reject task hit the right routes and return the resolution", async () => {

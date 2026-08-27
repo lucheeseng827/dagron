@@ -17,6 +17,14 @@ A YAML DAG is parsed, persisted as rows, then driven to completion by one or mor
 scheduler processes. From **v2** those processes scale horizontally against one Postgres database
 with no coordinator — the row leases are the only coordination point.
 
+[![dagron system context](images/architecture-system-context.png)](images/architecture-system-context.png)
+
+<sub>Redrawn from the Mermaid source below; the drawing collapses schedulers A and B into
+`Scheduler ×N` and the two gateway subgraphs into one **edge** zone. Source:
+[`images/architecture-system-context.html`](images/architecture-system-context.html).</sub>
+
+The same topology as Mermaid, for diffing and for editing the drawing from:
+
 ```mermaid
 flowchart LR
     yaml([DAG YAML file])

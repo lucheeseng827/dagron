@@ -108,6 +108,11 @@ pub fn expand(mut spec: DagSpec) -> Result<DagSpec> {
         tags: spec.tags,
         run_timeout_secs: spec.run_timeout_secs,
         max_active_runs: spec.max_active_runs,
+        // Carried through, not consumed here. The local `budget` above is the
+        // operator's global anti-blowup ceiling (DAGRON_MAX_TASKS_PER_RUN); this
+        // is the *author's* declared ceiling for this workflow, and it is
+        // checked against the expanded result in `DagGraph::from_spec`.
+        budget: spec.budget,
         deadline: spec.deadline,
         notify: spec.notify,
         result_from: spec.result_from,
@@ -517,7 +522,24 @@ fn build_leaf(
         // call-only fields never survive on a leaf; a runtime `when` (task
         // output refs) is the one gate that does — the engine consumes it.
         template: None,
-        arguments: BTreeMap::new(),
+        // …and so does `arguments` on a `type: workflow` trigger, where it is
+        // not a template call's arguments at all: it is the **child run's
+        // parameters**, consumed by the engine at dispatch rather than by this
+        // expander. Substituted here so a parent can pass its own scope down
+        // (`arguments: { conversation: "{{ conversation }}" }`); without that a
+        // trigger could only ever hand the child constants, and every run of a
+        // child workflow would be identical.
+        //
+        // On any other leaf `arguments` has nothing to pass to and is an error.
+        // It is *preserved* (raw — it is about to be rejected, not used) rather
+        // than dropped, so the post-expansion check in `dag::from_spec` can see
+        // it and reject it. Clearing it here instead would defeat that check and
+        // silently ignore a parameter that looks configured and goes nowhere.
+        arguments: if task.task_type.as_deref() == Some("workflow") {
+            task.arguments.iter().map(|(k, v)| (k.clone(), substitute(v, ctx))).collect()
+        } else {
+            task.arguments.clone()
+        },
         with_items: None,
         with_param: None,
         when: runtime_when,
