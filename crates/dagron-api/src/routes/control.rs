@@ -305,8 +305,10 @@ async fn resolve_approval(
     if rows == 0 {
         tx.rollback().await.map_err(internal_msg)?;
         // Disambiguate: unknown task → 404, existing-but-not-awaiting → 409.
+        // `1::bigint` — a bare literal is INT4 and will not decode into i64, so
+        // this disambiguation would 500 exactly when the task DOES exist.
         let known: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM task_runs WHERE id = $1 AND run_id = $2")
+            sqlx::query_scalar("SELECT 1::bigint FROM task_runs WHERE id = $1 AND run_id = $2")
                 .bind(tid)
                 .bind(id)
                 .fetch_optional(&state.read_pool)

@@ -276,7 +276,10 @@ pub async fn get_run_logs(
     // A run id that matches no task rows is either unknown or has no tasks yet.
     // Distinguish the two so a mistyped id doesn't look like a quiet run.
     if rows.is_empty() {
-        let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM workflow_runs WHERE id = $1")
+        // `1::bigint` — a bare literal is INT4 and will not decode into i64, so
+        // a run that exists but has no task rows would 500 instead of returning
+        // the empty log list.
+        let exists = sqlx::query_scalar::<_, i64>("SELECT 1::bigint FROM workflow_runs WHERE id = $1")
             .bind(&id)
             .fetch_optional(&state.read_pool)
             .await

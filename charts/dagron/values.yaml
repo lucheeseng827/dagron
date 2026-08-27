@@ -25,7 +25,7 @@ imagePullSecrets: []
 # `kubernetes` cargo features. The module Dockerfile defaults to a sqlite-only
 # build — see terraform/README.md §"Building the images".
 engine:
-  image: mancube/dagron-engine:0.8.0
+  image: mancube/dagron-engine:0.8.1
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 8080
@@ -128,7 +128,7 @@ gitops:
   enabled: false
   # First published in 0.5.0. Release packaging rewrites this tag to the release
   # version (docker.yml), so the pin here only matters to a repo checkout.
-  image: mancube/dagron-gitops:0.8.0
+  image: mancube/dagron-gitops:0.8.1
   imagePullPolicy: IfNotPresent
   # Seconds between auto-sync reconciles per repo. A manual Sync is immediate.
   pollSecs: 60
@@ -160,7 +160,7 @@ gitops:
 
 dagronApi:
   enabled: true
-  image: mancube/dagron-api:0.8.0
+  image: mancube/dagron-api:0.8.1
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 8080
@@ -228,7 +228,7 @@ envSecrets:
 # ── Frontend (Next.js UI) ────────────────────────────────────────────────────
 frontend:
   enabled: true
-  image: mancube/dagron-frontend:0.8.0
+  image: mancube/dagron-frontend:0.8.1
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 3000

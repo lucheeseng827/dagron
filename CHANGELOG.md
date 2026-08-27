@@ -6,6 +6,94 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-08-28
+
+Fixes a crash that made 0.8.0 unusable with Postgres. Anyone running the Postgres
+backend should skip 0.8.0 entirely; SQLite deployments are unaffected.
+
+### Changed
+- **Every Node-based action in the three published workflows is on a Node 24
+  release, and all are pinned by commit SHA.** The v0.8.0 runs — the first this
+  repository ever executed — all carried the same annotation: *"Node.js 20 is
+  deprecated … being forced to run on Node.js 24."* Eight actions were behind
+  ([ci.yml](.github/workflows/ci.yml), [docker.yml](.github/workflows/docker.yml),
+  [binaries.yml](.github/workflows/binaries.yml)): `actions/checkout` v4.2.2 → v7.0.1,
+  `upload-artifact` v4 → v7.0.1, `download-artifact` v4 → v8.0.1,
+  `docker/build-push-action` v6 → v7.3.0, `docker/login-action` v3 → v4.6.0,
+  `docker/setup-buildx-action` v3 → v4.3.0, `docker/metadata-action` v5 → v6.2.0,
+  `azure/setup-helm` v4 → v5.0.1. The runner is already forcing Node 24, so this
+  aligns the declarations with what actually runs rather than changing it.
+
+  Every one of these except `ci.yml`'s checkout was on a **floating major tag**
+  (`@v4`, `@v3`), which for the two workflows that build and publish the release
+  artifacts means the toolchain could move underneath a tagged build without a commit
+  saying so. They are now SHA-pinned like everything else, with the version in a
+  trailing comment. `Swatinem/rust-cache@v2` in `binaries.yml` is pinned to the same
+  SHA `ci.yml` already used.
+
+  The major bumps were checked against what these workflows actually pass, not taken
+  on faith. `setup-buildx-action` v4 and `build-push-action` v7 remove deprecated
+  inputs and two `DOCKER_BUILD_*` environment variables — none of which appear here.
+  `download-artifact` v5's breaking change extracts a single matched artifact —
+  whether by ID or a pattern that matches exactly one — directly into `path`
+  instead of a named subdirectory; both workflows here match multiple artifacts
+  with `merge-multiple`, so their layout is unaffected. v8 makes a digest
+  mismatch an error instead of a warning, which is the behaviour you want on a
+  release pipeline.
+
+### Fixed
+- **The engine crashed on Postgres the first tick it found work to do (0.8.0
+  regression).** `advance_ready_tasks`' round gate probed with
+  `SELECT 1 FROM task_runs WHERE status = 'pending' AND remaining_deps = 0` and
+  decoded it into `Option<i64>`. A bare integer literal is **INT4** in Postgres, and
+  sqlx refuses to decode INT4 into `i64`, so the reconcile loop died with
+  `mismatched types; Rust type i64 (as SQL type INT8) is not compatible with SQL type
+  INT4`. Probes are now `SELECT 1::bigint`, the cast the retention purge in the same
+  file already used.
+
+  The failure is the worst shape available: `fetch_optional` only decodes when a row
+  comes back, so an **idle engine looks perfectly healthy** and dies the moment the
+  first workflow arrives. `compose.quickstart.yaml` — the first thing anyone runs —
+  reproduces it on boot.
+
+  Four more instances of the same bare-literal probe are fixed alongside it, all on
+  Postgres-backed paths: `task_exists` in the core ops path, and in `dagron-api`
+  `control.rs` (approval resolution 404-vs-409 disambiguation), `logs.rs` (a run that exists
+  but has no task rows yet) and `tokens.rs` (revoking an already-revoked token).
+  Each would have returned 500 exactly in the case it was written to distinguish.
+  The `sqlite.rs` equivalents are unaffected — SQLite is dynamically typed, which is
+  precisely why nothing caught this.
+
+  **Why the gate missed it.** The release gate builds `--workspace` minus
+  `dagron-api`/`dagron-gitops` — the *sqlite* feature world — then those two on their
+  own. So `dagron-core`'s Postgres backend is compiled but its runtime path is never
+  executed, and these are runtime `query_scalar` calls rather than the compile-checked
+  `sqlx::query!` macros. Nothing in CI starts the engine against a Postgres. A
+  quickstart smoke test in the gate would have caught all five.
+
+- **The one clippy finding that was blocking the lint from ever being a gate.**
+  `crates/dagron-crypto/src/lib.rs` asserted a `bool` with
+  `assert_eq!(..., true)`; it now uses `assert!(..)` with a message, which is what
+  clippy's own suggestion said and what the line beneath it already did.
+
+  Worth recording because 0.8.0 shipped a wrong number about it. The 0.8.0 changelog
+  entry above and the comment in [ci.yml](.github/workflows/ci.yml) both said
+  `clippy -D warnings` failed on "3 findings in `dagron-core`". The first run of that
+  workflow — v0.8.0 was the first time it had ever executed — found exactly one, in a
+  different crate. The claim had never been measured; it was asserted, and the
+  workflow that could have checked it did not exist yet. The shipped 0.8.0 section is
+  left as published rather than quietly rewritten.
+
+  What clippy thinks of the rest of the tree is still unmeasured, and the comment in
+  `ci.yml` now says so instead of guessing. The step runs under `set -euo pipefail`,
+  so that single finding aborted the first `cargo clippy` before the second command
+  (`dagron-api` + `dagron-gitops`) ran at all, and sibling crates in the first
+  invocation were still checking when it bailed. The next run is the first honest
+  reading. If it is clean, promoting clippy to a required check costs one line.
+
+  rustfmt's number held up: 955 diffs against 955-ish claimed, and it stays advisory
+  until there is a `rustfmt.toml` describing the style actually in use.
+
 ## [0.8.0] - 2026-08-28
 
 ### Added

@@ -630,8 +630,13 @@ pub async fn advance_ready_tasks(pool: &Pool) -> Result<u64> {
         // UPDATE scans plus the slow path's fetch. `pending` rows only exist
         // for active runs, so every statement here scans live work, never
         // history.
+        // `1::bigint`, not `1`. A bare integer literal is INT4 in Postgres and
+        // sqlx will not decode INT4 into i64, so the probe panics the reconcile
+        // loop the first tick it actually finds a row — an empty queue returns
+        // None and never decodes, which is why an idle engine looks healthy.
+        // Same cast as the retention purge below.
         let any: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM task_runs WHERE status = 'pending' AND remaining_deps = 0 LIMIT 1",
+            "SELECT 1::bigint FROM task_runs WHERE status = 'pending' AND remaining_deps = 0 LIMIT 1",
         )
         .fetch_optional(pool)
         .await?;
@@ -2797,8 +2802,10 @@ pub async fn rerun_from_failed(pool: &Pool, run_id: &str) -> Result<Option<u64>>
 /// tell an unknown-task `404` apart from a not-clearable `409` on the error path.
 #[cfg(feature = "ops")]
 pub async fn task_exists(pool: &Pool, run_id: &str, task_id: &str) -> Result<bool> {
+    // `1::bigint` for the same reason as `advance_ready_tasks` above: a bare
+    // literal is INT4 and will not decode into i64 once the row exists.
     let found: Option<i64> =
-        sqlx::query_scalar("SELECT 1 FROM task_runs WHERE id = $1 AND run_id = $2")
+        sqlx::query_scalar("SELECT 1::bigint FROM task_runs WHERE id = $1 AND run_id = $2")
             .bind(task_id)
             .bind(run_id)
             .fetch_optional(pool)

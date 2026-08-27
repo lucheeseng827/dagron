@@ -276,8 +276,10 @@ pub async fn revoke_token(
         // Either it never existed, belongs to someone else, or is already
         // revoked. One answer for all three: which of them it is would tell an
         // attacker whether a token id is real.
+        // `1::bigint` — a bare literal is INT4 and will not decode into i64, so
+        // revoking an already-revoked token would 500 rather than 404/409.
         let exists = sqlx::query_scalar::<_, i64>(
-            "SELECT 1 FROM api_tokens WHERE id = $1 AND user_id = $2",
+            "SELECT 1::bigint FROM api_tokens WHERE id = $1 AND user_id = $2",
         )
         .bind(&id)
         .bind(&auth.0.sub)

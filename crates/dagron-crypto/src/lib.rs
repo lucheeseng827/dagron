@@ -1362,7 +1362,7 @@ mod tests {
         let f0 = sealer.seal_chunk(b"only", true).unwrap();
         let f1 = sealer.seal_chunk(b"extra", true).unwrap();
         let mut opener = StreamOpener::new(&p, &header).unwrap();
-        assert_eq!(opener.open_chunk(&f0).unwrap().1, true);
+        assert!(opener.open_chunk(&f0).unwrap().1, "first chunk is final");
         assert!(opener.open_chunk(&f1).is_err(), "no chunk allowed after final");
     }
 
