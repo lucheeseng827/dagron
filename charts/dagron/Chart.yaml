@@ -2,14 +2,14 @@ apiVersion: v2
 name: dagron
 description: |
   dagron DAG engine for Kubernetes. Deploys the stack — engine/API, the dagron-api
-  UI gateway, the Next.js frontend, and a throwaway in-cluster Postgres for testing.
+  UI gateway (which serves the console), and a throwaway in-cluster Postgres for testing.
   Runs on kind/k3d/k3s/EKS.
 type: application
 # version / appVersion are overwritten with the release tag at package time
 # (helm package --version/--app-version), so the OCI artifact is always stamped;
 # these defaults just keep a `helm package` from the source tree sane.
-version: 0.9.0
-appVersion: "0.9.0"
+version: 0.9.1
+appVersion: "0.9.1"
 kubeVersion: ">=1.24.0-0"
 home: https://dagron.dev
 sources:
@@ -43,22 +43,17 @@ annotations:
   # throwaway in-cluster test DB — whitelisted so it is not tracked for updates.
   artifacthub.io/images: |
     - name: engine
-      image: mancube/dagron-engine:0.9.0
+      image: mancube/dagron-engine:0.9.1
       platforms:
         - linux/amd64
         - linux/arm64
     - name: api
-      image: mancube/dagron-api:0.9.0
-      platforms:
-        - linux/amd64
-        - linux/arm64
-    - name: frontend
-      image: mancube/dagron-frontend:0.9.0
+      image: mancube/dagron-api:0.9.1
       platforms:
         - linux/amd64
         - linux/arm64
     - name: gitops
-      image: mancube/dagron-gitops:0.9.0
+      image: mancube/dagron-gitops:0.9.1
       platforms:
         - linux/amd64
         - linux/arm64

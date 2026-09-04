@@ -79,17 +79,20 @@ jobs:
             context: "."
             file: "./crates/dagron-api/Dockerfile"
             build_args: ""
-          # DEPRECATED — removed in 1.0.0. The console it carries now ships inside
-          # dagron-api (crates/dagron-api/Dockerfile builds and embeds it), so this
-          # is a 281 MB Node runtime with nothing left to do. Still published so
-          # anyone pinned to the tag has a release boundary to migrate across, not a
-          # tag that disappears. At 1.0.0: delete this entry, frontend/Dockerfile,
-          # and docs/dockerhub/dagron-frontend.md. Keep frontend/ — it is what
-          # dagron-api builds.
-          - name: dagron-frontend
-            context: "./frontend"
-            file: "./frontend/Dockerfile"
-            build_args: ""
+          # `dagron-frontend` used to be built here. It is gone as of 0.9.1, one
+          # minor earlier than the 1.0.0 removal that was announced, because the
+          # image cannot be built at all any more — let alone usefully:
+          #
+          #   * `frontend/next.config.js` sets `output: "export"` so dagron-api can
+          #     embed the console, and an export build emits `out/`, never
+          #     `.next/standalone`. The old Dockerfile copied the latter.
+          #   * Pointing it at `out/` would not save it. `BASE = "/api"` in
+          #     `src/lib/dagron-api.ts` is relative and the `/api` rewrite is gone
+          #     (it buffered `text/event-stream` and broke live updates). A console
+          #     served on :3000 by anything other than dagron-api 404s every call.
+          #
+          # Publishing a tag that builds into a dead console is worse than not
+          # publishing one. 0.8.1 remains the last working `mancube/dagron-frontend`.
           - name: dagron-mcp
             context: "."
             file: "./crates/dagron-mcp/Dockerfile"
@@ -148,11 +151,14 @@ jobs:
           # Empty for every image but the localdev engine, which means "build
           # the final stage" — the existing behaviour.
           target: ${{ matrix.image.target }}
-          # Only the frontend declares ARG APP_VERSION; passing it to the other
-          # images would just emit an unused-build-arg warning on every leg.
+          # dagron-api declares ARG APP_VERSION, because it is the image that
+          # builds and embeds the console now; passing it to the others would just
+          # emit an unused-build-arg warning on every leg. This followed the
+          # deprecated frontend image until 0.9.1, which meant the console inside
+          # every published dagron-api was stamped "dev".
           build-args: |
             ${{ matrix.image.build_args }}
-            ${{ matrix.image.name == 'dagron-frontend' && format('APP_VERSION={0}', steps.appver.outputs.version) || '' }}
+            ${{ matrix.image.name == 'dagron-api' && format('APP_VERSION={0}', steps.appver.outputs.version) || '' }}
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=docker.io/mancube/${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=true
           provenance: false
@@ -183,7 +189,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [dagron-engine, dagron-engine-localdev, dagron-api, dagron-frontend, dagron-mcp, dagron-gitops]
+        image: [dagron-engine, dagron-engine-localdev, dagron-api, dagron-mcp, dagron-gitops]
     steps:
       - name: Collect this image's per-arch digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1

@@ -46,7 +46,7 @@ services:
     #
     # For docker/kubernetes execution the task runs in its own image and the
     # distroless engine is the right one. See docs/OPERATIONS.md.
-    image: docker.io/mancube/dagron-engine-localdev:${DAGRON_VERSION:-0.9.0}
+    image: docker.io/mancube/dagron-engine-localdev:${DAGRON_VERSION:-0.9.1}
     environment:
       DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
       API_ADDR: 0.0.0.0:8787
@@ -134,7 +134,7 @@ services:
         condition: service_started
 
   dagron-api:
-    image: docker.io/mancube/dagron-api:${DAGRON_VERSION:-0.9.0}
+    image: docker.io/mancube/dagron-api:${DAGRON_VERSION:-0.9.1}
     environment:
       DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
       # Dev credentials, seeded on first start. Change them for anything that
@@ -165,7 +165,7 @@ services:
   # is noise in the logs of someone still finding their way around.
   gitops:
     profiles: ["gitops"]
-    image: docker.io/mancube/dagron-gitops:${DAGRON_VERSION:-0.9.0}
+    image: docker.io/mancube/dagron-gitops:${DAGRON_VERSION:-0.9.1}
     environment:
       DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
       GITOPS_POLL_SECS: "60"

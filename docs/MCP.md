@@ -165,7 +165,7 @@ The 1.0 bar for this crate was never "wrap everything": *an agent should be able
 to author, run, recover and inspect a workflow without a human dropping to
 `curl`*, and should be told plainly where the answer is deliberately no. That
 bar is met. The forty-two tools above cover **42 of the 84 `dagron-api`
-method+path pairs** (67 distinct routes) on 0.9.0; the remaining 42 are
+method+path pairs** (67 distinct routes) on 0.9.1; the remaining 42 are
 [declined or deferred](#p3--deliberately-not-tools) by decision, not by
 oversight, and every one of the 84 carries its disposition in the
 [full coverage matrix](#full-coverage-matrix).
@@ -333,7 +333,7 @@ the model step is real, and Send submits a run.
 
 ### Full coverage matrix
 
-Every `dagron-api` route on 0.9.0 with its disposition, so nothing is untracked.
+Every `dagron-api` route on 0.9.1 with its disposition, so nothing is untracked.
 `P3†` is "deferred pending budgets", not "declined".
 
 | Tier | Pairs |
@@ -473,7 +473,7 @@ Every `dagron-api` route on 0.9.0 with its disposition, so nothing is untracked.
 
 ### Provenance
 
-Derived 2026-09-04 against `dagron-api` 0.9.0 by diffing this doc's tool table
+Derived 2026-09-04 against `dagron-api` 0.9.1 by diffing this doc's tool table
 against [`API.md`](API.md) and against the route table extracted from the
 `dagron-api` binary. Read routes were probed on a live local stack and answered
 `200`; documented write-route methods and status codes are quoted from

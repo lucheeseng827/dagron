@@ -2,7 +2,7 @@
 
 **The auth + management API for dagron — username/password login to an HttpOnly JWT session, and the REST surface the console (and your scripts) call.**
 
-`dagron-api` sits between the `dagron-frontend` console and the engine's datastore: it authenticates users, mints a signed session cookie, and serves the workflow/run/schedule management API.
+`dagron-api` is the front of the stack: it **serves the operator console** at `/`, authenticates users, mints a signed session cookie, and serves the workflow/run/schedule management API under `/api` — one port, one origin, no proxy.
 
 - **Image:** `mancube/dagron-api` — Rust binary on **distroless/cc** (glibc), runs as **nonroot**, no shell.
 - **Arch:** `linux/amd64`, `linux/arm64`

@@ -6,6 +6,45 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-04
+
+A release-pipeline fix. 0.9.0 mirrored and tagged cleanly but **published no
+images and no chart**: the `dagron-frontend` build failed, and because the
+manifest job needs the whole matrix, five good images stayed as untagged
+digests and the Helm chart never went out.
+
+### Fixed
+- **`mancube/dagron-frontend` is discontinued; 0.8.1 was its last tag.** It was
+  announced for removal at 1.0.0, and that promise cannot be kept: the change
+  that moved the console into `dagron-api` also made this image unbuildable.
+
+  `frontend/next.config.js` sets `output: "export"` so `dagron-api` can embed
+  the console, and an export build emits `out/` — never the `.next/standalone`
+  the Dockerfile copied. The build died on `"/app/.next/standalone": not found`.
+
+  Repointing it at `out/` would not have saved it. `BASE = "/api"` in
+  `src/lib/dagron-api.ts` is a *relative* path and the rewrite that used to
+  answer it is gone (it buffered `text/event-stream` and broke live updates, as
+  0.9.0 records). A console served on `:3000` by anything that is not
+  `dagron-api` 404s every API call it makes. The image could have been made to
+  build; it could not have been made to work.
+
+  **A tag that builds into a dead console is worse than no tag**, so the matrix
+  entry, `frontend/Dockerfile` and the `frontend` compose service are gone one
+  minor early. `frontend/` itself stays — it is what `dagron-api` builds. The
+  chart's `frontend.image` is **pinned to 0.8.1** and no longer moves with the
+  chart version, so `frontend.enabled=true` still pulls something that exists
+  instead of an ImagePullBackOff on a tag that was never pushed.
+
+- **The console inside `dagron-api` was stamped `dev`.** `APP_VERSION` is what
+  puts a version in the sidebar brand, and the release workflow passed it only
+  to `dagron-frontend` — correct while that image built the console, wrong from
+  the moment `dagron-api` took over. Every published 0.9.0 API image would have
+  shown `dev`, which is the exact failure the version plumbing exists to
+  prevent: it says `dev` when it does not know, and it did not know. The build
+  arg now follows the console to `dagron-api`, in the release workflow and in
+  `compose.yaml`.
+
 ## [0.9.0] - 2026-09-04
 
 The release the last three months of `main` had already become. Everything the
@@ -380,10 +419,11 @@ The one thing to read before you upgrade is **Deprecated** below: if you deploy
 ### Deprecated
 - **`mancube/dagron-frontend` is deprecated and will be removed in 1.0.0.** The
   console it carried now ships inside `dagron-api` (see *Changed* below), so the
-  image is a 281 MB Node runtime with nothing left to do. It keeps building and
-  publishing until 1.0.0 so anyone pinned to it — or running a chart or compose file
-  that names it — has a release boundary to migrate across rather than a tag that
-  vanishes underneath them.
+  image is a 281 MB Node runtime with nothing left to do. The intent was to keep
+  building and publishing it until 1.0.0 so anyone pinned to it had a release
+  boundary to migrate across rather than a tag that vanished underneath them. That
+  did not survive contact with the build — see 0.9.1 above; **0.8.1 is the last
+  tag.**
 
   **To migrate:** delete the `frontend` service, drop the `:3000` publish, and open
   the API's port instead. The console is at `/` and the API under `/api` on the same
@@ -391,10 +431,11 @@ The one thing to read before you upgrade is **Deprecated** below: if you deploy
   with an ingress routing `/` to the frontend Service and `/api` to the API Service,
   both now point at the API.
 
-  1.0.0 will drop the image from `.github/workflows/docker.yml`, remove
-  `frontend/Dockerfile`, and stop publishing the Docker Hub overview at
-  `docs/dockerhub/dagron-frontend.md`. The `frontend/` sources stay — they are what
-  `dagron-api` builds and embeds.
+  0.9.1 does what 1.0.0 was going to: drops the image from
+  `.github/workflows/docker.yml` and removes `frontend/Dockerfile`. The Docker Hub
+  overview at `docs/dockerhub/dagron-frontend.md` stays as a tombstone pointing at
+  `dagron-api`. The `frontend/` sources stay — they are what `dagron-api` builds
+  and embeds.
 
 - **The Helm chart stops deploying the frontend.** `frontend.enabled` defaults to
   `false`, and the ingress routes `/` to `dagron-api` — which now serves the console
@@ -422,7 +463,8 @@ The one thing to read before you upgrade is **Deprecated** below: if you deploy
   published `:3000` *and* `:8080`, so a dev stack on 0.9 stood up two copies of
   the same page and left it ambiguous which one a bug report meant.
 
-  `--profile frontend` restores it until 1.0.0 removes it. One env var moved
+  `--profile frontend` restored it; 0.9.1 removes the service outright, because
+  the image behind it can no longer be built. One env var moved
   with the flip: `DAGRON_TRUST_PROXY_HEADERS` is now unset by default, because
   the console is served by the container the browser talks to — a login arrives
   from the real client address, and trusting `X-Forwarded-For` would mean

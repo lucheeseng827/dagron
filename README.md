@@ -15,7 +15,7 @@ binary, zero infrastructure to get started.
 [![Engine image size](https://img.shields.io/docker/image-size/mancube/dagron-engine?sort=semver&label=engine%20image)](https://hub.docker.com/r/mancube/dagron-engine)
 [![Platforms](https://img.shields.io/badge/platform-linux%2Famd64%20%7C%20arm64-informational)](https://hub.docker.com/r/mancube/dagron-engine)
 
-**Status: released.** The current release is **0.9.0** — multi-arch images
+**Status: released.** The current release is **0.9.1** — multi-arch images
 (`mancube/dagron-engine`, `-engine-localdev`, `-api`, `-gitops`, `-mcp`) and an
 OCI Helm chart (`oci://registry-1.docker.io/mancube/dagron`, listed on
 [Artifact Hub](https://artifacthub.io/packages/search?repo=dagron-workflow))
@@ -23,9 +23,9 @@ are published per tagged release. dagron's bet is a lean trade: one static Rust
 binary, plain YAML, and a database as the only state — durable workflow
 orchestration with no control plane and no cluster to operate.
 
-> **Upgrading from 0.8.x?** `mancube/dagron-frontend` is deprecated and will be
-> removed in 1.0: the console it served now comes from `dagron-api` itself, on
-> the same port as the API, so drop the container and the `frontend.enabled`
+> **Upgrading from 0.8.x?** `mancube/dagron-frontend` is discontinued — **0.8.1
+> is its last tag**. The console it served now comes from `dagron-api` itself,
+> on the same port as the API, so drop the container and the `frontend.enabled`
 > Helm value. Migrations are forward-only and apply at startup — back up first
 > ([`docs/OPERATIONS.md`](docs/OPERATIONS.md#backup--restore--what-is-the-state)).
 
@@ -85,7 +85,7 @@ podman compose   -f compose.quickstart.yaml up -d   # podman ≥ 4.7, provider i
 podman-compose   -f compose.quickstart.yaml up -d   # standalone provider, older podman too
 ```
 
-The images are pinned (`DAGRON_VERSION`, default **0.9.0** — the current
+The images are pinned (`DAGRON_VERSION`, default **0.9.1** — the current
 release). Floating `:latest` is deliberately not the default: a quickstart that
 silently changes under you is worse than one you have to bump.
 

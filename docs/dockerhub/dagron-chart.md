@@ -2,7 +2,7 @@
 
 **One-command deploy of the dagron stack to Kubernetes — engine + API + console + a throwaway in-cluster Postgres.**
 
-A Helm chart published as an **OCI artifact**. It wires the three dagron images together (`dagron-engine`, `dagron-api`, `dagron-frontend`, all `linux/amd64` + `linux/arm64`) plus an optional test Postgres, with ingress and secrets. Runs on kind / k3d / k3s / EKS.
+A Helm chart published as an **OCI artifact**. It wires the dagron images together (`dagron-engine`, `dagron-api` — which serves the console — and optionally `dagron-gitops`, all `linux/amd64` + `linux/arm64`) plus an optional test Postgres, with ingress and secrets. Runs on kind / k3d / k3s / EKS.
 
 - **Artifact:** `oci://registry-1.docker.io/mancube/dagron`
 - **Deploys:** engine · dagron-api · frontend · (optional) Postgres

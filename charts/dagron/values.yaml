@@ -25,7 +25,7 @@ imagePullSecrets: []
 # `kubernetes` cargo features. The module Dockerfile defaults to a sqlite-only
 # build — see terraform/README.md §"Building the images".
 engine:
-  image: mancube/dagron-engine:0.9.0
+  image: mancube/dagron-engine:0.9.1
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 8080
@@ -128,7 +128,7 @@ gitops:
   enabled: false
   # First published in 0.5.0. Release packaging rewrites this tag to the release
   # version (docker.yml), so the pin here only matters to a repo checkout.
-  image: mancube/dagron-gitops:0.9.0
+  image: mancube/dagron-gitops:0.9.1
   imagePullPolicy: IfNotPresent
   # Seconds between auto-sync reconciles per repo. A manual Sync is immediate.
   pollSecs: 60
@@ -160,7 +160,7 @@ gitops:
 
 dagronApi:
   enabled: true
-  image: mancube/dagron-api:0.9.0
+  image: mancube/dagron-api:0.9.1
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 8080
@@ -232,11 +232,16 @@ envSecrets:
 # the API already has. The ingress below routes / to the API while this is disabled.
 #
 # `enabled: true` restores the old two-pod topology and points the ingress back here,
-# for anyone who needs the previous layout during the 0.9 line. The image stops being
-# published at 1.0.0 and this block goes with it.
+# for anyone who needs the previous layout during the 0.9 line.
+#
+# The image is PINNED TO 0.8.1 and does not move with the chart. That is the last
+# tag that exists: `mancube/dagron-frontend` stopped being published at 0.9.1,
+# because `output: "export"` in the console's build made the image unbuildable and
+# a console served anywhere but dagron-api cannot reach `/api`. Pinning the chart
+# to a tag that was never pushed would turn `enabled: true` into ImagePullBackOff.
 frontend:
   enabled: false
-  image: mancube/dagron-frontend:0.9.0
+  image: mancube/dagron-frontend:0.8.1
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 3000

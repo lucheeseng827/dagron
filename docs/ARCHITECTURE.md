@@ -214,7 +214,7 @@ graph**, **task logs**, **task retry**) and re-surfaces the ops capabilities
 
 Since 0.9 it also **serves the console itself**, as a `ServeDir` fallback under
 every `/api` route: one port, one origin, no proxy and no second image (the
-`dagron-frontend` image is deprecated). And the engine carries a **second, smaller
+`dagron-frontend` image is discontinued — 0.8.1 was its last tag). And the engine carries a **second, smaller
 console of its own** — one embedded HTML file on the ops API — for the deployment
 `dagron-api` cannot reach: SQLite, air-gapped, one binary.
 

@@ -59,4 +59,4 @@ Identical to [`mancube/dagron-engine`](https://hub.docker.com/r/mancube/dagron-e
 | `MAX_INFLIGHT_RUNS` | admission cap; past it `POST /runs` returns `429`. |
 | `RUST_LOG` | log level (`info`). |
 
-Run it with `dagron-api` (auth/UI gateway) and `dagron-frontend` (console) for the full stack. For a real deployment use the Helm chart (`oci://registry-1.docker.io/mancube/dagron`), which deploys the distroless engine.
+Run it with `dagron-api`, which is both the auth gateway and the console, for the full stack. For a real deployment use the Helm chart (`oci://registry-1.docker.io/mancube/dagron`), which deploys the distroless engine.

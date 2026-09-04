@@ -43,8 +43,8 @@ This starts:
 Open **http://localhost:8080**.
 
 > Before 0.9 the console was a separate `frontend` container on `:3000`.
-> `compose.yaml` still carries it behind `--profile frontend` until 1.0.0
-> removes it; nothing needs it.
+> It is gone: `dagron-api` serves the same pages, and serving them from the
+> same origin as `/api` is what makes live updates work.
 
 > **Sign in** with the seeded admin from `compose.yaml`:
 > `admin@local` / `dagron-admin`. (dagron-api owns login and mints its own

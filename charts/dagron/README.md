@@ -5,7 +5,7 @@ engine/API, the `dagron-api` UI gateway, the Next.js frontend, and a throwaway
 in-cluster Postgres for testing. Runs on kind / k3d / k3s / EKS.
 
 - **Source:** https://github.com/lucheeseng827/dagron
-- **Images:** `mancube/dagron-engine`, `mancube/dagron-api`, `mancube/dagron-frontend` (multi-arch: `linux/amd64`, `linux/arm64`)
+- **Images:** `mancube/dagron-engine`, `mancube/dagron-api` (multi-arch: `linux/amd64`, `linux/arm64`)
 - **License:** Apache-2.0
 
 ## Install (OCI)
@@ -28,7 +28,7 @@ helm show values oci://registry-1.docker.io/mancube/dagron --version 0.5.0
 | --- | --- | --- |
 | `dagron.engine.image` | Engine/API image | `mancube/dagron-engine:<chart version>` |
 | `dagron.dagronApi.image` | UI gateway image | `mancube/dagron-api:<chart version>` |
-| `dagron.frontend.image` | Frontend image | `mancube/dagron-frontend:<chart version>` |
+| `dagron.frontend.image` | Frontend image — off by default; the console ships in `dagron-api` | `mancube/dagron-frontend:0.8.1` (pinned; discontinued after 0.8.1) |
 | `global.imageRegistry` | Relocate every image to a private mirror | `""` |
 
 The bundled Postgres is for testing only — point the engine at a managed
