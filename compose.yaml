@@ -2,7 +2,12 @@
 #   podman compose up --build
 #
 # Stack: Postgres ← engine (scheduler, runs migrations, ops API + resident) ←
-# dagron-api (authed edge) ← Next.js frontend (proxies /api → dagron-api).
+# dagron-api (authed edge, and since 0.9 the console itself).
+#
+# The console is at http://127.0.0.1:8080/ — same origin as the API under
+# /api, so there is no proxy in the default path and no second image to build.
+# The separate `dagron-frontend` container is deprecated (removed in 1.0.0) and
+# now sits behind a profile; see the `frontend` service at the bottom.
 #
 # Auth: dagron-api owns login. Sign in from the UI with the seeded admin
 # (DAGRON_ADMIN_EMAIL / DAGRON_ADMIN_PASSWORD below); dagron-api mints an HS256
@@ -101,12 +106,15 @@ services:
       # DAGRON_PW_HASH_CONCURRENCY (default 2 → ~38 MiB live at once).
       MALLOC_MMAP_THRESHOLD_: "131072"
       MALLOC_ARENA_MAX: "2"
-      # The console reaches dagron-api through the frontend's /api rewrite, so
-      # every login arrives from the frontend container's address. Key the login
-      # rate limit off the forwarded client address instead — safe here because
-      # this port is bound to 127.0.0.1 and the proxy sets the header. Leave unset
-      # anywhere dagron-api is reachable directly (a caller can forge it).
-      DAGRON_TRUST_PROXY_HEADERS: "true"
+      # Deliberately unset. The console is served by this container now, so a
+      # login arrives from the browser's own address and the rate limit keys off
+      # it correctly. Trusting `X-Forwarded-For` here would mean trusting a
+      # header a directly-reachable caller can forge, for no gain.
+      #
+      # Turn it back on (`DAGRON_TRUST_PROXY_HEADERS: "true"`) if you run the
+      # deprecated `frontend` profile below: then every login really does arrive
+      # from one container address, and without it the whole stack shares a
+      # single login-rate-limit bucket.
       # Same store the engine writes to, so /api/artifacts can serve what a run
       # produced.
       DAGRON_ARTIFACT_DIR: /artifacts
@@ -162,7 +170,15 @@ services:
       dagron-api:
         condition: service_started
 
+  # Deprecated, removed in 1.0.0. `dagron-api` has served the console since
+  # 0.9 (http://127.0.0.1:8080/), so this stands up a second copy of the same
+  # page on its own Node runtime. Kept behind a profile — not deleted — because
+  # `mancube/dagron-frontend` keeps publishing until 1.0.0, and anyone pinned to
+  # that topology needs somewhere to reproduce it:
+  #   podman compose --profile frontend up --build
+  # Read `DAGRON_TRUST_PROXY_HEADERS` above before you do.
   frontend:
+    profiles: ["frontend"]
     build:
       context: ./frontend
       dockerfile: Dockerfile

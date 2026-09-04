@@ -43,12 +43,18 @@ pub struct AppState {
     pub identity: Arc<dyn IdentityProvider>,
     /// Programmatic artifact store (`put`/`get` by key). `Some` when
     /// `DAGRON_ARTIFACT_DIR` is set — transparently envelope-encrypted at rest when
-    /// a KEK provider is configured (`dagron_artifact::store_from_env`). `None`
+    /// a KEK provider is configured (`dagron_artifact::store_from_env`). With
+    /// `DAGRON_ARTIFACT_TIER=1` it is the tiered store (local tier + budgeted
+    /// uplink to `DAGRON_ARTIFACT_URL`), which the periodic loop in `main.rs` and
+    /// `POST /api/artifacts/sync` drain through `ArtifactStore::sync`. `None`
     /// disables the artifact endpoints (503).
     pub artifact_store: Option<Arc<dyn dagron_artifact::ArtifactStore>>,
-    /// Single-flight guard for the store-wide key-rotation admin endpoint: only one
-    /// rotation may run at a time (a second concurrent request gets `409`), so
-    /// overlapping sweeps can't widen the write-vs-rotate window or double the work.
+    /// Single-flight guard shared by the two store-wide sweeps — key rotation
+    /// (`POST /api/artifacts/rotate`) and the tiered drain
+    /// (`POST /api/artifacts/sync`): a second concurrent request of either kind
+    /// gets `409`. One lock for both on purpose: a drain overlapping a re-key
+    /// would upload objects still wrapped under the retiring KEK, and overlapping
+    /// sweeps of one kind only widen the write-vs-sweep window and double the work.
     pub rotation_lock: Arc<Mutex<()>>,
     /// Per-client budget for `POST /api/login` — the one unauthenticated route
     /// that costs an Argon2 verify per call. See [`crate::ratelimit`].

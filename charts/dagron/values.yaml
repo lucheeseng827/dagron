@@ -25,7 +25,7 @@ imagePullSecrets: []
 # `kubernetes` cargo features. The module Dockerfile defaults to a sqlite-only
 # build — see terraform/README.md §"Building the images".
 engine:
-  image: mancube/dagron-engine:0.8.1
+  image: mancube/dagron-engine:0.9.0
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 8080
@@ -128,7 +128,7 @@ gitops:
   enabled: false
   # First published in 0.5.0. Release packaging rewrites this tag to the release
   # version (docker.yml), so the pin here only matters to a repo checkout.
-  image: mancube/dagron-gitops:0.8.1
+  image: mancube/dagron-gitops:0.9.0
   imagePullPolicy: IfNotPresent
   # Seconds between auto-sync reconciles per repo. A manual Sync is immediate.
   pollSecs: 60
@@ -160,7 +160,7 @@ gitops:
 
 dagronApi:
   enabled: true
-  image: mancube/dagron-api:0.8.1
+  image: mancube/dagron-api:0.9.0
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 8080
@@ -225,10 +225,18 @@ envSecrets:
   existingSecret:
     name: ""
 
-# ── Frontend (Next.js UI) ────────────────────────────────────────────────────
+# ── Frontend (Next.js UI) — DEPRECATED, removed in 1.0.0 ─────────────────────
+#
+# Off by default: dagron-api now serves the console itself, at / with the API under
+# /api on the same origin, so this Deployment would run a second pod to serve a page
+# the API already has. The ingress below routes / to the API while this is disabled.
+#
+# `enabled: true` restores the old two-pod topology and points the ingress back here,
+# for anyone who needs the previous layout during the 0.9 line. The image stops being
+# published at 1.0.0 and this block goes with it.
 frontend:
-  enabled: true
-  image: mancube/dagron-frontend:0.8.1
+  enabled: false
+  image: mancube/dagron-frontend:0.9.0
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 3000
@@ -237,7 +245,9 @@ frontend:
     requests: {cpu: 50m, memory: 128Mi}
     limits: {memory: 512Mi}
 
-# ── Ingress (single host, same-origin: /api → dagron-api, / → frontend) ──────
+# ── Ingress (single host, same-origin) ───────────────────────────────────────
+# /api → dagron-api always; / → dagron-api too, unless frontend.enabled puts the
+# deprecated console pod back in front of it.
 ingress:
   enabled: false
   className: nginx

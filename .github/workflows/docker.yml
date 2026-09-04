@@ -79,6 +79,13 @@ jobs:
             context: "."
             file: "./crates/dagron-api/Dockerfile"
             build_args: ""
+          # DEPRECATED — removed in 1.0.0. The console it carries now ships inside
+          # dagron-api (crates/dagron-api/Dockerfile builds and embeds it), so this
+          # is a 281 MB Node runtime with nothing left to do. Still published so
+          # anyone pinned to the tag has a release boundary to migrate across, not a
+          # tag that disappears. At 1.0.0: delete this entry, frontend/Dockerfile,
+          # and docs/dockerhub/dagron-frontend.md. Keep frontend/ — it is what
+          # dagron-api builds.
           - name: dagron-frontend
             context: "./frontend"
             file: "./frontend/Dockerfile"

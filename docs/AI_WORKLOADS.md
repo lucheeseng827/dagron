@@ -20,6 +20,13 @@ primitives turn that into first-class AI-workload support:
 3. **Accelerator-aware routing.** `resources.gpu` sugar for Kubernetes
    extended resources, and `runner_class` pools (e.g. `spot-gpu` vs
    `ondemand-gpu` vs `cpu`) so each stage lands on the right capacity.
+4. **Fault attribution and per-class retry budgets.** A retry policy that
+   spends the same budget on every failure gives up too early on a dead GPU and
+   burns GPU-hours reproducing a NaN loss. dagron classifies the failure, keeps
+   the verdict on the task row, and sizes the retry budget by what actually
+   broke — see **[HPC_AUTOPSY.md](HPC_AUTOPSY.md)**, which also documents the
+   `dagron-autopsy` binary that produces the same verdicts for jobs running
+   under Slurm rather than dagron.
 
 ## The checkpoint/resume contract
 
@@ -139,9 +146,9 @@ retries as a unit via run-level rerun — so gang tasks are single-attempt
 
 The gang spec, expansion, and rendezvous env are open; the **all-or-nothing
 claimer** (claim a gang only when every member is ready and capacity fits the
-whole gang, never a partial gang) runs in the dagron Enterprise scheduler
-(`RUNNER_GANGS=1`). Without it, members schedule as ordinary independent
-tasks.
+whole gang, never a partial gang) is not in this build — see
+[below](#what-this-build-does-not-do). Without it, members schedule as ordinary
+independent tasks.
 
 ## What the DAG model already gives AI pipelines
 
@@ -159,26 +166,22 @@ that survives a mid-run kill via checkpoint resume, spot/on-demand pool
 routing, sharded batch inference with a gather step, an LLM content pipeline
 with a human approval gate, and a train→eval→deploy quality gate.
 
-## dagron Enterprise
+## What this build does not do
 
 The primitives above are the programming model and are complete on their own.
-**dagron Enterprise** adds the managed fleet around them:
+Two capabilities named in passing on this page are **not** here, and are worth
+stating plainly so a spec that relies on one is not written by accident:
 
-- **Workflow generation** — describe a pipeline in natural language, get a
-  schema-validated dagron spec (generation is validated against the same
-  parser the engine runs, with automatic repair rounds).
-- **A hardened LLM task step** — a drop-in task binary for LLM calls with
-  durable retries, idempotent re-runs (no double-spend on retry), output
-  capture to artifacts, and an egress guard for credentials.
-- **Fleet placement** — cost/preemption-aware routing of `runner_class` pools
-  across clouds and regions, quota enforcement, and workspace isolation on a
-  managed control surface.
-- **Checkpoint placement policy** — write-local/replicate-async mirroring
-  (checkpoints land in the nearest bucket first, then replicate for
-  cross-cloud resume), on top of the open cloud backends above.
-- **Runner images** — maintained ML training/serving runner images for the
-  pools the scheduler routes to.
+- **The all-or-nothing gang claimer** (`RUNNER_GANGS=1`). The gang spec, its
+  expansion and the rendezvous env are open and documented above; the claimer
+  that admits a gang only when every member is ready and capacity fits the
+  whole gang is not. Without it, gang members schedule as ordinary independent
+  tasks — which is a correct schedule, not a broken one, but it is not a gang.
+- **Natural-language spec generation.** `dagron validate` and the parser it
+  calls are the open half; the generator that writes a spec against them is
+  not in this repository.
 
-The open engine is the same code the managed fleet runs — a workflow proven
-here needs no rewrite there. See
-[README → dagron Enterprise](../README.md#dagron-enterprise).
+Everything else on this page — heartbeated leases, checkpoint resume,
+`resources.gpu`, `runner_class` pools, the cloud artifact backends, the durable
+LLM step as a plain `command:` task — is the code in this tree, and a workflow
+proven on it is the same workflow anywhere else.

@@ -1,0 +1,124 @@
+# 10 — ABM: intent in, coordinated account plays out.
+#
+#   intent ×3 vendors ─▶ resolve accounts ─▶ tier ─▶ play(tier-1|tier-2|tier-3) ─▶ brief sales
+#
+# Nested templates are the whole point here. `account_play` composes `touch`
+# three times (ads, email, direct mail); `tier1_play` composes `account_play`
+# and adds the gifting step and the human step. A play is a unit a campaign
+# manager can read, change, and reuse — not 40 near-identical tasks that drift
+# apart over two quarters.
+#
+# The three tier calls are switched by `when:` over a *parameter*, decided at run
+# creation: a false condition means the task never exists, so a tier-3 run's DAG
+# contains only the tier-3 play. That is the cheap branch — no skipped nodes,
+# no "why is half this graph grey" in the console.
+name: mktg_abm_account_orchestration
+tags: [marketing, abm, intent, lead-gen]
+environment: prod
+run_timeout_secs: 21600
+budget: { tasks: 300 }
+parameters:
+  tier: "tier1"                  # tier1 | tier2 | tier3
+  segment: "enterprise-fintech"
+  accounts: '["acme-bank", "northwind-capital", "globex-payments"]'
+
+task_defaults:
+  max_attempts: 4
+  retry_delay_secs: 15
+  retry_max_delay_secs: 180
+  timeout_secs: 600
+  env:
+    - { name: SIXSENSE_KEY, value_from: { secret: SIXSENSE_API_KEY } }
+    - { name: DEMANDBASE_KEY, value_from: { secret: DEMANDBASE_API_KEY } }
+    - { name: G2_TOKEN, value_from: { secret: G2_BUYER_INTENT_TOKEN } }
+    - { name: HUBSPOT_TOKEN, value_from: { secret: HUBSPOT_PRIVATE_APP_TOKEN } }
+    - { name: LINKEDIN_TOKEN, value_from: { secret: LINKEDIN_ADS_TOKEN } }
+
+templates:
+  # The atom: one channel touch for one account.
+  - name: touch
+    parameters: { account: "", channel: "ads" }
+    tasks:
+      - name: build
+        command: ["sh", "-c", "abm-asset --account '{{ account }}' --channel {{ channel }} --segment {{ segment }} --out \"$DAGRON_ARTIFACTS/{{ account }}-{{ channel }}.json\""]
+      - name: activate
+        depends_on: [build]
+        pool: crm-api
+        command: ["sh", "-c", "abm-activate --channel {{ channel }} --spec \"$DAGRON_ARTIFACTS/{{ account }}-{{ channel }}.json\""]
+
+  # Composition level 1: the standard three-channel play.
+  - name: account_play
+    parameters: { account: "" }
+    tasks:
+      - { name: ads, template: touch, arguments: { account: "{{ account }}", channel: linkedin-ads } }
+      - { name: email, template: touch, arguments: { account: "{{ account }}", channel: email }, depends_on: [ads] }
+      - { name: web, template: touch, arguments: { account: "{{ account }}", channel: web-personalization }, depends_on: [ads] }
+
+  # Composition level 2: tier 1 adds spend and a human.
+  - name: tier1_play
+    parameters: { account: "" }
+    tasks:
+      - { name: core, template: account_play, arguments: { account: "{{ account }}" } }
+      - name: gifting
+        depends_on: [core]
+        command: ["sh", "-c", "sendoso-order --account '{{ account }}' --campaign {{ segment }}"]
+      - name: exec_signoff
+        type: approval
+        depends_on: [gifting]
+        approval_timeout_secs: 86400
+        approval_on_timeout: reject
+      - name: ae_brief
+        depends_on: [exec_signoff]
+        command: ["sh", "-c", "abm-brief --account '{{ account }}' --out \"$DAGRON_ARTIFACTS/brief-{{ account }}.md\""]
+
+tasks:
+  # Three intent vendors disagree by design; that is why we buy more than one.
+  # Each is allow_failure — a vendor being down degrades the signal, it does not
+  # cancel the quarter's ABM.
+  - name: intent
+    with_items:
+      - { vendor: 6sense, tool: sixsense-pull }
+      - { vendor: demandbase, tool: demandbase-pull }
+      - { vendor: g2, tool: g2-intent-pull }
+    instance_key: "{{ item.vendor }}"
+    allow_failure: true
+    pool: enrich-api
+    command: ["sh", "-c", "{{ item.tool }} --segment {{ segment }} --out \"$DAGRON_ARTIFACTS/intent-{{ item.vendor }}.json\""]
+
+  - name: resolve_accounts
+    depends_on: [intent]
+    trigger_rule: all_done
+    command: ["sh", "-c", "account-resolve --in \"$DAGRON_ARTIFACTS\" --crm hubspot --out \"$DAGRON_ARTIFACTS/accounts.json\""]
+
+  - name: score_accounts
+    depends_on: [resolve_accounts]
+    produces: ["hubspot://crm/companies/intent-score"]
+    command: ["sh", "-c", "account-score --in \"$DAGRON_ARTIFACTS/accounts.json\" --model abm-v3 --writeback hubspot"]
+
+  # Parameter-driven branch: exactly one of these three exists in any given run.
+  - name: play_tier1
+    template: tier1_play
+    with_param: "{{ accounts }}"
+    arguments: { account: "{{ item }}" }
+    when: "{{ tier }} == tier1"
+    depends_on: [score_accounts]
+
+  - name: play_tier2
+    template: account_play
+    with_param: "{{ accounts }}"
+    arguments: { account: "{{ item }}" }
+    when: "{{ tier }} == tier2"
+    depends_on: [score_accounts]
+
+  - name: play_tier3
+    template: touch
+    with_param: "{{ accounts }}"
+    arguments: { account: "{{ item }}", channel: linkedin-ads }
+    when: "{{ tier }} == tier3"
+    depends_on: [score_accounts]
+
+  - name: hand_to_sales
+    depends_on: [play_tier1, play_tier2, play_tier3]
+    trigger_rule: none_failed
+    produces: ["hubspot://crm/deals/abm-sourced"]
+    command: ["sh", "-c", "abm-handoff --segment {{ segment }} --tier {{ tier }} --notify sales-abm"]

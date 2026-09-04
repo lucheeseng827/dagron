@@ -428,6 +428,14 @@ pre,
      squeezed on screens with room to spare; wide data is the point here. */
   max-width: 1560px;
 }
+/* …and for the list pages, no cap at all. The same argument that took this
+   from 1180 to 1560 does not stop at 1560: a run list is one dense table with
+   nothing beside it, so on a wide display the cap buys no readability and
+   leaves a column of dead space the rows could have used. Prose and forms keep
+   the cap — a 1900px-wide input is not an improvement. */
+.dy-page-wide {
+  max-width: none;
+}
 .dy-h1 {
   font-size: 23px;
   font-weight: 700;
@@ -848,5 +856,402 @@ a:hover {
 @media (max-width: 760px) {
   .dy-cols3 {
     grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ── sidebar rail: the same nav, 56px wide ─────────────────────────────────
+   Collapsing is a width change plus clipping, deliberately not a different
+   component: the same <Link>s render in both states, so "you are here", the
+   badges and the keyboard order all survive the collapse. What goes away is
+   the text — every item keeps a `title`, which is the only label left. */
+/* Width only. This rule must NOT set `position` — the base `.dy-side` above is
+   `position: sticky`, and a later `position: relative` here silently un-stuck
+   the whole sidebar: it scrolled away with the page once the run list grew past
+   a screen. (It was added for a toggle that hung off the sidebar edge; the
+   toggle is in the flow now and needs no positioned ancestor.) */
+.dy-side {
+  transition: width 0.14s ease-out;
+}
+.dy-side[data-rail="on"] {
+  width: 56px;
+  padding-left: 7px;
+  padding-right: 7px;
+}
+/* Anything that is prose in the rail is clipped, not hidden: `display: none`
+   would take the labels out of each link's accessible name, and the icons
+   would become unlabelled buttons to a screen reader. */
+.dy-side[data-rail="on"] .dy-navitem > span,
+.dy-side[data-rail="on"] .dy-brand-row > div:last-child,
+.dy-side[data-rail="on"] .dy-status > div,
+.dy-side[data-rail="on"] .dy-user > div:last-child {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.dy-side[data-rail="on"] .dy-navitem,
+.dy-side[data-rail="on"] .dy-brand-row,
+.dy-side[data-rail="on"] .dy-status,
+.dy-side[data-rail="on"] .dy-user {
+  justify-content: center;
+  gap: 0;
+  padding-left: 0;
+  padding-right: 0;
+}
+/* A section heading with nothing beside it is just a stray word; the rule
+   keeps the grouping the heading was carrying. */
+.dy-side[data-rail="on"] .dy-navsection {
+  height: 1px;
+  padding: 0;
+  margin: 8px 6px;
+  overflow: hidden;
+  color: transparent;
+  background: var(--border);
+}
+.dy-side[data-rail="on"] .dy-navcount,
+.dy-side[data-rail="on"] .dy-kbd {
+  display: none;
+}
+/* The attention dot survives — an unread GitOps change or a dead letter is
+   exactly what the rail must still be able to say. */
+.dy-side[data-rail="on"] .dy-navitem {
+  position: relative;
+}
+.dy-side[data-rail="on"] .dy-navdot {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  margin: 0;
+}
+.dy-side[data-rail="on"] .dy-logo {
+  transform: scale(0.82);
+}
+
+/* Brand + rail toggle. The toggle is IN the flow, not hanging off the sidebar
+   edge: `.dy-side` sets `overflow-y: auto` for long nav, and an overflow
+   container clips its own overhang, so a half-outside button gets sliced down
+   the middle by the content beside it. */
+.dy-side-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+}
+.dy-side-head .dy-brand-row {
+  flex: 1;
+  min-width: 0;
+}
+.dy-rail-toggle {
+  flex-shrink: 0;
+  margin-top: 6px;
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: none;
+  color: var(--dim);
+  cursor: pointer;
+  transition: color 0.12s, background 0.12s, border-color 0.12s;
+}
+.dy-rail-toggle:hover {
+  color: var(--fg);
+  background: var(--steel-hi);
+  border-color: var(--border-strong);
+}
+/* In the rail the header stacks, so the toggle sits under the mark rather than
+   on top of it — and stays put, since there is no hover on a touch device to
+   reveal the way back out. */
+.dy-side[data-rail="on"] .dy-side-head {
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+.dy-side[data-rail="on"] .dy-side-head .dy-brand-row {
+  flex: none;
+  padding-bottom: 0;
+}
+.dy-side[data-rail="on"] .dy-rail-toggle {
+  margin-top: 0;
+  margin-bottom: 8px;
+}
+
+/* ── agent dock: the right-hand rail ───────────────────────────────────────
+   Closed it is a 26px tab, so the canvas pays nothing for a surface most
+   sessions never open. Open it is a column the content reflows around rather
+   than being overlaid by, because the graph and the agent activity are read
+   together or not at all. */
+/* A 26px strip in the chrome colour is invisible as an affordance — it reads
+   as page edge, not as a control. It gets the sidebar's own material, a real
+   seam, and a label under the glyph, so it is legible as something to click
+   without costing more width. */
+.dy-dock-tab {
+  position: sticky;
+  top: 0;
+  align-self: flex-start;
+  height: 100vh;
+  width: 30px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding-top: 16px;
+  border: 0;
+  border-left: 1px solid #0c0f12;
+  box-shadow: inset 1px 0 0 rgba(255, 255, 255, 0.03);
+  background: var(--side);
+  color: var(--muted);
+  cursor: pointer;
+  transition: color 0.12s, background 0.12s;
+}
+.dy-dock-tab::after {
+  content: "AGENT";
+  writing-mode: vertical-rl;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.22em;
+  color: var(--dim);
+}
+.dy-dock-tab:hover {
+  color: var(--accent);
+  background: var(--steel);
+}
+.dy-dock-tab:hover::after {
+  color: var(--muted);
+}
+
+.dy-dock {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  width: 340px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--side);
+  border-left: 1px solid #0c0f12;
+  box-shadow: inset 1px 0 0 rgba(255, 255, 255, 0.03);
+}
+.dy-dock-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 12px 12px 11px;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg);
+}
+.dy-dock-x {
+  border: 0;
+  background: none;
+  color: var(--dim);
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 4px;
+}
+.dy-dock-x:hover {
+  color: var(--fg);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.dy-dock-sect {
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--border);
+  min-height: 0;
+}
+/* The prompt log grows and scrolls on its own; the activity list is bounded by
+   its own item cap. */
+.dy-dock-grow {
+  flex: 1;
+  overflow-y: auto;
+}
+.dy-dock-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.dy-dock-hint {
+  margin-left: auto;
+  letter-spacing: 0.04em;
+  text-transform: none;
+  color: var(--muted-status);
+  cursor: help;
+  border-bottom: 1px dotted var(--muted-status);
+}
+.dy-dock-clear {
+  margin-left: auto;
+  border: 0;
+  background: none;
+  color: var(--dim);
+  font-family: inherit;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.dy-dock-clear:hover {
+  color: var(--red);
+}
+.dy-dock-empty {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--dim);
+}
+
+.dy-dock-runs {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.dy-dock-run {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
+  border-radius: 5px;
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 12.5px;
+}
+.dy-dock-run:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--fg);
+  text-decoration: none;
+}
+.dy-dock-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.dy-dock-run-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dy-dock-run-when {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  color: var(--dim);
+}
+
+.dy-dock-hist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.dy-dock-turn {
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 8px 9px;
+  background: var(--panel);
+}
+.dy-dock-turn-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.dy-dock-copy {
+  margin-left: auto;
+  border: 0;
+  background: none;
+  color: var(--dim);
+  font-size: 10.5px;
+  cursor: pointer;
+  padding: 0;
+}
+.dy-dock-copy:hover {
+  color: var(--accent);
+}
+.dy-dock-turn-text {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--fg);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.dy-dock-reply {
+  margin: 7px 0 0;
+  padding: 7px 8px;
+  border-radius: 5px;
+  background: var(--bg);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--muted);
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre;
+}
+.dy-dock-err {
+  margin: 6px 0 0;
+  font-size: 11.5px;
+  color: var(--red);
+}
+
+.dy-dock-compose {
+  padding: 10px 12px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--side);
+}
+.dy-dock-input {
+  width: 100%;
+  resize: vertical;
+  min-height: 62px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 8px 9px;
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.dy-dock-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.dy-dock-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+.dy-dock-send {
+  margin-left: auto;
+  padding: 5px 12px;
+  font-size: 12.5px;
+}
+
+/* Narrower than this the dock would leave the content column unusable; the tab
+   still opens it, as an overlay. */
+@media (max-width: 1100px) {
+  .dy-dock {
+    position: fixed;
+    right: 0;
+    top: 0;
+    z-index: 40;
+    width: min(340px, 100vw);
+    box-shadow: -18px 0 40px -20px rgba(0, 0, 0, 0.8);
   }
 }

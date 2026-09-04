@@ -1,7 +1,7 @@
 //! Audit trail for control-plane mutations, plus viewer read-only enforcement.
 //!
-//! **Enterprise-gated** (`--features enterprise`): the audit log (a compliance
-//! surface) and the read-only `viewer` role ship with dagron Enterprise. Without
+//! **Feature-gated** (`--features enterprise`): the audit log (a compliance
+//! surface) and the read-only `viewer` role are not in this build. Without
 //! that feature this module is a passthrough middleware — no `audit_log` table,
 //! no `/api/audit` route, no role enforcement — and every mutation behaves
 //! exactly as it did before either existed.

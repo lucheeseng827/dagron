@@ -17,14 +17,17 @@ s3 = ["cloud", "object_store/aws"]
 gcs = ["cloud", "object_store/gcp"]
 azure = ["cloud", "object_store/azure"]
 cloud = ["dep:object_store", "dep:futures-util"]
-# Encrypted artifacts at rest + the rotation sweep. Enterprise; forwards to the
+# Encrypted artifacts at rest + the rotation sweep. Feature-gated; forwards to the
 # KEK gate in dagron-crypto, which is where the line is actually enforced.
 enterprise = ["dagron-crypto/enterprise"]
 
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-tokio = { version = "1", features = ["fs", "rt", "io-util"] }
+# `sync`: the tiered store serialises its ledger behind a tokio Mutex (held across
+# the ledger file writes). Additive feature on an already-resolved crate — no
+# lockfile impact.
+tokio = { version = "1", features = ["fs", "rt", "io-util", "sync"] }
 tracing = "0.1"
 # Streaming decrypt: build an error-propagating byte stream + adapt it to AsyncRead.
 async-stream = "0.3"
@@ -38,6 +41,11 @@ futures-util = { version = "0.3", optional = true }
 # Envelope encryption for at-rest artifacts (G-C2). Default (SDK-free) features —
 # BYOK/KMS providers are selected at the call site via dagron_crypto::provider_from_env.
 dagron-crypto = { path = "../dagron-crypto" }
+# Tiered store (`tiered` module): content hashes, the NDJSON upload ledger.
+sha2 = "0.10"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }

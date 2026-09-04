@@ -268,7 +268,7 @@ export default function TaskPanel({
                 )}
               </span>
               {waiting.runLink ? (
-                <Link href={`/runs/${waiting.runLink}`} className="mono" style={{ color: "var(--blue)", wordBreak: "break-all" }}>
+                <Link href={`/runs/detail/?id=${waiting.runLink}`} className="mono" style={{ color: "var(--blue)", wordBreak: "break-all" }}>
                   {waiting.detail}
                 </Link>
               ) : (

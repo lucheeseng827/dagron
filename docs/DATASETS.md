@@ -1,10 +1,9 @@
 # Datasets — data-aware scheduling (produce → track → trigger)
 
-> Airflow Datasets / Dagster asset-sensor parity. The open-core split: the
-> single-team loop — produce, track, sense, single-dataset trigger — is
-> Apache-2.0; the
-> **full-blown data-aware scheduler** (multi-dataset composition, external
-> events, the org-level lineage layer) ships with **dagron Enterprise**.
+> Airflow Datasets / Dagster asset-sensor parity, for the single-team loop:
+> produce, track, sense, and trigger on one dataset. Where that loop stops is
+> [below](#limits-of-this-build) — stated as an error at the boundary, never as
+> a silent no-op.
 
 Time-based schedules answer "run at 02:00 and hope the data landed."
 Dataset-aware scheduling answers "run **because** the data landed":
@@ -106,23 +105,25 @@ subscribed dataset records a new update. The triggering URI is injected as
   cursor back and retries once a slot frees; nothing is lost.
 - Sweep cadence is ~5 s; `DATASET_TRIGGERS=0` opts a scheduler out.
 
-## Open vs. Enterprise
+## What the loop does and does not cover
 
-| Capability | Open (Apache-2.0) | Enterprise |
-|---|---|---|
-| `produces:` recording, registry + lineage ledger and their read APIs | ✅ full | ✅ |
-| `wait: { dataset: … }` sensor | ✅ full | ✅ |
-| Dataset-triggered workflows | ✅ **one** dataset per workflow | ✅ unlimited |
-| Multi-dataset composition (`on_datasets: [a, b, …]` + `datasets_mode: any\|all`) | — signposted error | ✅ AND/OR fan-in ("fire when *both* upstream tables landed") |
-| External dataset events (`POST /datasets/events`) — CDC, S3 notifications, other orchestrators | — `403` with signpost | ✅ (pairs with the managed CloudEvents ingest gateway) |
-| Freshness SLAs (fire/alert when a dataset goes stale), lineage graph UI, dataset partitions | — | on the Enterprise roadmap |
+| Capability | This build |
+|---|---|
+| `produces:` recording, registry + lineage ledger and their read APIs | full |
+| `wait: { dataset: … }` sensor | full |
+| Dataset-triggered workflows | **one** dataset per workflow |
+| Multi-dataset composition (`on_datasets: [a, b, …]` + `datasets_mode: any\|all`) | validation error, with the reason |
+| External dataset events (`POST /datasets/events`) — CDC, S3 notifications, other orchestrators | `403`, with the reason |
+| Freshness SLAs, a lineage graph UI, dataset partitions | not implemented |
 
-The **single-team loop is complete on its own** — one workflow produces, another
-senses or fires on it, lineage fully queryable, HA included. What Enterprise adds
-is composition and integration at org scale: fan-in across many teams' datasets,
-events from systems outside dagron, and the org-level lineage/freshness layer.
+The **single-team loop is complete on its own**: one workflow produces, another
+senses or fires on it, the lineage is fully queryable, and HA is included. What
+is missing is composition and integration at org scale — fan-in across many
+teams' datasets, and events from systems outside dagron. Both refuse loudly
+rather than half-working, which is the property that matters when a workflow's
+trigger is the thing you are debugging.
 
-## Limits of the open build
+## Limits of this build
 
 Every gate is a **signpost, not a dead end** — it names what was attempted,
 where it ships, and what to do instead in this build (the pattern

@@ -39,7 +39,7 @@
 //! **What this is not.** One file, one consumer, one host: there is no
 //! partitioning, no consumer group rebalance, no broker-side retention or
 //! cross-host failover. Managed broker connectors (Kafka, NATS, SQS, Redis)
-//! and the CloudEvents webhook gateway ship with dagron Enterprise; this
+//! and the CloudEvents webhook gateway are not in this build; this
 //! source is the same programming model at laptop scale.
 //!
 //! | Env var | Default | Meaning |

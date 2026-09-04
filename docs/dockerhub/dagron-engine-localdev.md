@@ -42,7 +42,9 @@ docker run \
 
 Setting `DAG_PATH` in the environment does nothing: the binary never reads it, falls back to a built-in default that does not exist in the image, and logs `cannot read DAG file` on every boot.
 
-`/workflows` is `WORKFLOW_DIR`, seeded with the bundled examples on first start when empty. It is a seed target, not an inbox — the default `file` source emits one YAML **once** at startup and then drains, so a file dropped in later is never picked up. Submit further workflows through the console or `POST /api/runs`.
+`/workflows` is `WORKFLOW_DIR`, seeded with the bundled examples on first start when empty. Under the default `file` source it is a seed target, not an inbox: one YAML is emitted **once** at startup and then drained, so a file dropped in later is never picked up.
+
+Set `SOURCE=dir` to make it a live inbox instead — every `*.yaml`/`*.yml` in the directory runs, a file added later runs when the next scan finds it (`DIR_POLL_MS`, default 2 s), and an edited file is re-submitted when the edit changes its modified time or length — the scan keys on that pair, so a same-length rewrite within the filesystem's timestamp granularity is not seen. Note that the engine seeds the bundled examples into an empty `WORKFLOW_DIR`, so a first start with `SOURCE=dir` and an empty volume runs all of them. Either way, further workflows can also go in through the console or `POST /api/runs`.
 
 ## Configuration (env)
 

@@ -44,7 +44,7 @@ export default function RerunMenu({
     setBusy(true);
     try {
       const { run_id } = await resubmitRun(runId);
-      router.push(`/runs/${run_id}`);
+      router.push(`/runs/detail/?id=${run_id}`);
     } catch (e) {
       onError(errMsg(e));
       setBusy(false);

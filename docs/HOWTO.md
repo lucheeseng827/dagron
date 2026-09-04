@@ -4,7 +4,7 @@ Task-oriented recipes: start a workflow (CLI + REST), chain one workflow from
 another, monitor runs, and wire secrets/environment variables. Commands assume
 the UI stack from [`compose.yaml`](../compose.yaml) (`docker compose up`), which
 serves the authenticated API gateway on `http://localhost:8080` and the web UI on
-`http://localhost:3000`.
+`http://localhost:8080`.
 
 - **Engine** — the `dagron` binary: scheduler daemon + task runner.
 - **dagron-api** (`/api/...`) — the authenticated gateway the UI and REST clients
@@ -154,7 +154,7 @@ or a cycle is rejected with `400`. Runnable pair:
 
 ## 4. Monitor a workflow
 
-All monitoring is REST (or the web UI at `:3000`). Using the `run_id` from the
+All monitoring is REST (or the web UI at `:8080`, same port). Using the `run_id` from the
 submit call:
 
 ```console

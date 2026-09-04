@@ -1,0 +1,140 @@
+# 07 — Content engine: brief ─▶ draft (Claude) ─▶ edit ─▶ human sign-off ─▶ publish.
+#
+# The durable-LLM-call pattern, in a marketing shape. The draft lands in the
+# run's artifact directory and that file is its own idempotency check: a retry
+# after a network blip, or an engine crash mid-run, finds the draft already
+# there and does not re-spend the tokens. An agent loop with a `try/except`
+# around the API call has no equivalent — when it dies halfway there is nothing
+# to resume, and the second run pays again.
+#
+# `type: approval` is where a marketer reads the copy. `approval_on_timeout:
+# reject` because unreviewed copy going live is worse than copy that is late.
+# `result_from: publish` makes the whole thing callable as a function, so the
+# editorial calendar tool can request a piece and get the published URL back.
+#
+#   curl -sS -b cookies.txt -X POST http://localhost:8080/api/runs \
+#     -H 'content-type: application/json' \
+#     -d "$(jq -Rn --arg y "$(cat 07_content_engine_llm.yaml)" \
+#            '{yaml:$y, parameters:{topic:"warehouse-native attribution", persona:"VP Demand Gen"}}')"
+name: mktg_content_engine_llm
+tags: [marketing, content, llm, approval]
+environment: prod
+result_from: publish
+run_timeout_secs: 86400        # a draft can wait a day for its reviewer
+deadline: { in: 4h }
+parameters:
+  topic: "warehouse-native attribution"
+  persona: "VP Demand Gen"
+  funnel_stage: "mofu"
+  target_keyword: "multi-touch attribution software"
+  slack_webhook: ""              # notify: URLs template against run PARAMETERS,
+                                 # not {{ env.* }} — set an instance-wide default
+                                 # in the console instead (sidebar -> Notifications).
+
+task_defaults:
+  max_attempts: 3
+  retry_delay_secs: 5
+  retry_max_delay_secs: 60
+  timeout_secs: 300
+  env:
+    - { name: ANTHROPIC_API_KEY, value_from: { secret: ANTHROPIC_API_KEY } }
+    - { name: ANTHROPIC_MODEL, value: "claude-sonnet-5" }
+    - { name: HUBSPOT_TOKEN, value_from: { secret: HUBSPOT_PRIVATE_APP_TOKEN } }
+
+notify:
+  slack:
+    webhook_url: "{{ slack_webhook }}"
+    on: [succeeded, failed, deadline_exceeded]
+
+tasks:
+  # Grounding first: what already ranks, what we already published, what sales
+  # actually gets asked. A draft written without these is why AI content reads
+  # like AI content.
+  - name: research
+    with_items:
+      - { src: search-console, tool: gsc-top-queries }
+      - { src: crm-objections, tool: hubspot-call-notes }
+      - { src: competitors, tool: serp-scrape }
+    instance_key: "{{ item.src }}"
+    allow_failure: true
+    max_attempts: 4
+    command: ["sh", "-c", "{{ item.tool }} --keyword \"{{ target_keyword }}\" --out \"$DAGRON_ARTIFACTS/research-{{ item.src }}.md\""]
+
+  - name: brief
+    depends_on: [research]
+    trigger_rule: all_done
+    command: ["sh", "-c", "build-brief --topic \"{{ topic }}\" --persona \"{{ persona }}\" --stage {{ funnel_stage }} --research \"$DAGRON_ARTIFACTS\" --out \"$DAGRON_ARTIFACTS/brief.md\""]
+
+  # The idempotent model call. Generation lands in a same-directory temp file and
+  # is renamed atomically only after it validates, so a crash mid-write can never
+  # leave a truncated draft that the next attempt "cache-hits" and publishes.
+  - name: draft
+    depends_on: [brief]
+    timeout_secs: 600
+    max_attempts: 3
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        out="$DAGRON_ARTIFACTS/draft.md"
+        tmp="$out.tmp"
+        rm -f "$tmp"
+        if [ -s "$out" ]; then
+          echo "draft already generated - not re-spending tokens"; exit 0
+        fi
+        payload=$(python3 -c 'import json,os,sys; print(json.dumps({
+          "model": os.environ["ANTHROPIC_MODEL"], "max_tokens": 4000,
+          "messages": [{"role": "user", "content": open(sys.argv[1]).read()}]}))' "$DAGRON_ARTIFACTS/brief.md")
+        curl -sf https://api.anthropic.com/v1/messages \
+          -H "x-api-key: $ANTHROPIC_API_KEY" \
+          -H "anthropic-version: 2023-06-01" \
+          -H "content-type: application/json" \
+          -d "$payload" \
+          | python3 -c 'import json,sys; print("".join(b.get("text","") for b in json.load(sys.stdin)["content"]))' > "$tmp"
+        [ -s "$tmp" ] || { rm -f "$tmp"; echo "empty draft" >&2; exit 1; }
+        mv "$tmp" "$out"
+        wc -w < "$out"
+
+  - name: seo_pass
+    depends_on: [draft]
+    command: ["sh", "-c", "seo-optimize \"$DAGRON_ARTIFACTS/draft.md\" --keyword \"{{ target_keyword }}\" --out \"$DAGRON_ARTIFACTS/optimized.md\""]
+
+  # Deterministic checks a model should not be trusted to self-report: claims
+  # against the approved claims list, reading level, banned phrases, plagiarism.
+  #
+  # After `seo_pass`, not beside it, and against `optimized.md` — the file
+  # `publish` actually ships. Linting `draft.md` in parallel would check a
+  # document that no longer exists by the time a human is asked to sign off:
+  # the SEO rewrite is free to add a claim, and the hard check would never see it.
+  - name: compliance_lint
+    depends_on: [seo_pass]
+    max_attempts: 1
+    command: ["sh", "-c", "copy-lint \"$DAGRON_ARTIFACTS/optimized.md\" --claims-file approved-claims.yaml --max-grade 10"]
+
+  - name: editor_signoff
+    type: approval
+    depends_on: [compliance_lint, seo_pass]
+    approval_timeout_secs: 57600     # 16h — one working day plus a night
+    approval_on_timeout: reject
+
+  - name: publish
+    depends_on: [editor_signoff]
+    timeout_secs: 600
+    produces:
+      - "hubspot://cms/blog-posts"
+      - "s3://acme-content/published"
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        url=$(hubspot-cms-publish --file "$DAGRON_ARTIFACTS/optimized.md" \
+                --topic "{{ topic }}" --stage {{ funnel_stage }} --token "$HUBSPOT_TOKEN")
+        aws s3 cp "$DAGRON_ARTIFACTS/optimized.md" "s3://acme-content/published/$DAGRON_RUN_ID.md"
+        echo "$url"
+
+  - name: archive_attempt
+    hook: on_exit
+    max_attempts: 1
+    command: ["sh", "-c", "aws s3 sync \"$DAGRON_ARTIFACTS\" \"s3://acme-content/drafts/$DAGRON_RUN_ID/\""]

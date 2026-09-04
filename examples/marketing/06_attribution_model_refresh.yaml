@@ -1,0 +1,128 @@
+# 06 — Multi-touch attribution refresh on GPU spot capacity.
+#
+#   wait(dataset) ─▶ assemble touchpoints ─▶ embed(spot GPU) ─▶ fit ─▶ validate ─▶ ship | hold
+#
+# The heaviest workflow marketing owns, and the one that shows why a workflow
+# runner and a cron script are different things.
+#
+# * `type: wait` with a `dataset:` sensor starts the run *because* ad spend
+#   landed (05's `produces:`), holding no worker slot while it waits.
+# * `runner_class: spot-gpu` puts the embedding job on preemptible capacity.
+#   Preemption is then just a retry: the task reports checkpoints, and dagron
+#   hands the retry the last committed one via `DAGRON_RESUME_FROM`, so attempt
+#   four resumes at batch 380,000 rather than at zero. That is what makes spot
+#   pricing usable for a job that takes three hours.
+# * `retry_budgets` splits the attempt budget by *what broke*: infrastructure
+#   faults (a preempted node, an ECC error) get many attempts, a NaN loss gets
+#   one, because retrying a broken model is just spending money slower.
+# * `when:` on the validation output decides whether the new model reaches the
+#   dashboards at all. The gate is an edge in the graph, not a Monday habit.
+name: mktg_attribution_model_refresh
+tags: [marketing, attribution, ml, gpu]
+environment: prod
+run_timeout_secs: 43200
+deadline: { in: 6h }
+max_active_runs: 1            # one refresh at a time; they contend for the same GPUs
+parameters:
+  lookback_days: "90"
+  model_version: "mta-v7"
+
+task_defaults:
+  max_attempts: 3
+  retry_delay_secs: 30
+  retry_max_delay_secs: 600
+  timeout_secs: 3600
+  env:
+    - { name: SNOWFLAKE_PWD, value_from: { secret: SNOWFLAKE_PASSWORD } }
+    - { name: GA4_SA_JSON, value_from: { secret: GA4_SERVICE_ACCOUNT_JSON } }
+    - { name: HUBSPOT_TOKEN, value_from: { secret: HUBSPOT_PRIVATE_APP_TOKEN } }
+    - { name: MODEL_BUCKET, value: "{{ env.MODEL_BUCKET }}" }
+
+tasks:
+  # Dataset sensor: succeeds on the first spend update recorded *after* the park.
+  # Updates already in the ledger do not count — it waits for fresh data, which
+  # is exactly the difference between "the model ran" and "the model was right".
+  - name: wait_for_spend
+    type: wait
+    wait: { dataset: "snowflake://analytics/marketing/fact_ad_spend" }
+
+  # Three sources, three failure modes, one join. GA4 quota errors are common and
+  # slow; the CRM export is fast and reliable. Separate tasks so they retry
+  # separately.
+  - name: pull_touchpoints
+    depends_on: [wait_for_spend]
+    with_items:
+      - { src: ga4, tool: ga4-export }
+      - { src: hubspot, tool: hubspot-timeline-export }
+      - { src: warehouse, tool: snowflake-unload }
+    instance_key: "{{ item.src }}"
+    max_attempts: 6
+    timeout_secs: 5400
+    command: ["sh", "-c", "{{ item.tool }} --days {{ lookback_days }} --out \"$DAGRON_ARTIFACTS/{{ item.src }}.parquet\""]
+
+  - name: assemble_journeys
+    depends_on: [pull_touchpoints]
+    timeout_secs: 7200
+    cache: { key: "journeys-{{ lookback_days }}-{{ model_version }}", max_age_secs: 43200 }
+    command: ["sh", "-c", "build-journeys --in \"$DAGRON_ARTIFACTS\" --out \"$DAGRON_ARTIFACTS/journeys.parquet\""]
+
+  # Preemptible GPU. `max_attempts: 8` is not optimism about the code — it is the
+  # expected number of spot reclaims over three hours, each of which resumes.
+  - name: embed_journeys
+    depends_on: [assemble_journeys]
+    runner_class: spot-gpu
+    service_account: dagron-mktg-gpu
+    resources:
+      gpu: { count: 4 }
+      requests: { cpu: "8", memory: "64Gi" }
+      limits: { cpu: "16", memory: "128Gi" }
+    docker_image: ghcr.io/acme/attribution-trainer:1.9
+    timeout_secs: 21600
+    max_attempts: 8
+    retry_on_timeout: false        # a real timeout means it is stuck, not unlucky
+    retry_budgets:
+      preemption: 8                # spot reclaim: resume from the last checkpoint
+      gpu-ecc: 6                   # bad card: reschedule, it is not our bug
+      gpu-oom: 2                   # twice, then the batch shape is wrong
+      nan-loss: 1                  # do not spend three more hours on a broken run
+    command: ["python", "embed.py", "--in", "/artifacts/journeys.parquet", "--checkpoint-dir", "/artifacts/ckpt"]
+
+  - name: fit_model
+    depends_on: [embed_journeys]
+    runner_class: ondemand-gpu     # short, and we do not want it preempted
+    resources: { gpu: { count: 1 } }
+    docker_image: ghcr.io/acme/attribution-trainer:1.9
+    timeout_secs: 5400
+    command: ["python", "fit.py", "--version", "{{ model_version }}", "--out", "/artifacts/model"]
+
+  # Prints `ship` or `hold`.
+  - name: validate_model
+    depends_on: [fit_model]
+    max_attempts: 1
+    command: ["sh", "-c", "attribution-eval --model \"$DAGRON_ARTIFACTS/model\" --baseline mta-v6 --min-lift 0.02"]
+
+  - name: publish_model
+    depends_on: [validate_model]
+    when: "{{ tasks.validate_model.output }} == ship"
+    produces:
+      - "s3://acme-models/attribution/{{ model_version }}"
+      - "snowflake://analytics/marketing/fact_attributed_revenue"
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        aws s3 sync "$DAGRON_ARTIFACTS/model" "s3://$MODEL_BUCKET/attribution/{{ model_version }}/"
+        score-pipeline --model {{ model_version }} --write snowflake
+
+  - name: hold_model
+    depends_on: [validate_model]
+    when: "{{ tasks.validate_model.output }} != ship"
+    max_attempts: 1
+    command: ["sh", "-c", "post-slack marketing-analytics \"{{ model_version }} held: no lift over mta-v6 (run $DAGRON_RUN_ID)\""]
+
+  - name: release_gpu_quota
+    hook: on_exit
+    max_attempts: 1
+    timeout_secs: 120
+    command: ["sh", "-c", "gpu-quota-release --pool spot-gpu --run \"$DAGRON_RUN_ID\""]

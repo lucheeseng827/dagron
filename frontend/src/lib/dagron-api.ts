@@ -538,3 +538,58 @@ export const syncGitRepo = (id: string): Promise<GitRepo> =>
 
 export const disconnectGitRepo = (id: string): Promise<void> =>
   apiFetch(`/git-repos/${encodeURIComponent(id)}`, { method: "DELETE" });
+
+// ── agent: natural-language spec generation ────────────────────────────────
+//
+// dagron-api exposes no generator in the OSS build — natural-language → DAG
+// lives in `dagron-ai` and is reached today only through `dagron-mcp-ee`'s
+// `dagron_generate_and_submit` tool (docs/MCP.md, "Roadmap to 1.0" P0). The
+// console therefore *asks* rather than assumes, and the agent dock adapts to
+// the answer instead of shipping a Send button that cannot work.
+
+/// True when something is mounted at `/ai/generate`.
+///
+/// A GET is the cheap question: **404** means no such route (the OSS build),
+/// **405** means the route is there and wants a POST — which is the answer we
+/// are actually after. A network failure is treated as absent; the dock's
+/// fallback path is useful either way, and a console that guesses "available"
+/// and then fails on Send is worse than one that guesses the other way.
+///
+/// So the check is for the answers that actually prove a route, not for the
+/// absence of one: `!== 404` would read 401, 403, 500 and every proxy error
+/// page as "available" and light up Send on a console whose POST is going to
+/// fail anyway — the exact failure this probe exists to avoid.
+export async function probeAiGenerator(): Promise<boolean> {
+  try {
+    const res = await fetch(`${BASE}/ai/generate`, {
+      method: "GET",
+      credentials: "same-origin",
+      headers: defaultHeaders(),
+    });
+    return res.status === 405 || res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/// Ask the generator for a workflow spec. Callers should have seen
+/// `probeAiGenerator()` return true first — this throws like any other call
+/// when the route is absent.
+export async function aiGenerate(prompt: string): Promise<string> {
+  const r = await apiFetch<{ yaml?: string; text?: string }>(`/ai/generate`, {
+    method: "POST",
+    body: JSON.stringify({ prompt }),
+  });
+  return r.yaml ?? r.text ?? "";
+}
+
+// ── archive ────────────────────────────────────────────────────────────────
+
+/// Archive one terminal run now, rather than waiting for the retention window.
+///
+/// **Destructive**: on success the run is durably in the archive sink and gone
+/// from the hot store, so it leaves `/api/runs` and appears under
+/// `/api/archive/runs`. Admin-only; `501` when no sink is configured, `409`
+/// when the run is still live.
+export const archiveRun = (id: string): Promise<{ run_id: string; archived: boolean; purged: number }> =>
+  apiFetch(`/runs/${encodeURIComponent(id)}/archive`, { method: "POST" });

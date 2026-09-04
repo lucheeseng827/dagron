@@ -1,6 +1,8 @@
 "use client";
 
-import { use, useCallback, useEffect, useRef, useState } from "react";
+import { Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import { useRouteId } from "@/lib/route-id";
 import Link from "next/link";
 import DagGraph from "@/components/dag/DagGraph";
 import RunTimeline from "@/components/dag/RunTimeline";
@@ -14,8 +16,10 @@ import { clearTriage, setTriage } from "@/lib/dagron-api";
 import { useToast } from "@/components/Toasts";
 import {
   approveTask,
+  archiveRun,
   cancelRun,
   clearTask,
+  getMe,
   getRun,
   getRunGraph,
   listWorkflows,
@@ -51,8 +55,18 @@ function hasAnyFilterParam(p: URLSearchParams): boolean {
   return FILTER_URL_KEYS.some((k) => p.has(k));
 }
 
-export default function RunPage({ params }: { params: Promise<{ id: string }> }) {
-  const { id } = use(params);
+export default function RunPage() {
+  // useRouteId() calls useSearchParams(), which suspends during prerender;
+  // the static export build fails without this boundary.
+  return (
+    <Suspense fallback={null}>
+      <RunPageInner />
+    </Suspense>
+  );
+}
+
+function RunPageInner() {
+  const id = useRouteId();
   const toast = useToast();
   const [run, setRun] = useState<RunDetail | null>(null);
   const [graph, setGraph] = useState<GraphResponse | null>(null);
@@ -61,6 +75,10 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
   const [conn, setConn] = useState<ConnStatus>("offline");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const router = useRouter();
+  // Archiving is admin-only server-side; the button follows so a non-admin is
+  // never offered an action that can only answer 403.
+  const [isAdmin, setIsAdmin] = useState(false);
   const [rerunOpen, setRerunOpen] = useState(false);
   const [view, setView] = useState<View>("graph");
   // Saved-workflow id matching this run's name, for the header backlink.
@@ -80,11 +98,22 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Auto-open the first task once per run; don't fight the user reclosing it.
   const didAutoSelect = useRef(false);
+  // Ticket for the newest in-flight load. `refetch` captures `id`, so opening
+  // run A and then run B before A's requests settle would otherwise let A's
+  // response land under B — B's id on screen, A's tasks below it. Each load
+  // takes a ticket and only the newest one is allowed to write.
+  const reqGen = useRef(0);
   const refetch = useCallback(() => {
+    // Take the ticket here, not inside the timeout: a load already in flight has
+    // to be superseded the moment a newer refetch is *requested*, including
+    // during the 150 ms debounce. Advancing it later left that window open —
+    // A's response could settle while A still held the newest ticket.
+    const gen = ++reqGen.current;
     if (timer.current) clearTimeout(timer.current);
     timer.current = setTimeout(() => {
       Promise.all([getRun(id), getRunGraph(id)])
         .then(([r, g]) => {
+          if (gen !== reqGen.current) return;
           setRun(r);
           setGraph(g);
           // Auto-open the deep-linked task (?task=<name or id>) or the first
@@ -101,7 +130,10 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
             return g.nodes[0]?.id ?? null;
           });
         })
-        .catch((e) => setError(String(e)));
+        .catch((e) => {
+          if (gen !== reqGen.current) return;
+          setError(String(e));
+        });
     }, 150);
   }, [id]);
 
@@ -178,6 +210,18 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
     };
   }, [run?.name]);
 
+  // Who is signed in, for the admin-only Archive action. Failure leaves it
+  // false — the button is hidden and the route would refuse anyway.
+  useEffect(() => {
+    let alive = true;
+    getMe()
+      .then((m) => alive && setIsAdmin(m.groups?.includes("admin") ?? false))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   // Cancel any queued refetch on unmount so it can't fire after navigation.
   useEffect(() => {
     return () => {
@@ -235,6 +279,31 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
     if (!confirm(`Clear "${name}" and re-run it plus everything downstream of it?`)) return;
     void act(() => clearTask(id, tid), "Task cleared — downstream re-running");
   };
+  // Archiving is archive-*then-purge*: the run leaves the hot store the moment
+  // its document is durably in the sink. So the confirm says where the run
+  // goes, not just that something will happen — and on success we navigate,
+  // because staying on a detail page for a run that no longer exists would
+  // just 404 on the next refetch.
+  const onArchive = () => {
+    if (
+      !confirm(
+        "Archive this run now?\n\nIt is written to the archive sink and then removed from the live store — " +
+          "it will move out of Runs and into the Archive tab. This cannot be undone from here.",
+      )
+    )
+      return;
+    setBusy(true);
+    archiveRun(id)
+      .then(() => {
+        toast("Run archived");
+        router.push("/runs/?tab=archive");
+      })
+      .catch((e) => {
+        setError(String(e));
+        toast(String(e), "error");
+        setBusy(false);
+      });
+  };
   const onApprove = (tid: string) => void act(() => approveTask(id, tid), "Gate approved");
   const onReject = (tid: string) => {
     if (!confirm("Reject this approval gate? The task fails and dependents skip.")) return;
@@ -264,7 +333,7 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
         <strong style={{ fontSize: 15, whiteSpace: "nowrap" }}>
           {run?.name ? (
             workflowId ? (
-              <Link href={`/workflows/${workflowId}/history`} style={{ color: "var(--fg)" }} title="Workflow history">
+              <Link href={`/workflows/history/?id=${workflowId}`} style={{ color: "var(--fg)" }} title="Workflow history">
                 {run.name}
               </Link>
             ) : (
@@ -329,6 +398,19 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
         )}
         {run && TERMINAL.has(run.status) && (
           <RerunMenu runId={id} disabled={busy} onError={setError} onEdit={() => setRerunOpen(true)} />
+        )}
+        {/* Terminal runs only: archiving purges the run from the hot store, so
+            offering it while the scheduler is still driving the DAG would be
+            offering to delete live state. */}
+        {run && TERMINAL.has(run.status) && isAdmin && (
+          <button
+            onClick={onArchive}
+            disabled={busy}
+            className="dy-btn"
+            title="Write this run to the archive sink and remove it from the live store"
+          >
+            Archive
+          </button>
         )}
         {/* Only for failures: triaging a run that succeeded would be recording
             a decision about a non-event. */}

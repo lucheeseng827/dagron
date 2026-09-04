@@ -41,6 +41,7 @@ the `argo` importer exists — prints a dagron DAG YAML to stdout), `dagron-mcp`
 | `postgres` | no | Postgres datastore: `LISTEN/NOTIFY` wake, `FOR UPDATE SKIP LOCKED` multi-worker claim. Required by HA and by the UI stack (`FEATURES: postgres,ops` in `compose.yaml`). |
 | `ops` | yes | The engine management API (`API_ADDR`), cron, retention GC, DB schedules, leadership. |
 | `kubernetes` | no | `EXECUTOR=kubernetes` (KubeExecutor). Without it that value is a startup error, never a silent downgrade. |
+| `mqtt` | no | `SOURCE=mqtt` — the open MQTT ingestion source, for plant floors, gateways and robot fleets. Without it that value is a startup error naming the rebuild, never a silent downgrade. Links `rumqttc` with the same rustls/ring stack the rest of the binary uses, so it adds no second crypto provider. |
 | `archive-s3` | no | Cloud GC archive sink over S3 (`GC_ARCHIVE_URL=s3://…`, incl. S3-compatible MinIO/Ceph via `AWS_ENDPOINT_URL`). A `GC_ARCHIVE_URL` scheme whose backend feature is absent is a startup error, never a silent downgrade — same contract as `kubernetes`. Implies `ops`. |
 | `archive-gcs` | no | Google Cloud Storage archive sink (`GC_ARCHIVE_URL=gs://…`; credentials from `GOOGLE_*` env). Implies `ops`. |
 | `archive-azure` | no | Azure Blob Storage archive sink (`GC_ARCHIVE_URL=az://…` or `azure://…`; credentials from `AZURE_*` env). Implies `ops`. |
@@ -59,7 +60,18 @@ All read in `crates/dagron-engine/src/lib.rs` unless noted.
 | `POLL_INTERVAL_MS` | u64 (ms) | `500` (floor 10) | Reconcile-loop timer bound — the longest the loop may sleep with work outstanding. The loop also wakes the moment a local task completes and (Postgres) on any `LISTEN/NOTIFY` event, so this timer is a safety net there; on SQLite it additionally paces time-based retries and parked sensors. Part of the low-latency profile ([docs/LOW_LATENCY.md](LOW_LATENCY.md)). |
 | `SWEEP_INTERVAL_MS` | u64 (ms) | = `POLL_INTERVAL_MS` (floor 10) | Cadence of the maintenance sweeps (expired-lease recovery, run deadlines, SLA alerts, approval expiry, sub-workflow / wait-sensor / dataset reconciliation). At the default this matches the old every-tick behaviour; profiles that shrink `POLL_INTERVAL_MS` set this back to ~`500` so faster ticks don't multiply sweep load. Sweeps only run when a tick runs, so the effective cadence is at least the time between ticks. |
 | `LEASE_SECS` | i64 | `30` (floor 3) | Claim-time task lease window, shared by both backends and by the heartbeat's renewals. A crashed scheduler's tasks wait out this window before any peer reclaims them, so shortening it shortens crash recovery; the worker heartbeat renews every ⌊lease/3⌋ s (floor 1 s), keeping the two-missed-renewals headroom at any setting. With `TASK_LEASE_HEARTBEAT=false`, tasks must finish inside one window — keep it above your longest `timeout_secs`. |
-| `SOURCE` | `file` \| `stream` | `file` | Workflow ingestion source. `file` = one-shot DAG file; `stream` = follow an NDJSON event file / named pipe ([docs/STREAMING.md](STREAMING.md)). Managed broker connectors (`redis`/`sqs`/`kafka`/`nats`/`events`) are part of dagron Enterprise and error at startup here with a pointer (`dagron-source/src/source.rs`). |
+| `MQTT_URL` | `mqtt://host[:port]` \| `mqtts://…` | `mqtt://127.0.0.1:1883` | `SOURCE=mqtt` only: the broker. `mqtts://` enables TLS with the platform root store (default port 8883, plain 1883). |
+| `MQTT_TOPIC` | topic filter | `dagron/workflows` | Topic to subscribe to; MQTT wildcards (`+`, `#`) are allowed, so one unit can serve a whole cell. Each message payload is a workflow spec (YAML, or JSON — YAML is a superset). |
+| `MQTT_CLIENT_ID` | string | `dagron-<uuid>` | MQTT client id. **Set a stable one per unit**: it is what makes offline redelivery possible, and it is what `MQTT_CLEAN_SESSION` defaults from. |
+| `MQTT_QOS` | `0` \| `1` \| `2` | `1` | Subscription QoS. `0` cannot redeliver, so a message lost in a disconnect is gone; `1`/`2` are the durable choices. |
+| `MQTT_USERNAME` | string | — | Broker username, when the broker authenticates. |
+| `MQTT_PASSWORD` | string | — | Broker password. Never printed by `dagron config` (redacted like every other secret knob), and not trimmed — a trailing space may be part of the credential. |
+| `MQTT_CLEAN_SESSION` | bool | `false` when `MQTT_CLIENT_ID` is set, else `true` | `false` keeps a persistent broker session, so QoS-1/2 messages published while the unit was offline are redelivered on reconnect — the whole point on a duty-cycled link. That only works if the broker sees the same client id again, so the default follows `MQTT_CLIENT_ID`: name one and the session resumes; leave it generated and the source starts clean rather than orphaning a session (and the messages queued against it) on every restart. `false` without a stable id is a startup error. |
+| `MQTT_KEEPALIVE_SECS` | u64 (s) | `30` | PING interval. `0` disables keepalive, which is what a link that is metered by the byte usually wants. |
+| `MQTT_DLQ_TOPIC` | topic | — (datastore `dead_letters` only) | Where a poison message is mirrored, in addition to the durable `dead_letters` row. It **must not** be matched by `MQTT_TOPIC`, or the source would consume its own dead letters and re-park them forever; that is a startup error, not a warning. The mirrored payload is truncated past 256 KiB (`truncated: true` on the envelope) — an envelope too large to encode would drop the connection and stall the subscription, and the durable row is the record that matters. |
+| `MQTT_POSITION_FIELD` | field name | — (at-least-once) | Opt in to exactly-once. Names a top-level field in the payload carrying a per-topic monotonic id **the producer assigns in order** (Sparkplug's `seq`, a device's own counter — *not* a CloudEvents `id` or a UUID, which are unique but unordered, so a cursor built from one would skip messages); the source commits it with the run it creates and skips — acking, never re-running — anything at or below the committed cursor. Unset, delivery is at-least-once. |
+| `SOURCE` | `file` \| `dir` \| `stream` \| `mqtt` | `file` | Workflow ingestion source. `file` = one-shot DAG file (emits once at startup, then drains); `dir` = **watch `WORKFLOW_DIR` for YAML** — a file added later runs, an edited file is re-submitted, and the process stays up because a watched directory is never exhausted; `stream` = follow an NDJSON event file / named pipe ([docs/STREAMING.md](STREAMING.md)). `mqtt` = subscribe to a broker topic and turn each message into a run (`--features mqtt`, see the `MQTT_*` rows). Managed broker connectors (`redis`/`sqs`/`kafka`/`nats`/`events`) and the fleet plane (`fleet`) are not in this build and error at startup with a pointer rather than starting a source you did not ask for (`dagron-source/src/source.rs`). |
+| `DIR_POLL_MS` | u64 (ms) | `2000` (floor 100) | `SOURCE=dir` only: how often `WORKFLOW_DIR` is re-scanned. A poll, not a watch — inotify does not fire on the mounts this is for (Docker/Podman bind mounts from a Windows or macOS host, NFS/SMB shares). One `readdir` plus a `stat` per file per scan. Each file's (mtime, length) is committed with the run it becomes (`source_offsets`, keyed `dir/<file>`), so a restart re-runs nothing that already ran. |
 | `STREAM_PATH` | path | — (required for `SOURCE=stream`) | NDJSON file or FIFO to follow; one workflow spec per line. A **directory** switches to sharded multi-consumer mode: each `*.ndjson` file is a partition, split across engines via per-partition leases (`source_partitions`), each shard with its own exactly-once cursor. |
 | `STREAM_MODE` | `auto` \| `file` \| `sharded` | `auto` | How `STREAM_PATH` is interpreted. `auto` inspects the path at startup (dir → sharded, file/FIFO → single-stream) and **errors when the path does not exist** — mode is fixed at startup, so it is never guessed. `file` waits for a single stream file to appear; `sharded` requires the shard directory. |
 | `STREAM_SUFFIX` | string | `.ndjson` | Sharded mode: which files in the directory are shards. |
@@ -70,6 +82,11 @@ All read in `crates/dagron-engine/src/lib.rs` unless noted.
 | `STREAM_DLQ_PATH` | path | `<STREAM_PATH>.dlq` | Poison-line mirror (NDJSON), alongside the durable `dead_letters` rows. |
 | `TASK_LEASE_HEARTBEAT` | bool | `true` | Workers renew a running task's lease every ⌊`LEASE_SECS`/3⌋ s (+`LEASE_SECS`, so 10 s +30 s at defaults) while it executes, so long tasks (training, consumers) are never reclaimed mid-run. `false` restores the old finish-inside-one-lease behaviour. |
 | `RUNNER_GANGS` | `1`/`true` | off | Gang co-scheduling ([docs/AI_WORKLOADS.md](AI_WORKLOADS.md)): claim `gang:` tasks all-or-nothing and cancel a failed member's siblings. Requires a scheduler built with the `enterprise` feature; inert otherwise. Composes with `POOLS` and `priority`: gang members inherit the task's `pool`, and a pooled gang is claimed only when its pool can seat **every** member at once (never partially, never over the cap); ordinary claims on this path keep the same priority ordering. |
+| `DAGRON_PRESSURE_FILE` | path | — (no gate) | Back-pressure gate for constrained hosts: while this file exists the engine claims **no new tasks** (a file whose first token is `0`, `false`, `off` or `resume` counts as absent, so an agent can flip it without deleting it). In-flight tasks finish and every other loop keeps running; only claiming stops. A thermal, battery or maintenance daemon owns the file. Note a one-shot `dagron <file>.yaml` will not exit while the gate is closed — its runs are still active. |
+| `DAGRON_MIN_FREE_BYTES` | u64 (bytes) | `0` (off) | Free-space floor on the SQLite datastore's filesystem. Below it, **new run creation is refused** rather than risking a half-written datastore: the ops API answers `507` + `Retry-After`, and the ingest source is throttled instead of dead-lettering the payload. Only the embedded backend enforces it; with Postgres the disk belongs to the database server. If the probe itself fails, the floor fails open with one warning. The `edge` profile sets 64 MiB. |
+| `DAGRON_CLOCK_CHECK_SECS` | u64 (s) | `30` (0 disables) | How often the wall clock is compared against the monotonic clock to detect a step. |
+| `DAGRON_CLOCK_STEP_TOLERANCE_MS` | u64 (ms) | `1000` | A wall-vs-monotonic disagreement above this is a step: the engine records `drifted` on runs it is executing and stamps new ones the same way. |
+| `DAGRON_CLOCK_SYNC_FILE` | path | — (no positive evidence) | A file whose existence means the clock is disciplined (e.g. `/run/systemd/timesync/synchronized`). Present ⇒ runs are stamped `synced`; absent ⇒ `unknown`, which is honest rather than optimistic. Re-checked every tick. |
 | `MAX_INFLIGHT_RUNS` | i64 | `64` | Admission valve: cap on simultaneously active runs; overflow stays buffered at the source. The ops API answers `429` + `Retry-After` above it. **`0` disables the cap** on both admission paths (the API check and the ingest actor's throttle); a negative value is normalized to `0`. |
 | `MAX_INFLIGHT_TASKS` | i64 | `0` (off) | Second admission dimension, on TASKS. Runs are the wrong unit on their own: a run of 100,000 tasks and a run of four both count as one against `MAX_INFLIGHT_RUNS`, so a fleet comfortably under the run cap can be far past what the scheduler and datastore carry. Counts `task_runs` in `pending`/`ready`/`running` (a task parked on an approval is not pressure and is excluded). Only queried when set, so the default path pays no extra round trip. |
 | `DAGRON_MAX_TASKS_PER_RUN` | usize | compiled ceiling (100000) | Per-run cap on the EXPANDED graph, enforced as a budget during expansion so a fan-out blow-up fails loudly instead of exhausting memory. May only LOWER the compiled ceiling — a larger value is ignored, because this knob exists to tighten a bound that prevents an OOM, not to widen it. |
@@ -77,9 +94,11 @@ All read in `crates/dagron-engine/src/lib.rs` unless noted.
 | `DATABASE_URL` | conn string | `postgres://localhost/workflow` | Postgres builds only; positional `DB_TARGET` wins. Redacted before logging. |
 | `API_ADDR` | `host:port` | unset = ops API **disabled** (`dagron dev` sets `127.0.0.1:8787`) | Bind address of the engine's unauthenticated ops API; also keeps the process resident. Invalid values warn and disable the API. |
 | `DAGRON_READY_TIMEOUT_MS` | u64 ≥ 50 | `500` | Budget for the ops API's `/readyz` datastore ping — 503 `datastore probe timed out` past it, so a wedged pool never hangs the probe past the kubelet's `timeoutSeconds`. Same knob (name and semantics) as dagron-api's. |
+| `DAGRON_CONSOLE` | `off`/`false`/`0`/`no` = unmount | unset = console served | Serves the operator console at `/` and `/console` on the ops API. Opt **out**, not in: the API those pages drive is on that socket either way, so unmounting the UI hides it and closes nothing. An ops API you need closed needs a network boundary — see `API_ADDR` above. |
 | `DOCKER_IMAGE` | image ref | `alpine:latest` | Default image for `EXECUTOR=docker` (also k8s fallback). |
 | `K8S_IMAGE` | image ref | `$DOCKER_IMAGE` → `alpine:latest` | Image for KubeExecutor. |
 | `K8S_NAMESPACE` | string | `default` | KubeExecutor namespace. |
+| `DAGRON_MAX_TASK_TIMEOUT_SECS` | u64 > 0 | unset = **no ceiling** | Upper bound on any single task's wall clock, applied by every executor (local, docker, k8s). A task's own `timeout_secs` is a *request*: it is clamped to this, and so is the 25 s default. Unset changes nothing, which is right for a self-host — it is your hardware. A multi-tenant install wants it set, because plan quotas cap tasks per day and runs per month while nothing capped how long one task may run, leaving worst-case compute per plan unbounded. A value that is not a positive integer (including `0`, which would time out every task instantly) is ignored with a warning rather than silently becoming a ceiling that is not one. |
 | `DAGRON_TASK_RUN_AS_USER` | uid | unset | KubeExecutor: stamp `runAsUser` (and `runAsNonRoot` when > 0) onto every task pod. Unset leaves the pod's user to the image, which is what happened before this existed — a task image's final `USER root` ran as root. |
 | `DAGRON_TASK_READ_ONLY_ROOT_FS` | `1`/`true` = on | off | KubeExecutor: `readOnlyRootFilesystem` + `allowPrivilegeEscalation: false` on task containers. |
 | `DAGRON_TASK_DROP_ALL_CAPABILITIES` | `1`/`true` = on | off | KubeExecutor: `capabilities.drop: [ALL]` on task containers. |
@@ -95,8 +114,8 @@ All read in `crates/dagron-engine/src/lib.rs` unless noted.
 | `CRON_CONFIG` | path | unset = cron off | Cron schedule YAML (below). Leadership-gated; keeps the process resident. |
 | `GC_RETENTION_SECS` | i64 > 0 | unset = GC off | Retention window for the run/task GC. Leadership-gated; resident. |
 | `GC_INTERVAL_SECS` | u64 | `3600` | GC sweep interval. |
-| `GC_ARCHIVE_DIR` | path | unset = plain purge | Archive-before-purge: the GC sweep exports each expired terminal run as a self-contained `dagron.run-archive.v1` JSON file (`run-<id>.json`: run + definition + tasks + outbox events; atomic tmp→fsync→rename) and purges **only** verified exports. Point it at an object-store-synced volume. |
-| `GC_ARCHIVE_URL` | `s3://` \| `gs://` \| `az://` \| `azure://` `bucket[/prefix]` | unset | Cloud archive-before-purge (**requires the matching cargo feature** — `archive-s3` / `archive-gcs` / `archive-azure`; a scheme without its feature is a startup error, never a silent plain purge). Same document/purge contract as `GC_ARCHIVE_DIR`, but each run is one atomic object `PUT`; credentials/region/endpoint from the backend's standard env (`AWS_*` — incl. `AWS_ENDPOINT_URL` for MinIO — / `GOOGLE_*` / `AZURE_*`). Wins over `GC_ARCHIVE_DIR`. |
+| `GC_ARCHIVE_DIR` | path | unset = plain purge | Archive-before-purge: the GC sweep exports each expired terminal run as a self-contained `dagron.run-archive.v1` JSON file (`run-<id>.json`: run + definition + tasks + outbox events; atomic tmp→fsync→rename) and purges **only** verified exports. Point it at an object-store-synced volume. **Set it on `dagron-api` too** — the same path/bucket — or the console cannot read archived runs back, and `POST /api/runs/{id}/archive` answers `501` rather than archiving. |
+| `GC_ARCHIVE_URL` | `s3://` \| `gs://` \| `az://` \| `azure://` `bucket[/prefix]` | unset | Cloud archive-before-purge (**requires the matching cargo feature** — `archive-s3` / `archive-gcs` / `archive-azure`; a scheme without its feature is a startup error, never a silent plain purge). Same document/purge contract as `GC_ARCHIVE_DIR`, but each run is one atomic object `PUT`; credentials/region/endpoint from the backend's standard env (`AWS_*` — incl. `AWS_ENDPOINT_URL` for MinIO — / `GOOGLE_*` / `AZURE_*`). Wins over `GC_ARCHIVE_DIR`. **Set it on `dagron-api` too** — the same bucket/prefix, and that binary built with the matching feature — or `POST /api/runs/{id}/archive` answers `501`, and the console cannot read archived runs back. |
 | `GC_ARCHIVE_COMPACT_MIN_AGE_DAYS` | i64 | `30` | `dagron archive-compact` only: documents younger than this stay **individually retrievable** (`/api/archive/runs/{id}`); older ones fold into the Parquet dataset and become analytics-only. `0` compacts everything eligible. |
 | `READY_AGE_ALERT_SECS` | i64 | `300` (`0` = off) | Stale-ready (unclaimable-class) alert: WARN when a runner class's oldest `ready` task has waited longer than this — catches a class no live scheduler serves. Leadership-gated; runs in any resident daemon. Same signal exported as `scheduler_ready_oldest_age_seconds{runner_class=…}`. |
 | `READY_AGE_CHECK_INTERVAL_SECS` | u64 | `60` | How often the stale-ready alert loop checks. |
@@ -112,6 +131,9 @@ All read in `crates/dagron-engine/src/lib.rs` unless noted.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | URL | unset = export off | With an `otel`-feature build, enables OTLP (HTTP/protobuf) span export to this collector (#28 follow-on); other `OTEL_EXPORTER_OTLP_*` vars tune headers/timeouts. Ignored without `--features otel`. See [OpenTelemetry](#opentelemetry---features-otel). |
 | `DAGRON_ARTIFACT_DIR` | path | unset = off | Local artifact store root; each task gets its run's shared dir injected as `DAGRON_ARTIFACTS`, plus a per-task `DAGRON_CHECKPOINT_DIR` under it for checkpoint-aware resume (`dagron-artifact`, [docs/AI_WORKLOADS.md](AI_WORKLOADS.md)). |
 | `DAGRON_ARTIFACT_URL` | `s3://` \| `gs://` \| `az://` bucket/prefix | unset = off | Cloud artifact/checkpoint location. The engine injects per-run/per-task URLs (`DAGRON_ARTIFACTS_URL`, `DAGRON_CHECKPOINT_URL`) — tasks reach the bucket with their own tooling — and the artifact API serves the same bucket via the `dagron-artifact` cloud backend (features `s3`/`gcs`/`azure`; credentials from the standard `AWS_*`/`GOOGLE_*`/`AZURE_*` env; takes precedence over `DAGRON_ARTIFACT_DIR` for API reads/writes). |
+| `DAGRON_ARTIFACT_TIER` | bool | — (tiering off) | Turn the artifact store into a **tiered** one: every write lands locally first and is uploaded to `DAGRON_ARTIFACT_URL` later, under a budget. Needs both `DAGRON_ARTIFACT_DIR` and `DAGRON_ARTIFACT_URL` — asking for tiering with only one of them is a startup error, never a silent downgrade. For units that capture data on a metered or intermittent link. |
+| `DAGRON_ARTIFACT_UPLINK_BYTES_PER_DAY` | u64 (bytes) | — (unlimited) | Daily uplink budget for the tiered store, counted in UTC days and persisted, so a restart does not hand the unit a fresh allowance. An artifact larger than the whole budget is skipped with a warning rather than blocking everything queued behind it. |
+| `DAGRON_BUNDLE_PUBKEYS` | comma-separated keys | — (bundles refused) | Trusted ed25519 public keys (32 bytes, hex or base64) for **signed workflow bundles** ([docs/BUNDLES.md](BUNDLES.md)). Verification fails closed: unset means every bundle is refused, and there is no unsigned path. |
 | *(injected into tasks)* | — | — | The engine sets these **in every task's environment** at dispatch (they are not read from the operator's environment): `DAGRON_RUN_ID` / `DAGRON_TASK` / `DAGRON_TASK_ID` (task identity, e.g. for `POST /runs/{id}/tasks/{task_id}/checkpoint`); `DAGRON_ARTIFACTS` + `DAGRON_CHECKPOINT_DIR` (when the local artifact store is on); `DAGRON_ARTIFACTS_URL` + `DAGRON_CHECKPOINT_URL` (when `DAGRON_ARTIFACT_URL` is set); and, on retry attempts of a task that reported a checkpoint, `DAGRON_RESUME_FROM` / `DAGRON_RESUME_MARKER` ([docs/AI_WORKLOADS.md](AI_WORKLOADS.md)). |
 | `DAGRON_SENSITIVE_ENV_PATTERNS` | comma list | `SECRET,TOKEN,PASSWORD,PASSWD,PWD,CREDENTIAL,APIKEY,ACCESS_KEY,PRIVATE_KEY` | Task env var **name** substrings (case-insensitive) whose values are masked to `***` in task output/logs (secret masking, #8). Set empty to disable name-based masking. |
 | `DAGRON_REDACT_ENV` | comma list | unset | Engine-process env var **names** whose values are always masked in task output (e.g. `DATABASE_URL`), on top of the name-pattern matching above. |
@@ -142,6 +164,7 @@ MAX_INFLIGHT_RUNS: 256
 | Profile | Presets | Intent |
 | --- | --- | --- |
 | `low-latency` | `POLL_INTERVAL_MS=25`, `SWEEP_INTERVAL_MS=500`, `LEASE_SECS=5` | The trading-desk engine tuning ([docs/LOW_LATENCY.md §6](LOW_LATENCY.md)); pair with `RUNNER_CLASSES` pulse segmentation and a same-AZ Postgres. |
+| `edge` | `WORKER_COUNT=2`, `POLL_INTERVAL_MS=1000`, `SWEEP_INTERVAL_MS=5000`, `MAX_INFLIGHT_RUNS=4`, `MAX_INFLIGHT_TASKS=64`, `DAGRON_MIN_FREE_BYTES=67108864` | Constrained gateways, robots and vehicles ([docs/EDGE_PROFILE.md](EDGE_PROFILE.md)): few workers, slow ticks, small in-flight caps, and a 64 MiB free-disk floor so a full flash device refuses new runs instead of corrupting its datastore. |
 | `throughput` | *(none — stock defaults)* | Declares the intent in a reviewed file without changing anything. |
 
 An unknown key or unknown profile in the file is a **startup error** (a
@@ -153,6 +176,12 @@ serves the same at `GET /config`, and startup logs the fingerprint — two
 replicas with the same fingerprint run the same knob values. Deliberately no
 hot reload: settings are boot-immutable (the audit story); the short runtime
 allow-list stays proposed (LOW_LATENCY S-5).
+
+Some `DAGRON_*` families belong to *other* dagron components that legitimately
+share a shell with the engine — the API edge's `DAGRON_JWT_*`, the MCP adapter's
+`DAGRON_MCP_*`, and `DAGRON_FLEET_*`, which an optional sidecar worker reads and
+the engine never does. Those are registered as foreign and the scan stays quiet
+about them; they are documented by the component that owns them, not here.
 
 ## S3-compatible object storage (MinIO / Ceph) — air-gapped archive tier
 
@@ -220,7 +249,8 @@ Postgres-only service (SSE needs `LISTEN/NOTIFY`).
 | `GIT_API_BASE` | URL | `https://api.github.com` | GitHub API root (GHE). |
 | `DAGRON_GIT_ALLOW_INSECURE` | bool | `false` | Permit `http`/`git`/`file` clone transports for registered GitOps repos (tests / air-gapped dev only — off so a server-side clone can't be pointed at plaintext, an internal host, or a local path). |
 | `DAGRON_ARTIFACT_MAX_BYTES` | usize | `134217728` (128 MiB) | Body cap for artifact PUTs (separately from the 1 MiB core cap). |
-| `DAGRON_AUDIT_SINK_URL` / `DAGRON_AUDIT_SINK_TOKEN` | URL / bearer | unset = local audit table only | Enterprise builds: forward each audit record to a central sink (fire-and-forget). |
+| `DAGRON_ARTIFACT_SYNC_SECS` | u64 (s) | `60` (0 disables) | How often the tiered artifact store drains to its remote tier (`DAGRON_ARTIFACT_TIER`). A no-op for every other store, so the loop is harmless when tiering is off; `POST /api/artifacts/sync` is the on-demand path for a unit that has just docked. |
+| `DAGRON_AUDIT_SINK_URL` / `DAGRON_AUDIT_SINK_TOKEN` | URL / bearer | unset = local audit table only | Read where the `enterprise` feature is on: forward each audit record to a central sink (fire-and-forget). |
 
 Every knob above is registered in `crates/dagron-api/src/config.rs`: startup
 logs each explicitly-set value (secrets redacted) plus a **configuration
@@ -229,16 +259,17 @@ can alert when one replica's settings drift from the reviewed deployment.
 
 ## Artifact encryption at rest (envelope / BYOK-KMS) & key rotation
 
-> **Enterprise.** Envelope mode — data keys wrapped by a KEK you control — ships
-> with dagron Enterprise. An open build that is handed a `DAGRON_ENV_KEK_PROVIDER`
+> **Not in this build.** Envelope mode — data keys wrapped by a KEK you
+> control — is not implemented here. A build handed a `DAGRON_ENV_KEK_PROVIDER`
 > **refuses to start the path with a signpost** rather than quietly falling back,
 > because silently downgrading a deployment that asked for KMS to a single env-var
 > key is not a surprise anyone should find in a ciphertext dump.
 >
-> **Open in every build:** environment secrets encrypted with AES-256-GCM under
-> `DAGRON_ENV_SECRET_KEY` (the `v1:` format — see [`HOWTO.md` §5](HOWTO.md)), and
-> the plain artifact store (`DAGRON_ARTIFACT_DIR` / `DAGRON_ARTIFACT_URL`). Only
-> the KEK layer above them is paid.
+> **Present in this build:** environment secrets encrypted with AES-256-GCM
+> under `DAGRON_ENV_SECRET_KEY` (the `v1:` format — see
+> [`HOWTO.md` §5](HOWTO.md)), and the plain artifact store
+> (`DAGRON_ARTIFACT_DIR` / `DAGRON_ARTIFACT_URL`). Only the KEK layer above
+> them is missing.
 
 Read by `dagron-crypto` (used by `dagron-api` on write and `dagron-engine` on
 decrypt). With a KEK provider set, artifacts (and DB secrets) are envelope-
@@ -319,6 +350,25 @@ per-task fields (`dagron-core/src/dag.rs`, `TaskSpec`): `command` (argv list),
 `retry_max_delay_secs` (backoff ceiling), `retry_on_timeout` (default `true`; set
 `false` so a task killed by its `timeout_secs` deadline fails at once instead of
 burning its remaining `max_attempts` — timeout-only, other failures still retry),
+`retry_budgets: { <fault-class>: <attempts>, … }` (per-fault-class attempt
+budgets — how many attempts this task gets *given what broke*, so an ECC error
+and a NaN loss do not draw from the same three. Resolved most-specific first:
+this map's entry for the class that occurred, then the class's disposition
+default (infrastructure **5**, platform **3**, application **1**), then
+`max_attempts`. That fallback is **not a ceiling over the classified cases**:
+failures classify from their own output with no opt-in, so a task that never
+sets this field still takes the disposition default when its failure matches a
+class — `max_attempts: 3` runs 5 times for a `gpu-ecc` and once for a
+`nan-loss`. That is the feature working, but it does move attempt counts on
+existing workflows; name a class here to pin it back to a number you choose.
+`max_attempts` applies in two cases: a failure that classified as nothing, and
+one whose class carries the *unknown* disposition (`nccl-timeout`, `unknown`),
+whose default budget is `0` on purpose — an uncorroborated collective timeout is
+a symptom, so it declines to set a policy and leaves `max_attempts` deciding.
+`0` means the attempt that just ran was the last one; `retry_on_timeout: false` still applies first and still wins.
+Keys are validated at parse — an unknown class is an error, not an inert
+policy — and the vocabulary is `dagron-autopsy --explain`
+([docs/HPC_AUTOPSY.md](HPC_AUTOPSY.md))),
 `timeout_secs` (default **25 s**, chosen to sit inside the 30 s task lease —
 `dagron-executor/src/executor.rs`),
 `priority` (default `0`; dispatch order among simultaneously-`ready` tasks —
@@ -351,8 +401,10 @@ in the registry + lineage ledger, waking dataset sensors and firing
 executor extras (`docker_image`,
 `resources`, `service_account`, `runner_class`). A `task_defaults:` block sets
 DAG-wide defaults for `max_attempts`, `retry_delay_secs`, `retry_max_delay_secs`,
-`retry_on_timeout`, `timeout_secs`, `docker_image`, `runner_class`, `priority`,
-`pool`, and `env` (a task's own value always wins).
+`retry_on_timeout`, `retry_budgets`, `timeout_secs`, `docker_image`,
+`runner_class`, `priority`, `pool`, and `env` (a task's own value always wins —
+and `retry_budgets` merges **per class**, so a task that overrides one class
+still inherits the rest rather than silently dropping them).
 
 DAG-level fields (`DagSpec`): `run_timeout_secs` (hard run deadline → cancel),
 `deadline` (soft SLA → alert), `max_active_runs` (default unlimited; the max number
@@ -364,15 +416,15 @@ submissions requeue, and schedule/backfill fires wait for a slot), `result_from`
 registry surfaces them on `GET /api/workflows` and filters with `?tag=<t>`; the
 engine ignores them), and `on_datasets` (dataset triggers: fire a run of this
 **registered** workflow when a subscribed dataset records an update, with the
-trigger injected as `{{ trigger_dataset }}`; the open build subscribes **one**
-dataset — multi-dataset composition with `datasets_mode: any|all` ships with
-dagron Enterprise; [docs/DATASETS.md](DATASETS.md)).
+trigger injected as `{{ trigger_dataset }}`; this build subscribes **one**
+dataset — multi-dataset composition with `datasets_mode: any|all` is not in
+this build; [docs/DATASETS.md](DATASETS.md)).
 
 ## Data formats & compatibility
 
 - **State schema** = embedded sqlx migrations, applied automatically at
-  startup: `crates/dagron-core/migrations/` (SQLite, 001–033) and
-  `migrations_pg/` (Postgres, 001–040). Forward-only — there are no down
+  startup: `crates/dagron-core/migrations/` (SQLite, 001–040) and
+  `migrations_pg/` (Postgres, 001–051). Forward-only — there are no down
   migrations, so **back up before upgrading** (see
   [`OPERATIONS.md`](OPERATIONS.md#backup--restore--what-is-the-state)). `dagron-api` additionally
   ensures its own `users`/`git_repos` tables and the additive

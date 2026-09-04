@@ -237,15 +237,17 @@ impl Actor for IngestActor {
                         // create_run can fail transiently (a DB blip), so retry
                         // via nack up to the threshold before giving up.
                         Err(e) => {
-                            // Per-workflow concurrency cap (#21) is a "try later",
+                            // A capacity refusal (#21 concurrency cap, or the
+                            // constrained-host free-disk floor) is a "try later",
                             // not a poison: requeue without counting toward the
                             // dead-letter threshold, so a valid workflow submitted
-                            // while at capacity is never dead-lettered — it
-                            // redelivers and starts once a run slot frees.
-                            if e.downcast_ref::<dagron_core::models::MaxActiveRunsReached>()
-                                .is_some()
-                            {
-                                info!(error = %e, "at max_active_runs — nacking for later redelivery");
+                            // while the unit is full is never dead-lettered — it
+                            // redelivers and starts once a run slot or some disk
+                            // frees. Both conditions arrive in bursts and affect
+                            // every message equally, which is exactly when
+                            // dead-lettering would consume the whole backlog.
+                            if dagron_core::models::is_capacity_refusal(&e) {
+                                info!(error = %e, "datastore at capacity — nacking for later redelivery");
                                 if let Err(e) = state.source.nack(&message.handle).await {
                                     warn!(error = %e, "nack failed — message redelivers after timeout");
                                 }

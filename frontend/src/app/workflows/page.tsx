@@ -65,7 +65,7 @@ export default function WorkflowsPage() {
     setBusy(id);
     try {
       const { run_id } = await runWorkflow(id);
-      router.push(`/runs/${run_id}`);
+      router.push(`/runs/detail/?id=${run_id}`);
     } catch (e) {
       setError(errMsg(e));
       setBusy(null);
@@ -172,7 +172,7 @@ export default function WorkflowsPage() {
               {/* workflow */}
               <div style={{ minWidth: 0 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <Link href={`/workflows/${r.id}/history`} style={{ fontWeight: 600, color: "var(--fg)" }} title="Run history & task health">
+                  <Link href={`/workflows/history/?id=${r.id}`} style={{ fontWeight: 600, color: "var(--fg)" }} title="Run history & task health">
                     {r.name}
                   </Link>
                   <SourceBadge source={r.source} />
@@ -222,7 +222,7 @@ export default function WorkflowsPage() {
                     ▶
                   </IconBtn>
                 )}
-                <Link href={`/workflows/${r.id}`} className="dy-iconbtn" title="Edit" aria-label={`Edit ${r.name}`}>
+                <Link href={`/workflows/detail/?id=${r.id}`} className="dy-iconbtn" title="Edit" aria-label={`Edit ${r.name}`}>
                   ✎
                 </Link>
                 <IconBtn title="Delete" ariaLabel={`Delete ${r.name}`} disabled={busy === r.id} onClick={() => onDelete(r.id)}>
@@ -243,7 +243,7 @@ export default function WorkflowsPage() {
             // the chips as siblings that filter exactly as they do in the table.
             <div key={r.id} className="dy-card" style={{ position: "relative", opacity: r.paused ? 0.65 : 1 }}>
               <div style={{ position: "absolute", top: 0, left: 0, width: 3, height: "100%", background: statusColor((r.last_status ?? "pending") as TaskStatus) }} />
-              <Link href={`/workflows/${r.id}/history`} style={{ display: "block", color: "var(--fg)" }}>
+              <Link href={`/workflows/history/?id=${r.id}`} style={{ display: "block", color: "var(--fg)" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
                   <strong>{r.name}</strong>
                   <SourceBadge source={r.source} />

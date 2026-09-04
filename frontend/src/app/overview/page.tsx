@@ -247,7 +247,7 @@ export default function OverviewPage() {
             </span>
           </div>
           {nextRuns.map((w) => (
-            <Link key={w.id} href={`/workflows/${w.id}`} className="dy-row" style={{ gap: 14 }}>
+            <Link key={w.id} href={`/workflows/detail/?id=${w.id}`} className="dy-row" style={{ gap: 14 }}>
               <span className="mono" style={{ width: 56, color: "var(--muted)", flexShrink: 0 }}>
                 {w.next_fire_at ? hhmm(w.next_fire_at) : "—"}
               </span>
@@ -272,7 +272,7 @@ export default function OverviewPage() {
             <Link href="/runs">View all →</Link>
           </div>
             {recent.map((r) => (
-              <Link key={r.id} href={`/runs/${r.id}`} className="dy-row">
+              <Link key={r.id} href={`/runs/detail/?id=${r.id}`} className="dy-row">
                 <span className="dy-dot" style={{ background: statusColor(r.status as TaskStatus) }} />
                 <span style={{ minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                   {r.name ?? r.id.slice(0, 8)}

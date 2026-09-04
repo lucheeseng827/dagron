@@ -1,0 +1,150 @@
+# 05 — Daily paid-media cost sync, backfillable to any past day.
+#
+#   pull ×5 networks ─▶ conform ─▶ load(Snowflake) ─▶ push spend back to HubSpot
+#
+# Every task keys off `{{ scheduled_time }}` — the *nominal* fire time a schedule
+# or backfill hands the run, not `now`. That single substitution is what makes
+# a re-run of 2026-06-14 process the 14th instead of today, so restating a month
+# after Google reports late conversions is a backfill, not a fork of the DAG:
+#
+#   # Schedules and backfills live on the management API server (dagron-api,
+#   # port 8080 by default) — not on the engine's own ops port, which serves the
+#   # shorter /runs surface the README and 04 use. $SCHED is this workflow's
+#   # schedule id (GET /api/schedules).
+#   curl -X POST localhost:8080/api/backfills \
+#        -H 'content-type: application/json' \
+#        -d "{\"schedule_id\":$SCHED,\"from\":\"2026-06-01T00:00:00Z\",\"to\":\"2026-06-30T23:59:59Z\"}"
+#
+# The engine paces the job (`GET /api/backfills/{id}` to watch it); the
+# synchronous form is `POST /api/schedules/{id}/backfill` for small ranges.
+#
+# `cache:` is keyed on the same value, so a re-run after a downstream bug reuses
+# the API pulls it already paid for and only redoes the work that changed.
+# Ads APIs rate-limit hard, so retries back off exponentially but are capped
+# (`retry_max_delay_secs`) — an uncapped doubling turns a 30-second blip into a
+# 20-minute stall.
+name: mktg_paid_media_cost_sync
+tags: [marketing, paid-media, etl, backfill]
+environment: prod
+run_timeout_secs: 7200
+deadline: { in: 90m }
+max_active_runs: 3            # a 30-day backfill fires 30 runs; run three at a time
+parameters:
+  scheduled_time: ""          # filled by cron / schedules / backfill catch-up
+
+task_defaults:
+  max_attempts: 5
+  retry_delay_secs: 15
+  retry_max_delay_secs: 300
+  timeout_secs: 900
+  env:
+    - { name: GOOGLE_ADS_TOKEN, value_from: { secret: GOOGLE_ADS_REFRESH_TOKEN } }
+    - { name: META_ADS_TOKEN, value_from: { secret: META_ADS_ACCESS_TOKEN } }
+    - { name: LINKEDIN_TOKEN, value_from: { secret: LINKEDIN_ADS_TOKEN } }
+    - { name: REDDIT_TOKEN, value_from: { secret: REDDIT_ADS_TOKEN } }
+    - { name: HUBSPOT_TOKEN, value_from: { secret: HUBSPOT_PRIVATE_APP_TOKEN } }
+    - { name: SNOWFLAKE_PWD, value_from: { secret: SNOWFLAKE_PASSWORD } }
+    - { name: LAKE_BUCKET, value: "{{ env.LAKE_BUCKET }}" }
+    # The nominal fire time reaches the shell through the environment, not
+    # through the command string: it is submit-time input, and `date -u -d`
+    # deserves a quoted variable rather than a pasted one.
+    - { name: SCHEDULED_TIME, value: "{{ scheduled_time }}" }
+
+tasks:
+  # One instance per ad network, named after the network. `pool: ads-api` caps
+  # how many of them hold a vendor connection at once across every run — which
+  # matters most during a backfill, when 30 days fire at the same time.
+  - name: pull
+    with_items:
+      - { network: google-ads }
+      - { network: meta-ads }
+      - { network: linkedin-ads }
+      - { network: reddit-ads }
+      - { network: bing-ads }
+    instance_key: "{{ item.network }}"
+    pool: ads-api
+    cache:
+      key: "adspend-{{ item.network }}-{{ scheduled_time }}"
+      max_age_secs: 604800      # a closed day never changes; a week is generous
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        # A backfill's entire promise is that it processes its nominal day rather
+        # than today. So an unparseable non-empty `scheduled_time` stops the task:
+        # the old `|| date -u +%F` fallback turned a mistyped backfill window into
+        # a run that DELETEs and reloads *today's* partition with another day's
+        # numbers. Empty is the ordinary manual run, and only that falls back.
+        if [ -n "$SCHEDULED_TIME" ]; then
+          day=$(date -u -d "$SCHEDULED_TIME" +%F) || {
+            echo "scheduled_time '$SCHEDULED_TIME' is not a timestamp this image can parse" >&2
+            exit 1
+          }
+        else
+          day=$(date -u +%F)
+        fi
+        ads-pull --network {{ item.network }} --date "$day" \
+          --metrics spend,impressions,clicks,conversions \
+          --dimensions campaign,adgroup,utm_campaign,utm_content \
+          > "$DAGRON_ARTIFACTS/{{ item.network }}.ndjson"
+
+  - name: conform
+    depends_on: [pull]
+    timeout_secs: 1200
+    command: ["sh", "-c", "conform-adspend --in \"$DAGRON_ARTIFACTS\" --currency USD --out \"$DAGRON_ARTIFACTS/spend.ndjson\""]
+
+  - name: land_s3
+    depends_on: [conform]
+    produces: ["s3://acme-lake/marketing/adspend"]
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        if [ -n "$SCHEDULED_TIME" ]; then
+          day=$(date -u -d "$SCHEDULED_TIME" +%F) || {
+            echo "scheduled_time '$SCHEDULED_TIME' is not a timestamp this image can parse" >&2
+            exit 1
+          }
+        else
+          day=$(date -u +%F)
+        fi
+        aws s3 cp "$DAGRON_ARTIFACTS/spend.ndjson" \
+          "s3://$LAKE_BUCKET/marketing/adspend/dt=$day/part-$DAGRON_RUN_ID.ndjson"
+
+  # Idempotent by design: DELETE the partition, then COPY it. A retry that lands
+  # mid-load must not double-count spend — nothing erodes trust in a marketing
+  # dashboard faster than a CAC that moves when nobody changed anything.
+  - name: load_warehouse
+    depends_on: [land_s3]
+    max_attempts: 3
+    timeout_secs: 1800
+    produces: ["snowflake://analytics/marketing/fact_ad_spend"]
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        if [ -n "$SCHEDULED_TIME" ]; then
+          day=$(date -u -d "$SCHEDULED_TIME" +%F) || {
+            echo "scheduled_time '$SCHEDULED_TIME' is not a timestamp this image can parse" >&2
+            exit 1
+          }
+        else
+          day=$(date -u +%F)
+        fi
+        snowsql -q "DELETE FROM analytics.marketing.fact_ad_spend WHERE spend_date = '$day';
+                    COPY INTO analytics.marketing.fact_ad_spend
+                    FROM @mktg_stage/marketing/adspend/dt=$day/ FILE_FORMAT=(TYPE=JSON);"
+
+  - name: push_to_hubspot
+    depends_on: [load_warehouse]
+    pool: crm-api
+    produces: ["hubspot://marketing/campaigns/spend"]
+    command: ["sh", "-c", "hubspot-campaign-spend --input \"$DAGRON_ARTIFACTS/spend.ndjson\" --token \"$HUBSPOT_TOKEN\""]
+
+  - name: freshness_metric
+    hook: on_exit
+    max_attempts: 1
+    command: ["sh", "-c", "emit-metric mktg.adspend.sync_age_hours 0"]

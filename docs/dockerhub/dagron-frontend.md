@@ -1,5 +1,18 @@
 # dagron console (`mancube/dagron-frontend`)
 
+> ## ⚠️ Deprecated — removed in 1.0.0
+>
+> The console now ships **inside `mancube/dagron-api`**, which serves it at `/` with
+> the API under `/api` on the same origin. This image is a Node runtime with nothing
+> left to do, and it is 281 MB against the 16 MB the console actually needs.
+>
+> **Migrating:** drop the `frontend` service and its `:3000` publish, and open the
+> API's port instead. One origin means no proxy — which also fixes live updates,
+> since the proxy this image ran buffered `text/event-stream` and never opened it.
+>
+> It keeps publishing until 1.0.0 so a pinned tag does not vanish underneath you.
+
+
 **The dagron operator console — a Next.js UI for workflows, runs, schedules, and metrics, talking to `dagron-api`.**
 
 - **Image:** `mancube/dagron-frontend` — Next.js **standalone** server on a **Chainguard (distroless, Wolfi) node** base, runs **nonroot** (uid 65532).

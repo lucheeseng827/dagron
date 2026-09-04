@@ -1,0 +1,36 @@
+[package]
+name = "dagron-autopsy"
+version = "0.1.0"
+edition = "2021"
+description = "dagron job autopsy — schedules nothing. Sits beside an existing Slurm cluster, joins sacct + DCGM + NCCL logs + InfiniBand counters against a job's node set and time window, and emits a fault-attributed job record: what broke, on which device, when, with the evidence."
+
+[[bin]]
+name = "dagron-autopsy"
+path = "src/main.rs"
+
+[lib]
+name = "dagron_autopsy"
+path = "src/lib.rs"
+
+[features]
+# dagron-core is here for one thing — the shared fault taxonomy — but it also
+# carries the datastore facade, which insists on exactly one backend. Forwarded
+# the same way ee/dagron-placement does, defaulting to the workspace's sqlite so
+# `cargo build --workspace` resolves.
+#
+# Nothing in the collect → correlate → emit path touches a database: the tool's
+# whole premise is that it installs on a cluster that has never heard of dagron.
+default = ["sqlite"]
+sqlite = ["dagron-core/sqlite"]
+postgres = ["dagron-core/postgres"]
+
+[dependencies]
+# The vocabulary. Deliberately the *same* enum the engine's retry budget reads —
+# two copies of a fault taxonomy is how the tool and the scheduler come to
+# disagree about what happened.
+dagron-core = { path = "../dagron-core", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `serde` because the emitted record is JSON and every field in it is a time.
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"

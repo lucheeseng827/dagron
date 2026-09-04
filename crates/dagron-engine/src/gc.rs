@@ -224,25 +224,12 @@ pub async fn sweep_archive(
     Ok((total_archived, total_purged))
 }
 
-/// Atomically write one run's archive document: tmp file → fsync → rename to
-/// `run-<id>.json`. Overwriting an existing archive (a crash between archive
-/// and purge) is the idempotent re-do, not an error.
+/// Atomically write one run's archive document. The fsync chain moved to
+/// [`dagron_core::archive::write_document`] when dagron-api gained a per-run
+/// archive route: two processes now treat a successful write as purge
+/// permission, and that contract needs one implementation, not two.
 fn write_archive(dir: &Path, run_id: &str, doc: &serde_json::Value) -> std::io::Result<PathBuf> {
-    use std::io::Write;
-    std::fs::create_dir_all(dir)?;
-    let final_path = dir.join(format!("run-{run_id}.json"));
-    let tmp_path = dir.join(format!(".run-{run_id}.json.tmp"));
-    let mut f = std::fs::File::create(&tmp_path)?;
-    serde_json::to_writer(&mut f, doc).map_err(std::io::Error::other)?;
-    f.flush()?;
-    f.sync_all()?;
-    std::fs::rename(&tmp_path, &final_path)?;
-    // The rename's directory-entry update is not durable until the parent
-    // directory is fsynced too — without this, a crash after the (verified)
-    // archive+purge could revert the entry and lose the run entirely.
-    // Propagate failure so the caller keeps the run in the hot store.
-    std::fs::File::open(dir)?.sync_all()?;
-    Ok(final_path)
+    dagron_core::archive::write_document(dir, run_id, doc)
 }
 
 #[cfg(all(test, feature = "sqlite"))]

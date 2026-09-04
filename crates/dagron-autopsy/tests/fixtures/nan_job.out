@@ -1,0 +1,5 @@
+node-40:41221:41310 [0] NCCL INFO NET/IB : Using [0]mlx5_0:1/IB nranks=128
+step 8100 loss 1.9931
+step 8200 loss nan
+[rank0]: RuntimeError: Found NaN in loss, aborting run at step 8213
+[rank1]: [E ProcessGroupNCCL.cpp:563] [Rank 1] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=88214, Timeout(ms)=600000) ran for 600351 milliseconds before timing out.

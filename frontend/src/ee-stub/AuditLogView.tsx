@@ -20,7 +20,7 @@ export default function AuditLogView() {
         <p style={{ margin: 0, lineHeight: 1.7, color: "var(--muted)" }}>
           The audit trail — every successful mutation recorded with who / what / when, plus the
           read-only <code className="mono">viewer</code> role — is part of{" "}
-          <strong>dagron Enterprise</strong>. This build (OSS) does not record or serve audit
+          <strong>not part of this build</strong>. This build does not record or serve audit
           entries.
         </p>
       </div>

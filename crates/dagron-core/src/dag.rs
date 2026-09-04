@@ -133,6 +133,30 @@ pub struct TaskSpec {
     /// retry. Falls back to [`TaskDefaults::retry_on_timeout`], then `true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_on_timeout: Option<bool>,
+    /// Per-fault-class attempt budgets — how many attempts this task gets
+    /// *given what broke*.
+    ///
+    /// `max_attempts` spends the same budget on every failure, which is why
+    /// teams wrap schedulers in bespoke retry bash: an ECC error and a NaN loss
+    /// draw from the same three attempts, so infra faults give up too early and
+    /// application faults burn GPU-hours proving a determinism nobody doubted.
+    ///
+    /// ```yaml
+    /// retry_budgets:
+    ///   gpu-ecc: 8          # the node broke; try elsewhere, liberally
+    ///   fabric-ib: 8
+    ///   nan-loss: 0         # never again — the next attempt diverges too
+    ///   checkpoint-corrupt: 0
+    /// ```
+    ///
+    /// Keys are [`crate::fault::FaultClass`] strings and are validated at parse
+    /// (an unknown key is a typo that would silently never fire, so it is a
+    /// hard error rather than a shrug). A class with no entry falls back to its
+    /// disposition default, then to `max_attempts` — see
+    /// [`crate::models::effective_budget`]. `0` means the attempt that just ran
+    /// was the last one.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub retry_budgets: std::collections::BTreeMap<String, u32>,
     /// Per-task subprocess timeout in seconds. Falls back to the 25 s hard limit when absent.
     pub timeout_secs: Option<u64>,
     /// Docker image for this task. Used by DockerExecutor; ignored by LocalExecutor.
@@ -354,7 +378,7 @@ pub struct WaitSpec {
     /// Dataset to wait on — a **dataset sensor** (Dagster asset sensor /
     /// Airflow dataset-condition). The task parks holding no worker slot and
     /// succeeds when the named dataset records an update **after** the park
-    /// (a `produces:` task succeeded, or — Enterprise — an external dataset
+    /// (a `produces:` task succeeded, or — feature-gated — an external dataset
     /// event was posted). Updates already in the ledger at park time do not
     /// count: the sensor waits for *fresh* data, not any data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -733,15 +757,15 @@ pub struct DagSpec {
     /// **Dataset triggers** (Airflow dataset scheduling / Dagster asset
     /// sensors): fire a run of this *registered* workflow when one of these
     /// datasets records a new update (a task with a matching `produces:`
-    /// succeeded, or — Enterprise — an external event was posted). The open
-    /// build supports exactly **one** dataset here; subscribing to several
-    /// (fan-in composition, with [`DagSpec::datasets_mode`]) ships with dagron
-    /// Enterprise. Fires coalesce: updates that arrive while a fire is being
+    /// succeeded, or — where the feature is on — an external event was
+    /// posted). This build supports exactly **one** dataset here; subscribing to
+    /// several (fan-in composition, with [`DagSpec::datasets_mode`]) is not in
+    /// this build. Fires coalesce: updates that arrive while a fire is being
     /// processed produce one run, not one per event. Empty = not
     /// dataset-triggered.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub on_datasets: Vec<String>,
-    /// How multiple [`DagSpec::on_datasets`] entries combine (**Enterprise**):
+    /// How multiple [`DagSpec::on_datasets`] entries combine (**feature-gated**):
     /// `"any"` — fire when any subscribed dataset updates (default); `"all"` —
     /// fire only once *every* subscribed dataset has updated since the last
     /// fire (the Airflow AND-of-datasets semantics, e.g. "refresh the join
@@ -774,6 +798,14 @@ pub struct TaskDefaults {
     /// that does not set its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_on_timeout: Option<bool>,
+    /// DAG-wide [`TaskSpec::retry_budgets`]. Applies **per class**, not
+    /// wholesale: a task that names `nan-loss` keeps its own number and still
+    /// inherits the default's `gpu-ecc`. Written the other way — all-or-nothing
+    /// — a task overriding one class would silently lose every other budget the
+    /// workflow declared, which is precisely the failure this feature exists to
+    /// stop.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub retry_budgets: std::collections::BTreeMap<String, u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -942,7 +974,7 @@ impl DagGraph {
 
         // Dataset triggers (`on_datasets:`): valid, deduplicated URIs. The open
         // build fires on a single dataset; multi-dataset composition (and its
-        // `datasets_mode`) is the Enterprise data-aware scheduler — reject with
+        // `datasets_mode`) is the feature-gated data-aware scheduler — reject with
         // a signpost, not a silent partial subscription (the SOURCE-connector
         // funnel pattern).
         {
@@ -974,8 +1006,8 @@ impl DagGraph {
             {
                 bail!(
                     "DAG '{}' subscribes to {} datasets{}: multi-dataset triggers and \
-                     `datasets_mode` composition (any-of / all-of fan-in) ship with dagron \
-                     Enterprise — https://github.com/lucheeseng827/dagron#dagron-enterprise. \
+                     `datasets_mode` composition (any-of / all-of fan-in) are not in \
+                     this build — https://github.com/lucheeseng827/dagron#what-this-build-does-not-do. \
                      This build fires on a single dataset: keep exactly one `on_datasets` \
                      entry (and omit `datasets_mode`), or split consumers into one \
                      workflow per upstream dataset.",
@@ -989,6 +1021,41 @@ impl DagGraph {
         for task in &spec.tasks {
             if node_index.contains_key(&task.name) {
                 bail!("duplicate task name '{}' in DAG '{}'", task.name, spec.name);
+            }
+            // A `retry_budgets` key that does not match a fault class *exactly*
+            // never matches anything at runtime — the lookup is by
+            // `FaultClass::as_str()`, so a key stored as `GPU_ECC` is a policy
+            // the author wrote that silently does nothing, on the path that
+            // decides whether to spend another thousand GPU-hours.
+            //
+            // Checking `FaultClass::parse(key) != Unknown` is *not* enough, and
+            // that was the original bug here: `parse` is deliberately tolerant
+            // (it lowercases and maps `_` to `-`) so it can read rows written by
+            // other builds. Using a tolerant reader as a strict validator
+            // accepts `GPU_ECC`, `Gpu-Ecc` and `canceled`, stores them verbatim,
+            // and the runtime lookup then misses. Compare against the canonical
+            // spelling instead — which also makes the `unknown` bucket fall out
+            // for free, since `Unknown.as_str()` is `"unknown"`.
+            for key in task.retry_budgets.keys() {
+                let canonical = crate::fault::FaultClass::parse(key).as_str();
+                if key != canonical {
+                    let hint = if crate::fault::FaultClass::parse(key)
+                        != crate::fault::FaultClass::Unknown
+                    {
+                        format!(" (did you mean '{canonical}'?)")
+                    } else {
+                        String::new()
+                    };
+                    bail!(
+                        "unknown retry_budgets fault class '{}' on task '{}' in DAG '{}'{}; \
+                         expected one of: {}",
+                        key,
+                        task.name,
+                        spec.name,
+                        hint,
+                        crate::fault::FAULT_CLASS_NAMES.join(", ")
+                    );
+                }
             }
             if task.max_attempts == 0 {
                 bail!(
@@ -1573,7 +1640,7 @@ tasks:
     }
 
     /// Dataset spec surface: `produces:` on tasks, the `wait.dataset` sensor,
-    /// and `on_datasets:` triggers — plus the OSS/Enterprise composition gate.
+    /// and `on_datasets:` triggers — plus the composition feature gate.
     #[test]
     fn dataset_spec_validation() {
         // Valid: produces on a command task; templates at expansion elsewhere.
@@ -1636,15 +1703,15 @@ tasks:
         )
         .is_err());
 
-        // Composition (multi-dataset / datasets_mode) is the Enterprise line:
+        // Composition (multi-dataset / datasets_mode) is the feature line:
         // the open build rejects it with a signpost naming the edition; an
         // enterprise build accepts it.
         let multi = "name: p\non_datasets: [\"a://b\", \"a://c\"]\ndatasets_mode: all\ntasks:\n  - { name: t, command: [\"true\"] }\n";
         #[cfg(not(feature = "enterprise"))]
         {
             let err =
-                DagGraph::from_yaml(multi).err().expect("multi-dataset is Enterprise").to_string();
-            assert!(err.contains("dagron Enterprise"), "signpost names the edition: {err}");
+                DagGraph::from_yaml(multi).err().expect("multi-dataset is feature-gated").to_string();
+            assert!(err.contains("not in this build"), "signpost names the gap: {err}");
         }
         #[cfg(feature = "enterprise")]
         {
@@ -2026,5 +2093,110 @@ tasks:
             err.contains("must set exactly one of `command`"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn retry_budgets_parse_and_survive_expansion() {
+        let yaml = "\
+name: w
+tasks:
+  - name: train
+    command: [\"true\"]
+    max_attempts: 3
+    retry_budgets:
+      gpu-ecc: 8
+      nan-loss: 0
+";
+        let g = DagGraph::from_yaml(yaml).unwrap();
+        let t = g.task_spec("train").unwrap();
+        assert_eq!(t.retry_budgets.get("gpu-ecc"), Some(&8));
+        assert_eq!(t.retry_budgets.get("nan-loss"), Some(&0));
+        assert_eq!(t.max_attempts, 3);
+    }
+
+    #[test]
+    fn a_misspelled_fault_class_is_a_parse_error_not_a_silent_no_op() {
+        // The failure mode this guards: `gpu_ecc_error` parses to Unknown,
+        // matches nothing at runtime, and the author believes they set a policy
+        // on the code path that decides whether to spend another thousand
+        // GPU-hours.
+        let yaml = "\
+name: w
+tasks:
+  - name: train
+    command: [\"true\"]
+    retry_budgets:
+      gpu_ecc_error: 8
+";
+        let err = match DagGraph::from_yaml(yaml) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected a parse error for a misspelled fault class"),
+        };
+        assert!(err.contains("unknown retry_budgets fault class"), "{err}");
+        // The error lists the legal alternatives rather than making the author grep.
+        assert!(err.contains("gpu-ecc"), "{err}");
+    }
+
+    #[test]
+    fn a_non_canonical_spelling_is_rejected_rather_than_silently_never_firing() {
+        // The subtle half of the typo guard. `FaultClass::parse` is tolerant on
+        // purpose so it can read rows written by other builds — so `GPU_ECC`
+        // *parses*, passes a naive validity check, is stored verbatim, and then
+        // never matches the runtime lookup, which is by the canonical
+        // `as_str()`. The author's policy silently does nothing.
+        for bad in ["GPU_ECC", "Gpu-Ecc", "gpu_ecc", "canceled"] {
+            let yaml = format!(
+                "name: w\ntasks:\n  - {{ name: t, command: [\"true\"], retry_budgets: {{ {bad}: 8 }} }}\n"
+            );
+            let err = match DagGraph::from_yaml(&yaml) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("expected '{bad}' to be rejected"),
+            };
+            assert!(err.contains("unknown retry_budgets fault class"), "{bad}: {err}");
+        }
+        // And the error points at the canonical spelling rather than making the
+        // author diff two strings by eye.
+        let yaml = "name: w\ntasks:\n  - { name: t, command: [\"true\"], retry_budgets: { GPU_ECC: 8 } }\n";
+        let err = match DagGraph::from_yaml(yaml) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected rejection"),
+        };
+        assert!(err.contains("did you mean 'gpu-ecc'?"), "{err}");
+    }
+
+    #[test]
+    fn the_literal_unknown_class_is_a_legal_budget_key() {
+        // "we looked and could not tell" is a real bucket an operator may want
+        // to cap, and it round-trips through parse() to Unknown like a typo
+        // would — so it needs an explicit exemption from the typo check.
+        let yaml = "name: w\ntasks:\n  - { name: t, command: [\"true\"], retry_budgets: { unknown: 2 } }\n";
+        let g = DagGraph::from_yaml(yaml).unwrap();
+        assert_eq!(g.task_spec("t").unwrap().retry_budgets.get("unknown"), Some(&2));
+    }
+
+    #[test]
+    fn task_defaults_merge_retry_budgets_per_class_not_wholesale() {
+        // The task names one class; it must keep the workflow's other classes.
+        let yaml = "\
+name: w
+task_defaults:
+  retry_budgets:
+    gpu-ecc: 8
+    fabric-ib: 6
+tasks:
+  - name: a
+    command: [\"true\"]
+    retry_budgets:
+      gpu-ecc: 2
+  - name: b
+    command: [\"true\"]
+";
+        let g = DagGraph::from_yaml(yaml).unwrap();
+        let a = g.task_spec("a").unwrap();
+        assert_eq!(a.retry_budgets.get("gpu-ecc"), Some(&2), "task wins its own class");
+        assert_eq!(a.retry_budgets.get("fabric-ib"), Some(&6), "and inherits the rest");
+        let b = g.task_spec("b").unwrap();
+        assert_eq!(b.retry_budgets.get("gpu-ecc"), Some(&8));
+        assert_eq!(b.retry_budgets.get("fabric-ib"), Some(&6));
     }
 }

@@ -1,8 +1,11 @@
 {{- if .Values.ingress.enabled }}
 {{- if not .Values.ingress.host }}{{ fail "ingress.enabled=true requires ingress.host" }}{{- end }}
 {{- if not .Values.dagronApi.enabled }}{{ fail "ingress.enabled=true requires dagronApi.enabled=true (the /api backend)" }}{{- end }}
-{{- if not .Values.frontend.enabled }}{{ fail "ingress.enabled=true requires frontend.enabled=true (the / backend)" }}{{- end }}
-# Single host, same-origin: /api/* → dagron-api, everything else → frontend.
+# No frontend precondition: dagron-api serves the console itself, so it backs BOTH
+# paths by default. The check that used to be here refused an ingress without the
+# frontend Deployment, which is now the normal topology.
+# Single host, same-origin: /api/* → dagron-api, everything else → the console —
+# dagron-api, or the deprecated frontend pod when frontend.enabled puts it in front.
 # Same origin means the HttpOnly session cookie set on /api/login is sent on
 # every request. `/api` is listed first (more specific prefix).
 apiVersion: networking.k8s.io/v1
@@ -35,11 +38,19 @@ spec:
                 name: {{ include "dagron.fullname" . }}-api
                 port:
                   number: {{ .Values.dagronApi.port }}
+          # `/` follows the console. dagron-api serves it by default; enabling the
+          # deprecated frontend puts that pod back in front instead.
           - path: /
             pathType: Prefix
             backend:
               service:
+{{- if .Values.frontend.enabled }}
                 name: {{ include "dagron.fullname" . }}-frontend
                 port:
                   number: {{ .Values.frontend.port }}
+{{- else }}
+                name: {{ include "dagron.fullname" . }}-api
+                port:
+                  number: {{ .Values.dagronApi.port }}
+{{- end }}
 {{- end }}

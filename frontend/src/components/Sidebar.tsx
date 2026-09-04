@@ -4,6 +4,8 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { getHealth, getMe, listWorkflows, logout, type Me } from "@/lib/dagron-api";
+import { AGENT_DOCK_ENABLED } from "@/lib/agent";
+import { useAgentDock, useSidebarRail } from "@/lib/shell-prefs";
 import type { HealthResponse } from "@/types/dagron";
 
 type IconName =
@@ -22,6 +24,7 @@ type IconName =
   | "bell"
   | "key"
   | "search"
+  | "agent"
   | "envs";
 
 interface NavItem {
@@ -61,11 +64,13 @@ const ADMIN: NavItem[] = [
 const ACCOUNT: NavItem[] = [
   { href: "/settings/tokens", label: "API tokens", icon: "key" },
 ];
-// Enterprise-build screens (health.edition === "enterprise"): the audit trail.
+// Screens shown only when health.edition === "enterprise": the audit trail.
 const ADMIN_EE: NavItem[] = [{ href: "/settings/audit", label: "Audit log", icon: "audit" }];
 
 export default function Sidebar() {
   const pathname = usePathname();
+  const [rail, setRail] = useSidebarRail();
+  const [dock, setDock] = useAgentDock();
   const [me, setMe] = useState<Me | null>(null);
   const [wfCount, setWfCount] = useState<number | null>(null);
   const [health, setHealth] = useState<HealthResponse | null>(null);
@@ -95,6 +100,19 @@ export default function Sidebar() {
     };
   }, [pathname]);
 
+  // Ctrl/Cmd-B collapses the nav to a rail — the binding every editor with a
+  // sidebar already uses, and the ⌘K palette is the only other global one.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "b") {
+        e.preventDefault();
+        setRail(!rail);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [rail, setRail]);
+
   async function signOut() {
     await logout();
     window.location.assign("/");
@@ -106,7 +124,15 @@ export default function Sidebar() {
   function renderItem(n: NavItem) {
     const active = pathname === n.href || pathname.startsWith(`${n.href}/`);
     return (
-      <Link key={n.href} href={n.href} className={`dy-navitem ${active ? "dy-navitem-active" : ""}`}>
+      <Link
+        key={n.href}
+        href={n.href}
+        className={`dy-navitem ${active ? "dy-navitem-active" : ""}`}
+        // In rail mode the label is clipped away, so the only thing naming the
+        // destination is the native tooltip — and the accessible name, which
+        // the <span> still provides to a screen reader.
+        title={rail ? n.label : undefined}
+      >
         <NavIcon name={n.icon} />
         <span>{n.label}</span>
         {n.badge === "wfCount" && wfCount != null && <span className="dy-navcount">{wfCount}</span>}
@@ -144,8 +170,15 @@ export default function Sidebar() {
   const initial = (me?.name || me?.email || "?").trim().charAt(0).toUpperCase();
 
   return (
-    <aside className="dy-side">
-      <Link href="/overview" className="dy-brand-row" style={{ color: "var(--fg)" }}>
+    <aside className="dy-side" data-rail={rail ? "on" : undefined}>
+      {/* Brand and the rail toggle share a header row. The toggle used to hang
+          off the sidebar's right edge, which looked right and was wrong: the
+          sidebar sets `overflow-y: auto` for long nav, and an overflow
+          container clips its own overhang — half the button disappeared under
+          the content. In the flow it cannot be clipped, and in rail mode the
+          row stacks so the toggle sits under the logo instead of on top of it. */}
+      <div className="dy-side-head">
+        <Link href="/overview" className="dy-brand-row" style={{ color: "var(--fg)" }} title={rail ? "dagron" : undefined}>
         {/* Same mark as the favicon (app/icon.svg): orange gradient tile + the
             two-tone double-chevron, so the tab icon and the brand logo match. */}
         <div className="dy-logo">
@@ -180,18 +213,52 @@ export default function Sidebar() {
             ) : null}
           </div>
         </div>
-      </Link>
+        </Link>
+
+        <button
+          type="button"
+          className="dy-rail-toggle"
+          onClick={() => setRail(!rail)}
+          title={rail ? "Expand sidebar (Ctrl/⌘ B)" : "Collapse sidebar (Ctrl/⌘ B)"}
+          aria-label={rail ? "Expand sidebar" : "Collapse sidebar"}
+          aria-expanded={!rail}
+        >
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            {rail ? <polyline points="9 18 15 12 9 6" /> : <polyline points="15 18 9 12 15 6" />}
+          </svg>
+        </button>
+      </div>
 
       {/* Global search — opens the ⌘K palette (also bound to Ctrl/Cmd-K). */}
       <button
         type="button"
         className="dy-navitem dy-search-btn"
         onClick={() => window.dispatchEvent(new Event("dagron:open-search"))}
+        title={rail ? "Search (⌘K)" : undefined}
       >
         <NavIcon name="search" />
         <span>Search</span>
         <kbd className="dy-kbd">⌘K</kbd>
       </button>
+
+      {/* The agent dock lives on the far right, where a thin tab is easy to
+          miss. It is a tool rather than a page, so it sits with Search — the
+          other button in this nav that opens a surface instead of navigating.
+          Hidden entirely while the dock is dormant: an entry point to a
+          feature that is not finished is the thing AGENT_DOCK_ENABLED exists
+          to avoid. */}
+      {AGENT_DOCK_ENABLED && (
+        <button
+          type="button"
+          className={`dy-navitem ${dock ? "dy-navitem-active" : ""}`}
+          onClick={() => setDock(!dock)}
+          title={rail ? "Agent dock" : undefined}
+          aria-pressed={dock}
+        >
+          <NavIcon name="agent" />
+          <span>Agent</span>
+        </button>
+      )}
 
       {MAIN.map(renderItem)}
 
@@ -213,9 +280,11 @@ export default function Sidebar() {
         <div
           className="dy-status"
           title={
-            health?.leader_holder
-              ? `leader: ${health.leader_holder}`
-              : "no leadership lease held"
+            rail
+              ? `${status.title} — ${status.sub}`
+              : health?.leader_holder
+                ? `leader: ${health.leader_holder}`
+                : "no leadership lease held"
           }
         >
           <span
@@ -229,7 +298,12 @@ export default function Sidebar() {
             </div>
           </div>
         </div>
-        <button type="button" className="dy-user" onClick={() => void signOut()} title="Sign out">
+        <button
+          type="button"
+          className="dy-user"
+          onClick={() => void signOut()}
+          title={rail ? `${me?.name || me?.email || "Account"} — sign out` : "Sign out"}
+        >
           <div className="dy-avatar">{initial}</div>
           <div style={{ lineHeight: 1.25, minWidth: 0 }}>
             <div style={{ fontSize: 12, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
@@ -369,6 +443,18 @@ function NavIcon({ name }: { name: IconName }) {
         <svg {...p}>
           <circle cx="11" cy="11" r="8" />
           <line x1="21" y1="21" x2="16.65" y2="16.65" />
+        </svg>
+      );
+    case "agent":
+      // Same glyph the dock's tab and header use, so the three surfaces that
+      // open or are the dock read as one thing.
+      return (
+        <svg {...p}>
+          <rect x="4" y="8" width="16" height="12" rx="3" />
+          <path d="M12 8V4" />
+          <circle cx="12" cy="3" r="1.2" />
+          <circle cx="9.5" cy="14" r="1.1" fill="currentColor" stroke="none" />
+          <circle cx="14.5" cy="14" r="1.1" fill="currentColor" stroke="none" />
         </svg>
       );
     case "envs":

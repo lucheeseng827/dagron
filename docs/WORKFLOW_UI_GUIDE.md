@@ -37,10 +37,14 @@ This starts:
 - **postgres** — the datastore (source of truth).
 - **engine** — the scheduler/reconcile loop + executors (`EXECUTOR=local`, so
   `command:` tasks run as local processes). It also runs the DB migrations.
-- **dagron-api** (`:8080`) — the authenticated gateway the UI talks to.
-- **frontend** (`:3000`) — the Next.js console.
+- **dagron-api** (`:8080`) — the authenticated gateway, and the console: it
+  serves the UI at `/` and the API under `/api` on the same origin.
 
-Open **http://localhost:3000**.
+Open **http://localhost:8080**.
+
+> Before 0.9 the console was a separate `frontend` container on `:3000`.
+> `compose.yaml` still carries it behind `--profile frontend` until 1.0.0
+> removes it; nothing needs it.
 
 > **Sign in** with the seeded admin from `compose.yaml`:
 > `admin@local` / `dagron-admin`. (dagron-api owns login and mints its own

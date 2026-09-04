@@ -32,17 +32,66 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::{
-    routing::{get, post},
+    routing::{any, get, post},
     Json, Router,
 };
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
 use auth::AuthUser;
 use state::{AppState, TaskEvent};
+
+/// Serve the exported console, or nothing when it was not built in.
+///
+/// The console is a fully static site (`frontend/`, `output: "export"`): 47 of its
+/// 65 sources are `"use client"`, it uses no server-only Next API, and every call
+/// goes through `BASE = "/api"` — a *relative* path. Serving it from this process
+/// makes that path same-origin for real, which removes the Next `rewrites()` proxy
+/// entirely. That proxy is why live updates were broken: it buffers responses and
+/// never flushes headers for an infinite `text/event-stream`, so `/api/events/stream`
+/// hung and the console showed "Offline" against a healthy API.
+///
+/// Mounted as a FALLBACK, so it can never shadow an API route: axum tries every
+/// `/api/...` route first and only unmatched paths reach the file server. A path
+/// that is not a file falls through to `index.html`, because Next's client router
+/// owns navigation once the app has booted (deep links, and the `?id=` detail
+/// routes that replaced the old dynamic segments).
+///
+/// `DAGRON_CONSOLE_DIR` (default `/usr/share/dagron/console`) is where the image
+/// puts it. When the directory is absent this is a 404-only service and the API
+/// behaves exactly as it did before — a `cargo run` on a dev box does not need a
+/// Node build to serve JSON.
+fn console_router() -> ServeDir<ServeFile> {
+    let dir = std::env::var("DAGRON_CONSOLE_DIR")
+        .unwrap_or_else(|_| "/usr/share/dagron/console".to_string());
+    let index = std::path::Path::new(&dir).join("index.html");
+    if index.is_file() {
+        info!(console_dir = %dir, "serving embedded console at /");
+    } else {
+        info!(console_dir = %dir, "no console build found; serving API only");
+    }
+    ServeDir::new(&dir).fallback(ServeFile::new(index))
+}
+
+/// Unmatched `/api/...` is an API error, not a console page.
+///
+/// The console is the router's fallback, and `ServeDir`'s own fallback serves
+/// `index.html` — with a `200`, since `fallback` (unlike `not_found_service`)
+/// leaves the status alone. So a mistyped or retired endpoint answered
+/// `200 text/html`, and a client that asked for JSON got a web page to parse.
+/// Claiming the namespace keeps that contained: axum matches a static segment
+/// ahead of a catch-all, so every real `/api/...` route still wins, and only
+/// what none of them matched arrives here.
+async fn api_not_found() -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "error": "not found" })),
+    )
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -133,6 +182,44 @@ async fn main() -> Result<()> {
         let encrypted = matches!(dagron_crypto::provider_from_env(), Ok(Some(_)));
         info!(encrypted, "artifact API enabled (PUT/GET /api/runs/*/artifacts/*)");
     }
+    // Tiered store drain: move locally-captured artifacts to the remote tier
+    // under the daily uplink budget. A no-op (`Ok(0)`) for every other store, so
+    // the loop is harmless when tiering is off; `DAGRON_ARTIFACT_SYNC_SECS=0`
+    // disables it outright (an operator may prefer `POST /api/artifacts/sync`).
+    // Shared with the rotation and on-demand-sync routes: a drain that overlaps
+    // a re-key would stream objects still wrapped under the retiring KEK, and
+    // `LocalFsStore::put` truncates before it writes, so a reader can catch a
+    // half-written blob mid-rotation. The periodic drain must take the same lock
+    // the routes do, which means building it here rather than with `AppState`.
+    let rotation_lock = Arc::new(tokio::sync::Mutex::new(()));
+    if let Some(store) = artifact_store.clone() {
+        let lock = Arc::clone(&rotation_lock);
+        let secs: u64 = std::env::var("DAGRON_ARTIFACT_SYNC_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(60);
+        if secs > 0 {
+            tokio::spawn(async move {
+                let mut ticks = tokio::time::interval(std::time::Duration::from_secs(secs));
+                ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticks.tick().await;
+                    // Skip the tick rather than queue behind a sweep: the drain
+                    // is periodic, so the next one is along shortly, and waiting
+                    // would only pile ticks up behind a long rotation.
+                    let Ok(_guard) = lock.try_lock() else {
+                        info!("artifact tier sync skipped — a store-wide sweep holds the lock");
+                        continue;
+                    };
+                    match store.sync().await {
+                        Ok(0) => {}
+                        Ok(moved) => info!(moved, "artifact tier sync"),
+                        Err(e) => tracing::warn!(error = %e, "artifact tier sync failed"),
+                    }
+                }
+            });
+        }
+    }
 
     let listener_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let state = AppState {
@@ -143,7 +230,7 @@ async fn main() -> Result<()> {
         cookie_secure,
         identity,
         artifact_store,
-        rotation_lock: Arc::new(tokio::sync::Mutex::new(())),
+        rotation_lock: Arc::clone(&rotation_lock),
         login_limiter: Arc::new(ratelimit::RateLimiter::from_env()),
         listener_ready: Arc::clone(&listener_ready),
     };
@@ -232,12 +319,16 @@ async fn main() -> Result<()> {
         // Observability + dead-letter queue (authed UI edge over engine ops surface).
         .route("/api/archive/runs", get(routes::archive::list_archived_runs))
         .route("/api/archive/runs/{id}", get(routes::archive::get_archived_run))
+        // Archive one terminal run now rather than waiting for retention.
+        // Destructive and admin-only — it purges the run from the hot store
+        // once the document is durably in the sink.
+        .route("/api/runs/{id}/archive", post(routes::archive::archive_run))
         .route("/api/metrics", get(routes::ops::metrics))
         .route("/api/metrics/timeseries", get(routes::ops::metrics_timeseries))
         // Human-in-the-loop worklist: every gate parked in awaiting_approval.
         .route("/api/approvals", get(routes::ops::list_approvals))
         // Data-aware scheduling: the dataset registry + its lineage ledger. Read
-        // -only here — updates come from `produces:` tasks (or the Enterprise
+        // -only here — updates come from `produces:` tasks (or the feature-gated
         // external-events route on the engine).
         .route("/api/datasets", get(routes::datasets::list_datasets))
         .route("/api/datasets/events", get(routes::datasets::list_dataset_events))
@@ -269,6 +360,10 @@ async fn main() -> Result<()> {
                 .put(routes::workflows::update_workflow)
                 .delete(routes::workflows::delete_workflow),
         )
+        // Signed bundle apply (verification is open; staged rollout by cohort is
+        // not in this build - the handler signposts it). Static segment, so it
+        // sits before the `{id}` routes to keep the ordering obvious.
+        .route("/api/workflows/bundle", post(routes::bundles::apply_bundle))
         .route("/api/workflows/{id}/run", post(routes::workflows::run_workflow))
         // Lifecycle: version history, and a state that is not deletion. Pausing
         // leaves the workflow's schedules intact — that is the whole difference
@@ -313,16 +408,23 @@ async fn main() -> Result<()> {
         .route("/api/backfills/{id}/cancel", post(routes::backfills::cancel));
 
     // Admin: store-wide artifact key rotation (KEK_OLD → current KEK). Rotation
-    // only means anything where a KEK exists, and KEKs are Enterprise
+    // only means anything where a KEK exists, and KEKs need the `enterprise` feature
     // (`dagron_crypto::build_provider`) — so the route is absent from an open
     // build rather than present and guaranteed to fail.
     #[cfg(feature = "enterprise")]
     let app = app.route("/api/artifacts/rotate", post(routes::artifacts::rotate_artifacts));
 
-    // Enterprise routes (the open-core split): the audit trail read.
+    // Feature-gated routes: the audit trail read.
     // OSS builds answer 404 here, matching the feature being absent.
     #[cfg(feature = "enterprise")]
     let app = app.route("/api/audit", get(routes::audit::list_audit));
+
+    // Fleet plane (unit registry, cohorts, fan-out). Registered in EVERY build:
+    // the open build answers with a signpost naming the edition, not a 404 —
+    // the user hits it at the exact moment they feel the need.
+    let app = app.route("/api/fleet", get(routes::fleet::list_fleet));
+    // Tiered artifact drain on demand (the periodic loop below is the default).
+    let app = app.route("/api/artifacts/sync", post(routes::artifacts::sync_artifacts));
 
     // Core routes keep the tight 1 MiB body cap (submit YAML etc.) to resist abuse.
     let app = app.layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024));
@@ -363,6 +465,14 @@ async fn main() -> Result<()> {
     let app = app
         .merge(login)
         .merge(artifacts)
+        // Before the console fallback: /api is the API's namespace even where no
+        // route matched. See `api_not_found`. Three routes, not one: an axum
+        // wildcard will not match an empty capture, so `/api/{*rest}` covers
+        // neither `/api` nor `/api/` and both would reach the console.
+        .route("/api", any(api_not_found))
+        .route("/api/", any(api_not_found))
+        .route("/api/{*rest}", any(api_not_found))
+        .fallback_service(console_router())
         // Viewer read-only enforcement + audit trail for successful mutations
         // (a passthrough on OSS builds — see routes/audit.rs). Applies to both.
         .layer(axum::middleware::from_fn_with_state(

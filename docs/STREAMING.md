@@ -26,6 +26,7 @@ queue    ─┘   (source)   │ backpressure   │ retries/backoff    └─ ne
 | **Exactly-once run creation** — a source's cursor commits **in the same datastore transaction** as the run (or dead letter) it accounts for (`source_offsets`); on restart the source is repositioned past everything already accounted for, so a full crash-replay creates zero duplicates. To replay deliberately, delete the `source_offsets` row (the authoritative cursor); the `.offset` file is only a shell-tooling mirror and clearing it alone does nothing. | `db::create_run_with_offset` + the `pending_position` / `set_committed_position` seam on `WorkflowSource` |
 | Drain mode (`STREAM_FOLLOW=false`) — process a backlog then exit: batch replay of the same stream | same |
 | **Multi-consumer sharding** — point `STREAM_PATH` at a *directory* of NDJSON shards and N engines split them via **per-partition range leases** (one consumer per shard, heartbeat-renewed, rebalanced when a consumer dies), each shard with its own exactly-once cursor. The broker-free consumer group; the same lease primitives (`claim/renew/release_source_partitions`) back partitioned broker/CDC connectors. | `ShardedStreamSource` + `dagron-core` partition-lease fns |
+| `SOURCE=mqtt` — **subscribe to a broker topic** (plant floor, gateway, robot fleet), one workflow per message. Manual acks (the PUBACK goes out only after the run is durably created), at-least-once by default, **exactly-once** when `MQTT_POSITION_FIELD` names a monotonic id in the payload (Sparkplug `seq`, CloudEvents `id`) — the id commits with the run under `mqtt/<topic>` and a redelivered duplicate is acked and skipped. `mqtts://` for TLS, `MQTT_DLQ_TOPIC` for a broker-side dead-letter mirror. Built with `--features mqtt`; a broker that is down is a retry, never an exit. | `dagron-source` [`mqtt.rs`](../crates/dagron-source/src/mqtt.rs) + [`examples/edge/mqtt/`](../examples/edge/mqtt/) |
 | Poison-event **dead-lettering** — a durable `dead_letters` row + a `.dlq` NDJSON mirror; inspect / redrive / delete via API & UI | `dagron-source` ingest + [`docs/DLQ.md`](DLQ.md) |
 | Admission backpressure — `MAX_INFLIGHT_RUNS` holds intake while the engine drains; the file buffers the burst | ingest actor |
 | Micro-batch schedules + windowed **backfill/catch-up** (`{{ scheduled_time }}`) — the batching half of streaming | [`docs/BACKFILL_USECASES.md`](BACKFILL_USECASES.md) |
@@ -80,34 +81,26 @@ change-data-capture replication, log anomaly alerting with a dead-letter
 redrive, sensor micro-batch windows with backfill, and kill-safe exactly-once
 payment processing.
 
-## The managed connector suite (dagron Enterprise)
+## Source kinds this build does not have
 
-The open build's `SOURCE=stream` and the seam are the full programming model —
-what **dagron Enterprise** adds is the *managed connector fleet* on the same
-trait, for teams whose events already live on brokers:
+`SOURCE=stream` and the `SourceFactory` seam are the whole programming model
+here. A handful of other source kinds are *recognised names* — the engine knows
+them well enough to refuse them clearly rather than start with a source you did
+not ask for:
 
-- **Broker connectors** — Kafka (manual offset commit on ack), NATS JetStream
-  (durable pull consumers), SQS (visibility-timeout leases), Redis (reliable
-  list), each with broker-native dead-letter routing (DLT topics, DLQ queues)
-  and per-connector batching/backpressure knobs.
-- **CloudEvents webhook gateway** (`SOURCE=events`) — signed HTTP ingress with
-  idempotency de-duplication and declarative trigger rules mapping event types
-  to workflows.
-- **The streams data plane** — a per-pipeline worker that moves and reshapes
-  records broker→broker (transform chains, live repartitioning, publisher
-  confirms) around the workflows the engine runs.
-- **Native change-data-capture** — a Postgres logical-replication connector
-  (`SOURCE=postgres-cdc`): change batches become workflow runs with the batch
-  LSN committed on the same exactly-once substrate as everything above, and
-  the replication slot advanced only after the work is durable — plus a
-  Debezium-envelope adapter (`SOURCE=debezium` over a broker connector) that
-  covers MySQL, MongoDB, SQL Server, and more; a broker-free native MySQL
-  binlog client follows on the same track.
+    SOURCE=kafka | nats | sqs | redis      broker connectors
+    SOURCE=events                          CloudEvents webhook gateway
+    SOURCE=postgres-cdc | debezium         change-data-capture
+    SOURCE=fleet                           managed MQTT across a unit fleet
 
-Selecting a managed connector kind (`SOURCE=kafka|nats|sqs|redis|events`) in
-this build prints exactly where the line is — see
-[README → dagron Enterprise](../README.md#dagron-enterprise). Everything
-upstream of the connector (the trait, the ingest actor, delivery semantics,
-dead-lettering, backpressure) is the open code on this page, so a pipeline
-proven on `SOURCE=stream` moves to Kafka by changing environment variables,
-not workflows.
+Selecting one is a **startup error**, never a silent downgrade — the same
+contract `GC_ARCHIVE_URL` and the executor kinds follow. Managed
+implementations of these exist outside this repository; nothing on this page
+depends on them.
+
+What that costs you is the connector, not the model. Everything upstream of it
+is the open code documented above — the trait, the ingest actor, exactly-once
+offset commits, dead-lettering, backpressure — so a pipeline proven on
+`SOURCE=stream` moves to a broker by changing environment variables rather than
+workflows. Anything that appends lines is a producer, and `kcat`, `psql COPY`
+and `tail -f | jq -c` are three of them.

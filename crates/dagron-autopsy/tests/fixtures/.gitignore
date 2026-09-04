@@ -1,0 +1,13 @@
+# The repository root ignores `*.txt`, which silently swallowed three fixtures
+# this crate's tests read by name — `sacct.txt` (the frame every test in
+# tests/autopsy.rs starts from) and the InfiniBand counter samples. Untracked,
+# CI fails at "reading fixture sacct.txt", and the failure looks like a bug in
+# the parser rather than a missing file.
+#
+# `!*` rather than `!*.txt`: the directory holds `.ndjson` and `.out` fixtures
+# too, and a future root-level pattern for either would reintroduce exactly the
+# same failure. Everything in a fixtures directory is source by definition.
+#
+# Scoped here rather than weakening the root rule, which still applies
+# everywhere else in the monorepo.
+!*

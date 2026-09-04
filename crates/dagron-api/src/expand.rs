@@ -91,7 +91,7 @@ fn depends_on(task: &Value) -> Vec<String> {
 }
 
 /// The names a spec directly chains (one entry per `workflow_ref` task).
-fn direct_refs(spec: &Value) -> Vec<String> {
+pub(crate) fn direct_refs(spec: &Value) -> Vec<String> {
     tasks_of(spec).iter().filter_map(|t| str_field(t, "workflow_ref")).collect()
 }
 

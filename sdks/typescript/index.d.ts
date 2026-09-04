@@ -112,6 +112,13 @@ export interface RunDetail {
   triage_note: string | null;
   triaged_at: string | null;
   triaged_by: string | null;
+  /** Whether the engine's wall clock was trustworthy when the run was recorded:
+   *  `synced` | `drifted` | `unknown`, or `null` when never assessed. */
+  clock_confidence: string | null;
+  /** Measured wall-vs-monotonic offset (ms) behind a `drifted` verdict. */
+  clock_offset_ms: number | null;
+  /** What produced the verdict (`sync-file` | `step` | `behind-datastore`). */
+  clock_source: string | null;
   /** Why this run failed, when it did — `null` otherwise, so a caller can
    *  branch on presence without inspecting `status`. */
   failure: RunFailure | null;

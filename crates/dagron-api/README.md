@@ -56,6 +56,11 @@ Control (auth required):
 
 `GET /healthz` is unauthenticated (liveness).
 
+Unmatched `/api/...` answers `404 {"error":"not found"}`. Worth stating because
+the console is the router's fallback: without a catch-all claiming the namespace,
+a mistyped endpoint would fall through and return `index.html` with a `200`,
+handing a JSON client a web page. Non-API paths still reach the console.
+
 Not served by the open build: `GET /api/audit` and the read-only `viewer` role
 are gated behind `--features enterprise`. With the feature off the mutation
 middleware is a pure passthrough — nothing is recorded, no role is enforced, and
@@ -119,3 +124,4 @@ task `input` JSON must match `dag::TaskSpec`).
 | `DAGRON_JWT_SECRET` | HS256 secret dagron-api uses to sign + validate its own session JWT (≥ 32 bytes) |
 | `DAGRON_COOKIE_SECURE` | set the session cookie's `Secure` attribute (enable behind HTTPS/TLS termination) |
 | `PORT` | listen port (default 8080) |
+| `DAGRON_CONSOLE_DIR` | where the exported console lives (default `/usr/share/dagron/console`), served at `/` beneath the API routes. Absent directory = API only, which is what a `cargo run` on a dev box gets without a Node build. |

@@ -79,7 +79,7 @@ Run creation is **exactly-once** — each line's offset commits in the same
 transaction as its run, so a crash-restart re-creates nothing; the deliberate
 rewind above is the recover-a-corrupted-replica move. (A native Postgres
 change-data-capture connector with LSN offsets on this same substrate ships
-with dagron Enterprise.)
+elsewhere.)
 
 ## 03 — Log anomaly alerting + dead letters
 
@@ -155,4 +155,4 @@ cut -d, -f1 data/payments_ledger.csv | sort | uniq -d    # → empty (no double-
 **Moving any of these to a managed broker** (events already on Kafka/NATS/SQS/
 Redis, or signed webhooks via CloudEvents) is an environment-variable change on
 the same workflows — the connector suite ships with
-[dagron Enterprise](../../README.md#dagron-enterprise).
+[not in this build](../../README.md#what-this-build-does-not-do).

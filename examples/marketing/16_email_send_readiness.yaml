@@ -1,0 +1,108 @@
+# 16 — Pre-send readiness for a marketing email. The checklist, as a graph.
+#
+#   render ─▶ 6 checks in parallel ─▶ seed send ─▶ inbox placement ─▶ approval ─▶ send
+#
+# Everything a good email ops person does by hand before hitting Send, declared
+# once so it cannot be skipped on the Friday when the campaign is late.
+#
+# `notify.git` is the detail worth stealing: these workflow definitions live in
+# a Git repo synced by dagron's GitOps source, so the run reports back as a
+# **commit status** on the PR that changed the email template. A reviewer sees
+# the green check from the actual readiness run before merging, not a promise
+# that someone ran it locally.
+#
+# The `repeat:` on inbox placement is the poll-until-done pattern with teeth:
+# seed inboxes take minutes to receive, so it polls up to 20 times at 30s and
+# then *fails* — a placement test that never returned is not a pass.
+name: mktg_email_send_readiness
+tags: [marketing, email, quality-gate]
+environment: prod
+result_from: send
+run_timeout_secs: 43200
+deadline: { in: 2h }
+parameters:
+  email_id: "2026-09-nurture-step-3"
+  list_id: "icp_a_no_opp_90d"
+  commit_sha: ""                 # supplied by the CI caller at submit time
+  slack_webhook: ""              # notify: URLs template against run PARAMETERS,
+                                 # not {{ env.* }} — set an instance-wide default
+                                 # in the console instead (sidebar -> Notifications).
+
+task_defaults:
+  max_attempts: 3
+  retry_delay_secs: 10
+  retry_max_delay_secs: 90
+  timeout_secs: 300
+  env:
+    - { name: HUBSPOT_TOKEN, value_from: { secret: HUBSPOT_PRIVATE_APP_TOKEN } }
+    - { name: LITMUS_KEY, value_from: { secret: LITMUS_API_KEY } }
+    - { name: GLOCKAPPS_KEY, value_from: { secret: GLOCKAPPS_API_KEY } }
+
+notify:
+  git:
+    provider: github
+    repo: acme/marketing-workflows
+    sha: "{{ commit_sha }}"
+    context: dagron/email-readiness
+  slack:
+    webhook_url: "{{ slack_webhook }}"
+
+tasks:
+  - name: render
+    command: ["sh", "-c", "hubspot-email-render --id {{ email_id }} --out \"$DAGRON_ARTIFACTS/email.html\""]
+
+  # Six checks, deliberately independent. Two of them are advisory (`spam_score`
+  # and `render_matrix` produce judgement, not facts), so they are allow_failure
+  # and the join is all_done — an advisory vendor being down should not stop a
+  # send that passes every hard check.
+  - name: checks
+    depends_on: [render]
+    with_items:
+      - { check: links, tool: link-check, advisory: "no" }
+      - { check: utm, tool: utm-lint, advisory: "no" }
+      - { check: personalisation, tool: token-lint, advisory: "no" }
+      - { check: suppression, tool: suppression-audit, advisory: "no" }
+      - { check: spam-score, tool: spamassassin-score, advisory: "yes" }
+      - { check: render-matrix, tool: litmus-preview, advisory: "yes" }
+    instance_key: "{{ item.check }}"
+    allow_failure: true
+    command: ["sh", "-c", "{{ item.tool }} \"$DAGRON_ARTIFACTS/email.html\" --list {{ list_id }} --report \"$DAGRON_ARTIFACTS/{{ item.check }}.json\""]
+
+  # The gatekeeper: reads all six reports and fails if any *hard* check failed.
+  # Advisory failures land in the summary a human reads at the approval step.
+  - name: gate
+    depends_on: [checks]
+    trigger_rule: all_done
+    max_attempts: 1
+    command: ["sh", "-c", "readiness-gate --reports \"$DAGRON_ARTIFACTS\" --hard links,utm,personalisation,suppression --out \"$DAGRON_ARTIFACTS/summary.md\""]
+
+  - name: seed_send
+    depends_on: [gate]
+    command: ["sh", "-c", "glockapps-seed-send --html \"$DAGRON_ARTIFACTS/email.html\" --test-id \"$DAGRON_RUN_ID\""]
+
+  # Poll until the seed inboxes report. Bounded at 10 minutes: a placement test
+  # that never returns is an error, not a pass.
+  - name: inbox_placement
+    depends_on: [seed_send]
+    repeat: { until: "{{ output }} == complete", max_iterations: 20, delay_secs: 30 }
+    timeout_secs: 60
+    command: ["sh", "-c", "glockapps-result --test-id \"$DAGRON_RUN_ID\" --min-inbox-rate 0.90 --out \"$DAGRON_ARTIFACTS/placement.json\""]
+
+  - name: marketer_signoff
+    type: approval
+    depends_on: [inbox_placement]
+    approval_timeout_secs: 28800
+    approval_on_timeout: reject
+
+  - name: send
+    depends_on: [marketer_signoff]
+    timeout_secs: 900
+    max_attempts: 2
+    retry_on_timeout: false        # never retry a send blind
+    produces: ["hubspot://marketing/emails/{{ email_id }}"]
+    command: ["sh", "-c", "hubspot-email-send --id {{ email_id }} --list {{ list_id }} --idempotency-key \"$DAGRON_RUN_ID\" --token \"$HUBSPOT_TOKEN\""]
+
+  - name: archive_evidence
+    hook: on_exit
+    max_attempts: 2
+    command: ["sh", "-c", "aws s3 sync \"$DAGRON_ARTIFACTS\" \"s3://acme-lake/marketing/email-readiness/{{ email_id }}/$DAGRON_RUN_ID/\""]

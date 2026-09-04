@@ -1,3 +1,5 @@
+<img src="docs/images/dagron-logo.png" alt="" width="72">
+
 # dagron
 
 A small, durable **DAG workflow runner**. Define a workflow as a graph of tasks
@@ -13,18 +15,27 @@ binary, zero infrastructure to get started.
 [![Engine image size](https://img.shields.io/docker/image-size/mancube/dagron-engine?sort=semver&label=engine%20image)](https://hub.docker.com/r/mancube/dagron-engine)
 [![Platforms](https://img.shields.io/badge/platform-linux%2Famd64%20%7C%20arm64-informational)](https://hub.docker.com/r/mancube/dagron-engine)
 
-**Status: released** — multi-arch images (`mancube/dagron-engine`, `-api`,
-`-frontend`) and an OCI Helm chart (`oci://registry-1.docker.io/mancube/dagron`,
-listed on [Artifact Hub](https://artifacthub.io/packages/search?repo=dagron-workflow))
+**Status: released.** The current release is **0.9.0** — multi-arch images
+(`mancube/dagron-engine`, `-engine-localdev`, `-api`, `-gitops`, `-mcp`) and an
+OCI Helm chart (`oci://registry-1.docker.io/mancube/dagron`, listed on
+[Artifact Hub](https://artifacthub.io/packages/search?repo=dagron-workflow))
 are published per tagged release. dagron's bet is a lean trade: one static Rust
 binary, plain YAML, and a database as the only state — durable workflow
 orchestration with no control plane and no cluster to operate.
 
+> **Upgrading from 0.8.x?** `mancube/dagron-frontend` is deprecated and will be
+> removed in 1.0: the console it served now comes from `dagron-api` itself, on
+> the same port as the API, so drop the container and the `frontend.enabled`
+> Helm value. Migrations are forward-only and apply at startup — back up first
+> ([`docs/OPERATIONS.md`](docs/OPERATIONS.md#backup--restore--what-is-the-state)).
+
 ## See it in action
 
-The optional web UI (the `dagron-api` gateway + Next.js frontend, brought up with
-`docker compose up`) gives you a live view over the same engine the CLI drives —
-submit workflows, watch runs stream, inspect the DAG, and read task logs.
+The console gives you a live view over the same engine the CLI drives — submit
+workflows, watch runs stream, inspect the DAG, and read task logs.
+`dagron-api` serves it itself, so the stack is one port and one origin with no
+separate frontend process; the engine carries a smaller console of its own for
+the single-binary case (see [below](#the-console-without-the-stack)).
 
 | Overview — scheduler health, runs today, success rate, GitOps sync | Run detail — the live DAG graph with per-task status + output |
 |---|---|
@@ -44,7 +55,9 @@ submit workflows, watch runs stream, inspect the DAG, and read task logs.
     (ships `LocalExecutor` subprocesses, plus Docker and Kubernetes backends
     behind env/feature switches).
   - [`WorkflowSource`](crates/dagron-source/src/source.rs) — *where workflows
-    come from* (ships `FileSource` and an in-process `ChannelSource`).
+    come from* (ships `FileSource`, `StreamSource` — NDJSON with exactly-once
+    offsets — an in-process `ChannelSource`, and `DirSource`, a watched
+    directory).
 - **Runs anywhere** — no database *server* required: the default build embeds
   SQLite (state lives in a single `workflow.db` file); switch the Cargo
   feature to `postgres` for multi-node.
@@ -72,16 +85,16 @@ podman compose   -f compose.quickstart.yaml up -d   # podman ≥ 4.7, provider i
 podman-compose   -f compose.quickstart.yaml up -d   # standalone provider, older podman too
 ```
 
-The images are pinned; override with `DAGRON_VERSION=0.8.1`. Floating `:latest`
-is deliberately not the default — a quickstart that silently changes under you
-is worse than one you have to bump.
+The images are pinned (`DAGRON_VERSION`, default **0.9.0** — the current
+release). Floating `:latest` is deliberately not the default: a quickstart that
+silently changes under you is worse than one you have to bump.
 
 > **Changing dagron itself?** [`compose.yaml`](compose.yaml) next to it builds
 > every service from source (`docker compose up --build`) — right when you are
 > developing, wrong when you are meeting it.
 
 Success looks like (`… logs -f engine dagron-api`, since `-d` detaches; trimmed,
-Postgres + frontend logs elided):
+Postgres logs elided):
 
 ```text
 schema-gate-1 | schema-gate: engine migrations committed; releasing dagron-api
@@ -97,8 +110,8 @@ has committed, because both create some of the same tables and two concurrent
 `CREATE TABLE IF NOT EXISTS` for one table do not serialize — the loser exits on
 `duplicate key value violates unique constraint "pg_type_typname_nsp_index"`
 instead of taking the no-op path. Without the gate that race is the *default* on
-a clean volume: `dagron-api` dies before it listens, and `frontend` — which
-joins its network namespace — cannot start at all.
+a clean volume: `dagron-api` dies before it listens, and with it goes the console
+and every API client behind it.
 
 The gate is *bounded*: if the engine never opens its management port within
 ~60s it releases `dagron-api` anyway rather than deadlock the whole stack on an
@@ -109,7 +122,7 @@ engine finished migrating, only that it is worth letting the API try. On an
 unusually slow host a first boot can still lose the race; if it does, bring the
 stack `up` again once the engine is past its migrations.
 
-Open <http://localhost:3000> and sign in with the seeded dev admin
+Open <http://localhost:8080> and sign in with the seeded dev admin
 (`admin@local` / `dagron-admin` — from the compose file; seeded on first start
 only, so changing them later needs `down -v`. Change everything for a real
 deploy, see [`docs/OPERATIONS.md`](docs/OPERATIONS.md)).
@@ -405,6 +418,24 @@ downloading it all to grep in a browser is not a filter. Responses report
 `matched` against `total`, so a view that hides most of a run always says so.
 Full reference: [docs/API.md §Log filter](docs/API.md#log-filter).
 
+### A directory as the inbox
+
+`SOURCE=dir` watches `WORKFLOW_DIR` (default `/workflows`): drop a `*.yaml` in and
+it runs, edit one and the next scan re-submits it.
+
+```bash
+SOURCE=dir WORKFLOW_DIR=./workflows ./dagron &
+cp pipeline.yaml ./workflows/      # runs within DIR_POLL_MS (default 2 s)
+```
+
+It polls rather than watching, because inotify does not fire on the mounts this is
+for — bind mounts from a Windows or macOS host, NFS and SMB shares. Each file's
+(modified time, length) commits with the run it becomes, so a restart re-runs
+nothing that already ran, and an edit runs whenever it moves either half of that
+key — a rewrite that keeps the same length inside the filesystem's timestamp
+granularity is not seen as a change. `DAG` argument and `SOURCE=file` are
+unchanged: one YAML, once, then drain.
+
 ### Streaming: events in, workflows out
 
 `SOURCE=stream` follows an append-only NDJSON file or named pipe — one workflow
@@ -421,8 +452,10 @@ echo '{"name":"handle_order","tasks":[{"name":"p","command":["echo","o-1001"]}]}
 
 Semantics, replay/drain modes, and five runnable case studies:
 [`docs/STREAMING.md`](docs/STREAMING.md) + [`examples/streaming/`](examples/streaming/).
-Managed broker connectors (Kafka, NATS, SQS, Redis) and the CloudEvents webhook
-gateway ship with [dagron Enterprise](#dagron-enterprise) behind the same seam.
+Managed broker connectors (Kafka, NATS, SQS, Redis) and a CloudEvents webhook
+gateway are not in this build; the seam they plug into is
+([`SourceFactory`](crates/dagron-source/src/source.rs)), and `SOURCE=stream` is
+the open path to the same shape.
 
 ### AI workloads: long, preemptible, checkpointed
 
@@ -475,14 +508,22 @@ Docker and Kubernetes executors are exactly that.
 
 `dagron-mcp` fronts the same `dagron-api` over the
 [Model Context Protocol](https://modelcontextprotocol.io) (JSON-RPC on stdio),
-so any MCP client — Claude Desktop, an IDE, your own agent — can submit,
-inspect, and cancel runs **and** observe the engine's live state through three
-cluster-internal tools: `dagron_get_metrics`, `dagron_list_dead_letters`, and
+so any MCP client — Claude Desktop, an IDE, your own agent — can take a workflow
+all the way round: register a named workflow and run it with arguments, wait on
+it, read its logs and artifacts, resolve an approval gate, rerun what failed, and
+record what it concluded. Forty-two tools, including the cluster-internal ones
+that let an agent observe the engine rather than only command it —
+`dagron_get_metrics`, `dagron_get_health`, `dagron_list_dead_letters`, and
 `dagron_get_run_events` (a bounded poll of the per-run SSE event channel).
 
 ```sh
-cargo run -p dagron-mcp        # speaks JSON-RPC over stdio
+cargo run -p dagron-mcp                       # speaks JSON-RPC over stdio
+DAGRON_MCP_READONLY=1 cargo run -p dagron-mcp # the 24 read tools only
 ```
+
+Eighteen of the forty-two change cluster state. `DAGRON_MCP_READONLY=1` hides
+them from `tools/list` and refuses them on call, which is the setting to reach
+for whenever the agent's prompt carries text you don't control.
 
 The agent talks to the **same JWT-gated UI edge** the browser uses, never the
 engine's internal ops API. See [`docs/MCP.md`](docs/MCP.md) for the tool
@@ -491,24 +532,72 @@ edge isolation, executor sandboxing, prompt-injection defense, audit). The
 agent event-call sequence is diagrammed in
 [`docs/ARCHITECTURE.md#5.8`](docs/ARCHITECTURE.md#58-mcp-agent-event-call--submit--bounded-sse-event-poll).
 
+## The console, without the stack
+
+`dagron-api` serves the full console (runs, workflows, the editor, approvals,
+settings) at `/`, with the API under `/api` — one port and one origin, no proxy
+and no second image. That is the deployment with Postgres behind it.
+
+The engine binary carries a smaller one of its own. Set `API_ADDR` and open it:
+
+```bash
+API_ADDR=127.0.0.1:8787 dagron workflow.yaml workflow.db
+# then http://127.0.0.1:8787
+```
+
+Runs with a status filter, a run's tasks with their attempts and timings, whole-run
+and per-task logs, cancel and rerun, per-task clear/approve/reject, dead letters with
+redrive, the effective configuration and the metrics exposition. **No Node, no second
+process, no network fetch** — it is embedded in the binary, so it works air-gapped and
+against SQLite. `DAGRON_CONSOLE=off` leaves it unmounted.
+
+> **The management API has no authentication.** That is true with or without the
+> console — `cancel`, `rerun`, `approve` and redrive have always been reachable by
+> anyone who can reach `API_ADDR`. The console makes that one browser tab away instead
+> of one OpenAPI read, so keep `API_ADDR` on loopback or a private address, with
+> authentication in front of it if you publish it. dagron warns at startup on a
+> non-loopback bind. `DAGRON_CONSOLE=off` hides the UI and closes nothing else.
+
 ## Architecture
 
 [![dagron system context](docs/images/architecture-system-context.png)](docs/ARCHITECTURE.md#1-system-context)
 
-Three ways in — the browser, an AI agent over MCP, and a plain YAML file — one
-datastore that *is* the source of truth, and N identical scheduler processes that
-claim work out of it with no coordinator, no leader election and no heartbeat
-table. Every scheduling decision is a SQL transition, so a scheduler can be
-killed at any point and the survivors reconstruct state from the rows alone.
+Three ways in — the browser, an AI agent over MCP, and YAML on disk (one file,
+or a watched directory) — one datastore that *is* the source of truth,
+and N identical scheduler processes that claim work out of it with no
+coordinator, no leader election and no heartbeat table. Every scheduling decision
+is a SQL transition, so a scheduler can be killed at any point and the survivors
+reconstruct state from the rows alone.
 
 dagron is a Cargo workspace: a thin `dagron` binary over the **`dagron-engine`**
-reconcile-loop library, which wires together `dagron-core` (DAG model + the
-SQLite/Postgres datastore facade), `dagron-executor` (Local/Docker/Kube backends
-+ worker pool) and `dagron-source` (workflow ingestion), with `dagron-api` as the
-authenticated UI edge and `dagron-mcp` as the per-agent adapter. The full design
-reference — component diagrams, the task state machine, and step-by-step
-event/call sequences (claiming, `LISTEN/NOTIFY` wake, crash recovery, queue
-ingestion, MCP) — is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+reconcile-loop library, which wires the rest together. Nothing below is required
+to run a workflow except the first five rows.
+
+| Crate | Owns |
+|---|---|
+| `dagron` (bin) | the entry point, and nothing else: `dagron_engine::run(Seams::default())` |
+| `dagron-engine` | the reconcile loop as a library — config, executor/worker/ingest wiring, and the ops surface (API + built-in console, cron, GC, leadership, schedules) behind `--features ops` |
+| `dagron-core` | DAG model + validation, matrix/call expansion, the SQLite/Postgres datastore facade, the metrics registry |
+| `dagron-executor` | the `Executor` trait + Local / Docker / Kubernetes backends, and the ractor worker pool |
+| `dagron-source` | the `WorkflowSource` trait + File / Dir / Stream / Channel sources, and the ingest actor that turns submissions into runs |
+| `dagron-api` | the authenticated UI edge (Postgres-only): `LISTEN/NOTIFY` → SSE, and the console itself at `/` |
+| `dagron-mcp` | MCP server over stdio — the management API as agent tools |
+| `dagron-gitops` | optional worker image: polls connected repos and reconciles their specs into the workflows table |
+| `dagron-autopsy` | standalone job autopsy — **schedules nothing**. Joins Slurm `sacct` + DCGM + NCCL logs + InfiniBand counters into a fault-attributed record for a failed GPU job ([`docs/HPC_AUTOPSY.md`](docs/HPC_AUTOPSY.md)) |
+| `dagron-identity` | auth seam — `IdentityProvider` + a local argon2 provider; SSO plugs in behind it |
+| `dagron-artifact` | artifact-store seam — local filesystem by default, S3 / GCS / Azure behind features |
+| `dagron-crypto` | secret-value encryption (AES-256-GCM, env-derived key), shared by the engine and the API |
+| `dagron-logging` | the shared `tracing` bootstrap every binary calls first |
+| `dagron-lineage` | OpenLineage emitter — best-effort `RunEvent`s on run finalization |
+| `dagron-import` | importers — Argo Workflows specs → dagron YAML |
+| `dagron-plan` | spec diff for a pull request: what a workflow change does before it merges |
+| `dagron-forge` | commit statuses / PR checks on GitHub or GitLab when a run finishes |
+| `dagron-step-mcp` | a task that calls a tool on an MCP server, with dagron's retries and artifacts around it |
+
+The full design reference — component diagrams, the task state machine, and
+step-by-step event/call sequences (claiming, `LISTEN/NOTIFY` wake, crash
+recovery, queue ingestion, MCP) — is in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 **Reference docs:** [`docs/CONFIG.md`](docs/CONFIG.md) — every env var,
 positional arg, Cargo feature and config file in one table.
@@ -516,23 +605,21 @@ positional arg, Cargo feature and config file in one table.
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — deploy, upgrade, backup per
 backend, monitoring, security posture, symptom-first troubleshooting.
 
-## dagron Enterprise
+## What this build does not do
 
-Everything on this page is Apache-2.0 and complete on its own — the engine
-here is the same code the managed fleet runs. **dagron Enterprise** adds
-the managed layer around a fleet of engines:
+Everything on this page is Apache-2.0 and complete on its own. A few knobs name
+capabilities that are **not** in this build, and they say so rather than failing
+quietly: selecting a managed connector kind (`SOURCE=kafka`, `nats`, `sqs`,
+`redis`) is a startup error, not a silent downgrade to something else. The open
+path — `SOURCE=stream` and the `SourceFactory` seam — always works, and a
+pipeline proven on it moves to another source by changing environment
+variables rather than workflows.
 
-| Open source (this repo) | dagron Enterprise adds |
-|---|---|
-| `SOURCE=stream`, exactly-once transactional offsets, the `SourceFactory` seam | Managed broker connectors — Kafka, NATS, SQS, Redis — with broker-native dead-letter routing; native Postgres change-data-capture on the same exactly-once substrate; the CloudEvents webhook gateway; a streams data plane (transforms, live repartitioning) |
-| Lease heartbeat, checkpoint resume, `resources.gpu`, `runner_class` pools | Placement policy over the pools — spot-first with starvation/preemption fallback, cost/preemption-aware multi-cloud routing, quotas, workspace isolation; maintained ML runner images |
-| Durable LLM steps as plain `command:` tasks | A hardened LLM task binary (idempotent retries, output capture, credential egress guard) and natural-language workflow generation validated against the engine's own parser |
-| Self-contained auth, single team | Enterprise identity (single sign-on, role-based access), audit trail, and the managed cloud |
-
-Selecting an enterprise connector kind in this build (e.g. `SOURCE=kafka`)
-errors with a pointer back to this section — the open path (`SOURCE=stream`,
-the seam) always works, and a pipeline proven on it moves to a managed
-connector by changing environment variables, not workflows.
+The same holds for the other seams: `Executor`, `WorkflowSource` and the
+artifact store are traits, and a build without a given backend says which
+feature is missing instead of pretending. The seams exist so an implementation
+you write — or one someone else ships — drops in without forking a file here.
+Nothing on this page depends on that happening.
 
 ## Contributing
 

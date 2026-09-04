@@ -25,6 +25,10 @@ use crate::state::AppState;
 
 const DEFAULT_LIMIT: i64 = 100;
 const MAX_LIMIT: i64 = 500;
+/// Bounds `run-<id>.json` well under the 255-byte NAME_MAX every
+/// filesystem we archive to enforces. Run ids are uuids today; this is
+/// only here so a hand-made id fails as a 400 and not as a sink error.
+const MAX_RUN_ID_LEN: usize = 128;
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct ArchivedRunSummary {
@@ -82,8 +86,14 @@ pub async fn get_archived_run(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     // The id becomes a sink object name — same conservative charset the engine
-    // uses for run ids (uuids), so a crafted id can't traverse the sink.
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+    // uses for run ids (uuids), so a crafted id can't traverse the sink, and
+    // the same length bound as the write path so one rule describes the name in
+    // both directions. (Here it is belt-and-braces: the index lookup below
+    // answers 404 long before the sink is asked for anything.)
+    if id.is_empty()
+        || id.len() > MAX_RUN_ID_LEN
+        || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
         return Err(err(StatusCode::BAD_REQUEST, json!({"error": "invalid run id"})));
     }
 
@@ -137,6 +147,184 @@ pub async fn get_archived_run(
     obj.insert("archived".into(), json!(true));
     obj.insert("index".into(), serde_json::to_value(&row).unwrap_or_default());
     Ok(Json(doc))
+}
+
+/// `POST /api/runs/{id}/archive` — archive one terminal run **now**, instead of
+/// waiting for the retention window to reach it.
+///
+/// This is the same archive-before-purge the GC performs, aimed at one run:
+/// export the document, verify it landed, index it, then delete the run from
+/// the hot store. It is therefore **destructive** — the run leaves `/api/runs`
+/// and reappears under `/api/archive/runs` — and the order matters as much
+/// here as it does in the sweep. Write, then index, then purge: a run purged
+/// before its index row exists is history nothing can list.
+///
+/// Admin-only. The retention window is an instance-wide policy set by an
+/// operator; letting any signed-in user pull individual runs out of the hot
+/// store ahead of it is the same authority, exercised one run at a time.
+///
+/// Refusals are specific on purpose, because each has a different fix:
+/// * `400` — malformed id.
+/// * `403` — not an admin.
+/// * `404` — no such run in the hot store (already archived, or never existed).
+/// * `409` — the run is not terminal. Archiving a live run would purge state
+///   the scheduler is still driving.
+/// * `501` — no sink configured on dagron-api. Without one there is nothing to
+///   archive *to*, and proceeding would be a delete wearing a kinder word.
+/// * `502` — the sink refused the write. The run stays in the hot store.
+pub async fn archive_run(
+    AuthUser(claims): AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !claims.groups.iter().any(|g| g == "admin") {
+        return Err(err(StatusCode::FORBIDDEN, json!({"error": "admin group required"})));
+    }
+    // The id becomes a sink object name — same conservative charset as the read
+    // path, so a crafted id cannot traverse the sink. The length bound earns its
+    // place on this route: nothing here has consulted the archive index, so an
+    // over-long id reaches the sink and fails the write with ENAMETOOLONG,
+    // answering 502 "archive sink unreachable" for what is plainly a bad
+    // request.
+    if id.is_empty()
+        || id.len() > MAX_RUN_ID_LEN
+        || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err(err(StatusCode::BAD_REQUEST, json!({"error": "invalid run id"})));
+    }
+    if !sink_configured() {
+        return Err(err(
+            StatusCode::NOT_IMPLEMENTED,
+            json!({
+                "error": "no archive sink configured on dagron-api \
+                          (set GC_ARCHIVE_DIR, or GC_ARCHIVE_URL with a cloud archive feature)"
+            }),
+        ));
+    }
+
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM workflow_runs WHERE id = $1")
+            .bind(&id)
+            .fetch_optional(&state.write_pool)
+            .await
+            .map_err(|e| err(internal(e), json!({"error": "internal error"})))?;
+    let Some(status) = status else {
+        return Err(err(StatusCode::NOT_FOUND, json!({"error": "run not found in the hot store"})));
+    };
+    if !matches!(status.as_str(), "succeeded" | "failed" | "cancelled") {
+        return Err(err(
+            StatusCode::CONFLICT,
+            json!({"error": "run is not terminal", "status": status}),
+        ));
+    }
+
+    let doc = dagron_core::db::archive_doc_for_run(&state.write_pool, &id)
+        .await
+        .map_err(|e| {
+            tracing::error!(run_id = %id, error = %e, "archive document build failed");
+            err(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "internal error"}))
+        })?
+        .ok_or_else(|| {
+            err(StatusCode::NOT_FOUND, json!({"error": "run not found in the hot store"}))
+        })?;
+
+    // Fail closed: no index row and no purge unless the document verifiably
+    // landed, exactly as the sweep does.
+    store_document(&id, &doc).await.map_err(|e| {
+        tracing::error!(run_id = %id, error = %e, "archive write failed — run kept in hot store");
+        err(
+            StatusCode::BAD_GATEWAY,
+            json!({"error": "archive sink write failed — run kept in the hot store", "run_id": id}),
+        )
+    })?;
+
+    let run = &doc["run"];
+    dagron_core::db::index_archived_run(
+        &state.write_pool,
+        &id,
+        run["definition_name"].as_str().unwrap_or(""),
+        run["status"].as_str().unwrap_or("unknown"),
+        run["created_at"].as_str(),
+        run["finished_at"].as_str(),
+    )
+    .await
+    .map_err(|e| {
+        // 500, not 502: this is our own index write on `write_pool`. The 502
+        // above means the archive sink is unreachable, which is a different
+        // page for whoever is holding it.
+        tracing::error!(run_id = %id, error = %e, "archive index write failed — run kept in hot store");
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": "archive index write failed — run kept in the hot store", "run_id": id}),
+        )
+    })?;
+
+    let purged = dagron_core::db::purge_runs_by_id(&state.write_pool, std::slice::from_ref(&id))
+        .await
+        .map_err(|e| {
+            // Archived and indexed but not purged: the run is listable in both
+            // places until the next sweep reaches it, which is the harmless
+            // direction to fail in.
+            tracing::error!(run_id = %id, error = %e, "archive purge failed after a durable write");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "archived, but purging from the hot store failed", "run_id": id}),
+            )
+        })?;
+
+    tracing::info!(run_id = %id, by = %claims.email, purged, "run archived on request");
+    Ok(Json(json!({"run_id": id, "archived": true, "purged": purged})))
+}
+
+/// True when this process can write to an archive sink — the same env contract
+/// the reads use, asked before anything is mutated.
+fn sink_configured() -> bool {
+    let set = |k: &str| std::env::var(k).ok().is_some_and(|v| !v.trim().is_empty());
+    set("GC_ARCHIVE_URL") || set("GC_ARCHIVE_DIR")
+}
+
+/// Durably write `run-<id>.json` to the configured sink. The mirror of
+/// [`fetch_document`], and the same precedence: `GC_ARCHIVE_URL` over
+/// `GC_ARCHIVE_DIR`.
+///
+/// Returning `Ok` is purge permission, so the local path uses the engine's own
+/// fsync chain (`dagron_core::archive`) rather than a second copy of it, and
+/// the object path relies on a completed PUT being atomic.
+async fn store_document(id: &str, doc: &serde_json::Value) -> anyhow::Result<()> {
+    use anyhow::Context;
+    if let Ok(url) = std::env::var("GC_ARCHIVE_URL") {
+        let url = url.trim().to_string();
+        if !url.is_empty() {
+            #[cfg(feature = "archive-cloud")]
+            {
+                let (store, prefix) = crate::objstore::from_url(&url)?;
+                let path = prefix.child(dagron_core::archive::document_name(id));
+                let bytes = serde_json::to_vec(doc)?;
+                object_store::ObjectStore::put(
+                    &store,
+                    &path,
+                    object_store::PutPayload::from(bytes),
+                )
+                .await?;
+                return Ok(());
+            }
+            #[cfg(not(feature = "archive-cloud"))]
+            anyhow::bail!(
+                "GC_ARCHIVE_URL is set but dagron-api was built without a cloud archive feature \
+                 (archive-s3 / archive-gcs / archive-azure)"
+            );
+        }
+    }
+    let dir = std::env::var("GC_ARCHIVE_DIR")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .context("neither GC_ARCHIVE_URL nor GC_ARCHIVE_DIR is configured on dagron-api")?;
+    let dir = std::path::PathBuf::from(dir.trim());
+    let (id, doc) = (id.to_string(), doc.clone());
+    // The fsync chain is blocking; keep it off the async worker.
+    tokio::task::spawn_blocking(move || dagron_core::archive::write_document(&dir, &id, &doc))
+        .await??;
+    Ok(())
 }
 
 /// Fetch `run-<id>.json` from the configured sink. Mirrors the engine's env

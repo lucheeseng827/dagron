@@ -14,6 +14,29 @@
 //! dagron-api cannot depend on dagron-core (its sqlite/postgres feature
 //! exclusivity would trip under workspace feature unification), so the shared
 //! primitive lives here.
+//!
+//! The same reasoning puts **signed workflow bundles** here ([`bundle`]): the
+//! GitOps worker, the management API and a fleet unit all verify the same
+//! ed25519-signed manifest against `DAGRON_BUNDLE_PUBKEYS`, and one verifier
+//! shared by all three is the only way "verified" means one thing. Keygen and
+//! signing live in the `bundle_sign` example; docs/BUNDLES.md is the contract.
+
+pub mod bundle;
+
+/// Serializes the tests that mutate the process environment. `setenv` is not
+/// thread-safe against a concurrent read anywhere in the process, and cargo runs
+/// a crate's tests on several threads — so it is the *environment*, not any one
+/// variable, that has to be owned for the duration. Every such test in this
+/// crate takes this lock, `bundle`'s included.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`ENV_LOCK`], ignoring poisoning: a panicking test has already failed,
+/// and a poisoned lock must not cascade into every other test in the crate.
+#[cfg(test)]
+pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
@@ -991,7 +1014,7 @@ fn build_provider(get: Getter) -> Result<Option<Box<dyn KeyProvider>>> {
     let which = get(PROVIDER_ENV).map(|v| v.to_ascii_lowercase());
 
     // ── Open-core line ────────────────────────────────────────────────────────
-    // Envelope encryption (BYOK/KMS-wrapped data keys) is Enterprise. The open
+    // Envelope encryption (BYOK/KMS-wrapped data keys) is feature-gated. The open
     // build keeps the full `v1:` path — environment secrets encrypted with
     // AES-256-GCM under `DAGRON_ENV_SECRET_KEY` — which is what compose ships and
     // what `docs/HOWTO.md` §5 documents; only the KEK layer above it is paid.
@@ -1004,7 +1027,7 @@ fn build_provider(get: Getter) -> Result<Option<Box<dyn KeyProvider>>> {
     // security surprise nobody should discover from a ciphertext dump.
     if !cfg!(feature = "enterprise") && !matches!(which.as_deref(), None | Some("none")) {
         bail!(
-            "{PROVIDER_ENV}={} requests envelope encryption (BYOK/KMS-wrapped data keys),              which ships with dagron Enterprise —              https://github.com/lucheeseng827/dagron#dagron-enterprise. This build encrypts              environment secrets with AES-256-GCM under DAGRON_ENV_SECRET_KEY (the `v1:`              format); unset {PROVIDER_ENV} to use it.",
+            "{PROVIDER_ENV}={} requests envelope encryption (BYOK/KMS-wrapped data keys),              which is not in this build —              https://github.com/lucheeseng827/dagron#what-this-build-does-not-do. This build encrypts              environment secrets with AES-256-GCM under DAGRON_ENV_SECRET_KEY (the `v1:`              format); unset {PROVIDER_ENV} to use it.",
             which.as_deref().unwrap_or("")
         );
     }
@@ -1199,6 +1222,7 @@ mod tests {
 
     #[test]
     fn kms_command_times_out_instead_of_hanging() {
+        let _env = crate::env_guard();
         // A wrapper that never returns must not hang encrypt/decrypt forever.
         std::env::set_var("DAGRON_ENV_KMS_TIMEOUT_SECS", "1");
         let p = CommandKmsProvider {
@@ -1410,6 +1434,9 @@ mod tests {
     #[cfg(feature = "kms-gcp")]
     #[test]
     fn gcp_kms_round_trip_live() {
+        // Held across the whole test: `from_env` reads more of the environment,
+        // and another test mutating it concurrently is a race on environ itself.
+        let _env = crate::env_guard();
         let Ok(key) = std::env::var("DAGRON_ENV_KMS_KEY_ID") else {
             eprintln!("skipping gcp_kms_round_trip_live: DAGRON_ENV_KMS_KEY_ID not set");
             return;
@@ -1430,6 +1457,7 @@ mod tests {
     #[cfg(feature = "kms-azure")]
     #[test]
     fn azure_kv_round_trip_live() {
+        let _env = crate::env_guard();
         let (Ok(vault), Ok(key)) = (
             std::env::var("DAGRON_ENV_KMS_VAULT_URL"),
             std::env::var("DAGRON_ENV_KMS_KEY_ID"),
@@ -1502,7 +1530,7 @@ mod open_core_tests {
         assert_eq!(version_of(&sealed), Some("v1"));
     }
 
-    /// Envelope mode off is not an Enterprise question — both builds agree.
+    /// Envelope mode off is not a feature question — both builds agree.
     #[test]
     fn provider_unset_is_none_in_every_build() {
         let get = |_: &str| None;
@@ -1526,11 +1554,11 @@ mod open_core_tests {
             Err(e) => e.to_string(),
             Ok(_) => panic!("envelope mode must be refused in an open build"),
         };
-        assert!(err.contains("dagron Enterprise"), "signpost names the edition: {err}");
+        assert!(err.contains("not in this build"), "signpost names the gap: {err}");
         assert!(err.contains("DAGRON_ENV_SECRET_KEY"), "and points at the open alternative: {err}");
     }
 
-    /// The same configuration in an Enterprise build builds a working provider.
+    /// The same configuration in a feature-on build builds a working provider.
     #[cfg(feature = "enterprise")]
     #[test]
     fn enterprise_build_accepts_a_kek() {

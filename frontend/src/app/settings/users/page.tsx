@@ -105,7 +105,7 @@ export default function UsersPage() {
               <Field label="Role">
                 <select value={role} onChange={(e) => setRole(e.target.value as Role)} className="dy-btn" style={{ cursor: "pointer" }}>
                   <option value="operator">Operator — full control</option>
-                  {isEnterprise && <option value="viewer">Viewer — read-only (Enterprise)</option>}
+                  {isEnterprise && <option value="viewer">Viewer — read-only</option>}
                   <option value="admin">Admin — control + user management</option>
                 </select>
               </Field>

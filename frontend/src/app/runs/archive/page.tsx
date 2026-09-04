@@ -3,7 +3,8 @@
 // Read-only view of an archived run's `dagron.run-archive.v1` document —
 // history stays browsable after the archive GC moves a run out of the hot store.
 
-import { use, useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
+import { useRouteId } from "@/lib/route-id";
 import Link from "next/link";
 import { getArchivedRun } from "@/lib/dagron-api";
 import { statusColor, statusLabel } from "@/lib/adapter";
@@ -11,8 +12,18 @@ import { errMsg } from "@/lib/err";
 import { absTime, duration } from "@/lib/time";
 import type { ArchivedRunDoc, TaskStatus } from "@/types/dagron";
 
-export default function ArchivedRunPage({ params }: { params: Promise<{ id: string }> }) {
-  const { id } = use(params);
+export default function ArchivedRunPage() {
+  // useRouteId() calls useSearchParams(), which suspends during prerender;
+  // the static export build fails without this boundary.
+  return (
+    <Suspense fallback={null}>
+      <ArchivedRunPageInner />
+    </Suspense>
+  );
+}
+
+function ArchivedRunPageInner() {
+  const id = useRouteId();
   const [doc, setDoc] = useState<ArchivedRunDoc | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [openTask, setOpenTask] = useState<string | null>(null);

@@ -1,0 +1,119 @@
+# 01 — Lead capture from every source, into one HubSpot upsert.
+#
+#   extract (fan-out ×5, one per source) ─▶ normalize ─▶ validate ─▶ upsert ─▶ announce
+#
+# The shape marketing ops actually has: leads arrive from five systems that fail
+# independently. Each source is a labelled fan-out instance (`instance_key`), so
+# a run's DAG reads `extract.linkedin-ads`, not `extract.3`, and a rerun targets
+# the one that broke. Sources are `allow_failure` with an `all_done` join —
+# a dead partner SFTP must not hold back today's form fills — and the join is
+# where the run decides whether what landed is loadable.
+#
+# `produces:` puts the upsert in the lineage ledger, which is what lets 02
+# (enrichment) fire *because* contacts landed instead of guessing with a cron.
+#
+#   dagron validate examples/marketing/01_lead_capture_multisource.yaml   # offline lint
+#   dagron dev      examples/marketing/01_lead_capture_multisource.yaml   # ingest + console
+#
+# (`dagron` is a scheduler daemon, not a submit CLI — it ingests a file, or you
+# POST to the API. See docs/HOWTO.md §1–2.)
+name: mktg_lead_capture_multisource
+tags: [marketing, lead-gen, ingest]
+environment: prod
+deadline: { in: 20m }
+run_timeout_secs: 3600
+max_active_runs: 1
+parameters:
+  slack_webhook: ""              # notify: URLs template against run PARAMETERS,
+                                 # not {{ env.* }} — set an instance-wide default
+                                 # in the console instead (sidebar -> Notifications).
+
+task_defaults:
+  max_attempts: 4
+  retry_delay_secs: 5
+  retry_max_delay_secs: 60
+  timeout_secs: 300
+  env:
+    - { name: HUBSPOT_TOKEN, value_from: { secret: HUBSPOT_PRIVATE_APP_TOKEN } }
+    - { name: LAKE_BUCKET, value: "{{ env.LAKE_BUCKET }}" }
+
+notify:
+  slack:
+    webhook_url: "{{ slack_webhook }}"   # failures + missed SLA
+  webhook:
+    url: https://ops.example.com/hooks/dagron/lead-capture
+    on: [succeeded, failed, deadline_exceeded]
+
+tasks:
+  # One instance per source. A source that dies is a normal outcome here, not an
+  # outage — it fails its own instance and the join still runs.
+  - name: extract
+    with_items:
+      - { source: hubspot-forms, kind: api,  budget: 6 }
+      - { source: zoom-webinar,  kind: api,  budget: 4 }
+      - { source: drift-chat,    kind: api,  budget: 4 }
+      - { source: linkedin-ads,  kind: api,  budget: 6 }
+      - { source: partner-sftp,  kind: s3,   budget: 3 }
+    instance_key: "{{ item.source }}"
+    allow_failure: true
+    max_attempts: 6
+    pool: crm-api                       # shared rate-limit budget, see POOLS
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        out="$DAGRON_ARTIFACTS/raw-{{ item.source }}.ndjson"
+        case "{{ item.kind }}" in
+          api) extract-source --source {{ item.source }} --since "$(date -u -d '1 hour ago' +%FT%TZ)" > "$out" ;;
+          s3)  aws s3 cp "s3://$LAKE_BUCKET/inbound/{{ item.source }}/latest.ndjson" "$out" ;;
+        esac
+        wc -l < "$out"
+
+  # all_done: load what arrived. all_success would let one dead source stall the
+  # whole hour's leads, which is the failure mode this pipeline exists to avoid.
+  - name: normalize
+    depends_on: [extract]
+    trigger_rule: all_done
+    timeout_secs: 600
+    command: ["sh", "-c", "normalize-leads --in \"$DAGRON_ARTIFACTS\" --out \"$DAGRON_ARTIFACTS/leads.ndjson\" --schema lead.v3"]
+
+  # Prints `ok` or `quarantine` — 03's routing and the branch below both read it.
+  - name: validate
+    depends_on: [normalize]
+    max_attempts: 1
+    command: ["sh", "-c", "validate-leads \"$DAGRON_ARTIFACTS/leads.ndjson\" --min-rows 1 --require email"]
+
+  - name: upsert
+    depends_on: [validate]
+    when: "{{ tasks.validate.output }} == ok"
+    timeout_secs: 900
+    pool: crm-api
+    produces:
+      - hubspot://crm/contacts
+      - s3://acme-lake/marketing/leads/raw
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        aws s3 cp "$DAGRON_ARTIFACTS/leads.ndjson" \
+          "s3://$LAKE_BUCKET/marketing/leads/raw/dt=$(date -u +%F)/$DAGRON_RUN_ID.ndjson"
+        hubspot-batch-upsert --object contacts --input "$DAGRON_ARTIFACTS/leads.ndjson" \
+          --id-property email --token "$HUBSPOT_TOKEN"
+
+  - name: quarantine
+    depends_on: [validate]
+    when: "{{ tasks.validate.output }} != ok"
+    command: ["sh", "-c", "aws s3 cp \"$DAGRON_ARTIFACTS/leads.ndjson\" \"s3://$LAKE_BUCKET/marketing/quarantine/$DAGRON_RUN_ID.ndjson\""]
+
+  - name: announce
+    depends_on: [upsert]
+    max_attempts: 2
+    command: ["sh", "-c", "post-slack '#demand-gen' \"$(wc -l < \"$DAGRON_ARTIFACTS/leads.ndjson\") leads captured\""]
+
+  # Auto-wired to every non-hook task — no depends_on to keep in sync as the DAG grows.
+  - name: page_mktg_ops
+    hook: on_failure
+    max_attempts: 1
+    command: ["sh", "-c", "pagerduty-event --severity warning --summary 'lead capture degraded'"]

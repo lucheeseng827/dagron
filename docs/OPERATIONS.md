@@ -11,8 +11,9 @@ fails mid-upgrade — are in [`BACKUP_RECOVERY.md`](BACKUP_RECOVERY.md).
 **Full UI stack (local/dev):** `podman compose up --build` (validated with
 podman; docker compose works the same) from the module root brings up
 `postgres` → `engine` (Postgres+ops build, ops API on 8787, cluster-internal)
-→ `dagron-api` (`127.0.0.1:8080`) → `frontend` (`127.0.0.1:3000`). Sign in at
-`http://localhost:3000` with the seeded admin (`admin@local` /
+→ `dagron-api` (`127.0.0.1:8080`), which serves the console at `/` and the API
+under `/api` on that same port. Sign in at
+`http://localhost:8080` with the seeded admin (`admin@local` /
 `dagron-admin`). Before any non-local deploy, change `DAGRON_JWT_SECRET`
 (≥ 32 chars), the admin password, and leave `DAGRON_COOKIE_SECURE` at its
 default (`true`). `compose.docker-executor.yaml` is a dev-only override that

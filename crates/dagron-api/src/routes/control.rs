@@ -1239,14 +1239,14 @@ tasks:
         assert!(err.1.contains("duplicate template name 't'"), "got: {}", err.1);
     }
 
-    /// The console and the engine must agree on where the Enterprise line is.
+    /// The console and the engine must agree on where the feature line is.
     ///
     /// `parse_and_validate` hands specs to `dagron_core`'s parser, so whether a
     /// multi-dataset spec is accepted depends on the features dagron-api forwards
     /// to dagron-core — not on dagron-api's own `enterprise` flag. They were not
-    /// wired together, so an Enterprise build of the console refused specs the
-    /// Enterprise engine beside it accepted, and told the operator to go buy the
-    /// edition they already had.
+    /// wired together, so a feature-on console refused specs the feature-on
+    /// engine beside it accepted, and pointed the operator at a capability
+    /// they already had.
     #[test]
     fn the_dataset_composition_line_matches_the_engine() {
         let multi = "
@@ -1267,7 +1267,7 @@ tasks:
         #[cfg(not(feature = "enterprise"))]
         {
             let err = core.err().expect("an open build refuses multi-dataset composition").to_string();
-            assert!(err.contains("dagron Enterprise"), "signpost names the edition: {err}");
+            assert!(err.contains("not in this build"), "signpost names the gap: {err}");
         }
     }
 

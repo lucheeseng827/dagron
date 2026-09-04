@@ -1,0 +1,161 @@
+# 19 — Competitive intelligence: an agent's tools, as workflow tasks.
+#
+#   collect (MCP tools) ─▶ poll until indexed ─▶ analyse (Claude) ─▶ digest ─▶ battlecard PR
+#
+# `dagron-mcp` lets an agent drive dagron. `dagron-step-mcp` is the inverse: it
+# lets this DAG drive an agent's tools, one tool call per task. That swap is the
+# whole point of the workflow.
+#
+# A tool call inside an agent's own loop has no retries, no timeout, no captured
+# artifact, and no place in a run history — when it fails halfway there is
+# nothing to resume, and nobody can answer "what did it actually read?" three
+# weeks later when the battlecard turns out to be wrong. As tasks, each call
+# gets backoff, a deadline, an artifact the next step consumes, and a row in the
+# run. The `DAGRON_MCP_STEP_OUTPUT` file also makes a retry idempotent: a crash
+# after the call but before the commit finds the result already written and does
+# not call the tool — and pay for it — twice.
+#
+# The MCP servers are the same ones the team's assistants use, under the same
+# permissions, so the pipeline cannot quietly grow its own shadow tool access.
+name: mktg_competitor_intel_agent
+tags: [marketing, competitive-intel, mcp, llm]
+environment: prod
+run_timeout_secs: 14400
+deadline: { in: 2h }
+parameters:
+  competitors: '["northwind", "globex", "initech"]'
+  since_days: "7"
+
+task_defaults:
+  max_attempts: 3
+  retry_delay_secs: 10
+  retry_max_delay_secs: 120
+  timeout_secs: 600
+  env:
+    - { name: ANTHROPIC_API_KEY, value_from: { secret: ANTHROPIC_API_KEY } }
+    - { name: ANTHROPIC_MODEL, value: "claude-sonnet-5" }
+    - { name: NOTION_TOKEN, value_from: { secret: NOTION_API_TOKEN } }
+    - { name: GITHUB_TOKEN, value_from: { secret: GITHUB_PAT } }
+
+templates:
+  # One competitor's collection sweep, expressed as MCP tool calls.
+  - name: collect_competitor
+    parameters: { name: "" }
+    tasks:
+      # A fetch tool through MCP rather than curl: same server, same allowlist,
+      # same audit trail as the assistants use.
+      - name: fetch_site
+        max_attempts: 4
+        retry_delay_secs: 15
+        env:
+          - { name: DAGRON_MCP_STEP_SERVER, value: "npx" }
+          - name: DAGRON_MCP_STEP_SERVER_ARGS
+            value: '["-y", "@modelcontextprotocol/server-fetch"]'
+          - { name: DAGRON_MCP_STEP_TOOL, value: "fetch" }
+          - { name: DAGRON_MCP_STEP_ARGS, value: '{"url": "https://{{ name }}.com/pricing"}' }
+          - { name: DAGRON_MCP_STEP_OUTPUT, value: "/artifacts/{{ name }}-pricing.txt" }
+          - { name: DAGRON_MCP_STEP_TIMEOUT_SECS, value: "90" }
+        command: ["dagron-step-mcp"]
+
+      - name: fetch_changelog
+        depends_on: [fetch_site]
+        allow_failure: true
+        env:
+          - { name: DAGRON_MCP_STEP_SERVER, value: "npx" }
+          - name: DAGRON_MCP_STEP_SERVER_ARGS
+            value: '["-y", "@modelcontextprotocol/server-fetch"]'
+          - { name: DAGRON_MCP_STEP_TOOL, value: "fetch" }
+          - { name: DAGRON_MCP_STEP_ARGS, value: '{"url": "https://{{ name }}.com/changelog"}' }
+          - { name: DAGRON_MCP_STEP_OUTPUT, value: "/artifacts/{{ name }}-changelog.txt" }
+        command: ["dagron-step-mcp"]
+
+      # Non-MCP sources alongside them — an MCP result is just task output, and
+      # task output is just an argument to the next thing.
+      - name: fetch_reviews
+        depends_on: [fetch_site]
+        allow_failure: true
+        pool: enrich-api
+        command: ["sh", "-c", "g2-reviews --vendor {{ name }} --since {{ since_days }}d > \"$DAGRON_ARTIFACTS/{{ name }}-reviews.json\""]
+
+      - name: fetch_ads
+        depends_on: [fetch_site]
+        allow_failure: true
+        pool: ads-api
+        command: ["sh", "-c", "meta-ad-library --advertiser {{ name }} --since {{ since_days }}d > \"$DAGRON_ARTIFACTS/{{ name }}-ads.json\""]
+
+tasks:
+  - name: collect
+    template: collect_competitor
+    with_param: "{{ competitors }}"
+    arguments: { name: "{{ item }}" }
+
+  # The search index is populated asynchronously by the collector. Poll until it
+  # reports `indexed`, bounded — 15 tries at 20s, then fail rather than analyse
+  # half the corpus and present it as the whole picture.
+  - name: await_index
+    depends_on: [collect]
+    trigger_rule: all_done
+    repeat: { until: "{{ output }} == indexed", max_iterations: 15, delay_secs: 20 }
+    timeout_secs: 60
+    command: ["sh", "-c", "intel-index-status --run \"$DAGRON_RUN_ID\""]
+
+  # The durable model call: writes to an artifact, checks for it first, never
+  # re-spends tokens on a retry.
+  - name: analyse
+    depends_on: [await_index]
+    timeout_secs: 900
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        out="$DAGRON_ARTIFACTS/analysis.md"
+        [ -s "$out" ] && { echo "analysis already generated"; exit 0; }
+        tmp="$out.tmp"; rm -f "$tmp"
+        payload=$(python3 -c 'import json,os,glob;
+        corpus="\n\n".join(open(p, errors="ignore").read()[:20000] for p in sorted(glob.glob(os.environ["DAGRON_ARTIFACTS"]+"/*")) if os.path.isfile(p));
+        print(json.dumps({"model": os.environ["ANTHROPIC_MODEL"], "max_tokens": 4000, "messages": [{"role":"user","content":"Summarise competitor positioning, pricing and messaging changes. Cite the source file for every claim.\n\n"+corpus}]}))')
+        curl -sf https://api.anthropic.com/v1/messages \
+          -H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: 2023-06-01" \
+          -H "content-type: application/json" -d "$payload" \
+          | python3 -c 'import json,sys; print("".join(b.get("text","") for b in json.load(sys.stdin)["content"]))' > "$tmp"
+        [ -s "$tmp" ] || { rm -f "$tmp"; echo "empty analysis" >&2; exit 1; }
+        mv "$tmp" "$out"
+
+  # Write the digest back through MCP too — one tool surface in, one out.
+  - name: publish_digest
+    depends_on: [analyse]
+    env:
+      - { name: DAGRON_MCP_STEP_SERVER, value: "npx" }
+      - name: DAGRON_MCP_STEP_SERVER_ARGS
+        value: '["-y", "@notionhq/notion-mcp-server"]'
+      - { name: DAGRON_MCP_STEP_TOOL, value: "create_page" }
+      - { name: DAGRON_MCP_STEP_ARGS_FILE, value: "/artifacts/notion-args.json" }
+      - { name: DAGRON_MCP_STEP_OUTPUT, value: "/artifacts/notion-result.json" }
+    command:
+      - sh
+      - -c
+      - >-
+        notion-args --title "Competitive digest $(date -u +%F)"
+        --body "$DAGRON_ARTIFACTS/analysis.md" > "$DAGRON_ARTIFACTS/notion-args.json"
+        && dagron-step-mcp
+
+  # A battlecard change is a pull request a human reviews. The agent proposes;
+  # product marketing decides.
+  - name: battlecard_pr
+    depends_on: [analyse]
+    command: ["sh", "-c", "battlecard-pr --analysis \"$DAGRON_ARTIFACTS/analysis.md\" --repo acme/sales-enablement --branch \"intel/$DAGRON_RUN_ID\""]
+
+  # `all_success` (the default), not `all_done`: this message asserts the digest
+  # is ready, and `all_done` would send it verbatim after the Notion write or the
+  # battlecard PR had failed. A false all-clear is worse than no message — so the
+  # claim skips when it isn't true, and the hook below reports the other case.
+  - name: notify_pmm
+    depends_on: [publish_digest, battlecard_pr]
+    max_attempts: 2
+    command: ["sh", "-c", "post-slack product-marketing \"competitive digest ready - run $DAGRON_RUN_ID\""]
+
+  - name: alert_intel_failed
+    hook: on_failure
+    max_attempts: 1
+    command: ["sh", "-c", "post-slack product-marketing \"competitive intel run failed - run $DAGRON_RUN_ID\""]

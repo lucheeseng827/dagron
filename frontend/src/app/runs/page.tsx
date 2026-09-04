@@ -8,12 +8,15 @@ import { listArchivedRuns, listRuns, listWorkflows } from "@/lib/dagron-api";
 import { statusColor } from "@/lib/adapter";
 import { errMsg } from "@/lib/err";
 import { useLiveRefresh, useLiveUpdates } from "@/lib/live";
+import { PAGE_SIZES, usePageSize, type PageSize } from "@/lib/shell-prefs";
 import { absTime, timeAgo, duration } from "@/lib/time";
 import type { ArchivedRunSummary, RunSummary, TaskStatus } from "@/types/dagron";
 
 // Comp column layout: ● | Workflow | Run | Started | Duration | Trigger
 const GRID = "24px 1.4fr 1.2fr 1fr 1fr 1fr";
-const PAGE_SIZE = 50;
+// Rows per page is a preference now (lib/shell-prefs), not a constant: 50 is
+// still the default, but a list this dense is read very differently by someone
+// scanning a busy day than by someone checking one workflow.
 
 const STATUS_FILTERS = ["all", "running", "succeeded", "failed", "cancelled"] as const;
 type StatusFilter = (typeof STATUS_FILTERS)[number];
@@ -33,12 +36,17 @@ export default function RunsPage() {
   const [name, setName] = useState("");
   const [trigger, setTrigger] = useState("");
   const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = usePageSize();
   // One extra row is requested per page purely to detect "has next page".
   const [hasMore, setHasMore] = useState(false);
 
   useEffect(() => {
-    const s = new URLSearchParams(window.location.search).get("status");
+    const qs = new URLSearchParams(window.location.search);
+    const s = qs.get("status");
     if (s && (STATUS_FILTERS as readonly string[]).includes(s)) setStatus(s as StatusFilter);
+    // `tab` seeds the same way, so archiving a run can land the operator where
+    // the run just went instead of on a live list it is no longer in.
+    if (qs.get("tab") === "archive") setTab("archive");
     listWorkflows()
       .then((ws) => setNames(ws.map((w) => w.name).sort()))
       .catch(() => {});
@@ -50,25 +58,25 @@ export default function RunsPage() {
         status: status === "all" ? undefined : status,
         name: name || undefined,
         trigger: trigger || undefined,
-        limit: PAGE_SIZE + 1,
-        offset: page * PAGE_SIZE,
+        limit: pageSize + 1,
+        offset: page * pageSize,
       })
         .then((rs) => {
-          setHasMore(rs.length > PAGE_SIZE);
-          setRuns(rs.slice(0, PAGE_SIZE));
+          setHasMore(rs.length > pageSize);
+          setRuns(rs.slice(0, pageSize));
           setError(null);
         })
         .catch((e) => setError(errMsg(e)));
     } else {
-      listArchivedRuns({ name: name || undefined, limit: PAGE_SIZE + 1, offset: page * PAGE_SIZE })
+      listArchivedRuns({ name: name || undefined, limit: pageSize + 1, offset: page * pageSize })
         .then((rs) => {
-          setHasMore(rs.length > PAGE_SIZE);
-          setArchived(rs.slice(0, PAGE_SIZE));
+          setHasMore(rs.length > pageSize);
+          setArchived(rs.slice(0, pageSize));
           setError(null);
         })
         .catch((e) => setError(errMsg(e)));
     }
-  }, [tab, status, name, trigger, page]);
+  }, [tab, status, name, trigger, page, pageSize]);
   useEffect(() => load(), [load]);
   // Live mode: refetch on activity from the account-wide event stream. Task
   // events only move the live list — the archive tab holds no stream open.
@@ -80,20 +88,55 @@ export default function RunsPage() {
     setPage(0);
   };
 
+  const shown = tab === "live" ? runs.length : archived.length;
+  const first = shown === 0 ? 0 : page * pageSize + 1;
+
+  // Rendered at both ends of the list. Defined once: two copies of a control
+  // that writes the same preference is two things to keep in step.
+  const rowsControl = (
+    <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "var(--muted)" }}>
+      Rows
+      <select
+        className="dy-btn"
+        value={pageSize}
+        onChange={(e) => {
+          // Page 1 is the only page guaranteed to exist at the new size —
+          // staying on page 4 of 50 would land past the end at 200.
+          setPageSize(Number(e.target.value) as PageSize);
+          setPage(0);
+        }}
+        aria-label="Rows per page"
+      >
+        {PAGE_SIZES.map((n) => (
+          <option key={n} value={n}>
+            {n}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+
   const pager = (
     <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 18px" }}>
       <button className="dy-btn" disabled={page === 0} onClick={() => setPage((p) => Math.max(0, p - 1))}>
         ← Prev
       </button>
-      <span style={{ fontSize: 12.5, color: "var(--muted)" }}>Page {page + 1}</span>
+      {/* The row range, not just the page number: "Page 1" on its own cannot
+          tell you whether you are looking at everything or at the first slice
+          of something much longer. */}
+      <span style={{ fontSize: 12.5, color: "var(--muted)" }}>
+        {shown === 0 ? "No runs" : `${first}–${page * pageSize + shown}`}
+        {hasMore || page > 0 ? ` · page ${page + 1}` : ""}
+      </span>
       <button className="dy-btn" disabled={!hasMore} onClick={() => setPage((p) => p + 1)}>
         Next →
       </button>
+      <div style={{ marginLeft: "auto" }}>{rowsControl}</div>
     </div>
   );
 
   return (
-    <div className="dy-page">
+    <div className="dy-page dy-page-wide">
       <div className="dy-pagehead">
         <div>
           <h1 className="dy-h1" style={{ marginBottom: 0 }}>
@@ -163,6 +206,11 @@ export default function RunsPage() {
             <option value="backfill">Backfill</option>
           </select>
         )}
+        {/* Page size belongs with the filters too, not only under the table:
+            deciding how much to look at is the same kind of decision as
+            deciding what to look at, and on a long page the footer copy is a
+            scroll away from where that decision gets made. */}
+        <div style={{ marginLeft: "auto" }}>{rowsControl}</div>
       </div>
 
       {error && <p style={{ color: "var(--red)" }}>{error}</p>}
@@ -197,7 +245,7 @@ export default function RunsPage() {
             return (
               <Link
                 key={r.id}
-                href={`/runs/${r.id}`}
+                href={`/runs/detail/?id=${r.id}`}
                 className="dy-runrow"
                 style={{ display: "grid", gridTemplateColumns: GRID, gap: 12 }}
               >
@@ -256,7 +304,7 @@ export default function RunsPage() {
                 {row}
               </div>
             ) : (
-              <Link key={r.run_id} href={`/runs/archive/${r.run_id}`} className="dy-runrow" style={{ display: "grid", gridTemplateColumns: GRID, gap: 12 }}>
+              <Link key={r.run_id} href={`/runs/archive/?id=${r.run_id}`} className="dy-runrow" style={{ display: "grid", gridTemplateColumns: GRID, gap: 12 }}>
                 {row}
               </Link>
             );

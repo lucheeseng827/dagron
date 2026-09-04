@@ -1,0 +1,101 @@
+# 09 — Webinar to pipeline: the four days after the event, automated.
+#
+#   reminders ─▶ wait(until go-live) ─▶ wait(url: recording) ─▶ attendance ─▶ split ─▶ SDR tasks
+#
+# Every sensor kind in one workflow, because a webinar is mostly waiting:
+#
+#   wait: { until: <rfc3339> }  park until the event starts — absolute
+#   wait: { for: 2h }           park until the room has emptied — relative
+#   wait: { url: ... }          park until the recording is actually published
+#
+# A parked task holds **no worker slot**. A four-day run costs nothing while it
+# waits, which is why the follow-up sequence can be one run with one run id and
+# one audit trail rather than four cron jobs that each have to rediscover state.
+#
+# `repeat:` polls the attendance export until the provider finishes generating
+# it, bounded — a poll that never comes true fails the task instead of wedging.
+name: mktg_webinar_to_pipeline
+tags: [marketing, events, lead-gen, sensors]
+environment: prod
+run_timeout_secs: 432000        # 5 days — the whole follow-up window
+deadline: { in: 96h }
+parameters:
+  webinar_id: "zoom-88123456789"
+  starts_at: "2026-09-17T16:00:00Z"
+  recording_url: "https://acme.com/webinars/2026-09-17/recording"
+
+task_defaults:
+  max_attempts: 4
+  retry_delay_secs: 20
+  retry_max_delay_secs: 300
+  timeout_secs: 600
+  env:
+    - { name: ZOOM_JWT, value_from: { secret: ZOOM_SERVER_TO_SERVER_TOKEN } }
+    - { name: HUBSPOT_TOKEN, value_from: { secret: HUBSPOT_PRIVATE_APP_TOKEN } }
+    - { name: SENDGRID_KEY, value_from: { secret: SENDGRID_API_KEY } }
+
+tasks:
+  - name: sync_registrants
+    pool: crm-api
+    produces: ["hubspot://crm/lists/webinar-{{ webinar_id }}"]
+    command: ["sh", "-c", "zoom-registrants --id {{ webinar_id }} | hubspot-list-sync --list webinar-{{ webinar_id }} --token \"$HUBSPOT_TOKEN\""]
+
+  - name: reminder_24h
+    depends_on: [sync_registrants]
+    command: ["sh", "-c", "send-sequence --template webinar-reminder-24h --list webinar-{{ webinar_id }}"]
+
+  # Absolute time sensor: nothing downstream is allowed to happen before the
+  # event actually starts, no matter when the run was submitted.
+  - name: wait_for_start
+    type: wait
+    depends_on: [reminder_24h]
+    wait: { until: "{{ starts_at }}" }
+
+  # Relative time sensor, anchored when reached: give the room two hours to
+  # empty before asking the provider who attended.
+  - name: wait_for_end
+    type: wait
+    depends_on: [wait_for_start]
+    wait: { for: "2h" }
+
+  # The provider generates the attendance report asynchronously. Poll until it
+  # says `ready`, at most 40 times, 90s apart — a hard ceiling of an hour.
+  - name: attendance_export
+    depends_on: [wait_for_end]
+    repeat: { until: "{{ output }} == ready", max_iterations: 40, delay_secs: 90 }
+    timeout_secs: 300
+    command: ["sh", "-c", "zoom-report-status --id {{ webinar_id }} --download \"$DAGRON_ARTIFACTS/attendance.csv\""]
+
+  # HTTP sensor: the "watch the replay" email must not go out before the replay
+  # exists. The engine GETs this every WAIT_POLL_SECS and succeeds on the first 2xx.
+  - name: wait_for_recording
+    type: wait
+    depends_on: [wait_for_end]
+    wait: { url: "{{ recording_url }}" }
+
+  - name: segment_audience
+    depends_on: [attendance_export]
+    command: ["sh", "-c", "segment-attendees --in \"$DAGRON_ARTIFACTS/attendance.csv\" --rules attended,partial,no-show --out \"$DAGRON_ARTIFACTS/segments/\""]
+
+  - name: followup_attended
+    depends_on: [segment_audience, wait_for_recording]
+    pool: crm-api
+    produces: ["hubspot://crm/contacts/webinar-engaged"]
+    command: ["sh", "-c", "send-sequence --template webinar-thanks --segment \"$DAGRON_ARTIFACTS/segments/attended.csv\" --replay '{{ recording_url }}'"]
+
+  - name: followup_noshow
+    depends_on: [segment_audience, wait_for_recording]
+    pool: crm-api
+    command: ["sh", "-c", "send-sequence --template webinar-sorry-we-missed-you --segment \"$DAGRON_ARTIFACTS/segments/no-show.csv\" --replay '{{ recording_url }}'"]
+
+  # Only the people who stayed past the demo get a human. Everything else is a
+  # nurture email — sales time is the scarcest input in the funnel.
+  - name: sdr_tasks
+    depends_on: [followup_attended]
+    pool: crm-api
+    command: ["sh", "-c", "hubspot-create-tasks --from \"$DAGRON_ARTIFACTS/segments/attended.csv\" --filter 'minutes_attended>25' --due '+1 day'"]
+
+  - name: post_mortem
+    depends_on: [sdr_tasks, followup_noshow]
+    trigger_rule: all_done
+    command: ["sh", "-c", "webinar-report --id {{ webinar_id }} --out \"$DAGRON_ARTIFACTS/report.md\" && post-slack demand-gen \"webinar {{ webinar_id }} wrapped\""]

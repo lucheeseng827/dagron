@@ -72,7 +72,7 @@ impl Executor for KubeExecutor {
         if ctx.command.is_empty() {
             bail!("empty command");
         }
-        let secs = ctx.timeout_secs.unwrap_or(25);
+        let secs = crate::executor::effective_timeout_secs(ctx.timeout_secs);
         let image = ctx.docker_image.as_deref().unwrap_or(&self.default_image);
         // Short unique pod name (DNS-1123 label: lowercase alphanumeric + '-').
         let name = format!("sched-{}", Uuid::new_v4().simple());

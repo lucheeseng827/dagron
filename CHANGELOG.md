@@ -6,6 +6,494 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-04
+
+The release the last three months of `main` had already become. Everything the
+README marked **0.9** ships here: the console moves inside `dagron-api` (one
+port, one origin, no proxy and no second image), the engine binary carries a
+console of its own for the single-binary case, and `SOURCE=dir` turns a watched
+directory into a live inbox.
+
+Three themes beyond that. The **agent surface** stopped being a demo — the MCP
+server went from 9 tools to 42 and gained a read-only mode, so an agent can
+author, run, recover and inspect a workflow without a human dropping to `curl`.
+The **constrained host** became a first-class target: an `edge` profile, a
+pressure gate and a free-disk floor, MQTT ingestion, signed workflow bundles,
+a tiered artifact store with an uplink budget, clock confidence on every run,
+and armv7 binaries. And **history** got an exit: archive-before-purge is now
+reachable per run, not only on the retention sweep's schedule.
+
+Upgrading from 0.8.x is a restart. The schema migrates forward automatically
+and there are no down migrations, so back up first
+([`docs/OPERATIONS.md`](docs/OPERATIONS.md#backup--restore--what-is-the-state)).
+The one thing to read before you upgrade is **Deprecated** below: if you deploy
+`mancube/dagron-frontend`, stop — the console it served now comes from
+`dagron-api` on the same port.
+
+### Added
+- **`dagron-mcp` closes the agent-API gap: 9 tools → 42.** The MCP surface could
+  submit ad-hoc YAML and watch it fail, and not much else — so an agent hit
+  `curl` for everything the bar actually asks of it. It can now *author* (register,
+  update, pause, retire and run a **named** workflow, which is what makes a
+  `type: workflow` parent/child DAG reachable at all), *wait*
+  (`dagron_wait_run` long-polls to terminal instead of costing a round trip and a
+  slice of context window per poll tick), *recover* (rerun, resubmit, retry a
+  task, clear a task and its downstream cone, redrive or discard a dead letter),
+  *resolve gates* (`dagron_list_approvals` + approve/reject — before this, a DAG
+  with a human-in-the-middle gate was one an MCP agent could start and never
+  finish), *read files* (`dagron_get_artifact`, the missing half of any
+  file-producing DAG), and *write down what it concluded* (`dagron_triage_run`,
+  the one write here a reviewer reads rather than reruns). Three shipped tools
+  also caught up with routes that had outgrown them: `dagron_submit_run` now
+  sends `parameters` and an `Idempotency-Key` (the client with the least ability
+  to reason about its own retries was the one denied the safety net), and
+  `dagron_list_runs` takes `status`/`name`/`trigger`/`limit`/`offset` instead of
+  listing everything unfiltered. Plus visibility: `dagron_search` (every id-taking
+  tool assumed the agent already held a uuid), `dagron_get_run_graph`,
+  `dagron_get_run_spec`, `dagron_get_health`, `dagron_get_metrics_timeseries`,
+  the dataset registry and lineage ledger, the archive, and workflow run/version
+  history. That is 42 of `dagron-api`'s 84 method+path pairs; the other 42 —
+  credentials, instance settings, GitOps wiring, schedules and backfills — stay
+  declined or deferred with a row each in
+  [docs/MCP.md](docs/MCP.md#full-coverage-matrix), so "no tool" is a recorded
+  decision rather than an oversight.
+- **`DAGRON_MCP_READONLY=1` — the write half, off.** Those additions turn this
+  server from mostly-read into read-write against a live scheduler, so the
+  safe-by-default posture it had when there was little to write is now a
+  deliberate switch. It hides
+  all eighteen mutating tools from `tools/list` *and* refuses them in the
+  dispatcher: hidden because a tool an agent can see is a tool it will plan
+  around, refused because a composing server (a downstream build may compose its
+  catalogue on top of this one) must not be able to smuggle a write past it. The
+  24 read tools stay, which is still enough to diagnose a failing cluster end to
+  end.
+- **Archive one run on demand, from the console.** Archiving used to be
+  something only time did to you: the retention GC swept terminal runs past
+  `GC_RETENTION_SECS` into the sink and purged them, and there was no way to
+  say "this one, now". `POST /api/runs/{id}/archive` is that sweep aimed at a
+  single run, and the console puts an **Archive** button on a terminal run's
+  detail page for admins. It is deliberately the *same* operation, not a
+  gentler one: archive-then-purge, in the sweep's fail-closed order — write the
+  `dagron.run-archive.v1` document, verify it landed, index it, and only then
+  delete the run from the hot store. The run moves out of Runs and into the
+  Archive tab, and a failure at any step leaves it exactly where it was.
+  Refusals are specific because the fixes differ: `409` for a non-terminal run
+  (archiving one the scheduler is still driving would purge live state), and
+  **`501` when no sink is configured on dagron-api** — without somewhere to
+  archive *to*, the purge would be a delete wearing a kinder word, so it does
+  not happen. Admin-only: retention is an instance-wide policy, and pulling
+  runs out of the hot store ahead of it is the same authority exercised one run
+  at a time. The fsync chain the local sink depends on moved to
+  `dagron_core::archive` — two processes now treat a successful write as purge
+  permission, and that contract needs one implementation, not two.
+- **The transactional outbox can now be treated as a bounded spool.** The outbox
+  was written for a delivery worker with a reachable endpoint: claim, post,
+  mark. A scheduler on a metered or intermittent link fills it far faster than it
+  drains it, and the disk it fills is usually a flash card — so `dagron-core`
+  gained the measurements and the release valve that shape needs.
+  `outbox_pending_bytes` and `outbox_oldest_pending_age_secs` are the two gauges
+  a budget is set against; `shed_outbox(pool, max_bytes, max_age_secs, policy)`
+  parks what no longer fits as `status = 'shed'` — oldest first, or largest
+  first when one oversized payload is the problem — keeping the payload and
+  recording which budget dropped it in `last_error`, so
+  `SELECT COUNT(*), last_error FROM event_outbox WHERE status = 'shed' GROUP BY
+  last_error` answers "what did this disk cost me". Shedding is deliberate data
+  loss: the alternative is a spool that grows until the datastore stops
+  accepting writes, which loses the run state too. Nothing sheds by default —
+  both budgets are parameters, and `0` disables either. Alongside them,
+  `claim_outbox_batch_for_uplink` returns each claimed row with its `created_at`
+  (a receiver a week later needs to know when the *machine* produced the event,
+  not when the link came back) and `latest_run_for_spec` resolves the newest run
+  created from given spec bytes since a moment — the bridge for a submitter that
+  has to report which run its submission became. Both backends, identical
+  signatures; `event_outbox.status` has no `CHECK` constraint, so no migration.
+- **`SOURCE=mqtt` — the open MQTT ingestion source** (`--features mqtt`,
+  [docs/STREAMING.md](docs/STREAMING.md)). A plant floor, a gateway or a robot
+  publishes a workflow spec to a topic and the unit runs it. Subscribes with
+  manual acks; set a stable `MQTT_CLIENT_ID` to resume a **persistent session**,
+  so QoS-1 messages published while the unit was offline are redelivered rather
+  than lost — which is the case that matters on a duty-cycled link. Without one
+  the client id is generated and the session is clean, because a broker cannot
+  queue for a subscriber whose name changes at every restart. Delivery is
+  at-least-once by default; `MQTT_POSITION_FIELD` names a per-topic monotonic id
+  in the payload (Sparkplug's `seq`) and turns it into exactly-once by
+  committing that cursor with the run it creates and acking, never re-running,
+  anything at or below it. A broker that is down is a retry, never an exit; a
+  dead-letter topic inside your own subscription is a startup error rather than
+  an infinite loop. Managed, credentialed protocol sources are not in this
+  build.
+- **Constrained-host admission: a pressure gate and a free-disk floor.**
+  `DAGRON_PRESSURE_FILE` lets a thermal, battery or maintenance daemon stop the
+  engine claiming new tasks by touching a file — in-flight work finishes and
+  every other loop keeps running. `DAGRON_MIN_FREE_BYTES` refuses to create new
+  runs when the datastore's filesystem is nearly full (`507` + `Retry-After` on
+  the ops API, a throttle rather than a dead letter at the source), because a
+  half-written SQLite file on a full flash device is worse than a rejected run.
+  Both are off by default; the new **`edge` profile** turns the floor on with
+  the rest of the constrained-host tuning
+  ([docs/EDGE_PROFILE.md](docs/EDGE_PROFILE.md)).
+- **Clock confidence on every run** — `synced` / `drifted` / `unknown`, with the
+  measured offset and what produced the verdict, on `GET /runs/{id}` and both
+  `dagron-api` run reads. A unit that boots with no network and no clock still
+  keeps its schedule, but its timestamps are not evidence, and until now nothing
+  said so. The engine checks the wall clock against the monotonic clock, notices
+  a step, and marks runs it is already executing; a boot whose clock predates the
+  newest row in its own datastore is `drifted` on the spot. Recovery is never
+  gated on the verdict — a drifted unit still reclaims its leases.
+- **Tiered artifact store: capture locally, uplink on a budget**
+  (`DAGRON_ARTIFACT_TIER`). Every write lands on local disk first and moves to
+  the cloud tier later, under `DAGRON_ARTIFACT_UPLINK_BYTES_PER_DAY`, with a
+  durable ledger so a restart resumes rather than re-uploads and identical bytes
+  transfer once. Reads fall back to the remote tier when the local copy is gone,
+  so a unit can free space without losing access to what it captured.
+  `POST /api/artifacts/sync` drains on demand for a unit that has just docked.
+- **Signed workflow bundles** ([docs/BUNDLES.md](docs/BUNDLES.md)). A bundle is a
+  manifest of content-addressed specs with a detached ed25519 signature over the
+  exact manifest bytes. Verification is all-or-nothing and **fails closed**: an
+  unknown format, a missing or extra file, a hash mismatch or a signature that
+  matches none of `DAGRON_BUNDLE_PUBKEYS` is an error, and there is no unsigned
+  path. The GitOps worker applies a signed repository in one transaction
+  (`DAGRON_BUNDLE_REQUIRE=1` refuses unsigned ones outright) and
+  `POST /api/workflows/bundle` does the same over HTTP, stamping each
+  `workflow_versions` row with the bundle's provenance. Verification ships in
+  every build — the alternative would be an open build whose default is to
+  execute unsigned remote definitions. Staged rollout across a fleet is not in
+  this build.
+- **`armv7-unknown-linux-musleabihf` release binaries** for the long tail of
+  32-bit gateways already in the field, cross-compiled on the release runner.
+- **Fault attribution — what a failure *was*, and whether another attempt is
+  worth anything** ([docs/HPC_AUTOPSY.md](docs/HPC_AUTOPSY.md)). `status =
+  'failed'` says the engine gave up; it has never been able to say what broke,
+  so every consumer of a failure re-derived the cause from logs that are already
+  rotated. On a GPU fleet that gap is the cost model: an XID 79 and a NaN loss
+  are both `failed`, and retrying the second like the first burns another N
+  GPU-hours to reach the same answer.
+  - **The taxonomy** (`dagron_core::fault`): 23 classes, each carrying a
+    *disposition* (infrastructure / application / platform / unknown), a
+    *precedence* (root-cause / ambiguous / symptom), whether the node should be
+    drained, and a default attempt budget — plus the NVIDIA XID table that
+    splits kernel-side faults (13/31/43/45 — the job's pointer bug) from device
+    faults (48/63/64/79/94/95 — the board). Getting that backwards either
+    drains healthy nodes or retries a dead GPU forever. An uncorroborated NCCL
+    collective timeout is classed `nccl-timeout` with an **unknown**
+    disposition and **symptom** precedence, and is never promoted to a cause by
+    text alone: it is printed by every rank that was *waiting* — the healthy
+    ones — and the rank that died often prints nothing at all.
+  - **`retry_budgets:`** on a task and in `task_defaults:` — per-class attempt
+    budgets, resolved most-specific-first: the task's own entry for the class
+    that occurred, then the class's disposition default (infra 5, platform 3,
+    application 1), then `max_attempts`. **This moves attempt counts on
+    workflows nobody edited, and is meant to.** Failures classify from their own
+    output with no opt-in, so a task that never mentions `retry_budgets` still
+    takes the disposition default whenever its failure matches a class:
+    `max_attempts: 3` becomes 5 for a `gpu-ecc` and 1 for a `nan-loss`.
+    `max_attempts` is the fallback, not a ceiling over the classified cases,
+    which is the point of the feature (a dead GPU deserves another node; a NaN
+    loss does not deserve two more hours). It is what you get in **two** cases:
+    a failure that classified as nothing, and one whose class carries the
+    *unknown* disposition — `nccl-timeout` and `unknown`, whose default budget
+    is deliberately `0` so they decline to have an opinion. That matters most
+    for `nccl-timeout`, the class a distributed failure reaches for first: an
+    uncorroborated collective timeout is a symptom, so it sets no policy of its
+    own and the task's `max_attempts` still decides. Write a class into
+    `retry_budgets` to pin it to a number you choose; the task's own entry beats
+    the default.
+    The `retry_on_timeout: false` carve-out (#24) still applies first and still
+    wins. A misspelled class is a parse error rather than a silently-inert
+    policy — this is the code path that decides whether to spend another
+    thousand GPU-hours. `task_defaults` merges per class, so a task overriding
+    `nan-loss` still inherits the workflow's `gpu-ecc`.
+  - **The durable record**: migrations 040 (SQLite) / 050-051 (Postgres) add
+    `fault_class`, `fault_detail` and `fault_confidence` to `task_runs`,
+    written fence-guarded on the retry path (`db::record_task_fault`) so a
+    reclaimed attempt cannot relabel the newer one's failure. `NULL` (nothing
+    looked) stays distinguishable from `'unknown'` (looked, could not tell).
+    Read back via `db::get_task_fault` / `db::fault_class_counts`.
+  - **Metrics**: `scheduler_task_faults_total{class,disposition}` and the
+    `scheduler_task_faults_by_disposition_total` roll-up — fixed-cardinality by
+    construction (the taxonomy is closed), with every class emitted at zero so
+    `increase()` over a window predating the first fault still works.
+  - **`dagron-autopsy`** (`crates/dagron-autopsy`, binary `dagron-autopsy`) - a
+    job autopsy that **schedules nothing**. It sits beside an existing Slurm or
+    Kubernetes cluster, joins `sacct` + DCGM + NCCL logs + InfiniBand counters
+    against a job's node set and time window, and emits a fault-attributed job
+    record ("GPU 3 on node-47 threw XID 79 at T-90s; drain the node, retry
+    elsewhere") as operator text or JSON. Every input is a file, so it runs
+    against last week's job with no database, daemon or agent. The join filters
+    by the job's node set (else one broken node is blamed for every job on the
+    cluster), extends the window past the job's end (the driver's XID lands in
+    syslog after the process is gone), ranks by precedence *before* time (the
+    earliest signal is almost always the symptom), and - with no device
+    evidence - reads the rank topology: everyone stuck and nobody missing is a
+    `deadlock`, everyone-but-a-few stuck names those few as `straggler-rank`,
+    and a partition is neither. Fabric counters need a before/after pair
+    because every healthy port has large lifetime error counters; only a rise
+    inside the window is evidence. A verdict below `medium` confidence reports
+    rather than acts, missing sources are confessed in the record, and no
+    evidence at all is reported as *unattributed*, never as fine.
+
+- **An operator console inside the engine binary** — `dagron` now serves a UI at
+  `/` on its ops API (`API_ADDR`), embedded with `include_str!` exactly as `/docs`
+  already embeds Swagger. **19 KB, no Node, no second process, no network fetch**,
+  so it works air-gapped and against SQLite: the deployment the full console cannot
+  reach, because that one needs `dagron-api` and Postgres.
+
+  Scope is what the ops API can back, and no more: the runs list with a status
+  filter and auto-refresh, a run's tasks with their attempt and timings, whole-run
+  and per-task logs, cancel and rerun, per-task clear/approve/reject, dead letters
+  with redrive, plus the effective configuration and the metrics exposition. Every
+  API path is unchanged — the console only claims `/` and `/console`, so existing
+  clients see no difference.
+
+  It is deliberately **not** the `dagron-api` console trimmed down. That app speaks
+  a different dialect (`/api/runs` returns a bare `RunSummary[]` carrying
+  `definition_id`, `trigger_kind` and triage fields; this API returns
+  `{"runs": [...]}`) and assumes an auth surface the engine has none of. Its Monaco
+  editor alone is 14 MB against this file's 19 KB, and authoring is not what an
+  operator on a constrained box needs. Unifying the two is worth doing later; it is
+  not a prerequisite for seeing a run on a gateway.
+
+  `DAGRON_CONSOLE=off` leaves it unmounted. Opt *out*, not in, because the API it
+  drives is served on the same socket either way — hiding the UI does not reduce what
+  that socket can do, so defaulting it off would buy the appearance of safety and no
+  safety. **The management API has never had authentication**: `cancel`, `rerun`,
+  `approve` and dead-letter redrive have always been open to anyone who can reach
+  `API_ADDR`. What the console changes is discoverability, which is worth saying out
+  loud — so a non-loopback bind now logs a warning naming exactly what is exposed, and
+  the startup line reports whether the console is mounted.
+- **`SOURCE=dir` — a directory of YAML as live input.** Drop a file into
+  `WORKFLOW_DIR` and it runs; edit one and the next scan re-submits it. The default
+  `file` source emits a single spec at startup and drains, which is why pointing the
+  engine at a directory produced "Is a directory" and why a YAML dropped in later was
+  never seen. "Put a file in a folder" is the model operators already have from every
+  other tool on the box, and the on-ramp for people who will never wire up GitOps.
+
+  **It polls, deliberately — no inotify.** File watching does not fire on the mounts
+  this is for: Docker/Podman bind mounts from a Windows or macOS host, NFS and SMB
+  shares on a NAS. A watcher that silently never triggers is worse than a scan that
+  always works. One `readdir` plus a `stat` per file every `DIR_POLL_MS` (default
+  2000, floor 100).
+
+  Re-emission is keyed on (modified time, length), so an untouched file is never
+  submitted twice and an edited one always is. Two edits inside one filesystem
+  timestamp granularity *with an identical length* is the known blind spot; a content
+  hash would close it by reading every file on every scan, the wrong trade for a
+  directory someone edits by hand. **That key survives a restart**: it is committed
+  to `source_offsets` in the same transaction as the run it becomes (one row per
+  file, keyed `dir/<file>` — the exactly-once machinery `SOURCE=stream` already
+  uses), so a crash-looping container does not re-run every workflow in the
+  directory on each boot. A file the ingest actor could not turn into a run *yet*
+  (a workflow at its `max_active_runs` cap) stays in flight and is redelivered on
+  the next pull, rather than being dropped until someone edits it.
+  `*.yaml`/`*.yml`, this directory only — no
+  recursion, so a README or a vendored chart below it is not swept into a dead
+  letter. An unreadable file is retried rather than recorded, which is what makes a
+  large spec dropped in with `cp` land once it finishes copying; and a directory that
+  does not exist yet idles instead of failing, because the mount may arrive after the
+  engine does.
+
+- **The release gate now runs a workflow against Postgres**
+  ([.github/workflows/sync-dagron-oss.yml](../../../.github/workflows/sync-dagron-oss.yml)):
+  a Postgres service, a three-task chain submitted to a real engine, and assertions
+  that it reaches `run complete` / `"status":"succeeded"` with no decode error.
+
+  This is the hole 0.8.0 fell through. The existing gate builds and tests two
+  feature worlds and **neither runs the engine on Postgres** — the engine half is the
+  SQLite build, and the Postgres half is `dagron-api`/`-gitops`, which never start a
+  scheduler. So `dagron-core`'s Postgres backend compiled and was never executed, and
+  a bare `SELECT 1` that cannot decode into `i64` reached a public release. Unit
+  tests could not have caught it: SQLite is dynamically typed, and these are runtime
+  `query_scalar` calls rather than compile-checked `sqlx::query!` macros.
+
+  The chain is three tasks, not one, so at least one task becomes runnable *because a
+  dependency finished* — the exact transition the 0.8.0 probe died on. **Verified by
+  reintroducing the bug:** both assertions fire and the release fails.
+
+  It runs with `LOG_FORMAT=json`. The default `full` format writes ANSI colour even
+  to a file, which splits `status=succeeded` across escape sequences so a grep for it
+  silently never matches — a gate that passes everything. That was measured, not
+  assumed, and the step says so.
+
+  **The image path is gated too.** The source tree was only half the exposure,
+  because what operators pull is an image, and the release pipeline pushed one
+  without ever running it. It now builds the engine image once with `load`, runs a
+  three-task chain *in that image* against a Postgres service, and only then pushes
+  — the second build is a layer-cache hit, so the gate costs one container start.
+  Testing the artifact rather than a `cargo build` is the point: the runtime is
+  distroless, so the smoke tasks run `dagron validate` (the image's only executable —
+  a smoke test calling `echo` would fail for a reason that has nothing to do with
+  the datastore, and that trap is exactly what running the real artifact finds).
+
+- **The numbers, committed.** `results/` is no longer gitignored, and there is a
+  harness that fills it. [`docs/LOW_LATENCY.md` §7](docs/LOW_LATENCY.md) has
+  specified this since it was written, in words that were their own indictment:
+  *"`results/` is currently gitignored and empty — every published number lives
+  only in prose"*. Four pieces, all of them small:
+
+  - [`loadtest/harness/micro_dags.py`](loadtest/harness/micro_dags.py) — the §1.1
+    chain / fan / dense generators. Those three DAGs produced the table the whole
+    low-latency plan rests on and **had never existed in the repo**; they lived on
+    somebody's laptop. `["true"]` tasks, so what the wall time measures is the
+    scheduler, not the work.
+  - [`latency_bench.py`](loadtest/harness/latency_bench.py) — the runner. The §1.1
+    reproduction (about a minute), the **depth sweep** 10²–10⁴ that
+    `SCALABILITY-PLAN.md` calls "designed but never run" (its deepest chain to date
+    was 6), and the **width sweep** to 10⁵ edges, where `create_run` is timed as an
+    operator meets it — a `POST /runs` against a warm engine — with statement counts
+    when `pg_stat_statements` is there. Per-hop p50/p99 come from the engine's own
+    A-5 histogram, interpolated the way `histogram_quantile` does, so a dashboard
+    and a committed file report the same number instead of each having their own.
+  - [`hop_gate.py`](loadtest/harness/hop_gate.py) — §2's table encoded, and the
+    >20 % hop-p99 regression that exits non-zero.
+  - `.github/workflows/dagron-latency-gate.yml` — on a release tag, weekly, or on
+    demand. Not on every push: a sweep sharing a runner with a compile job measures
+    the compile job.
+
+  **The first measurements are committed with it** (32-vCPU container, release
+  build, stock knobs — [`docs/LOW_LATENCY.md` §7.2](docs/LOW_LATENCY.md) has the
+  tables). §1.1's chain8 went 7.78 s → **0.096 s** on a stock build, 6× better than
+  the hand-patched `poll=25ms` experiment that motivated Phases A and B. Two
+  findings that only existed because someone finally ran the sweep:
+
+  - **Per-hop cost is flat from 10² to 10³ chains (~5 ms) and 4× worse at 10⁴**
+    (22.6 ms), moving the p50 rather than the tail — per-tick work that scales with
+    the run's rows, not an occasional stall.
+  - **A run submitted through the API waits a full `POLL_INTERVAL_MS` for its first
+    dispatch on SQLite** (515 ms measured, against 14 ms for the same DAG from the
+    file source) — the SQLite waker has no early-wake source, while Postgres
+    `create_run` NOTIFYs in its own transaction. The Postgres sweep dispatches
+    14–58 ms after create, which is the same claim measured from the other side.
+    A-1 woke the loop for finished tasks; nothing wakes it for a new run.
+
+  Also measured: `create_run` costs **281 statements for 110,000 rows** at 10⁵
+  edges — B-3's batching is real — but 9 s of wall time, so the remaining cost is
+  round trips and commits rather than a statement per row.
+
+  Two deliberate refusals. The gate **skips rather than compares** when the
+  baseline's backend, profile, machine, CPU count or `POLL_INTERVAL_MS` differ —
+  absolute latency is a property of the machine, and a gate that pretends otherwise
+  fails on hardware and passes on regressions. And §2's SLOs are **reported, not
+  enforced** (`--enforce-slo` opts in), because §2 itself lists today's numbers as
+  far outside them: a gate that is red before anyone touches it is a gate everyone
+  learns to route around.
+
+### Deprecated
+- **`mancube/dagron-frontend` is deprecated and will be removed in 1.0.0.** The
+  console it carried now ships inside `dagron-api` (see *Changed* below), so the
+  image is a 281 MB Node runtime with nothing left to do. It keeps building and
+  publishing until 1.0.0 so anyone pinned to it — or running a chart or compose file
+  that names it — has a release boundary to migrate across rather than a tag that
+  vanishes underneath them.
+
+  **To migrate:** delete the `frontend` service, drop the `:3000` publish, and open
+  the API's port instead. The console is at `/` and the API under `/api` on the same
+  origin; `compose.quickstart.yaml` here is the worked example. If you front dagron
+  with an ingress routing `/` to the frontend Service and `/api` to the API Service,
+  both now point at the API.
+
+  1.0.0 will drop the image from `.github/workflows/docker.yml`, remove
+  `frontend/Dockerfile`, and stop publishing the Docker Hub overview at
+  `docs/dockerhub/dagron-frontend.md`. The `frontend/` sources stay — they are what
+  `dagron-api` builds and embeds.
+
+- **The Helm chart stops deploying the frontend.** `frontend.enabled` defaults to
+  `false`, and the ingress routes `/` to `dagron-api` — which now serves the console
+  there — instead of to a frontend Service. A default install goes from three pods to
+  two and stops running a 281 MB pod to serve a page the API already has.
+
+  Waiting for 1.0.0 would have shipped the console **twice** on every chart install
+  for a whole minor line: once from the deprecated frontend pod that the ingress still
+  pointed at, once from the API. That overlap is worth avoiding now; removing the
+  block entirely still waits for the breaking release.
+
+  `frontend.enabled=true` restores the old two-pod topology and points the ingress
+  back at it, for anyone who needs the previous layout during 0.9. Two things went
+  with the flip: the template precondition that *refused* an ingress unless the
+  frontend was enabled (it now backs both paths itself), and the post-install notes,
+  which had no branch for "no ingress, no frontend" and would have printed nothing at
+  all about reaching the UI. The default path is now one port-forward to `:8080`
+  rather than two plus a same-origin caveat.
+
+- **`compose.yaml` stops starting the frontend too.** The service moves behind
+  `profiles: ["frontend"]`, the way `gitops` already is, so the default
+  `podman compose up --build` brings up Postgres, the engine and `dagron-api`
+  — and the console at `http://127.0.0.1:8080/`, from the API that was already
+  running. It is the same double-serving the chart change avoids: this file
+  published `:3000` *and* `:8080`, so a dev stack on 0.9 stood up two copies of
+  the same page and left it ambiguous which one a bug report meant.
+
+  `--profile frontend` restores it until 1.0.0 removes it. One env var moved
+  with the flip: `DAGRON_TRUST_PROXY_HEADERS` is now unset by default, because
+  the console is served by the container the browser talks to — a login arrives
+  from the real client address, and trusting `X-Forwarded-For` would mean
+  trusting a header a directly-reachable caller can forge, for nothing. The
+  frontend profile wants it back on, and says so where it is defined.
+
+### Changed
+- **The console ships inside `dagron-api` instead of its own image, and live
+  updates work again as a consequence.** `mancube/dagron-frontend` was a 281 MB
+  Node runtime whose only jobs were serving files and proxying `/api`. It never
+  needed a server: 47 of the frontend's 65 sources are `"use client"`, it uses no
+  server-only Next API at all (no `next/headers`, no `cookies()`, no server
+  actions, route handlers or middleware), and every request goes through
+  `BASE = "/api"` — a *relative* path. So the app is now built with
+  `output: "export"` and handed to the Rust binary, which serves it at `/` as a
+  fallback service beneath the API routes.
+
+  **No components were rewritten.** The DAG view, log viewer, run tables and
+  editor are untouched. The whole change is a Next config switch, four pages, and
+  about twelve links.
+
+  Deleting the proxy is the interesting half. Next's `rewrites()` buffers
+  responses and never flushes headers for an infinite `text/event-stream`, so
+  `/api/events/stream` hung — measured: no headers in 15 s through the proxy,
+  immediate `200 text/event-stream` direct. That is why the console reported
+  **Offline** on a healthy stack and why runs only appeared on a manual refresh.
+  Same-origin, there is no proxy left to buffer, and the stream opens at once.
+
+- **Detail pages moved from dynamic segments to query parameters** — `/runs/[id]`
+  → `/runs/detail/?id=`, and likewise for `/runs/archive`, `/workflows/detail` and
+  `/workflows/history`. A statically exported site resolves dynamic segments at
+  build time via `generateStaticParams`, and a run id is not knowable then. These
+  pages already did all their work in the browser after mount, so the change is
+  `use(params)` → `useRouteId()` (`src/lib/route-id.ts`) inside a `<Suspense>`
+  boundary, which `useSearchParams()` requires during prerender.
+
+  **Old bookmarks are carried across.** A blocking inline script in the root layout
+  maps a pre-0.9 path to its new home before hydration — `/runs/<id>` →
+  `/runs/detail/?id=<id>`, and the same for `runs/archive`, `workflows/<id>` and
+  `workflows/<id>/history` — preserving any query string, so a link from an alert
+  carrying `?task=` still opens on that task. It runs inline rather than as an effect
+  so there is no flash of the wrong page and it does not depend on how the client
+  router treats a path that was never exported. Reserved page names (`detail`,
+  `archive`, `history`, `new`) are excluded by an allowlist, so a run whose id happens
+  to be `detail` cannot loop.
+
+- **The quickstart is one port and one fewer container.** `compose.quickstart.yaml`
+  drops the `frontend` service entirely, along with the `network_mode:
+  "service:dagron-api"` trick that existed only to make the baked-in
+  `localhost:8080` proxy target resolve. Open <http://localhost:8080>; the console
+  is at `/` and the API under `/api`. `DAGRON_CONSOLE_DIR` (default
+  `/usr/share/dagron/console`) relocates the assets, and when the directory is
+  absent `dagron-api` serves the API alone — so `cargo run` on a dev box still
+  needs no Node build.
+
+### Fixed
+- **A failing task's stderr is no longer discarded.** `LocalExecutor` logged the
+  subprocess's stderr and then stored only stdout, so `RuntimeError`, `CUDA
+  error`, every NCCL warning and every Python traceback - all written to stderr
+  - never reached the stored `output`, the run detail, or anything reading it. A
+  failing command's output now carries its stderr tail (16 KiB, cut on a line
+  boundary where the tail has one — a single oversized line keeps its end
+  instead; the tail rather than the head because the fatal error is the last
+  thing a process prints). **Only on failure**: a successful task's output is
+  byte-identical to before, because `repeat.until` terminates loops from it, the
+  memo store caches it and `produces:` lineage reads it. This also makes the
+  local backend agree with the other two - `DockerExecutor` already interleaves
+  both streams and `KubeExecutor` stores the pod's combined log; local was the
+  odd one out.
+
+
 ## [0.8.1] - 2026-08-28
 
 Fixes a crash that made 0.8.0 unusable with Postgres. Anyone running the Postgres
@@ -993,13 +1481,13 @@ above).
   check over the whole mirrored set — every relative link in every included file,
   resolved against the include list — is what found them, and the remaining
   offenders are all pre-existing.
-- **An Enterprise console no longer refuses specs the Enterprise engine accepts.**
+- **A feature-on console no longer refuses specs the feature-on engine accepts.**
   `dagron-api`'s `enterprise` feature did not forward to `dagron-core` (it pinned
-  `features = ["postgres", "ops"]`), so every dagron-core gate stayed shut in an
-  Enterprise build of the API. The visible symptom: a workflow using multi-dataset
+  `features = ["postgres", "ops"]`), so every dagron-core gate stayed shut in a
+  feature-on build of the API. The visible symptom: a workflow using multi-dataset
   composition (`on_datasets: [a, b]` / `datasets_mode:`) submitted through the
-  console was rejected with the open-build signpost — telling a customer to buy the
-  edition they were already running — while the identical spec sent to the engine's
+  console was rejected with the gap signpost — pointing an operator at a capability
+  they were already running — while the identical spec sent to the engine's
   ops API was accepted. Same cluster, two answers. A test now pins the console's
   answer to the engine's in both build shapes; it fails without the forwarding.
 - **The GitOps worker is actually buildable and published.** #721 split GitOps
@@ -1013,7 +1501,7 @@ above).
 
 ### Changed
 - **Envelope encryption (BYOK/KMS) and encrypted artifacts at rest are
-  Enterprise.** Drawn before 0.5.0 ships, deliberately: the KEK layer has never
+  feature-gated.** Drawn before 0.5.0 ships, deliberately: the KEK layer has never
   appeared in a tagged OSS release (`dagron-crypto/src/lib.rs` was 121 lines at
   `dagron-oss-v0.4.3` with no `KeyProvider`; it is 1468 now), so this is a line
   drawn rather than a takeback.
@@ -1021,7 +1509,7 @@ above).
   **Open in every build, unchanged:** environment secrets encrypted with
   AES-256-GCM under `DAGRON_ENV_SECRET_KEY` — the `v1:` format the compose stack
   and [docs/HOWTO.md](docs/HOWTO.md) §5 use — and the plain artifact store.
-  **Enterprise:** KEK providers (AWS KMS / GCP KMS / Azure Key Vault / the
+  **Behind the feature:** KEK providers (AWS KMS / GCP KMS / Azure Key Vault / the
   command seam), envelope-wrapped data keys, artifact encryption at rest, and the
   store-wide rotation sweep (`POST /api/artifacts/rotate`, a route now absent from
   open builds).
@@ -1177,13 +1665,13 @@ above).
     into one run; a fire refused at `max_active_runs` rolls its cursor back and
     retries. SQLite migrations 032–033, Postgres 039–040; metrics
     `scheduler_dataset_updates_total` / `scheduler_dataset_fires_total`.
-  - **Open-core split** (per the open-core split): the single-team loop —
-    produce, lineage, sensor, single-dataset trigger — is fully open.
+  - **Scope of this build**: the single-team loop —
+    produce, lineage, sensor, single-dataset trigger — is complete here.
     **Multi-dataset composition** (`on_datasets: [a, b, …]` +
     `datasets_mode: any|all` fan-in) and **external dataset events**
     (`POST /datasets/events`, for CDC/object-store producers outside dagron)
-    ship with dagron Enterprise; the open build answers both with signpost
-    errors naming the edition and the OSS workaround (the SOURCE-connector
+    are not in this build; it answers both with signpost
+    errors naming what is missing and the workaround (the SOURCE-connector
     funnel pattern).
 - **HTTP wait sensor: `wait.url`** (parity fast-win #27 follow-on — Airflow
   `HttpSensor`) — a task `{ type: wait, wait: { url: <http(s)-endpoint> } }` parks
@@ -1332,7 +1820,7 @@ above).
   leaf, single-attempt gang tasks (die-together retry is a unit-level rerun).
   The all-or-nothing gang claimer (`RUNNER_GANGS=1` — claim a gang only when
   every member is ready and capacity fits it whole, cancel a failed member's
-  siblings) ships with the dagron Enterprise scheduler; without it, members
+  siblings) is not in this build; without it, members
   schedule as ordinary tasks. Placement sweeps leave gang members in place.
 - **Per-partition range leases + sharded streams (multi-consumer)** — a
   `source_partitions` lease table with claim/renew/release primitives (both
@@ -1373,7 +1861,7 @@ above).
   `STREAM_FOLLOW=false` to drain a backlog and exit). Poison lines are
   dead-lettered (durable row + a `.dlq` NDJSON mirror) instead of wedging the
   stream. Selecting a managed connector kind (`kafka`/`nats`/`sqs`/`redis`/
-  `events`) now errors with an accurate signpost to the dagron Enterprise
+  `events`) now errors with an accurate signpost naming the missing
   connector suite and the built-in alternatives. Guide: `docs/STREAMING.md`;
   runnable case studies: `examples/streaming/`.
 - **Long-running tasks: lease heartbeat** — workers renew a running task's

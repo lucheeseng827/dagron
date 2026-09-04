@@ -1,0 +1,76 @@
+# Fault-class-aware retry budgets — how many attempts a task gets *given what
+# broke*.
+#
+# The problem this solves: `max_attempts` spends the same budget on every
+# failure. An ECC error and a NaN loss draw from the same three attempts, so
+# infrastructure faults give up too early and application faults burn GPU-hours
+# proving a determinism nobody doubted. On a 128-GPU job, three blind retries of
+# a diverged run is roughly 3,000 wasted GPU-hours to learn nothing.
+#
+# Run it:
+#   dagron run examples/ai/06_fault_class_retry_budgets.yaml
+#
+# Inspect what was attributed:
+#   sqlite3 dagron.db \
+#     "SELECT name, attempt, fault_class, fault_confidence, fault_detail
+#        FROM task_runs WHERE fault_class IS NOT NULL"
+#
+# The taxonomy: `dagron-autopsy --explain`, or docs/HPC_AUTOPSY.md.
+name: fault_class_retry_budgets
+
+# Declared once, merged into every task **per class** — a task that overrides
+# `nan-loss` still inherits `gpu-ecc` from here.
+task_defaults:
+  retry_budgets:
+    # Infrastructure: the node broke, the job did nothing wrong, and the retry
+    # lands somewhere else. Retry liberally.
+    gpu-ecc: 8
+    gpu-fallen-off-bus: 8
+    gpu-unresponsive: 8
+    nvlink: 8
+    fabric-ib: 8
+    node-fail: 8
+    storage: 6
+    # Platform: nothing is broken. On spot capacity, retry *is* the strategy.
+    preemption: 20
+    # Application: the next attempt reproduces it, at full cluster cost.
+    nan-loss: 0
+    checkpoint-corrupt: 0
+    gpu-oom: 0
+    deadlock: 1
+
+tasks:
+  # Stand-in for a real training step. In production this is `torchrun`; the
+  # point of the example is the policy around it, which is identical either way.
+  - name: pretrain
+    command: ["sh", "-c", "echo 'step 100 loss 2.44'; exit 0"]
+    runner_class: spot-gpu
+    resources:
+      gpu: { count: 8 }
+    # The fallback for anything unclassified — a failure whose text matches no
+    # signature gets these three. A failure that *does* classify takes its
+    # class's budget instead (below, or the disposition default), so this is not
+    # a ceiling over the classified cases.
+    max_attempts: 3
+    retry_delay_secs: 30
+    retry_max_delay_secs: 600
+    # A deadline kill usually recurs; opting out of retrying it is unaffected by
+    # any fault class (#24's carve-out applies first and still wins).
+    timeout_secs: 86400
+    retry_on_timeout: false
+
+  # The counter-example, kept in the file on purpose. This task's failure text
+  # classifies as `nan-loss`, whose budget above is 0 — so it is attempted once
+  # and never again, no matter how generous `max_attempts` is.
+  - name: divergence_guard
+    depends_on: [pretrain]
+    command: ["sh", "-c", "echo 'RuntimeError: Found NaN in loss'; exit 1"]
+    allow_failure: true
+    max_attempts: 10
+
+  - name: evaluate
+    depends_on: [pretrain]
+    command: ["sh", "-c", "echo 'eval ok'"]
+    runner_class: ondemand-gpu
+    resources:
+      gpu: { count: 1 }

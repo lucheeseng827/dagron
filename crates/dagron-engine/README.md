@@ -23,7 +23,7 @@ flowchart LR
     rl --> workers
   end
 
-  src["dagron-source (SOURCE=file|stream)"] --> ingest
+  src["dagron-source (SOURCE=file|dir|stream)"] --> ingest
   workers -->|"spawn task"| exec["dagron-executor (EXECUTOR=local|docker|kubernetes)"]
   rl <-->|"dagron-core db facade (Pool · Waker)"| store[("datastore — SQLite or Postgres")]
   ops --> store
@@ -120,11 +120,13 @@ Selected environment variables read by `run()`:
 |-----|---------|
 | `DATABASE_URL` | Postgres connection string (postgres builds). |
 | `EXECUTOR` | Executor backend: `local` (default) / `docker` / `kubernetes`. |
-| `SOURCE` | Ingestion source: `file` (default) / `stream`. Managed broker connectors are part of dagron Enterprise and error at startup here with a pointer (`dagron-source/src/source.rs`). |
+| `SOURCE` | Ingestion source: `file` (default, one-shot) / `dir` (watch `WORKFLOW_DIR` — a file added later runs, an edited one is re-submitted when the edit changes its modified time or length) / `stream`. Managed broker connectors are not in this build and error at startup with a pointer (`dagron-source/src/source.rs`). |
+| `DIR_POLL_MS` | `SOURCE=dir` scan interval in ms (default 2000, floor 100). |
 | `WORKER_COUNT` | Worker pool size (default 16). |
 | `MAX_INFLIGHT_RUNS` | Admission cap on concurrently active runs (default 64; `0` disables the cap). |
 | `DEAD_LETTER_MAX_ATTEMPTS` | Transient create-run retries before dead-lettering (default 3). |
 | `API_ADDR` | Management API listen address (enables the ops server). |
+| `DAGRON_CONSOLE` | Operator console at `/` and `/console` on the ops server. On unless set to `off`/`false`/`0`/`no` — the API those pages drive is on that socket either way, so unmounting the UI closes nothing. |
 | `CRON_CONFIG` | Path to the cron config file (enables the cron loop). |
 | `GC_RETENTION_SECS` / `GC_INTERVAL_SECS` | Retention GC window and sweep interval. |
 | `DB_SCHEDULES` | Enable DB-backed UI schedules (`1`/`true`). |

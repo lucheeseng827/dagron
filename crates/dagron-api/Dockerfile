@@ -1,6 +1,28 @@
 # dagron-api — authenticated UI gateway. Depends on the sibling `dagron-logging`
 # crate (path dep), so the build context is the module_54 root:
 #   podman build -t dagron-api -f crates/dagron-api/Dockerfile .
+# ── Console: the web UI, built as a fully static site and served by dagron-api ──
+#
+# The console used to ship as its own image (mancube/dagron-frontend, 281 MB of
+# Node runtime) whose only jobs were serving files and proxying /api. It never
+# needed a server: 47 of its 65 sources are "use client", it uses no server-only
+# Next API, and every request goes through `BASE = "/api"` — a relative path. So
+# it is exported (`output: "export"`) and handed to the Rust binary instead.
+#
+# Removing the proxy is not just a size win. Next's rewrites() buffers responses
+# and never flushes headers for an infinite text/event-stream, so /api/events/stream
+# hung and the console reported "Offline" against a healthy API. Same-origin here,
+# the stream opens immediately.
+FROM node:22-slim AS console
+WORKDIR /web
+ARG APP_VERSION=dev
+ENV APP_VERSION=$APP_VERSION
+ENV NEXT_TELEMETRY_DISABLED=1
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
 FROM rust:1.94-slim-bookworm AS builder
 WORKDIR /app
 # dagron-api builds standalone — its own crate, not via the module workspace. It
@@ -36,6 +58,9 @@ RUN touch src/main.rs && cargo build --release --bin dagron-api ${CARGO_FEATURES
 # ── Runtime: distroless/cc (glibc, no shell) ────────────────────────────────────
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=builder /app/crates/dagron-api/target/release/dagron-api /usr/local/bin/dagron-api
+# Served at / by the binary; override the location with DAGRON_CONSOLE_DIR.
+# Absent = API-only, which is what a `cargo run` on a dev box gets.
+COPY --from=console /web/out /usr/share/dagron/console
 ENV PORT=8080
 EXPOSE 8080
 USER 65532:65532

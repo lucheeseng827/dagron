@@ -8,7 +8,7 @@
 //! so a viewer can see *who wakes up* when a dataset updates.
 //!
 //! Read-only by design. Recording an update is `produces:` on a task (open) or
-//! `POST /datasets/events` on the engine (Enterprise); neither belongs here.
+//! `POST /datasets/events` on the engine (feature-gated); neither belongs here.
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;

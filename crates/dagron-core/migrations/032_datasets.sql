@@ -13,7 +13,7 @@
 --   dataset_events.id consumed). Firing is a CAS advance on the cursor —
 --   HA-safe with no leadership: only the scheduler that wins the UPDATE
 --   creates the run. The open build subscribes one dataset per workflow;
---   multi-dataset composition ships with dagron Enterprise.
+--   multi-dataset composition is not in this build.
 CREATE TABLE IF NOT EXISTS datasets (
     uri          TEXT PRIMARY KEY,
     updated_at   TEXT NOT NULL,
@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS dataset_events (
     run_id    TEXT,
     task_id   TEXT,
     task_name TEXT,
-    -- 'task' (a produces: success) or 'external' (Enterprise: posted via the API).
+    -- 'task' (a produces: success) or 'external' (feature-gated: posted via the API).
     source    TEXT NOT NULL DEFAULT 'task',
     at        TEXT NOT NULL
 );
@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS dataset_triggers (
     uri               TEXT NOT NULL,
     cursor            BIGINT NOT NULL DEFAULT 0,
     -- 'any' (fire on any subscribed dataset's update) or 'all' (fire once every
-    -- subscribed dataset updated since the last fire — Enterprise composition).
+    -- subscribed dataset updated since the last fire — composition under the `enterprise` feature).
     mode              TEXT NOT NULL DEFAULT 'any',
     last_fired_at     TEXT,
     last_fired_run_id TEXT,

@@ -87,7 +87,7 @@ export default function WorkflowEditor({ id }: { id?: string }) {
     try {
       if (isNew) {
         const w = await createWorkflow(spec, name || undefined, description || undefined);
-        router.push(`/workflows/${w.id}`);
+        router.push(`/workflows/detail/?id=${w.id}`);
       } else {
         await updateWorkflow(id!, spec, name || undefined, description || undefined);
         // Re-read state/version rather than assume: the save just bumped the
@@ -107,7 +107,7 @@ export default function WorkflowEditor({ id }: { id?: string }) {
     setBusy(true);
     try {
       const { run_id } = await runWorkflow(id);
-      router.push(`/runs/${run_id}`);
+      router.push(`/runs/detail/?id=${run_id}`);
     } catch (e) {
       setError(errMsg(e));
       setBusy(false);

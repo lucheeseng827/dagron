@@ -18,10 +18,13 @@ flowchart LR
     dag["dag — parse · validate · DagGraph"]
     expand["expand — matrix / call → leaf tasks"]
     models["models — row types · status enums"]
+    fault["fault — what a failure was · disposition"]
     db["db — datastore facade (Pool · Waker)"]
     metrics["metrics — process registry"]
     dag --> expand --> db
     models --- db
+    models --> fault
+    metrics --> fault
   end
 
   db -->|"feature sqlite (default)"| sqlite[("SQLite — optimistic CAS claim")]
@@ -38,7 +41,17 @@ flags* below.
   (`DagSpec`, `TaskSpec`, `EnvVar`, and related spec types).
 - **`expand`** — matrix / call-task expansion into concrete leaf tasks, plus the
   `substitute` helper for `{{ param }}` templating against a spec's parameters.
-- **`models`** — datastore row types and status enums shared across the API.
+- **`models`** — datastore row types and status enums shared across the API,
+  plus the retry decision itself (`should_retry_failed_with_class`,
+  `effective_budget`).
+- **`fault`** — the fault-attribution taxonomy: what a failure *was*
+  (`FaultClass`), whether another attempt is worth anything (`Disposition`),
+  whether a signal can be believed as a cause (`Precedence`), and the XID table
+  and text classifier that map a failure's own output onto them. Lives here
+  rather than in a sidecar because the engine has to classify a failure at the
+  moment it decides whether to retry. `dagron-autopsy` correlates these same
+  classes across DCGM, NCCL and the fabric — one vocabulary, or the tool and
+  the scheduler come to disagree about what happened.
 - **`db`** — the datastore facade (`Pool`, `Waker`, run/task lifecycle queries such
   as `create_run`, `claim_ready`, `advance_ready_tasks`, `reap_completed_runs`).
   Exactly one backend is compiled in; a `compile_error!` enforces this.
@@ -72,6 +85,36 @@ sequenceDiagram
   S-->>C: (run_id, RunStatus) for each finalized run
   S-->>C: Waker::wait — NOTIFY (postgres) or timer (sqlite)
 ```
+
+## Retry budgets (`retry_budgets:`)
+
+`TaskSpec` carries per-fault-class attempt budgets, because `max_attempts`
+spends the same budget on every failure — so infrastructure faults give up too
+early and application faults burn GPU-hours reproving a determinism nobody
+doubted. `models::effective_budget` resolves them most-specific-first: the
+task's own entry for the class that occurred → the class's disposition default
+(infrastructure 5, platform 3, application 1) → `max_attempts`.
+
+**This changes how an existing workflow retries, and is meant to.** Failures are
+classified from their own output with no opt-in, so a task that never mentions
+`retry_budgets` still gets the disposition default whenever its failure matches
+a class: `max_attempts: 3` becomes 5 attempts for a `gpu-ecc` and 1 for a
+`nan-loss`. `max_attempts` is the fallback, not a ceiling over the classified
+ones — that is the whole point (a dead GPU deserves another node; a NaN loss
+does not deserve two more hours), but it means an upgrade moves attempt counts
+on workflows nobody edited. It stays in force for **two** kinds of failure: one
+that classified as nothing, and one whose class carries the *unknown*
+disposition — `nccl-timeout` and `unknown`, whose `default_budget()` is `0` on
+purpose so they decline to have an opinion. `nccl-timeout` is the one to hold on
+to: an uncorroborated collective timeout is a symptom, so it sets no retry
+policy of its own. Pin any class to a number you choose by writing it out in
+`retry_budgets`, which wins over the default. Keys are validated at parse against the canonical
+`FaultClass` spelling; the verdict is stored on `task_runs`
+(`fault_class` / `fault_detail` / `fault_confidence`, migrations 040 and
+050–051) and counted by `scheduler_task_faults_total`.
+
+Full reference: [`docs/CONFIG.md`](../../docs/CONFIG.md) ·
+[`docs/HPC_AUTOPSY.md`](../../docs/HPC_AUTOPSY.md).
 
 ## Feature flags
 

@@ -9,6 +9,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { globalSearch } from "@/lib/dagron-api";
 import { statusColor } from "@/lib/adapter";
+import { AGENT_DOCK_ENABLED } from "@/lib/agent";
+import { useAgentDock } from "@/lib/shell-prefs";
 import { timeAgo } from "@/lib/time";
 import type { SearchResponse } from "@/types/dagron";
 
@@ -36,13 +38,18 @@ interface Item {
   title: string;
   sub?: string;
   dot?: string;
+  /// Where Enter goes. Empty for an item that runs an `action` instead.
   href: string;
+  /// Toggles a surface rather than navigating — the palette is where people
+  /// look for chrome they cannot see, which is exactly the dock's problem.
+  action?: () => void;
 }
 
 const EMPTY_RESULTS: SearchResponse = { query: "", workflows: [], runs: [], schedules: [] };
 
 export default function CommandPalette() {
   const router = useRouter();
+  const [dock, setDock] = useAgentDock();
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState("");
   const [results, setResults] = useState<SearchResponse>(EMPTY_RESULTS);
@@ -114,6 +121,16 @@ export default function CommandPalette() {
     const needle = q.trim().toLowerCase();
     const out: Item[] = [];
     if (needle) {
+      if (AGENT_DOCK_ENABLED && "agent dock mcp ai assistant prompt".includes(needle)) {
+        out.push({
+          key: "act:agent-dock",
+          group: "Actions",
+          title: dock ? "Close agent dock" : "Open agent dock",
+          sub: "agent activity and the prompt log",
+          href: "",
+          action: () => setDock(!dock),
+        });
+      }
       for (const p of PAGES) {
         if (p.label.toLowerCase().includes(needle) || p.keywords.includes(needle)) {
           out.push({ key: `page:${p.href}`, group: "Pages", title: p.label, href: p.href });
@@ -126,7 +143,7 @@ export default function CommandPalette() {
         group: "Workflows",
         title: w.name,
         sub: w.description ?? undefined,
-        href: `/workflows/${w.id}/history`,
+        href: `/workflows/history/?id=${w.id}`,
       });
     }
     for (const r of results.runs) {
@@ -136,7 +153,7 @@ export default function CommandPalette() {
         title: `${r.name ?? "—"} · ${r.id.slice(0, 8)}`,
         sub: `${r.status} · ${timeAgo(r.created_at)}`,
         dot: statusColor(r.status),
-        href: `/runs/${r.id}`,
+        href: `/runs/detail/?id=${r.id}`,
       });
     }
     for (const s of results.schedules) {
@@ -145,16 +162,17 @@ export default function CommandPalette() {
         group: "Schedules",
         title: `${s.workflow_name} · ${s.cron_expr}`,
         sub: s.enabled ? "enabled" : "paused",
-        href: `/workflows/${s.workflow_id}`,
+        href: `/workflows/detail/?id=${s.workflow_id}`,
       });
     }
     return out;
-  }, [q, results]);
+  }, [q, results, dock, setDock]);
 
   const go = useCallback(
     (item: Item) => {
       setOpen(false);
-      router.push(item.href);
+      if (item.action) item.action();
+      else router.push(item.href);
     },
     [router],
   );

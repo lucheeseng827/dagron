@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import AgentPanel from "@/components/AgentPanel";
 import CommandPalette from "@/components/CommandPalette";
 import Sidebar from "@/components/Sidebar";
 import { checkSession, login } from "@/lib/dagron-api";
@@ -35,6 +36,9 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
     <div className="dy-shell">
       <Sidebar />
       <main className="dy-main">{children}</main>
+      {/* Right-hand dock: agent activity and the prompt log. Renders as a thin
+          tab when closed, so it costs the canvas nothing until it is wanted. */}
+      <AgentPanel />
       {/* Global ⌘K search — only mounted once the session is valid. */}
       <CommandPalette />
     </div>

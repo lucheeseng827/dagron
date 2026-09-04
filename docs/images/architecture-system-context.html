@@ -60,7 +60,7 @@
 
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="dagron-system-context-title dagron-system-context-desc">
       <title id="dagron-system-context-title">dagron system context</title>
-      <desc id="dagron-system-context-desc">Architecture diagram showing a browser and an AI agent reaching dagron through a JWT-gated API edge, DAG YAML files submitted directly, one datastore holding all workflow state, and N identical scheduler processes that claim work from that datastore with no coordinator and run each task as a subprocess, container, or pod.</desc>
+      <desc id="dagron-system-context-desc">Architecture diagram showing a browser and an AI agent reaching dagron through a JWT-gated API edge that also serves the operator console, DAG YAML submitted directly as a file or a watched directory, one datastore holding all workflow state, and N identical scheduler processes that claim work from that datastore with no coordinator and run each task as a subprocess, container, or pod.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#3d434b"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#965d04"/></marker>
@@ -148,7 +148,7 @@
       <rect x="64" y="158" width="28" height="12" rx="2" fill="transparent" stroke="rgba(125,135,146,0.40)" stroke-width="0.8"/>
       <text x="78" y="167" fill="#3d434b" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">UI</text>
       <text x="128" y="192" fill="#0e1013" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Browser</text>
-      <text x="128" y="208" fill="#3d434b" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">dagron frontend</text>
+      <text x="128" y="208" fill="#3d434b" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">console + API</text>
 
       <!-- AI agent (input) -->
       <rect x="56" y="296" width="144" height="72" rx="6" fill="#f2efe6"/>
@@ -164,15 +164,16 @@
       <rect x="64" y="430" width="28" height="12" rx="2" fill="transparent" stroke="rgba(125,135,146,0.40)" stroke-width="0.8"/>
       <text x="78" y="439" fill="#3d434b" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">YAML</text>
       <text x="128" y="464" fill="#0e1013" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">DAG YAML</text>
-      <text x="128" y="480" fill="#3d434b" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">workflow file</text>
+      <text x="128" y="480" fill="#3d434b" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">file or directory</text>
 
       <!-- dagron-api (backend) -->
       <rect x="288" y="152" width="160" height="72" rx="6" fill="#f2efe6"/>
       <rect x="288" y="152" width="160" height="72" rx="6" fill="#ffffff" stroke="#0e1013" stroke-width="1"/>
       <rect x="296" y="158" width="28" height="12" rx="2" fill="transparent" stroke="rgba(14,16,19,0.40)" stroke-width="0.8"/>
       <text x="310" y="167" fill="#0e1013" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">API</text>
-      <text x="368" y="192" fill="#0e1013" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">dagron-api</text>
-      <text x="368" y="208" fill="#3d434b" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">axum · JWT · SSE</text>
+      <text x="368" y="186" fill="#0e1013" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">dagron-api</text>
+      <text x="368" y="201" fill="#3d434b" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">axum · JWT · SSE</text>
+      <text x="368" y="214" fill="#3d434b" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">console at / · API /api</text>
 
       <!-- dagron-mcp (backend) -->
       <rect x="288" y="296" width="160" height="72" rx="6" fill="#f2efe6"/>

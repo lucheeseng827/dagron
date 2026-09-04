@@ -1,0 +1,4 @@
+node-40:41221:41310 [0] NCCL INFO NET/IB : Using [0]mlx5_0:1/IB nranks=4
+[rank0]: [E ProcessGroupNCCL.cpp:563] [Rank 0] Watchdog caught collective operation timeout
+[rank1]: [E ProcessGroupNCCL.cpp:563] [Rank 1] Watchdog caught collective operation timeout
+[rank2]: [E ProcessGroupNCCL.cpp:563] [Rank 2] Watchdog caught collective operation timeout

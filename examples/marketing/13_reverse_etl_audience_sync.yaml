@@ -1,0 +1,93 @@
+# 13 — Reverse ETL: warehouse segments out to every activation destination.
+#
+#   build segment ─▶ diff ─▶ push ×6 destinations ─▶ reconcile
+#
+# The warehouse is the source of truth for "who is in this audience"; six
+# downstream systems each hold a stale copy. This is the workflow that keeps
+# them honest, and it is mostly an exercise in not sending the same 200,000 rows
+# to six APIs every hour.
+#
+# `diff` computes an add/remove delta against the last successful sync — that is
+# what keeps an unchanged segment cheap, because the destination tools get an
+# empty delta and do nothing with it. The `cache:` key is a narrower tool than it
+# looks: it carries `{{ scheduled_time }}`, so it is fresh on every scheduled run
+# and only ever dedupes a *re-run of the same run* — a retry after a downstream
+# bug does not re-push the destinations that already succeeded. Keying it on the
+# delta's content would be the stronger guarantee and is not expressible here:
+# cache keys template from parameters, and the delta's hash is a task output.
+# `max_active_runs: 1` prevents two overlapping syncs from racing each other into
+# an inconsistent audience, which is the classic reverse-ETL outage: two runs,
+# opposite deltas, last write wins.
+#
+# Each destination `produces:` its own dataset, so downstream reporting can wait
+# on the destination it actually depends on rather than on "the sync job".
+name: mktg_reverse_etl_audience_sync
+tags: [marketing, reverse-etl, activation]
+environment: prod
+run_timeout_secs: 7200
+deadline: { in: 45m }
+max_active_runs: 1
+parameters:
+  segment_name: "icp_a_no_opp_90d"
+  scheduled_time: ""
+
+task_defaults:
+  max_attempts: 5
+  retry_delay_secs: 20
+  retry_max_delay_secs: 240
+  timeout_secs: 900
+  env:
+    - { name: SNOWFLAKE_PWD, value_from: { secret: SNOWFLAKE_PASSWORD } }
+    - { name: HUBSPOT_TOKEN, value_from: { secret: HUBSPOT_PRIVATE_APP_TOKEN } }
+    - { name: GOOGLE_ADS_TOKEN, value_from: { secret: GOOGLE_ADS_REFRESH_TOKEN } }
+    - { name: META_ADS_TOKEN, value_from: { secret: META_ADS_ACCESS_TOKEN } }
+    - { name: LINKEDIN_TOKEN, value_from: { secret: LINKEDIN_ADS_TOKEN } }
+    - { name: CUSTOMERIO_KEY, value_from: { secret: CUSTOMERIO_API_KEY } }
+
+tasks:
+  - name: build_segment
+    timeout_secs: 1800
+    command: ["sh", "-c", "snowsql -o output_format=csv -q \"SELECT * FROM analytics.marketing.audience_{{ segment_name }}\" > \"$DAGRON_ARTIFACTS/segment.csv\""]
+
+  - name: diff_against_last
+    depends_on: [build_segment]
+    command: ["sh", "-c", "audience-diff --new \"$DAGRON_ARTIFACTS/segment.csv\" --state s3://acme-lake/marketing/audience-state/{{ segment_name }}.csv --out \"$DAGRON_ARTIFACTS/delta.json\""]
+
+  # One instance per destination, named after it. Ad platforms rate-limit and
+  # occasionally 500 for an hour; `allow_failure` plus an `all_done` reconcile
+  # means Meta being down does not block the HubSpot list or the email tool.
+  - name: push
+    depends_on: [diff_against_last]
+    with_items:
+      - { dest: hubspot-list, tool: hubspot-list-sync }
+      - { dest: google-customer-match, tool: gads-audience-sync }
+      - { dest: meta-custom-audience, tool: meta-audience-sync }
+      - { dest: linkedin-matched-audience, tool: li-audience-sync }
+      - { dest: customerio, tool: customerio-segment-sync }
+      - { dest: intercom, tool: intercom-segment-sync }
+    instance_key: "{{ item.dest }}"
+    allow_failure: true
+    pool: activation-api
+    cache:
+      key: "push-{{ item.dest }}-{{ segment_name }}-{{ scheduled_time }}"
+      max_age_secs: 3600
+    produces: ["activation://{{ item.dest }}/{{ segment_name }}"]
+    command: ["sh", "-c", "{{ item.tool }} --segment {{ segment_name }} --delta \"$DAGRON_ARTIFACTS/delta.json\" --idempotency-key \"$DAGRON_RUN_ID\""]
+
+  - name: reconcile
+    depends_on: [push]
+    trigger_rule: all_done
+    max_attempts: 1
+    command: ["sh", "-c", "audience-reconcile --segment {{ segment_name }} --expect \"$DAGRON_ARTIFACTS/delta.json\" --out \"$DAGRON_ARTIFACTS/reconcile.json\""]
+
+  # Only commit the new state after reconciliation agrees. A half-pushed sync
+  # that saved its state would silently skip those rows forever.
+  - name: commit_state
+    depends_on: [reconcile]
+    produces: ["s3://acme-lake/marketing/audience-state/{{ segment_name }}"]
+    command: ["sh", "-c", "aws s3 cp \"$DAGRON_ARTIFACTS/segment.csv\" \"s3://acme-lake/marketing/audience-state/{{ segment_name }}.csv\""]
+
+  - name: alert_drift
+    hook: on_failure
+    max_attempts: 1
+    command: ["sh", "-c", "post-slack marketing-ops \"audience {{ segment_name }} out of sync - run $DAGRON_RUN_ID\""]

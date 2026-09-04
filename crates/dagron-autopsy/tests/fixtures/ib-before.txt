@@ -1,0 +1,4 @@
+node-40 mlx5_0:1 symbol_error 1204
+node-40 mlx5_0:1 link_downed 2
+node-47 mlx5_0:1 symbol_error 88
+node-47 mlx5_0:1 link_downed 0

@@ -1,0 +1,154 @@
+# 17 — The Monday funnel report, restatable for any past week.
+#
+#   6 extracts in parallel ─▶ model ─▶ QA ─▶ render ─▶ publish ─▶ Slack
+#
+# Marketing reporting has one hard requirement that dashboards usually fail:
+# **the number you showed the board last month has to still be reproducible**.
+# Every task here keys off `{{ scheduled_time }}` rather than `now`, so
+#
+#   # …on the management API server (dagron-api, 8080 by default); the engine's
+#   # own ops port serves /runs, not /api/backfills.
+#   curl -X POST localhost:8080/api/backfills \
+#        -H 'content-type: application/json' \
+#        -d "{\"schedule_id\":$SCHED,\"from\":\"2026-01-06T00:00:00Z\",\"to\":\"2026-08-31T00:00:00Z\"}"
+#
+# regenerates thirty-four weeks exactly as they were computed, and a run's
+# artifacts are the evidence for the numbers in it.
+#
+# `deadline: { in: 90m }` is the SLA that matters — the report is due before the
+# Monday leadership meeting. It is soft: a late report still gets produced, and
+# the missed deadline is an alert and a metric rather than a cancelled run.
+# `priority: -5` keeps it behind anything user-facing; nobody's lead routing
+# should wait on a chart.
+name: mktg_weekly_funnel_report
+tags: [marketing, reporting, analytics, scheduled]
+environment: prod
+run_timeout_secs: 10800
+deadline: { in: 90m }
+max_active_runs: 4
+parameters:
+  scheduled_time: ""
+  window_days: "7"
+
+task_defaults:
+  max_attempts: 4
+  retry_delay_secs: 20
+  retry_max_delay_secs: 300
+  timeout_secs: 1800
+  priority: -5
+  env:
+    - { name: SNOWFLAKE_PWD, value_from: { secret: SNOWFLAKE_PASSWORD } }
+    - { name: HUBSPOT_TOKEN, value_from: { secret: HUBSPOT_PRIVATE_APP_TOKEN } }
+    - { name: GA4_SA_JSON, value_from: { secret: GA4_SERVICE_ACCOUNT_JSON } }
+    - { name: STRIPE_KEY, value_from: { secret: STRIPE_RESTRICTED_KEY } }
+    - { name: LAKE_BUCKET, value: "{{ env.LAKE_BUCKET }}" }
+    # The nominal fire time reaches the shell through the environment, not
+    # through the command string: it is submit-time input, and `date -u -d`
+    # deserves a quoted variable rather than a pasted one.
+    - { name: SCHEDULED_TIME, value: "{{ scheduled_time }}" }
+    - { name: WINDOW_DAYS, value: "{{ window_days }}" }
+
+tasks:
+  # Six sources, one instance each, cached on the reporting week — so a rerun
+  # after a chart-formatting fix costs nothing at the warehouse.
+  - name: extract
+    with_items:
+      - { src: hubspot-funnel, tool: hubspot-funnel-export }
+      - { src: ga4-sessions, tool: ga4-export }
+      - { src: ad-spend, tool: snowflake-unload }
+      - { src: pipeline, tool: sfdc-opportunity-export }
+      - { src: revenue, tool: stripe-export }
+      - { src: product-usage, tool: amplitude-export }
+    instance_key: "{{ item.src }}"
+    cache:
+      key: "week-{{ item.src }}-{{ scheduled_time }}"
+      max_age_secs: 259200
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        # `publish` resolves an empty `scheduled_time` to the current week, so
+        # every task that reads the value has to resolve it the same way. Passing
+        # the empty string straight through to `--as-of` meant a manual run
+        # extracted an unspecified window and then published it labelled with
+        # this week — one file, two meanings for one empty value. This is the
+        # first task in the chain, so it is also where an unparseable value
+        # should stop the run, before anything is pulled.
+        if [ -n "$SCHEDULED_TIME" ]; then
+          as_of=$(date -u -d "$SCHEDULED_TIME" +%FT%TZ) || {
+            echo "scheduled_time '$SCHEDULED_TIME' is not a timestamp this image can parse" >&2
+            exit 1
+          }
+        else
+          as_of=$(date -u +%FT%TZ)
+        fi
+        {{ item.tool }} --window "$WINDOW_DAYS"d --as-of "$as_of" \
+          --out "$DAGRON_ARTIFACTS/{{ item.src }}.parquet"
+
+  - name: model
+    depends_on: [extract]
+    timeout_secs: 3600
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        as_of="${SCHEDULED_TIME:-$(date -u +%FT%TZ)}"
+        dbt run --select marts.marketing+ --vars "{as_of: \"$as_of\"}"
+
+  # Data QA is a task, not a Slack message from someone who noticed. If MQL
+  # count moved more than 40% week-on-week, the run stops and a human looks
+  # before leadership sees it.
+  - name: qa
+    depends_on: [model]
+    max_attempts: 1
+    command: ["sh", "-c", "dbt test --select marts.marketing+ && anomaly-check --metric mql_count --max-wow-delta 0.40"]
+
+  - name: render
+    depends_on: [qa]
+    docker_image: ghcr.io/acme/report-renderer:3.1
+    timeout_secs: 900
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        as_of="${SCHEDULED_TIME:-$(date -u +%FT%TZ)}"
+        render-report --template weekly-funnel --as-of "$as_of" \
+          --out "$DAGRON_ARTIFACTS/report.pdf"
+
+  - name: publish
+    depends_on: [render]
+    produces:
+      - "s3://acme-lake/marketing/reports/weekly-funnel"
+      - "snowflake://analytics/marketing/mart_funnel_weekly"
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        # An unparseable non-empty `scheduled_time` stops the task rather than
+        # silently publishing under the current week: a restatement that lands on
+        # the wrong week is worse than one that does not land, because the number
+        # the board was shown is then quietly overwritten. Empty is a manual run.
+        if [ -n "$SCHEDULED_TIME" ]; then
+          week=$(date -u -d "$SCHEDULED_TIME" +%G-W%V) || {
+            echo "scheduled_time '$SCHEDULED_TIME' is not a timestamp this image can parse" >&2
+            exit 1
+          }
+        else
+          week=$(date -u +%G-W%V)
+        fi
+        aws s3 cp "$DAGRON_ARTIFACTS/report.pdf" "s3://$LAKE_BUCKET/marketing/reports/weekly-funnel/$week.pdf"
+        echo "$week"
+
+  - name: distribute
+    depends_on: [publish]
+    max_attempts: 2
+    command: ["sh", "-c", "post-slack marketing \"Weekly funnel report is up: s3://$LAKE_BUCKET/marketing/reports/weekly-funnel/ (run $DAGRON_RUN_ID)\""]
+
+  - name: flag_late
+    hook: on_failure
+    max_attempts: 1
+    command: ["sh", "-c", "post-slack marketing-ops \"weekly funnel report failed for '$SCHEDULED_TIME' - run $DAGRON_RUN_ID\""]

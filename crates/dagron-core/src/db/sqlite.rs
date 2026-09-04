@@ -106,6 +106,79 @@ async fn create_run_inner(
     yaml_spec: &str,
     offset: Option<(&str, &str)>,
 ) -> Result<String> {
+    create_run_inner_with_floor(pool, dag, yaml_spec, offset, min_free_bytes()).await
+}
+
+/// `DAGRON_MIN_FREE_BYTES` — the free-disk admission floor in bytes, `0` = off
+/// (the default; the `edge` profile sets 64 MiB). Read once: boot-immutable
+/// like every other knob, and the create path must not pay an env lookup per
+/// run. Tests inject a floor through [`create_run_inner_with_floor`] rather
+/// than the environment, for the same reason `lease_secs()` is never tested
+/// by setting the variable after first use.
+fn min_free_bytes() -> u64 {
+    static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        std::env::var("DAGRON_MIN_FREE_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Refuse admission when the datastore's filesystem has under `floor` bytes
+/// free. Constrained hosts: a flash device that fills up corrupts the WAL
+/// rather than refusing writes, so the floor keeps headroom for the runs
+/// already in flight and for the checkpoint — new runs are the one write it
+/// is safe to say no to.
+///
+/// Probes the directory holding the database file, taken from *this pool's*
+/// connect options — never a process-global path — so a second pool in the
+/// same process (tests, the crash-recovery harness) probes its own
+/// filesystem. FAILS OPEN with one warning if the probe itself errors: a
+/// probe that cannot run is not evidence that the disk is full, and refusing
+/// every run over a permissions mistake would be a worse outage than the one
+/// the floor prevents.
+fn check_disk_floor(pool: &Pool, floor: u64) -> Result<()> {
+    if floor == 0 {
+        return Ok(());
+    }
+    let opts = pool.connect_options();
+    let dir = match opts.get_filename().parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        // A bare filename (`workflow.db`) lives in the working directory.
+        _ => std::path::PathBuf::from("."),
+    };
+    match super::free_bytes(&dir) {
+        Ok(free) if free < floor => {
+            Err(anyhow::Error::new(crate::models::DatastoreLowOnDisk { free, floor }))
+        }
+        Ok(_) => Ok(()),
+        Err(e) => {
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    dir = %dir.display(), error = %e, floor,
+                    "free-disk probe failed — the DAGRON_MIN_FREE_BYTES floor fails open (warned once)"
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// [`create_run_inner`] with the free-disk floor injected — the seam the
+/// floor is tested through. `floor == 0` skips the probe entirely.
+async fn create_run_inner_with_floor(
+    pool: &Pool,
+    dag: &DagGraph,
+    yaml_spec: &str,
+    offset: Option<(&str, &str)>,
+    floor: u64,
+) -> Result<String> {
+    // Before the transaction, before any id is minted: a refused run must
+    // leave nothing behind — no definition row, no moved source cursor.
+    check_disk_floor(pool, floor)?;
+
     let def_id = Uuid::new_v4().to_string();
     let run_id = Uuid::new_v4().to_string();
     let created = chrono::Utc::now();
@@ -159,10 +232,16 @@ async fn create_run_inner(
     .execute(&mut *tx)
     .await?;
 
+    // Clock confidence (migration 041): whatever this process currently knows
+    // about its own wall clock rides the row. `unknown` is a stored value, not
+    // NULL, so "never assessed" stays distinguishable from "written before
+    // the column existed". See `crate::clock`.
+    let clock = crate::clock::current();
     sqlx::query(
         "INSERT INTO workflow_runs
-           (id, definition_id, status, created_at, deadline_at, alert_deadline_at, result_from, environment)
-         VALUES (?, ?, 'running', ?, ?, ?, ?, ?)",
+           (id, definition_id, status, created_at, deadline_at, alert_deadline_at, result_from, environment,
+            clock_confidence, clock_offset_ms, clock_source)
+         VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&run_id)
     .bind(&def_id)
@@ -171,6 +250,9 @@ async fn create_run_inner(
     .bind(&alert_deadline_at)
     .bind(&dag.spec.result_from)
     .bind(&dag.spec.environment)
+    .bind(clock.confidence.as_str())
+    .bind(clock.offset_ms)
+    .bind(&clock.source)
     .execute(&mut *tx)
     .await?;
 
@@ -896,7 +978,15 @@ async fn claim_ready_filtered(
     };
     let mut tx = pool.begin().await?;
 
-    let now = chrono::Utc::now().to_rfc3339();
+    // ONE wall-clock read for the whole claim: the `scheduled_at <= now` gate
+    // and the lease expiry derive from the same instant, so a clock step
+    // between two reads can never hand a task a lease already expired (or a
+    // window too long) relative to the gate that admitted it. A duration must
+    // never come from two wall-clock reads (clock discipline on units whose
+    // clock is being set underneath them).
+    let now_dt = chrono::Utc::now();
+    let now = now_dt.to_rfc3339();
+    let lease_exp = (now_dt + chrono::TimeDelta::seconds(super::lease_secs())).to_rfc3339();
 
     // Per-pool concurrency budgets (#21): remaining slots for each configured
     // pool = capacity − currently running. Empty `pool_caps` ⇒ no gating, so the
@@ -954,8 +1044,6 @@ async fn claim_ready_filtered(
         return Ok(vec![]);
     }
 
-    let lease_exp =
-        (chrono::Utc::now() + chrono::TimeDelta::seconds(super::lease_secs())).to_rfc3339();
     let mut claimed = Vec::with_capacity(candidates.len());
 
     for task in candidates {
@@ -1022,7 +1110,10 @@ pub async fn claim_ready_gang(
     } else {
         format!(",{},", classes.join(","))
     };
-    let now = chrono::Utc::now().to_rfc3339();
+    // One wall-clock read for gate and lease alike — see `claim_ready_filtered`.
+    let now_dt = chrono::Utc::now();
+    let now = now_dt.to_rfc3339();
+    let lease_exp = (now_dt + chrono::TimeDelta::seconds(super::lease_secs())).to_rfc3339();
     // Budget resolution, gang selection, and the claiming UPDATE run in ONE write
     // transaction. SQLite serializes writers, so holding the transaction across
     // the pool count and the claim is what makes the budget check atomic against
@@ -1075,8 +1166,6 @@ pub async fn claim_ready_gang(
         return Ok(Vec::new());
     };
 
-    let lease_exp =
-        (chrono::Utc::now() + chrono::TimeDelta::seconds(super::lease_secs())).to_rfc3339();
     let claimed = sqlx::query_as::<_, TaskRun>(
         "UPDATE task_runs
          SET status = 'running',
@@ -2056,7 +2145,7 @@ pub async fn record_dataset_updates(
     Ok(())
 }
 
-/// Record an **external** dataset event (dagron Enterprise: producers outside
+/// Record an **external** dataset event (not in this build: producers outside
 /// dagron — CDC, object-store notifications — post updates via the API). Same
 /// ledger, `source = 'external'`; sensors and triggers see it identically.
 pub async fn record_external_dataset_event(pool: &Pool, uri: &str) -> Result<()> {
@@ -2155,7 +2244,7 @@ pub async fn prune_dataset_triggers(pool: &Pool) -> Result<u64> {
 
 /// Claim dataset triggers that are due to fire. For each subscribed workflow:
 /// `any` mode fires when **any** subscribed dataset has an event newer than its
-/// cursor; `all` mode (Enterprise composition) fires only when **every**
+/// cursor; `all` mode (composition, feature-gated) fires only when **every**
 /// subscribed dataset does. Claiming CAS-advances the fresh cursors to their
 /// current high-water marks in one transaction — the scheduler that wins the
 /// CAS owns the fire (HA-safe with no leadership; losers roll back and skip).
@@ -2398,12 +2487,24 @@ pub async fn retry_task(
     retry_at: String,
 ) -> Result<bool> {
     let rows = sqlx::query(
+        // The fault columns describe why this row is *currently* failed. A row
+        // about to run again is not failed, so the previous attempt's verdict
+        // is cleared here — otherwise a task that failed with `gpu-ecc`,
+        // retried on its class budget of 5 and then succeeded keeps
+        // `fault_class = 'gpu-ecc'` forever, and every roll-up counts a
+        // success as an infrastructure failure. That is precisely the case the
+        // wide infra budget exists to create, so the metric would be most
+        // wrong exactly where it is most load-bearing. The `inc_fault` counter
+        // already recorded the attempt when it happened; nothing is lost.
         "UPDATE task_runs
          SET status = 'ready',
              scheduled_at = ?,
              claimed_by = NULL,
              lease_expires_at = NULL,
-             output = ?
+             output = ?,
+             fault_class = NULL,
+             fault_detail = NULL,
+             fault_confidence = NULL
          WHERE id = ? AND claimed_by = ? AND version = ?",
     )
     .bind(&retry_at)
@@ -2420,6 +2521,94 @@ pub async fn retry_task(
         return Ok(false);
     }
     Ok(true)
+}
+
+// ── Fault attribution ────────────────────────────────────────────────────────
+
+/// Record the fault attribution for the attempt that just failed (migration
+/// 040/050): what broke, the line that says so, and how much to trust it.
+///
+/// **Fence-guarded like every other post-execution mutation.** Called
+/// immediately before `retry_task` / `mark_task_failed`, which carry the same
+/// guard — so a worker whose lease was already reclaimed writes neither the
+/// verdict nor the transition, and a stale attempt can never relabel a newer
+/// one's failure. The two are deliberately *not* one statement: `retry_task`
+/// is also the repeat-loop's re-queue path, which has no fault to record, and
+/// folding a diagnostic column into the state-machine transition would put a
+/// classification bug on the critical path of every requeue.
+///
+/// Best-effort at the call site: a failed write here loses a breadcrumb, never
+/// a state transition. Returns `false` when the fence no longer holds.
+pub async fn record_task_fault(
+    pool: &Pool,
+    task_id: &str,
+    worker_id: &str,
+    fence: i64,
+    class: crate::fault::FaultClass,
+    detail: Option<&str>,
+    confidence: crate::fault::Confidence,
+) -> Result<bool> {
+    let rows = sqlx::query(
+        "UPDATE task_runs
+         SET fault_class = ?, fault_detail = ?, fault_confidence = ?
+         WHERE id = ? AND claimed_by = ? AND version = ?",
+    )
+    .bind(class.as_str())
+    .bind(detail)
+    .bind(confidence.as_str())
+    .bind(task_id)
+    .bind(worker_id)
+    .bind(fence)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(rows > 0)
+}
+
+/// Read back the fault attribution for one task. The autopsy tool's `--from-db`
+/// path and the ops surface both need it, and neither wants to re-select the
+/// whole row (which carries the task's full spec JSON in `input`).
+#[cfg_attr(not(feature = "ops"), allow(dead_code))]
+pub async fn get_task_fault(
+    pool: &Pool,
+    task_id: &str,
+) -> Result<Option<(String, Option<String>, Option<String>)>> {
+    let row: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT fault_class, fault_detail, fault_confidence FROM task_runs WHERE id = ?",
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(c, d, conf)| c.map(|c| (c, d, conf))))
+}
+
+/// Fleet roll-up: how many failures of each class finished in `[since, until)`,
+/// and the total attempts they consumed. The query behind any
+/// "what did this cost us" number — served by the partial index from migration
+/// 040/051, which is why the `fault_class IS NOT NULL` predicate is spelled out
+/// rather than left implicit in the GROUP BY.
+#[cfg_attr(not(feature = "ops"), allow(dead_code))]
+pub async fn fault_class_counts(
+    pool: &Pool,
+    since: &str,
+    until: &str,
+) -> Result<Vec<(String, i64, i64)>> {
+    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        // `status = 'failed'` as well as a non-NULL class: belt and braces with
+        // the clear in `retry_task`, so a row that somehow keeps a stale
+        // verdict still cannot be counted as a failure it is not.
+        "SELECT fault_class, COUNT(*) AS n, COALESCE(SUM(attempt), 0) AS attempts
+         FROM task_runs
+         WHERE fault_class IS NOT NULL AND status = 'failed'
+           AND finished_at >= ? AND finished_at < ?
+         GROUP BY fault_class
+         ORDER BY n DESC",
+    )
+    .bind(since)
+    .bind(until)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }
 
 // ── Long-task primitives: heartbeat lease renewal + checkpoint pointers ──────
@@ -2675,6 +2864,16 @@ pub async fn rerun_from_failed(pool: &Pool, run_id: &str) -> Result<Option<u64>>
              lease_expires_at = NULL,
              output = NULL,
              finished_at = NULL,
+             -- The fault verdict describes why this row is *currently* failed.
+             -- A row being reset to run again is not failed, so the previous
+             -- attempt's attribution goes with the rest of its result. Missed
+             -- here originally: `retry_task` cleared them and these two reset
+             -- paths did not, so a rerun or a Clear task left a stale class on
+             -- a row that could then fail for an entirely different reason —
+             -- and the roll-up would report the old one.
+             fault_class = NULL,
+             fault_detail = NULL,
+             fault_confidence = NULL,
              scheduled_at = ?,
              version = version + 1
          WHERE run_id = ? AND status IN ('failed', 'cancelled', 'skipped')",
@@ -2763,7 +2962,11 @@ pub async fn clear_task_with_downstream(
          UPDATE task_runs
          SET status = 'pending', attempt = 0, claimed_by = NULL, lease_expires_at = NULL,
              output = NULL, finished_at = NULL, scheduled_at = ?, version = version + 1,
-             checkpoint_uri = NULL, checkpoint_marker = NULL
+             checkpoint_uri = NULL, checkpoint_marker = NULL,
+             -- Same reason as `retry_task` and `rerun_from_failed`: a cleared
+             -- row is not a failed row, so it must not carry a failed row's
+             -- verdict into whatever happens next.
+             fault_class = NULL, fault_detail = NULL, fault_confidence = NULL
          WHERE id IN (SELECT id FROM cone)
            AND status IN ('succeeded', 'failed', 'skipped', 'cancelled')",
     )
@@ -3617,6 +3820,534 @@ pub async fn mark_outbox_dead(pool: &Pool, id: &str, error: &str) -> Result<()> 
     Ok(())
 }
 
+// ── Transactional outbox: spool bounds for the fleet uplink ───────────────────
+//
+// A machine on a metered, duty-cycled or absent link fills its outbox far
+// faster than it drains it, and the disk it fills is usually a small flash
+// card. The functions below are what keeps that spool bounded: measure it
+// ([`outbox_pending_bytes`], [`outbox_oldest_pending_age_secs`]), drop what no
+// longer fits ([`shed_outbox`]), and claim a batch carrying the timestamps the
+// fleet protocol needs ([`claim_outbox_batch_for_uplink`]). The engine itself
+// never calls any of them — the fleet-link worker that ships with dagron
+// a feature-on build does, and this is the datastore half of that contract, kept here
+// so both backends stay identical and the SQL lives beside the outbox it
+// touches.
+
+/// The largest number of seconds this region will hand to
+/// [`chrono::TimeDelta::seconds`]. That constructor panics outside its
+/// millisecond range, and every duration here arrives from an operator's
+/// environment, so each one is clamped *before* the arithmetic rather than
+/// trusted to be sane. A hundred years is far past any spool budget worth
+/// configuring and far short of the panic.
+const MAX_SPOOL_SECS: i64 = 100 * 366 * 24 * 3600;
+
+/// The status a row shed by [`shed_outbox`] carries. `event_outbox.status` has
+/// no `CHECK` constraint (see the `008_event_outbox.sql` DDL), so this needs no
+/// migration; nothing re-claims such a row, because every claim filters
+/// `pending`.
+pub const OUTBOX_STATUS_SHED: &str = "shed";
+
+/// One claimed outbox row, plus the wall-clock time the engine wrote it.
+///
+/// [`claim_outbox_batch`] deliberately does not carry `created_at`: a webhook
+/// receives an event moments after it happened, so the receiver's own clock is
+/// close enough. A unit reconnecting after a week offline is the opposite case
+/// — what matters is when the machine produced the event, not when the link
+/// came back — so the uplink claim returns the column too and the fleet plane
+/// stores it verbatim.
+#[derive(Debug, Clone)]
+pub struct OutboxUplinkRow {
+    pub event: crate::models::OutboxEvent,
+    /// RFC 3339, exactly as the engine that emitted the event wrote it.
+    pub created_at: String,
+}
+
+/// [`claim_outbox_batch`] with `created_at` attached (see [`OutboxUplinkRow`]).
+///
+/// Identical lease discipline: the claim defers each row by `lease_secs`, so a
+/// worker that dies mid-upload simply lets the lease lapse and the rows are
+/// re-claimed. That makes delivery at-least-once, which is safe because the
+/// plane deduplicates on the row id — the same property the webhook drain
+/// relies on.
+pub async fn claim_outbox_batch_for_uplink(
+    pool: &Pool,
+    limit: i64,
+    lease_secs: i64,
+) -> Result<Vec<OutboxUplinkRow>> {
+    let now = chrono::Utc::now();
+    let now_s = now.to_rfc3339();
+    let lease_until =
+        (now + chrono::TimeDelta::seconds(lease_secs.clamp(0, MAX_SPOOL_SECS))).to_rfc3339();
+
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        id: String,
+        run_id: String,
+        event_type: String,
+        payload: String,
+        attempts: i64,
+        created_at: String,
+    }
+
+    let mut tx = pool.begin().await?;
+    let rows: Vec<Row> = sqlx::query_as::<_, Row>(
+        "SELECT id, run_id, event_type, payload, attempts, created_at FROM event_outbox
+         WHERE status = 'pending' AND next_attempt_at <= ?
+         ORDER BY next_attempt_at LIMIT ?",
+    )
+    .bind(&now_s)
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+    for r in &rows {
+        sqlx::query("UPDATE event_outbox SET next_attempt_at = ? WHERE id = ?")
+            .bind(&lease_until)
+            .bind(&r.id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| OutboxUplinkRow {
+            event: crate::models::OutboxEvent {
+                id: r.id,
+                run_id: r.run_id,
+                event_type: r.event_type,
+                payload: r.payload,
+                attempts: r.attempts,
+            },
+            created_at: r.created_at,
+        })
+        .collect())
+}
+
+/// Bytes of event payload still waiting to be delivered (`status = 'pending'`).
+///
+/// The payload is the row's whole variable cost — ids, types and timestamps are
+/// bounded and small — so it is what a byte budget is measured against.
+/// `LENGTH` over TEXT counts characters in SQLite, which under-counts anything
+/// non-ASCII; the `CAST(… AS BLOB)` makes it count bytes, matching the disk the
+/// budget is protecting.
+pub async fn outbox_pending_bytes(pool: &Pool) -> Result<i64> {
+    // SUM over no rows is NULL, not 0.
+    let total: Option<i64> = sqlx::query_scalar(
+        "SELECT SUM(LENGTH(CAST(payload AS BLOB))) FROM event_outbox WHERE status = 'pending'",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(total.unwrap_or(0))
+}
+
+/// How long the oldest still-undelivered event has been waiting, in seconds
+/// (`0` when the spool is empty).
+///
+/// `created_at` is written as `chrono::Utc::now().to_rfc3339()` everywhere the
+/// engine emits an event, and that spelling is fixed-width and always UTC, so
+/// the lexicographic `MIN` the datastore computes is also the chronological
+/// one. A row whose timestamp does not parse reads as age `0` rather than as an
+/// error: an unparseable clock is not a reason to refuse to measure the spool.
+pub async fn outbox_oldest_pending_age_secs(pool: &Pool) -> Result<i64> {
+    let oldest: Option<String> =
+        sqlx::query_scalar("SELECT MIN(created_at) FROM event_outbox WHERE status = 'pending'")
+            .fetch_one(pool)
+            .await?;
+    let Some(oldest) = oldest else {
+        return Ok(0);
+    };
+    let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&oldest) else {
+        tracing::debug!(created_at = %oldest, "outbox row has an unparseable created_at");
+        return Ok(0);
+    };
+    Ok((chrono::Utc::now() - ts.with_timezone(&chrono::Utc)).num_seconds().max(0))
+}
+
+/// Bring the pending spool back inside its budget, parking what no longer fits
+/// as [`OUTBOX_STATUS_SHED`]. Returns how many rows were shed.
+///
+/// Two budgets, applied in that order; `0` disables either one:
+///
+/// * **age** — `max_age_secs` sheds every pending row written longer ago than
+///   that. Telemetry that has been undeliverable for a week is worth less than
+///   the flash it is sitting on, and shedding it is what keeps the *recent*
+///   events deliverable.
+/// * **bytes** — `max_bytes` sheds until [`outbox_pending_bytes`] is back at or
+///   under the budget. `policy` picks the victims: `"largest"` takes the biggest
+///   payloads first (fewest rows lost per byte reclaimed — right when one
+///   oversized capture is the problem), and anything else takes the oldest
+///   first, which is the default because the events an operator is watching a
+///   machine for are the newest ones.
+///
+/// Shed rows are never re-claimed (every claim filters `status = 'pending'`),
+/// keep their payload, and carry the budget that dropped them in `last_error`,
+/// so `SELECT COUNT(*), last_error FROM event_outbox WHERE status = 'shed'` is a
+/// readable answer to "what did this disk cost me". They are data loss by
+/// design: the alternative is a spool that grows until the datastore itself
+/// stops accepting writes, which loses the *run state* too.
+pub async fn shed_outbox(
+    pool: &Pool,
+    max_bytes: i64,
+    max_age_secs: i64,
+    policy: &str,
+) -> Result<u64> {
+    // Victims are taken a page at a time: a spool of a million rows must not
+    // materialise in memory to drop the first few of them.
+    const PAGE: i64 = 512;
+
+    let due_now = chrono::Utc::now().to_rfc3339();
+    // Only rows that are *due* are eligible. A claim leases a row by pushing
+    // `next_attempt_at` into the future and leaving `status = 'pending'`, so a
+    // row a delivery worker is mid-POST on is indistinguishable from an idle
+    // one by status alone. Shedding it would be worse than losing it: the
+    // finalizers are `status = 'pending'`-guarded, so `mark_outbox_delivered`
+    // would silently match nothing and a successfully delivered event would sit
+    // in the spool forever, counted as loss by the audit query. A row in backoff
+    // is skipped for the same reason and becomes eligible once it is due again.
+
+    let mut shed: u64 = 0;
+
+    if max_age_secs > 0 {
+        let cutoff = (chrono::Utc::now()
+            - chrono::TimeDelta::seconds(max_age_secs.clamp(0, MAX_SPOOL_SECS)))
+        .to_rfc3339();
+        let reason = format!("shed: older than the {max_age_secs}s outbox age budget");
+        shed += sqlx::query(
+            "UPDATE event_outbox SET status = 'shed', last_error = ?
+             WHERE status = 'pending' AND created_at < ? AND next_attempt_at <= ?",
+        )
+        .bind(&reason)
+        .bind(&cutoff)
+        .bind(&due_now)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    }
+
+    if max_bytes > 0 {
+        let largest_first = policy.eq_ignore_ascii_case("largest");
+        // Two fixed statements rather than an interpolated ORDER BY: a sort key
+        // cannot be a bind parameter, so the only safe spelling is one where no
+        // caller-supplied string ever reaches the SQL text.
+        let sql = if largest_first {
+            "SELECT id, LENGTH(CAST(payload AS BLOB)) AS bytes FROM event_outbox
+             WHERE status = 'pending' AND next_attempt_at <= ?
+             ORDER BY bytes DESC, created_at ASC LIMIT ?"
+        } else {
+            "SELECT id, LENGTH(CAST(payload AS BLOB)) AS bytes FROM event_outbox
+             WHERE status = 'pending' AND next_attempt_at <= ?
+             ORDER BY created_at ASC LIMIT ?"
+        };
+        let reason = format!(
+            "shed: over the {max_bytes}-byte outbox budget ({} first)",
+            if largest_first { "largest" } else { "oldest" }
+        );
+        let mut pending = outbox_pending_bytes(pool).await?;
+        loop {
+            if pending <= max_bytes {
+                break;
+            }
+            let victims: Vec<(String, i64)> =
+                sqlx::query_as(sql).bind(&due_now).bind(PAGE).fetch_all(pool).await?;
+            if victims.is_empty() {
+                break;
+            }
+            let mut progressed = false;
+            for (id, bytes) in victims {
+                if pending <= max_bytes {
+                    break;
+                }
+                let n = sqlx::query(
+                    "UPDATE event_outbox SET status = 'shed', last_error = ?
+                     WHERE id = ? AND status = 'pending'",
+                )
+                .bind(&reason)
+                .bind(&id)
+                .execute(pool)
+                .await?
+                .rows_affected();
+                if n == 1 {
+                    shed += n;
+                    pending -= bytes;
+                    progressed = true;
+                }
+            }
+            // A whole page that shed nothing means another writer is racing us;
+            // stop rather than spin.
+            if !progressed {
+                break;
+            }
+        }
+    }
+
+    if shed > 0 {
+        tracing::warn!(
+            shed,
+            max_bytes,
+            max_age_secs,
+            policy,
+            "outbox rows shed to stay inside the spool budget — these events are lost"
+        );
+    }
+    Ok(shed)
+}
+
+/// The newest run created from exactly these spec bytes at or after `since`
+/// (RFC 3339), if there is one.
+///
+/// The fleet link acknowledges a work item with the `run_id` it became, so the
+/// plane can follow a fanned-out run to its outcome. Nothing hands the source
+/// that id, though — the ingest actor creates the run and the source's `ack`
+/// runs afterwards — so this is the bridge, and it is deliberately a
+/// **heuristic**: the spec text is the key, and `since` (the instant the work
+/// item was handed out) is what stops an identical spec submitted an hour ago
+/// from being reported instead. Two byte-identical specs created in the same
+/// instant are indistinguishable here; the ack is best-effort by contract, and
+/// the run's own lifecycle events carry the authoritative record.
+pub async fn latest_run_for_spec(pool: &Pool, spec: &str, since: &str) -> Result<Option<String>> {
+    let id: Option<String> = sqlx::query_scalar(
+        "SELECT r.id FROM workflow_runs r
+           JOIN workflow_definitions d ON d.id = r.definition_id
+          WHERE d.spec = ? AND r.created_at >= ?
+          ORDER BY r.created_at DESC, r.id DESC
+          LIMIT 1",
+    )
+    .bind(spec)
+    .bind(since)
+    .fetch_optional(pool)
+    .await?;
+    Ok(id)
+}
+
+#[cfg(test)]
+mod outbox_spool_tests {
+    use super::*;
+    use crate::dag::DagGraph;
+
+    /// Own fixture rather than `mod tests`'s: this module is the outbox spool's
+    /// contract and stays readable on its own.
+    async fn temp_pool() -> (Pool, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("module54_spool_{}.db", Uuid::new_v4()));
+        let pool = init_pool(path.to_str().unwrap()).await.unwrap();
+        (pool, path)
+    }
+
+    /// Seed one pending outbox row with an exact payload and age.
+    async fn seed(pool: &Pool, id: &str, payload: &str, age_secs: i64) {
+        let created = (chrono::Utc::now() - chrono::TimeDelta::seconds(age_secs)).to_rfc3339();
+        sqlx::query(
+            "INSERT INTO event_outbox
+               (id, run_id, event_type, payload, status, attempts, next_attempt_at, created_at)
+             VALUES (?, 'run-1', 'run.completed', ?, 'pending', 0, ?, ?)",
+        )
+        .bind(id)
+        .bind(payload)
+        .bind(&created)
+        .bind(&created)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn status_of(pool: &Pool, id: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM event_outbox WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The uplink claim is the webhook claim plus `created_at`: same lease, same
+    /// at-least-once behaviour, and the timestamp the plane needs to record when
+    /// a week-old event actually happened.
+    #[tokio::test]
+    async fn uplink_claim_carries_created_at_and_leases_the_row() {
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: up\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let run_id = create_run(&pool, &dag, yaml).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+        let claimed = claim_ready(&pool, "w", 10).await.unwrap();
+        assert!(mark_task_succeeded(&pool, &claimed[0].id, "w", claimed[0].version + 1, None)
+            .await
+            .unwrap());
+        assert_eq!(reap_completed_runs(&pool).await.unwrap().len(), 1);
+
+        let batch = claim_outbox_batch_for_uplink(&pool, 10, 30).await.unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].event.run_id, run_id);
+        assert_eq!(batch[0].event.event_type, "run.completed");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&batch[0].created_at).is_ok(),
+            "created_at rides the row as RFC 3339: {}",
+            batch[0].created_at
+        );
+        assert!(
+            claim_outbox_batch_for_uplink(&pool, 10, 30).await.unwrap().is_empty(),
+            "a leased row is not re-claimed inside its lease window"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The two gauges the spool budget is read from, and what they ignore.
+    #[tokio::test]
+    async fn pending_bytes_and_age_measure_only_undelivered_rows() {
+        let (pool, path) = temp_pool().await;
+        assert_eq!(
+            outbox_pending_bytes(&pool).await.unwrap(),
+            0,
+            "an empty spool sums to 0, not NULL"
+        );
+        assert_eq!(outbox_oldest_pending_age_secs(&pool).await.unwrap(), 0);
+
+        seed(&pool, "e-old", &"x".repeat(100), 3_600).await;
+        seed(&pool, "e-new", &"y".repeat(50), 10).await;
+        assert_eq!(outbox_pending_bytes(&pool).await.unwrap(), 150);
+        let age = outbox_oldest_pending_age_secs(&pool).await.unwrap();
+        assert!((3_595..=3_605).contains(&age), "oldest pending row is about an hour old: {age}");
+
+        // A delivered row has already left the spool; it costs nothing.
+        mark_outbox_delivered(&pool, "e-old").await.unwrap();
+        assert_eq!(outbox_pending_bytes(&pool).await.unwrap(), 50);
+        let age = outbox_oldest_pending_age_secs(&pool).await.unwrap();
+        assert!(age < 60, "only the fresh row is left: {age}");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The byte budget with the default policy: oldest out first, and only as
+    /// many rows as it takes to fit.
+    #[tokio::test]
+    async fn byte_budget_sheds_oldest_first_until_it_fits() {
+        let (pool, path) = temp_pool().await;
+        seed(&pool, "e-1", &"a".repeat(100), 300).await;
+        seed(&pool, "e-2", &"b".repeat(100), 200).await;
+        seed(&pool, "e-3", &"c".repeat(100), 100).await;
+
+        let shed = shed_outbox(&pool, 250, 0, "oldest").await.unwrap();
+        assert_eq!(shed, 1, "dropping one 100-byte row brings 300 under 250");
+        assert_eq!(status_of(&pool, "e-1").await, OUTBOX_STATUS_SHED);
+        assert_eq!(status_of(&pool, "e-2").await, "pending");
+        assert_eq!(status_of(&pool, "e-3").await, "pending");
+        assert_eq!(outbox_pending_bytes(&pool).await.unwrap(), 200);
+
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT last_error FROM event_outbox WHERE id = 'e-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let reason = reason.expect("a shed row records why it was dropped");
+        assert!(reason.contains("250-byte"), "{reason}");
+        assert!(reason.contains("oldest"), "{reason}");
+
+        // A shed row is out of the drain's reach for good.
+        let ids: Vec<String> = claim_outbox_batch_for_uplink(&pool, 10, 30)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event.id)
+            .collect();
+        assert_eq!(ids, vec!["e-2".to_string(), "e-3".to_string()]);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `largest` reclaims the same bytes from fewer rows — the policy for a
+    /// spool that one oversized capture is wedging.
+    #[tokio::test]
+    async fn largest_policy_drops_the_big_payload_not_the_small_old_ones() {
+        let (pool, path) = temp_pool().await;
+        seed(&pool, "e-small-old", &"a".repeat(10), 900).await;
+        seed(&pool, "e-huge", &"b".repeat(500), 300).await;
+        seed(&pool, "e-small-new", &"c".repeat(10), 10).await;
+
+        let shed = shed_outbox(&pool, 100, 0, "LARGEST").await.unwrap();
+        assert_eq!(shed, 1, "one row carries the whole overshoot");
+        assert_eq!(status_of(&pool, "e-huge").await, OUTBOX_STATUS_SHED);
+        assert_eq!(status_of(&pool, "e-small-old").await, "pending");
+        assert_eq!(status_of(&pool, "e-small-new").await, "pending");
+        assert_eq!(outbox_pending_bytes(&pool).await.unwrap(), 20);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The age budget, and the fact that `0` on either budget means "off" — a
+    /// default configuration must never silently drop anything.
+    #[tokio::test]
+    async fn age_budget_parks_stale_rows_and_zero_budgets_shed_nothing() {
+        let (pool, path) = temp_pool().await;
+        seed(&pool, "e-week", &"a".repeat(10), 7 * 24 * 3_600 + 60).await;
+        seed(&pool, "e-fresh", &"b".repeat(10), 30).await;
+
+        assert_eq!(shed_outbox(&pool, 0, 0, "oldest").await.unwrap(), 0, "no budget, no loss");
+        assert_eq!(status_of(&pool, "e-week").await, "pending");
+
+        let shed = shed_outbox(&pool, 0, 7 * 24 * 3_600, "oldest").await.unwrap();
+        assert_eq!(shed, 1);
+        assert_eq!(status_of(&pool, "e-week").await, OUTBOX_STATUS_SHED);
+        assert_eq!(status_of(&pool, "e-fresh").await, "pending");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An absurd budget must clamp, not panic: `TimeDelta::seconds` is a
+    /// panicking constructor and `DAGRON_FLEET_SPOOL_MAX_AGE_SECS` is an
+    /// operator-supplied number.
+    #[tokio::test]
+    async fn an_absurd_age_budget_clamps_instead_of_panicking() {
+        let (pool, path) = temp_pool().await;
+        seed(&pool, "e-1", "payload", 60).await;
+        assert_eq!(shed_outbox(&pool, 0, i64::MAX, "oldest").await.unwrap(), 0);
+        assert_eq!(status_of(&pool, "e-1").await, "pending");
+        // The same clamp on the claim's lease.
+        assert_eq!(claim_outbox_batch_for_uplink(&pool, 10, i64::MAX).await.unwrap().len(), 1);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The ack heuristic: the newest run from these exact bytes, and nothing
+    /// from before the work item was handed out.
+    #[tokio::test]
+    async fn latest_run_for_spec_is_newest_since_the_handout() {
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: fleet-item\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+
+        let before = create_run(&pool, &dag, yaml).await.unwrap();
+        let handed_out = chrono::Utc::now().to_rfc3339();
+        // create_run stamps RFC 3339 with sub-second precision, but two runs in
+        // the same microsecond would make "newest" ambiguous; step past it.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let after = create_run(&pool, &dag, yaml).await.unwrap();
+        assert_ne!(before, after);
+
+        let found = latest_run_for_spec(&pool, yaml, &handed_out).await.unwrap();
+        assert_eq!(found.as_deref(), Some(after.as_str()), "the run created since the hand-out");
+
+        let other = "name: other\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        assert_eq!(
+            latest_run_for_spec(&pool, other, &handed_out).await.unwrap(),
+            None,
+            "a different spec is not this work item's run"
+        );
+        let future = (chrono::Utc::now() + chrono::TimeDelta::seconds(60)).to_rfc3339();
+        assert_eq!(
+            latest_run_for_spec(&pool, yaml, &future).await.unwrap(),
+            None,
+            "nothing was created after the hand-out, so the ack carries no run id"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 /// Returns the terminal RunStatus once every task_run is in a terminal state,
 /// or None while work is still in progress.
 #[allow(dead_code)] // retained as documented single-run API; the daemon loop uses reap_completed_runs
@@ -3820,13 +4551,47 @@ pub async fn list_runs(
 pub async fn get_run(pool: &Pool, run_id: &str) -> Result<Option<crate::models::WorkflowRun>> {
     use crate::models::WorkflowRun;
     let row = sqlx::query_as::<_, WorkflowRun>(
-        "SELECT id, definition_id, status, input, output, created_at, finished_at
+        "SELECT id, definition_id, status, input, output, created_at, finished_at,
+                clock_confidence, clock_offset_ms, clock_source
          FROM workflow_runs WHERE id = ?",
     )
     .bind(run_id)
     .fetch_optional(pool)
     .await?;
     Ok(row)
+}
+
+/// Stamp every **running** run `drifted` (clock discipline): the detector
+/// caught a wall-clock step, or found the clock behind the datastore at boot,
+/// so the timestamps these runs will finish under are not evidence. Runs
+/// already terminal keep the confidence they were created with — their
+/// record is closed, and rewriting it would be the detector inventing
+/// history. Returns the number of runs touched. Not `ops`-gated: the lean
+/// daemon runs the detector too.
+pub async fn mark_runs_clock_drifted(pool: &Pool, offset_ms: i64, source: &str) -> Result<u64> {
+    let r = sqlx::query(
+        "UPDATE workflow_runs
+         SET clock_confidence = 'drifted', clock_offset_ms = ?, clock_source = ?
+         WHERE status = 'running'",
+    )
+    .bind(offset_ms)
+    .bind(source)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+/// `created_at` of the newest run in the datastore (RFC 3339), or `None` on
+/// an empty store — the boot plausibility probe: a clock that reads *earlier*
+/// than the newest record it is about to append to is wrong, whatever else it
+/// says. `MAX` over the text is chronological here because every row is
+/// written by `to_rfc3339()` in UTC, whose fixed field widths make lexical
+/// order time order.
+pub async fn latest_run_created_at(pool: &Pool) -> Result<Option<String>> {
+    let latest: Option<String> = sqlx::query_scalar("SELECT MAX(created_at) FROM workflow_runs")
+        .fetch_one(pool)
+        .await?;
+    Ok(latest)
 }
 
 /// All task rows of a run, ordered by name. Backs `GET /runs/:id`.
@@ -4062,33 +4827,51 @@ pub async fn archivable_runs(
 
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
-        let run = sqlx::query(
-            "SELECT wr.*, wd.name AS definition_name, wd.spec AS definition_spec
-             FROM workflow_runs wr
-             JOIN workflow_definitions wd ON wd.id = wr.definition_id
-             WHERE wr.id = ?",
-        )
-        .bind(&id)
-        .fetch_one(pool)
-        .await?;
-        let tasks = sqlx::query("SELECT * FROM task_runs WHERE run_id = ? ORDER BY name")
-            .bind(&id)
-            .fetch_all(pool)
-            .await?;
-        let outbox =
-            sqlx::query("SELECT * FROM event_outbox WHERE run_id = ? ORDER BY created_at")
-                .bind(&id)
-                .fetch_all(pool)
-                .await?;
-        let doc = serde_json::json!({
-            "format": "dagron.run-archive.v1",
-            "run": row_to_json(&run),
-            "tasks": tasks.iter().map(row_to_json).collect::<Vec<_>>(),
-            "outbox_events": outbox.iter().map(row_to_json).collect::<Vec<_>>(),
-        });
-        out.push((id, doc));
+        // The id came from the query above, so a missing run here would mean it
+        // was purged between the two — treat that as nothing to archive rather
+        // than failing the whole batch.
+        if let Some(doc) = archive_doc_for_run(pool, &id).await? {
+            out.push((id, doc));
+        }
     }
     Ok(out)
+}
+
+/// Build one run's `dagron.run-archive.v1` document — run + definition + tasks
+/// + outbox events, the self-contained record the sink stores.
+///
+/// `None` when the run does not exist. Deliberately **not** filtered by status
+/// or age: the batch sweep selects its own eligible ids, and the API's per-run
+/// archive route enforces its own guard so it can say *why* a run was refused
+/// rather than reporting an empty result.
+#[cfg(feature = "ops")]
+pub async fn archive_doc_for_run(pool: &Pool, id: &str) -> Result<Option<serde_json::Value>> {
+    let Some(run) = sqlx::query(
+        "SELECT wr.*, wd.name AS definition_name, wd.spec AS definition_spec
+         FROM workflow_runs wr
+         JOIN workflow_definitions wd ON wd.id = wr.definition_id
+         WHERE wr.id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let tasks = sqlx::query("SELECT * FROM task_runs WHERE run_id = ? ORDER BY name")
+        .bind(id)
+        .fetch_all(pool)
+        .await?;
+    let outbox = sqlx::query("SELECT * FROM event_outbox WHERE run_id = ? ORDER BY created_at")
+        .bind(id)
+        .fetch_all(pool)
+        .await?;
+    Ok(Some(serde_json::json!({
+        "format": "dagron.run-archive.v1",
+        "run": row_to_json(&run),
+        "tasks": tasks.iter().map(row_to_json).collect::<Vec<_>>(),
+        "outbox_events": outbox.iter().map(row_to_json).collect::<Vec<_>>(),
+    })))
 }
 
 /// Upsert one row into the `archived_runs` index — the listable map of what
@@ -6546,6 +7329,195 @@ tasks:
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The fault verdict is fenced exactly like the transition it accompanies:
+    /// a worker whose lease was reclaimed cannot relabel the newer attempt's
+    /// failure. Without this a slow rank-0 straggler's "nccl-timeout" would
+    /// overwrite the reclaiming attempt's real "gpu-ecc" — and the retry budget
+    /// reads the class, so the mislabel is not cosmetic.
+    #[tokio::test]
+    async fn fault_attribution_is_fenced_and_reads_back() {
+        use crate::fault::{Confidence, FaultClass};
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: r\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        create_run(&pool, &dag, yaml).await.unwrap();
+
+        advance_ready_tasks(&pool).await.unwrap();
+        let claimed = claim_ready(&pool, "w1", 10).await.unwrap();
+        let task_id = claimed[0].id.clone();
+        let fence = claimed[0].version + 1;
+
+        // Unclassified until something looks — distinct from "unknown".
+        assert_eq!(get_task_fault(&pool, &task_id).await.unwrap(), None);
+
+        assert!(
+            record_task_fault(
+                &pool, &task_id, "w1", fence,
+                FaultClass::GpuEcc, Some("Xid 48: Double Bit ECC Error"), Confidence::High
+            ).await.unwrap(),
+            "the claim holder's fenced write lands"
+        );
+        let (class, detail, conf) = get_task_fault(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(class, "gpu-ecc");
+        assert_eq!(conf.as_deref(), Some("high"));
+        assert!(detail.unwrap().contains("Xid 48"));
+
+        // A stale worker (wrong fence) and a foreign worker (wrong claim) both
+        // no-op rather than overwriting the verdict.
+        assert!(
+            !record_task_fault(
+                &pool, &task_id, "w1", fence + 1,
+                FaultClass::NcclTimeout, None, Confidence::Low
+            ).await.unwrap(),
+            "a stale fence is rejected"
+        );
+        assert!(
+            !record_task_fault(
+                &pool, &task_id, "w2", fence,
+                FaultClass::NcclTimeout, None, Confidence::Low
+            ).await.unwrap(),
+            "a worker that does not hold the claim is rejected"
+        );
+        assert_eq!(
+            get_task_fault(&pool, &task_id).await.unwrap().unwrap().0,
+            "gpu-ecc",
+            "the verdict survived both stale writes"
+        );
+
+        // The roll-up the cost question is asked with.
+        mark_task_failed(&pool, &task_id, "w1", fence, Some("boom".into())).await.unwrap();
+        let counts = fault_class_counts(&pool, "1970-01-01T00:00:00+00:00", "2999-01-01T00:00:00+00:00")
+            .await
+            .unwrap();
+        assert_eq!(counts, vec![("gpu-ecc".to_string(), 1, 1)]);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A verdict must not outlive the failure it describes. The infra classes
+    /// carry budgets above 1 precisely so the task gets another attempt — so
+    /// "failed with gpu-ecc, retried, succeeded" is the *common* path for them,
+    /// and a roll-up that still counts it as a gpu-ecc failure is most wrong
+    /// exactly where it is most load-bearing.
+    #[tokio::test]
+    async fn a_retried_then_succeeded_task_is_not_counted_as_a_failure() {
+        use crate::fault::{Confidence, FaultClass};
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: r\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        create_run(&pool, &dag, yaml).await.unwrap();
+
+        // Attempt 1: fails, attributed to a device fault.
+        advance_ready_tasks(&pool).await.unwrap();
+        let c1 = claim_ready(&pool, "w1", 10).await.unwrap();
+        let task_id = c1[0].id.clone();
+        let f1 = c1[0].version + 1;
+        record_task_fault(
+            &pool, &task_id, "w1", f1,
+            FaultClass::GpuEcc, Some("Xid 48"), Confidence::High,
+        )
+        .await
+        .unwrap();
+        let retry_at = chrono::Utc::now().to_rfc3339();
+        assert!(retry_task(&pool, &task_id, "w1", f1, Some("boom".into()), retry_at).await.unwrap());
+
+        // The verdict is gone the moment the row is queued to run again.
+        assert_eq!(
+            get_task_fault(&pool, &task_id).await.unwrap(),
+            None,
+            "a row about to run again is not a failed row"
+        );
+
+        // Attempt 2: succeeds, on another node, as the infra budget intends.
+        let c2 = claim_ready(&pool, "w2", 10).await.unwrap();
+        assert_eq!(c2.len(), 1, "the task is claimable again");
+        let f2 = c2[0].version + 1;
+        assert!(
+            mark_task_succeeded(&pool, &task_id, "w2", f2, Some("ok".into())).await.unwrap()
+        );
+
+        let counts =
+            fault_class_counts(&pool, "1970-01-01T00:00:00+00:00", "2999-01-01T00:00:00+00:00")
+                .await
+                .unwrap();
+        assert!(
+            counts.is_empty(),
+            "a task that recovered is not an infrastructure failure: {counts:?}"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Every path that resets a task for another attempt must drop the previous
+    /// attempt's verdict — not just the ordinary retry. `rerun_from_failed` and
+    /// `clear_task_with_downstream` were missed when `retry_task` was fixed, so
+    /// a rerun left a stale class on a row that could then fail for a wholly
+    /// different reason, and the roll-up reported the old one.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn every_reset_path_drops_the_previous_attempts_verdict() {
+        use crate::fault::{Confidence, FaultClass};
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: r\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let run_id = create_run(&pool, &dag, yaml).await.unwrap();
+
+        // Attribute a failure, then rerun the run from its failure frontier.
+        advance_ready_tasks(&pool).await.unwrap();
+        let c = claim_ready(&pool, "w1", 10).await.unwrap();
+        let task_id = c[0].id.clone();
+        let fence = c[0].version + 1;
+        record_task_fault(
+            &pool, &task_id, "w1", fence,
+            FaultClass::GpuEcc, Some("Xid 48"), Confidence::High,
+        ).await.unwrap();
+        mark_task_failed(&pool, &task_id, "w1", fence, Some("boom".into())).await.unwrap();
+        assert!(get_task_fault(&pool, &task_id).await.unwrap().is_some(), "recorded");
+
+        // `rerun_from_failed` re-arms the *run* as its atomic gate, so the run
+        // has to be finalized first — without this it returns `None`, resets
+        // nothing, and the assertion below would be testing a no-op.
+        reap_completed_runs(&pool).await.unwrap();
+        let reset = rerun_from_failed(&pool, &run_id).await.unwrap();
+        assert_eq!(reset, Some(1), "the failed task was actually reset");
+        assert_eq!(
+            get_task_fault(&pool, &task_id).await.unwrap(),
+            None,
+            "rerun_from_failed must not carry the old verdict forward"
+        );
+
+        // And the same for an operator's Clear task.
+        advance_ready_tasks(&pool).await.unwrap();
+        let c = claim_ready(&pool, "w2", 10).await.unwrap();
+        let fence = c[0].version + 1;
+        record_task_fault(
+            &pool, &task_id, "w2", fence,
+            FaultClass::NanLoss, Some("Found NaN in loss"), Confidence::High,
+        ).await.unwrap();
+        mark_task_failed(&pool, &task_id, "w2", fence, Some("boom".into())).await.unwrap();
+        assert!(get_task_fault(&pool, &task_id).await.unwrap().is_some());
+
+        let cleared = clear_task_with_downstream(&pool, &run_id, &task_id).await.unwrap();
+        assert_eq!(cleared, Some(1), "the task was actually cleared");
+        assert_eq!(
+            get_task_fault(&pool, &task_id).await.unwrap(),
+            None,
+            "clear_task_with_downstream must not carry the old verdict forward"
+        );
+
+        // Nothing stale is left for the roll-up to count.
+        let counts =
+            fault_class_counts(&pool, "1970-01-01T00:00:00+00:00", "2999-01-01T00:00:00+00:00")
+                .await
+                .unwrap();
+        assert!(counts.is_empty(), "no stale attribution survives a reset: {counts:?}");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// No double dispatch absent a crash: a claimed (running) task is not
     /// claimable again — the status guard alone blocks a second dispatch, and the
     /// version fence (see `stale_fence_is_rejected`) blocks a stale completion.
@@ -6910,6 +7882,254 @@ tasks:
         assert_eq!(status("gated_yes").await, TaskStatus::Ready, "when true → ready");
         assert_eq!(status("gated_no").await, TaskStatus::Skipped, "when false → skipped");
         assert_eq!(status("downstream").await, TaskStatus::Skipped, "skip cascades");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── Clock discipline + constrained-host floor (edge profile) ────────────
+
+    /// The three clock columns of one run, as stored.
+    async fn clock_stamp(pool: &Pool, run_id: &str) -> (Option<String>, Option<i64>, Option<String>) {
+        sqlx::query_as(
+            "SELECT clock_confidence, clock_offset_ms, clock_source FROM workflow_runs WHERE id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// `lease_expires_at` of one task row, parsed — `None` means no lease held.
+    async fn lease_of(pool: &Pool, task_id: &str) -> chrono::DateTime<chrono::Utc> {
+        let s: Option<String> =
+            sqlx::query_scalar("SELECT lease_expires_at FROM task_runs WHERE id = ?")
+                .bind(task_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        chrono::DateTime::parse_from_rfc3339(&s.expect("a claimed task holds a lease"))
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// Every run is stamped with the process's clock confidence at creation:
+    /// `unknown` as a stored value when nothing has assessed the clock, and
+    /// whatever the detector last published otherwise — offset and source
+    /// included. Read back through raw SQL so the stamp is verified in the
+    /// lean build too (`get_run` is `ops`-gated and covered separately).
+    #[tokio::test]
+    async fn create_run_stamps_the_published_clock_confidence() {
+        let _guard = crate::clock::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: clk\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+
+        crate::clock::publish(crate::clock::ClockStatus::unknown());
+        let r = create_run(&pool, &dag, yaml).await.unwrap();
+        assert_eq!(
+            clock_stamp(&pool, &r).await,
+            (Some("unknown".into()), None, None),
+            "unknown is a value, not NULL"
+        );
+
+        crate::clock::publish(crate::clock::ClockStatus::drifted(-4_200, "step"));
+        let r = create_run(&pool, &dag, yaml).await.unwrap();
+        assert_eq!(
+            clock_stamp(&pool, &r).await,
+            (Some("drifted".into()), Some(-4_200), Some("step".into()))
+        );
+
+        crate::clock::publish(crate::clock::ClockStatus::synced("sync-file"));
+        let r = create_run(&pool, &dag, yaml).await.unwrap();
+        assert_eq!(
+            clock_stamp(&pool, &r).await,
+            (Some("synced".into()), None, Some("sync-file".into()))
+        );
+
+        crate::clock::publish(crate::clock::ClockStatus::unknown());
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `get_run` carries the three clock fields (the engine's `GET /runs/{id}`
+    /// reads them from here), and a row written before migration 041 — NULL
+    /// in every column — reads as `None`, never as a guessed `unknown`.
+    #[cfg(feature = "ops")]
+    #[tokio::test]
+    async fn get_run_round_trips_clock_fields() {
+        let _guard = crate::clock::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: clk2\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        crate::clock::publish(crate::clock::ClockStatus::drifted(90_000, "behind-datastore"));
+        let run_id = create_run(&pool, &dag, yaml).await.unwrap();
+        crate::clock::publish(crate::clock::ClockStatus::unknown());
+
+        let run = get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(run.clock_confidence.as_deref(), Some("drifted"));
+        assert_eq!(run.clock_offset_ms, Some(90_000));
+        assert_eq!(run.clock_source.as_deref(), Some("behind-datastore"));
+
+        sqlx::query(
+            "UPDATE workflow_runs SET clock_confidence = NULL, clock_offset_ms = NULL, clock_source = NULL WHERE id = ?",
+        )
+        .bind(&run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run = get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!((run.clock_confidence, run.clock_offset_ms, run.clock_source), (None, None, None));
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A caught clock step re-stamps only the runs still in flight: a finished
+    /// run's record is closed and keeps the confidence it was written under.
+    #[tokio::test]
+    async fn mark_runs_clock_drifted_touches_running_runs_only() {
+        let _guard = crate::clock::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: drift\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        crate::clock::publish(crate::clock::ClockStatus::synced("sync-file"));
+        let running = create_run(&pool, &dag, yaml).await.unwrap();
+        let finished = create_run(&pool, &dag, yaml).await.unwrap();
+        crate::clock::publish(crate::clock::ClockStatus::unknown());
+        sqlx::query("UPDATE workflow_runs SET status = 'succeeded', finished_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(&finished)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(mark_runs_clock_drifted(&pool, -1_500, "step").await.unwrap(), 1);
+        assert_eq!(
+            clock_stamp(&pool, &running).await,
+            (Some("drifted".into()), Some(-1_500), Some("step".into()))
+        );
+        assert_eq!(
+            clock_stamp(&pool, &finished).await,
+            (Some("synced".into()), None, Some("sync-file".into())),
+            "a closed record is never rewritten"
+        );
+
+        // Nothing running → nothing touched, and no error.
+        sqlx::query("UPDATE workflow_runs SET status = 'succeeded'").execute(&pool).await.unwrap();
+        assert_eq!(mark_runs_clock_drifted(&pool, 7, "step").await.unwrap(), 0);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The boot plausibility probe reports the newest run's `created_at`, and
+    /// `None` on an empty store (a fresh unit has nothing to be behind).
+    #[tokio::test]
+    async fn latest_run_created_at_reports_the_newest_run() {
+        let (pool, path) = temp_pool().await;
+        assert_eq!(latest_run_created_at(&pool).await.unwrap(), None);
+
+        let yaml = "name: newest\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let first = create_run(&pool, &dag, yaml).await.unwrap();
+        let second = create_run(&pool, &dag, yaml).await.unwrap();
+        // Push the second run unmistakably into the future (two creates can
+        // share a millisecond) so the probe has a definite answer.
+        let future = (chrono::Utc::now() + chrono::TimeDelta::seconds(3_600)).to_rfc3339();
+        sqlx::query("UPDATE workflow_runs SET created_at = ? WHERE id = ?")
+            .bind(&future)
+            .bind(&second)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(latest_run_created_at(&pool).await.unwrap().as_deref(), Some(future.as_str()));
+        let first_at: String = sqlx::query_scalar("SELECT created_at FROM workflow_runs WHERE id = ?")
+            .bind(&first)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(future > first_at, "text order is time order for to_rfc3339() stamps");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The free-disk floor (`DAGRON_MIN_FREE_BYTES`), exercised through the
+    /// injecting helper: `0` is off, an unreachable floor refuses with the
+    /// typed error carrying both numbers and leaves nothing behind (no
+    /// definition, no run, no moved source cursor), and a one-byte floor
+    /// admits. The env knob itself is a `OnceLock` read, which is why the
+    /// test injects instead of setting it.
+    #[tokio::test]
+    async fn disk_floor_refuses_below_and_admits_above() {
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: floor\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let counts = |pool: Pool| async move {
+            let defs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_definitions")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            let runs: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM workflow_runs").fetch_one(&pool).await.unwrap();
+            (defs, runs)
+        };
+
+        assert!(create_run_inner_with_floor(&pool, &dag, yaml, None, 0).await.is_ok(), "0 = off");
+
+        let err = create_run_inner_with_floor(&pool, &dag, yaml, None, u64::MAX).await.unwrap_err();
+        let low = err
+            .downcast_ref::<crate::models::DatastoreLowOnDisk>()
+            .expect("a typed refusal, not a bare string");
+        assert_eq!(low.floor, u64::MAX);
+        assert!(low.free < low.floor);
+        assert!(err.to_string().contains("DAGRON_MIN_FREE_BYTES"), "{err}");
+
+        assert!(
+            create_run_inner_with_floor(&pool, &dag, yaml, None, 1).await.is_ok(),
+            "one byte of headroom admits"
+        );
+        assert_eq!(counts(pool.clone()).await, (2, 2), "the refused run left no rows behind");
+
+        // The exactly-once path is refused the same way, before its cursor moves.
+        let err = create_run_inner_with_floor(&pool, &dag, yaml, Some(("src", "9")), u64::MAX)
+            .await
+            .unwrap_err();
+        assert!(err.downcast_ref::<crate::models::DatastoreLowOnDisk>().is_some());
+        assert_eq!(source_offset(&pool, "src").await.unwrap(), None, "cursor untouched");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Single-read lease derivation: the lease a claim hands out is exactly
+    /// one `LEASE_SECS` window past the instant that gated `scheduled_at`, on
+    /// both claim paths — never a second wall-clock read taken later.
+    #[tokio::test]
+    async fn claim_lease_is_one_window_past_the_gate_instant() {
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: lease\ntasks:\n  - name: a\n    command: [\"true\"]\n  - name: g\n    command: [\"true\"]\n    gang: { size: 2 }\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        create_run(&pool, &dag, yaml).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+        let window = chrono::TimeDelta::seconds(crate::db::lease_secs());
+
+        let before = chrono::Utc::now();
+        let ordinary = claim_ready_classes_nongang(&pool, "w", 10, &[], &Default::default()).await.unwrap();
+        let after = chrono::Utc::now();
+        assert_eq!(ordinary.len(), 1, "the non-gang task");
+        let lease = lease_of(&pool, &ordinary[0].id).await;
+        assert!(lease >= before + window && lease <= after + window, "{lease} vs [{before}, {after}] + window");
+
+        let before = chrono::Utc::now();
+        let gang = claim_ready_gang(&pool, "w", 2, &[], &Default::default()).await.unwrap();
+        let after = chrono::Utc::now();
+        assert_eq!(gang.len(), 2, "the whole gang");
+        for member in &gang {
+            let lease = lease_of(&pool, &member.id).await;
+            assert!(lease >= before + window && lease <= after + window, "{lease} vs [{before}, {after}] + window");
+        }
 
         pool.close().await;
         let _ = std::fs::remove_file(&path);

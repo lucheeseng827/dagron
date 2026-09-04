@@ -76,7 +76,7 @@ export default function ApprovalsPage() {
               </div>
               <div style={{ fontSize: 12.5, color: "var(--dim)", marginTop: 2 }} title={a.since ? absTime(a.since) : undefined}>
                 waiting {a.since ? timeAgo(a.since).replace(" ago", "") : "—"} ·{" "}
-                <Link href={`/runs/${a.run_id}?task=${encodeURIComponent(a.task_name)}`} className="mono" style={{ color: "var(--blue)" }}>
+                <Link href={`/runs/detail/?id=${a.run_id}&task=${encodeURIComponent(a.task_name)}`} className="mono" style={{ color: "var(--blue)" }}>
                   run {a.run_id.slice(0, 8)}
                 </Link>
               </div>

@@ -35,6 +35,9 @@ export interface RunSummary {
   triage_note?: string;
   triaged_at?: string;
   triaged_by?: string;
+  /// Whether the engine's wall clock was trustworthy when this run was
+  /// recorded. Absent/null for runs the engine never assessed.
+  clock_confidence?: "synced" | "drifted" | "unknown" | null;
 }
 
 export type GitRepoState = "Synced" | "OutOfSync" | "Syncing";
@@ -146,6 +149,10 @@ export interface RunDetail {
   triage_note?: string;
   triaged_at?: string;
   triaged_by?: string;
+  /// Clock confidence at record time — see RunSummary.clock_confidence.
+  clock_confidence?: "synced" | "drifted" | "unknown" | null;
+  clock_offset_ms?: number | null;
+  clock_source?: string | null;
   id: string;
   definition_id: string;
   status: RunStatus;

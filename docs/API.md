@@ -12,8 +12,10 @@ handler modules they name — regenerate when those change.
 
 Postgres-only, stateless, listens on `PORT` (default `8080`).
 
-**Auth:** every route below except `/healthz`, `/readyz`, `POST /api/login`
-and `POST /api/logout` requires a valid HS256 session JWT, accepted either as the
+**Auth:** every route below except `/healthz`, `/readyz`, `POST /api/login`,
+`POST /api/logout` and `GET /api/badges/{name}` (a public SVG status label —
+see [Workflows](#workflows-schedules-gitops)) requires a valid HS256 session
+JWT, accepted either as the
 HttpOnly `dagron_session` cookie (browsers) or `Authorization: Bearer <jwt>`
 (API clients). Automation may instead present a personal access token (`dgp_`
 prefix) in the same `Authorization: Bearer` header; it resolves to its owner's
@@ -21,10 +23,12 @@ live permissions. Token *management* (`/api/tokens*`) is the one exception — i
 requires a password session and refuses a `dgp_` bearer with `403`, so a leaked
 token cannot mint its own replacements. Missing/invalid/expired → `401`
 (`src/auth.rs`).
-`POST /api/users`, `GET /api/users` and all three
-`/api/settings/notifications*` routes additionally require the `admin` group
-(`403` otherwise) — notification defaults hold secret webhook URLs and reroute
-every run's notifications, and the test route makes the server POST outbound.
+`POST /api/users`, `GET /api/users`, all three
+`/api/settings/notifications*` routes and `PUT /api/settings/dead-letters`
+additionally require the `admin` group (`403` otherwise) — notification defaults
+hold secret webhook URLs and reroute every run's notifications, the test route
+makes the server POST outbound, and the dead-letter retry count is instance-wide
+policy. Reading the dead-letter setting needs only a session.
 
 **Errors:** handlers answer `(status, {"error": "<message>"})`; DB failures map
 to `500` without leaking internals — except `GET /api/health`, which by design
@@ -68,10 +72,11 @@ curl -s http://localhost:8080/api/me -H "Authorization: Bearer $TOKEN"
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| GET | `/api/runs` | `?status=&name=&trigger=&limit=&offset=` (limit default 100, max 500) → `[{id, definition_id, status, created_at, finished_at, name, trigger_kind}]`. `name` filters by workflow, `trigger` by `manual`/`schedule`/`backfill`; `trigger_kind` is derived (schedule stamp / backfill ledger), no schema change |
+| GET | `/api/runs` | `?status=&name=&trigger=&limit=&offset=` (limit default 100, max 500) → `[{id, definition_id, status, created_at, finished_at, name, trigger_kind, clock_confidence}]`. `name` filters by workflow, `trigger` by `manual`/`schedule`/`backfill`; `trigger_kind` is derived (schedule stamp / backfill ledger), no schema change |
 | POST | `/api/runs` | `{yaml: "<workflow YAML>", parameters?: {k: v}}` → `201 {run_id}`; `400` on invalid YAML / cycles / duplicate or unknown task names (validated before anything is persisted). `parameters` override the spec's declared `parameters:` defaults; keys the spec never references are ignored. **Optional `Idempotency-Key:` header** — a repeat of the same submit returns the *same* `run_id` with `200` instead of creating a second run, so a retrying client cannot double-submit. `409` if the key was already used for a different body, or if an identical submit is still in flight (retry). An explicitly supplied *empty* `Idempotency-Key` is a `400` (`must not be empty`), so an absent header and an invalid empty one are distinguishable. Keys are printable ASCII, ≤255 chars, scoped to the authenticated caller, and live exactly as long as the run they name |
 | GET | `/api/runs/{id}` | run detail (`{…, name, trigger_kind, failure}`) + `tasks[]` (`{id, name, status, attempt, output, scheduled_at, finished_at}`); `404`. **`failure`** summarises why the run broke without a second call — `{task_id, task_name, attempt, failed_tasks, message, truncated}`, or `null` when nothing failed. It names the *earliest-finished* failed task (the likeliest cause rather than a downstream casualty) and `failed_tasks` says how many there were; `message` is the tail of that task's output, clipped to 20 lines / 4 KB with `truncated: true`. A run failed with no failed task — a `run_timeout_secs` overrun cancels its tasks — reports the run's own reason with `task_id: null`. Present as soon as a task fails, so a still-`running` run can carry one |
 | GET | `/api/runs/{id}/wait` | `?timeout_secs=` (default 30, clamp 1–600) long-poll to terminal → `{run_id, status, finished, result, failure}` (`result` = the `result_from` task's output on success); `404`; a timed-out wait is `200` with `finished: false`. **`failure`** is the same object `GET /api/runs/{id}` returns, present only when the wait ended on a failure — a synchronous caller gets the reason in the response it is already holding, with no second call. The task rows behind it are read only when there is a failure, so a succeeding wait costs nothing extra |
+| GET | `/api/runs/{id}/spec` | the stored, un-expanded DAG YAML this run was created from → `{yaml, name}`; `404` unknown run or definition. Backs the console's "re-run with changes" editor, and is the only way a caller that submitted ad-hoc YAML can recover what it ran |
 | GET | `/api/runs/{id}/graph` | DAG as `{nodes[], edges[]}` for the UI graph view |
 | GET | `/api/runs/{id}/logs` | **Workflow logs** — every task's output merged into one attributed stream, filtered server-side → `{run_id, tasks[], lines[], total, matched, truncated, eof, filtered, limit}`; `404` unknown run, `400` invalid filter. `?task=`/`?status=` narrow which tasks are read (name or id, repeatable or CSV); the [log filter](#log-filter) then narrows which lines survive. `total`/`matched` are counted **before** the line cap, so a truncated view always says how much it hid |
 | GET | `/api/runs/{id}/tasks/{tid}/logs` | `{task_id, name, status, attempt, output, offset, next_offset, eof, total, matched, truncated, filtered, lines?}`; `404`, `400` invalid filter. **`?offset=`** returns only the output past that char offset for live tailing — poll with `?offset=next_offset` until `eof`. The [log filter](#log-filter) applies *within* that slice while `next_offset` keeps counting the raw text, so filtering and tailing compose; `lines` is present only when a filter was asked for |
@@ -84,6 +89,8 @@ curl -s http://localhost:8080/api/me -H "Authorization: Bearer $TOKEN"
 | POST | `/api/runs/{id}/tasks/{tid}/clear` | clear a completed task + its downstream cone (Airflow "Clear, Downstream") → `{run_id, task_id, cleared}`; `404` unknown run/task, `409` task not completed |
 | POST | `/api/runs/{id}/tasks/{tid}/approve` | approve a `type: approval` gate → the task succeeds, DAG proceeds → `{run_id, task_id, resolution}`; `404`, `409` not awaiting approval |
 | POST | `/api/runs/{id}/tasks/{tid}/reject` | reject a gate → the task fails, `all_success` downstream skips; `404`, `409` |
+| POST | `/api/runs/{id}/triage` | record what a *human* decided about a failed run: `{state, note?}` → `{run_id, triage_state, triage_note, triaged_at, triaged_by}`; `400` unknown state, `404`. `state` is `acknowledged` (seen, still open), `resolved` (dealt with) or `ignored` (a real failure we accept) — three states rather than one flag, because "we have decided not to care" is not the same answer as "fixed". Re-triaging overwrites; the note is what is worth reading in three months |
+| DELETE | `/api/runs/{id}/triage` | clear the decision, putting the run back in the attention queue → the same object with nulls; `404` |
 
 Control mutations fire `pg_notify('task_events', run_id)` in-transaction, so
 the engine wakes immediately (`src/routes/control.rs`).
@@ -153,6 +160,7 @@ engine (S3 needs the api's `archive-s3` cargo feature).
 | --- | --- | --- |
 | GET | `/api/archive/runs` | `?name=&limit=&offset=` (limit default 100, max 500), newest-finished-first → `[{run_id, name, status, created_at, finished_at, archived_at, compacted_at, parquet_path}]` |
 | GET | `/api/archive/runs/{id}` | the full archive document (`{format, run, tasks[], outbox_events[], archived: true, index}`); `404` not in the index; **`410`** compacted to Parquet (body carries `parquet_path` — query the analytics dataset instead); `502` sink unreachable/unconfigured |
+| POST | `/api/runs/{id}/archive` | **admin-only, destructive.** Archive one terminal run *now* instead of waiting for the retention window: export the document, verify it landed, index it, purge the run from the hot store → `{run_id, archived: true, purged}`. The run leaves `GET /api/runs` and appears under `/api/archive/runs`. `403` not an admin; `404` not in the hot store (already archived, or never existed); **`409`** the run is not terminal — archiving a live run would purge state the scheduler is still driving; **`501`** no sink configured on dagron-api (without one there is nothing to archive *to*, and the purge would be a delete wearing a kinder word); `502` the sink or the index write failed — the run **stays** in the hot store. Same fail-closed order as the GC sweep: write, index, then purge |
 
 ### Observability & dead letters
 
@@ -162,8 +170,10 @@ engine (S3 needs the api's `archive-s3` cargo feature).
 | GET | `/api/metrics/timeseries` | `?days=` (default 14, clamp 1–90) `&name=` → per-day buckets `[{day, succeeded, failed, cancelled, active, avg_duration_secs, max_duration_secs}]` for the Metrics charts / workflow trend |
 | GET | `/api/approvals` | every task parked in `awaiting_approval`, oldest first → `[{run_id, task_id, task_name, workflow_name, since}]` (the human-in-the-loop worklist) |
 | GET | `/api/dead-letters` | `?limit=` (default 100, max 500) → `[{id, payload, error, source, failures, first_seen_at, last_error_at}]` |
-| POST | `/api/dead-letters/{id}/redrive` | → `{run_id, redriven_from}`; `404`/`400` |
+| POST | `/api/dead-letters/{id}/redrive` | → `{run_id, redriven_from}`; `404`/`400`. The claim deletes the row first, so a capacity refusal **re-parks the payload as a new dead letter** and answers with its id: `503` + `Retry-After: 1` `{dead_letter_id, workflow, max_active_runs, active_runs}` when the workflow is at its active-run cap, `507` + `Retry-After: 1` `{dead_letter_id, free_bytes, min_free_bytes}` when the datastore is below its free-disk floor. Both are retryable — retry the **returned** `dead_letter_id`, never the one you sent, which no longer exists |
 | DELETE | `/api/dead-letters/{id}` | → `204`; `404` |
+| GET | `/api/settings/dead-letters` | the instance dead-letter policy → `{max_attempts}`, or `null` when unset (the engine then keeps using its `DEAD_LETTER_MAX_ATTEMPTS` env value) |
+| PUT | `/api/settings/dead-letters` | `{max_attempts}` → the stored object; `403` non-admin, `400` `max_attempts` < 1. Takes effect on the next ingestion failure — the engine reads it on the failure path rather than caching it at startup, so there is no restart and no window where the console disagrees with what is running. Only the retry count is settable here: `STREAM_DLQ_PATH` is a path on the engine's own host and stays deployment configuration |
 
 ### Datasets (lineage & registry — data-aware scheduling)
 
@@ -183,11 +193,13 @@ unauthenticated); a dataset is updated by a task's `produces:`, never here.
 | --- | --- | --- |
 | GET/POST | `/api/workflows` | list (enriched with schedule + recent-run digest) / create `{name?, spec, description?}` → `201`; `409` duplicate name. Each row carries `tags: []` — the spec's `tags:` labels, **parsed from the stored spec on read** so they always reflect the current definition. **`?tag=<t>`** returns only workflows carrying that tag |
 | GET/PUT/DELETE | `/api/workflows/{id}` | read / update / delete; `404`, `409`. The read also returns the spec's `tags: []`. **PUT** first records the prior definition as a `workflow_versions` row, then overwrites the head. **DELETE** cascades to this workflow's schedules — prefer `state: retired` to stop it without losing them |
+| POST | `/api/workflows/bundle` | Apply a **signed workflow bundle** — `{manifest_b64, signature_b64, files: [{path, content_b64}]}` → `200 {bundle, version, digest, provenance, applied: [{id, name, version}]}`. Verification fails closed: `501` when `DAGRON_BUNDLE_PUBKEYS` is unset (there is no unsigned path), `400` on a bad signature, an unlisted or extra file, a hash mismatch, or a spec that does not validate — nothing is persisted unless the whole bundle is good. Applied in one transaction, each spec recording a `workflow_versions` row stamped with the bundle's provenance. An optional `cohort` field (staged rollout) is **not in this build**; this build answers `400` with a signpost and applies the bundle to this deployment immediately. See [docs/BUNDLES.md](BUNDLES.md) |
 | POST | `/api/workflows/{id}/run` | optional `{parameters?: {k: v}}` → **`201`** `{run_id, workflow_id}`; `409` if the workflow is `paused` or `retired` (only `active` starts a run). The body is optional — a request with no `Content-Type` runs the stored spec as-is, exactly as before. **Status changed from `200` to `201`**: this route creates a run and now says so, like `POST /api/runs` and `/resubmit`. Clients that check for 2xx are unaffected; anything asserting `== 200` needs updating |
 | GET | `/api/workflows/{id}/versions` | append-only definition history, newest first → `[{id, version, name, spec, created_at, created_by}]`. A version is recorded on create and on every `PUT`, so v1 is the original definition; `workflows.spec` remains the current head; `404` |
 | POST | `/api/workflows/{id}/state` | `{state}`, one of `active` / `paused` / `retired` → `{id, state}`. Both non-active states refuse to run (enforced in the scheduler **and** `/run`) and **leave the schedules untouched** — the difference from delete; `retired` also hides from the default listing; `400` unknown state, `404` |
 | GET | `/api/workflows/{id}/runs` | `?limit=&offset=` → this workflow's run history (same row shape as `/api/runs`). Runs are matched by definition **name** — the only linkage that exists (each run snapshots its own `workflow_definitions` row, so there is no FK to `workflows`); the list digest uses the same rule. Renaming a workflow therefore starts a fresh history; `404` |
 | POST | `/api/workflows/{id}/sync-to-git` | open a PR with the spec → `{pr_url, branch, path}`; `501` until `GITHUB_TOKEN`+`GIT_REPO` are set; `502` on GitHub errors |
+| GET | `/api/badges/{name}` | **unauthenticated** — a shields-style flat SVG of the named workflow's latest run outcome (`image/svg+xml`, `Cache-Control: no-cache`). Badges are embedded in READMEs and dashboards that cannot send an auth header, so the response reveals only a status label, never the spec; `no runs` (grey) covers both "unknown workflow" and "no runs yet", so the route does not disclose whether a workflow exists. Always `200` |
 | GET/POST | `/api/git-repos` | list / connect `{url, branch?, path?, auto_sync, auth?}` → `201`; `400` empty or unusable URL, `409` duplicate. `url` may be `https://`, `ssh://[user@]host/…` or scp-style `git@host:owner/repo` (an https URL still may not embed credentials). The list also returns `worker_online` and `credentials_configured`. |
 | DELETE | `/api/git-repos/{id}` | `204`; `404` |
 | POST | `/api/git-repos/{id}/sync` | sync now → updated repo row |
@@ -199,6 +211,12 @@ unauthenticated); a dataset is updated by a task's `produces:`, never here.
 | GET | `/api/backfills` | `?schedule_id=&limit=` → job list (`{id, schedule_id, status, requested, fired, cursor, …}`) |
 | GET | `/api/backfills/{id}` | one job for monitoring (`fired`/`requested`/`status`); `404` |
 | POST | `/api/backfills/{id}/cancel` | stop pacing a running job → `{id, cancelled}`; `404` unknown, `409` already finished |
+
+### Fleet
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| GET | `/api/fleet` | The units this deployment manages. Fleet management — unit enrolment and identity, cohorts, staged bundle rollout, selector fan-out — is **not in this build**; this build answers `403` with a signpost naming the edition and the single-unit path (run the engine on the machine and drive it through this API, `SOURCE=dir`, or GitOps sync). The route is present in every build on purpose: a dead `404` at the moment someone acquires a second machine teaches nothing |
 
 ### Artifacts (encrypted at rest — G-C2)
 
@@ -212,6 +230,7 @@ require an authenticated session; `503` when `DAGRON_ARTIFACT_DIR` is unset.
 | GET | `/api/runs/{run_id}/artifacts/{task}/{name}` | stream the (decrypted) bytes → `200 application/octet-stream`; `404` if absent (a mid-stream decrypt/IO error aborts the connection) |
 | GET | `/api/runs/{run_id}/artifacts/{task}/{name}/exists` | → `{exists: bool}` |
 | POST | `/api/artifacts/rotate` | **admin group only.** Re-key every artifact from the previous KEK (`*_OLD` env) to the current one — rewraps the per-object data key, no payload re-encryption → `{rotated: N}`. `403` non-admin, `409` a rotation is already running, `400` no previous KEK configured, `503` artifacts off |
+| POST | `/api/artifacts/sync` | **admin group only.** Drain the tiered artifact store to its remote tier now, under the daily uplink budget → `{moved: N}`. The on-demand path for a unit that has just reconnected; a periodic loop (`DAGRON_ARTIFACT_SYNC_SECS`) does the same on a timer. `{moved: 0}` for a store that is not tiered, `403` non-admin, `409` a store-wide sweep is already running, `503` artifacts off |
 
 > **Operational caveat — quiesce writes during rotation.** The single-flight lock
 > stops two rotations from overlapping, but it does **not** coordinate with normal
@@ -247,11 +266,11 @@ require an authenticated session; `503` when `DAGRON_ARTIFACT_DIR` is unset.
 | POST | `/runs/{id}/tasks/{task_id}/approve` · `/reject` | resolve a `type: approval` gate → `{run_id, task_id, resolution}`; `404`, `409` not awaiting approval |
 | POST | `/runs/{id}/tasks/{task_id}/checkpoint` | a **running** task reports its committed checkpoint (`{uri, marker?}`, typically via its injected `DAGRON_RUN_ID`/`DAGRON_TASK_ID`); the pointer survives retries and the next attempt gets `DAGRON_RESUME_FROM` ([AI_WORKLOADS.md](AI_WORKLOADS.md)) → `{run_id, task_id, checkpoint_uri, marker}`; `400` empty uri, `404`, `409` task not running |
 | GET | `/dead-letters` | `{dead_letters: […]}` |
-| POST | `/dead-letters/{id}/redrive` | `{run_id, redriven_from}`; `404`/`400` |
+| POST | `/dead-letters/{id}/redrive` | `{run_id, redriven_from}`; `404`/`400`; `503`/`507` + `Retry-After` on a capacity refusal, carrying the replacement `dead_letter_id` to retry (the original id is consumed by the claim) |
 | DELETE | `/dead-letters/{id}` | `{id, deleted: true}`; `404` |
 | GET | `/datasets` | Dataset registry (data-aware scheduling, [DATASETS.md](DATASETS.md)): `?limit=` (default 100, clamp 1–1000) → `{datasets: [{uri, updated_at, last_run_id, last_task, updates}]}`, most recently updated first |
 | GET | `/datasets/events` | Lineage ledger — which run/task updated which dataset when: `?uri=` (narrow to one dataset) `&limit=` (default 100, clamp 1–1000) → `{events: [{id, uri, workflow, run_id, task_name, source, at}]}`, newest first. `source` is `task` (a `produces:` success) or `external`. `id` is the monotonic cursor sensors/triggers key off |
-| POST | `/datasets/events` | Record an **external** dataset update (a producer outside dagron — CDC, object-store notification): `{uri}` → `{recorded}`. Wakes dataset sensors and fires `on_datasets:` triggers. **dagron Enterprise**; the open build returns `403` with a signpost (its datasets update via `produces:` tasks). `400` invalid URI |
+| POST | `/datasets/events` | Record an **external** dataset update (a producer outside dagron — CDC, object-store notification): `{uri}` → `{recorded}`. Wakes dataset sensors and fires `on_datasets:` triggers. **not implemented here**; this build returns `403` with a signpost (its datasets update via `produces:` tasks). `400` invalid URI |
 
 ```bash
 # dagron dev (or compose engine) — submit straight YAML, then watch it:

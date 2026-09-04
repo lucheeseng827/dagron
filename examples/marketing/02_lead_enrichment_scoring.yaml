@@ -1,0 +1,131 @@
+# 02 — Enrichment + fit scoring, fired *because* new contacts landed.
+#
+#   on_datasets: hubspot://crm/contacts   (01 produced it)
+#     └─▶ shard ─▶ enrich ×N ─▶ score ─▶ writeback ─▶ notify-sales
+#
+# The trigger is the point. No cron offset, no "run at :15 and hope 01 finished"
+# — this workflow subscribes to the dataset 01 declares, so it starts when the
+# data is actually current and never runs on yesterday's rows.
+#
+# Two knobs stop the enrichment vendors from being the bottleneck:
+# `pool: enrich-api` caps how many shards call them at once (a shared budget
+# across every workflow that names the pool), and `cache:` memoises a shard's
+# result under the trigger's identity, so a rerun after a scoring bug does not
+# re-buy 4,000 Clearbit lookups.
+#
+#   POOLS=enrich-api=4,crm-api=8 dagron ...
+name: mktg_lead_enrichment_scoring
+tags: [marketing, lead-gen, enrichment]
+environment: prod
+on_datasets:
+  - hubspot://crm/contacts
+parameters:
+  shards: "[0, 1, 2, 3, 4, 5, 6, 7]"   # override at submit to change width
+  trigger_dataset: ""                  # injected by the dataset trigger
+  scheduled_time: ""
+run_timeout_secs: 5400
+deadline: { in: 30m }
+
+task_defaults:
+  max_attempts: 3
+  retry_delay_secs: 10
+  retry_max_delay_secs: 120
+  timeout_secs: 600
+  env:
+    - { name: HUBSPOT_TOKEN,  value_from: { secret: HUBSPOT_PRIVATE_APP_TOKEN } }
+    - { name: CLEARBIT_KEY,   value_from: { secret: CLEARBIT_API_KEY } }
+    - { name: ZOOMINFO_KEY,   value_from: { secret: ZOOMINFO_API_KEY } }
+    - { name: SNOWFLAKE_PWD,  value_from: { secret: SNOWFLAKE_PASSWORD } }
+
+templates:
+  # One shard of the enrichment work. A template, not a copy-pasted task, so the
+  # retry/cache/pool policy is declared once for every shard.
+  - name: enrich_shard
+    parameters: { id: "0" }
+    tasks:
+      - name: firmographics
+        allow_failure: true              # a vendor 500 on shard 3 is not an outage
+        pool: enrich-api
+        max_attempts: 5
+        cache:
+          key: "enrich-{{ id }}-{{ trigger_dataset }}-{{ scheduled_time }}"
+          max_age_secs: 86400
+        command:
+          - sh
+          - -c
+          - |
+            set -eu
+            enrich-contacts --shard {{ id }} --vendor clearbit --fallback zoominfo \
+              --in "$DAGRON_ARTIFACTS/shard-{{ id }}.ndjson" \
+              --out "$DAGRON_ARTIFACTS/enriched-{{ id }}.ndjson"
+      - name: technographics
+        depends_on: [firmographics]
+        allow_failure: true
+        pool: enrich-api
+        command: ["sh", "-c", "enrich-tech-stack --in \"$DAGRON_ARTIFACTS/enriched-{{ id }}.ndjson\" --out \"$DAGRON_ARTIFACTS/tech-{{ id }}.ndjson\""]
+
+tasks:
+  # The split width comes from the same `shards` parameter that fans out `enrich`
+  # below, so the files on disk and the arms of the graph cannot disagree. It was
+  # a hardcoded `--shards 8`: a run submitted with 16 shards left arms 8-15 with
+  # no input file, and `allow_failure` on the enrichment arms turned that into a
+  # silent half-enriched score rather than a failure.
+  #
+  # `shards` is bound to the environment rather than pasted into the command
+  # string — the value is a submit-time parameter, and shell source is the wrong
+  # place to put one.
+  - name: shard
+    env:
+      - { name: SHARDS_JSON, value: "{{ shards }}" }
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        width=$(printf '%s' "$SHARDS_JSON" | tr -cd ',' | wc -c)
+        split-ndjson --in "$DAGRON_ARTIFACTS/new-contacts.ndjson" \
+          --shards "$((width + 1))" --prefix "$DAGRON_ARTIFACTS/shard"
+
+  # Dynamic width: `shards` is a JSON array parameter, so the graph gets wider or
+  # narrower at submit time without editing this file.
+  - name: enrich
+    template: enrich_shard
+    with_param: "{{ shards }}"
+    arguments: { id: "{{ item }}" }
+    depends_on: [shard]
+
+  # all_done, because enrichment arms are allow_failure — an all_success join
+  # would skip scoring the first time a vendor rate-limited one shard.
+  - name: score
+    depends_on: [enrich]
+    trigger_rule: all_done
+    priority: 10
+    timeout_secs: 900
+    command: ["sh", "-c", "fit-score --model icp-v4 --in \"$DAGRON_ARTIFACTS\" --out \"$DAGRON_ARTIFACTS/scored.ndjson\""]
+
+  - name: writeback
+    depends_on: [score]
+    pool: crm-api
+    timeout_secs: 900
+    produces:
+      - hubspot://crm/contacts/scored
+      - snowflake://analytics/marketing/dim_lead_score
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        hubspot-batch-upsert --object contacts --id-property email \
+          --properties icp_fit_score,icp_tier,enriched_at \
+          --input "$DAGRON_ARTIFACTS/scored.ndjson" --token "$HUBSPOT_TOKEN"
+        snowsql -q "COPY INTO analytics.marketing.dim_lead_score FROM @mktg_stage/$DAGRON_RUN_ID/"
+
+  - name: notify_sales
+    depends_on: [writeback]
+    max_attempts: 2
+    command: ["sh", "-c", "post-slack '#sales-signals' \"$(grep -c '\"icp_tier\":\"A\"' \"$DAGRON_ARTIFACTS/scored.ndjson\") new tier-A leads scored\""]
+
+  - name: record_cost
+    hook: on_exit                        # runs whatever happened — spend is spend
+    max_attempts: 1
+    command: ["sh", "-c", "emit-metric mktg.enrichment.vendor_calls \"$(cat \"$DAGRON_ARTIFACTS\"/enriched-*.ndjson 2>/dev/null | wc -l)\""]

@@ -131,6 +131,21 @@ pub struct Metrics {
     pub deadline_alerts: AtomicU64,
     /// Tasks resolved from the memoization cache without executing (#22).
     pub cache_hits: AtomicU64,
+    /// Failed attempts by [`crate::fault::FaultClass`], indexed by the class's
+    /// position in `FaultClass::ALL`.
+    ///
+    /// A fixed array rather than a map because the taxonomy is closed and
+    /// small (23): no lock, no allocation, and — the reason that matters — no
+    /// unbounded label cardinality on a `/metrics` scrape, which is how a
+    /// per-error-string counter takes down a Prometheus.
+    ///
+    /// A **count of failed attempts**, not GPU-hours. Costing the failures needs
+    /// each job's GPU count and elapsed time, which this counter does not carry
+    /// — that is `JobAutopsy::gpu_hours_lost` on the record side, and a fleet
+    /// ledger on the aggregate side. What this answers is the question that
+    /// comes before the cost one: *what is breaking, and is it ours or the
+    /// hardware's.*
+    pub task_faults: [AtomicU64; crate::fault::FaultClass::ALL.len()],
     /// Schedule fires skipped by a `when:` gate evaluating false.
     pub schedule_gated: AtomicU64,
     /// Schedules auto-stopped by a `stopStrategy` expression.
@@ -139,6 +154,22 @@ pub struct Metrics {
     pub dataset_updates: AtomicU64,
     /// Runs fired by dataset triggers (`on_datasets:`).
     pub dataset_fires: AtomicU64,
+    // ── Constrained-host gates + clock discipline (the edge profile) ────────
+    /// Runs refused by the SQLite free-disk floor (`DAGRON_MIN_FREE_BYTES`).
+    /// Bumped by whichever admission path caught the typed refusal — the
+    /// ingest actor's nack, the ops API's 507 — since the datastore that
+    /// raises it holds no metrics handle.
+    pub admission_refused_disk: AtomicU64,
+    /// `1` while the pressure file (`DAGRON_PRESSURE_FILE`) is holding new
+    /// claims at zero, else `0`. A state gauge like the catch-up gauges:
+    /// the reconcile loop is the single writer, re-publishing its verdict
+    /// every tick.
+    pub claims_paused: AtomicU64,
+    /// Wall-clock steps the clock detector caught — wall and monotonic
+    /// clocks disagreeing over one interval by more than
+    /// `DAGRON_CLOCK_STEP_TOLERANCE_MS`. Each one re-stamped the runs in
+    /// flight `drifted`.
+    pub clock_steps: AtomicU64,
     /// Runs created by the auto-backfill catch-up sweep (QW3 auto-catchup). A schedule that
     /// missed fires while the scheduler was down has them materialized here.
     #[cfg(feature = "enterprise")]
@@ -195,10 +226,14 @@ impl Default for Metrics {
             runs_deadline_exceeded: AtomicU64::new(0),
             deadline_alerts: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
+            task_faults: std::array::from_fn(|_| AtomicU64::new(0)),
             schedule_gated: AtomicU64::new(0),
             schedules_stopped: AtomicU64::new(0),
             dataset_updates: AtomicU64::new(0),
             dataset_fires: AtomicU64::new(0),
+            admission_refused_disk: AtomicU64::new(0),
+            claims_paused: AtomicU64::new(0),
+            clock_steps: AtomicU64::new(0),
             #[cfg(feature = "enterprise")]
             catchup_runs: AtomicU64::new(0),
             #[cfg(feature = "enterprise")]
@@ -243,6 +278,14 @@ impl Metrics {
     pub fn inc_retried(&self) {
         Self::bump(&self.tasks_retried);
     }
+    /// One failed attempt attributed to `class`. Counted whether or not the
+    /// attempt is retried — the question "what is breaking" is asked separately
+    /// from "what did we give up on".
+    pub fn inc_fault(&self, class: crate::fault::FaultClass) {
+        if let Some(i) = crate::fault::FaultClass::ALL.iter().position(|c| *c == class) {
+            Self::bump(&self.task_faults[i]);
+        }
+    }
     pub fn inc_dead_letters(&self) {
         Self::bump(&self.dead_letters);
     }
@@ -272,6 +315,19 @@ impl Metrics {
     /// One run fired by a dataset trigger (`on_datasets:`).
     pub fn inc_dataset_fires(&self) {
         Self::bump(&self.dataset_fires);
+    }
+    /// One run refused by the free-disk floor (`DAGRON_MIN_FREE_BYTES`).
+    pub fn inc_admission_refused_disk(&self) {
+        Self::bump(&self.admission_refused_disk);
+    }
+    /// Re-publish the pressure gate's verdict for this tick (the reconcile
+    /// loop is the single writer).
+    pub fn set_claims_paused(&self, paused: bool) {
+        self.claims_paused.store(u64::from(paused), Ordering::Relaxed);
+    }
+    /// One wall-clock step caught by the clock detector.
+    pub fn inc_clock_steps(&self) {
+        Self::bump(&self.clock_steps);
     }
     /// One run materialized by the auto-backfill catch-up sweep (QW3 auto-catchup).
     #[cfg(feature = "enterprise")]
@@ -332,7 +388,7 @@ impl Metrics {
     pub fn render(&self, snap: &MetricsSnapshot, pool: Option<&DbPoolStats>) -> String {
         let mut out = String::with_capacity(2048);
 
-        let counters: [(&str, &str, u64); 13] = [
+        let counters: [(&str, &str, u64); 15] = [
             ("scheduler_runs_created_total", "Runs created by this scheduler since boot.",
              self.runs_created.load(Ordering::Relaxed)),
             ("scheduler_tasks_dispatched_total", "Tasks dispatched to the worker pool.",
@@ -359,6 +415,10 @@ impl Metrics {
              self.dataset_updates.load(Ordering::Relaxed)),
             ("scheduler_dataset_fires_total", "Runs fired by dataset triggers (on_datasets:).",
              self.dataset_fires.load(Ordering::Relaxed)),
+            ("scheduler_admission_refused_disk_total", "Runs refused by the free-disk floor (DAGRON_MIN_FREE_BYTES).",
+             self.admission_refused_disk.load(Ordering::Relaxed)),
+            ("scheduler_clock_steps_total", "Wall-clock steps caught by the clock detector (wall vs monotonic past DAGRON_CLOCK_STEP_TOLERANCE_MS).",
+             self.clock_steps.load(Ordering::Relaxed)),
         ];
         for (name, help, value) in counters {
             let _ = writeln!(out, "# HELP {name} {help}");
@@ -378,6 +438,39 @@ impl Metrics {
                 let _ = writeln!(out, "# TYPE {name} counter");
                 let _ = writeln!(out, "{name} {value}");
             }
+        }
+
+        // Fault attribution. Two series off one array: the class (what broke)
+        // and the disposition (whether another attempt was worth anything).
+        // The disposition roll-up is emitted rather than left to a recording
+        // rule because it is the series the cost dashboard actually plots, and
+        // a `sum by` over 23 classes is exactly the kind of mapping that drifts
+        // from the code that defines it.
+        //
+        // Zero-valued classes are emitted too: a counter that only appears
+        // after the first occurrence cannot be alerted on with `increase()`
+        // over a window that starts before it existed.
+        let _ = writeln!(out, "# HELP scheduler_task_faults_total Failed task attempts by attributed fault class.");
+        let _ = writeln!(out, "# TYPE scheduler_task_faults_total counter");
+        let mut by_disposition: std::collections::BTreeMap<&'static str, u64> =
+            std::collections::BTreeMap::new();
+        for (i, class) in crate::fault::FaultClass::ALL.iter().enumerate() {
+            let v = self.task_faults[i].load(Ordering::Relaxed);
+            let _ = writeln!(
+                out,
+                "scheduler_task_faults_total{{class=\"{}\",disposition=\"{}\"}} {v}",
+                class.as_str(),
+                class.disposition().as_str()
+            );
+            *by_disposition.entry(class.disposition().as_str()).or_default() += v;
+        }
+        let _ = writeln!(out, "# HELP scheduler_task_faults_by_disposition_total Failed task attempts by fault disposition (infrastructure / application / platform / unknown).");
+        let _ = writeln!(out, "# TYPE scheduler_task_faults_by_disposition_total counter");
+        for (disposition, v) in &by_disposition {
+            let _ = writeln!(
+                out,
+                "scheduler_task_faults_by_disposition_total{{disposition=\"{disposition}\"}} {v}"
+            );
         }
 
         // Datastore gauges (whole-cluster truth, read per scrape).
@@ -443,6 +536,18 @@ impl Metrics {
         let _ = writeln!(out, "# HELP scheduler_dead_letters Dead-letter rows currently parked.");
         let _ = writeln!(out, "# TYPE scheduler_dead_letters gauge");
         let _ = writeln!(out, "scheduler_dead_letters {}", snap.dead_letters);
+
+        // Constrained-host gate + clock discipline (the edge profile). The
+        // pause gauge is the reconcile loop's last verdict on the pressure
+        // file; the confidence gauge is read live from `crate::clock` — its
+        // one writer is the engine's detector — so a scrape can never lag a
+        // published change.
+        let _ = writeln!(out, "# HELP scheduler_claims_paused 1 while DAGRON_PRESSURE_FILE is holding new task claims at zero, else 0.");
+        let _ = writeln!(out, "# TYPE scheduler_claims_paused gauge");
+        let _ = writeln!(out, "scheduler_claims_paused {}", self.claims_paused.load(Ordering::Relaxed));
+        let _ = writeln!(out, "# HELP scheduler_clock_confidence Wall-clock confidence stamped on new runs: 0 synced, 1 drifted, 2 unknown (alert on > 0).");
+        let _ = writeln!(out, "# TYPE scheduler_clock_confidence gauge");
+        let _ = writeln!(out, "scheduler_clock_confidence {}", crate::clock::current().confidence.gauge());
 
         // QW3 auto-catchup self-healing state gauges — republished by the
         // auto-backfill loop each sweep. Alerting on `scheduler_schedule_lag_seconds`
@@ -626,6 +731,35 @@ mod tests {
         assert!((495..=510).contains(&age), "tail age = max of folded classes, got {age}");
     }
 
+    /// The constrained-host and clock series render: the pause gauge follows
+    /// the loop's verdict, disk-floor refusals and clock steps count, and the
+    /// confidence gauge reads whatever `clock` last published — live, not a
+    /// copy that could lag.
+    #[test]
+    fn edge_gates_and_clock_confidence_render() {
+        let _guard = crate::clock::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let m = Metrics::new();
+        let snap = MetricsSnapshot::default();
+        m.set_claims_paused(true);
+        m.inc_admission_refused_disk();
+        m.inc_clock_steps();
+        m.inc_clock_steps();
+        crate::clock::publish(crate::clock::ClockStatus::drifted(-2_500, "step"));
+        let text = m.render(&snap, None);
+        assert!(text.contains("scheduler_claims_paused 1"), "{text}");
+        assert!(text.contains("scheduler_admission_refused_disk_total 1"), "{text}");
+        assert!(text.contains("scheduler_clock_steps_total 2"), "{text}");
+        assert!(text.contains("scheduler_clock_confidence 1"), "{text}");
+
+        m.set_claims_paused(false);
+        crate::clock::publish(crate::clock::ClockStatus::synced("sync-file"));
+        let text = m.render(&snap, None);
+        assert!(text.contains("scheduler_claims_paused 0"), "{text}");
+        assert!(text.contains("scheduler_clock_confidence 0"), "{text}");
+        crate::clock::publish(crate::clock::ClockStatus::unknown());
+        assert!(m.render(&snap, None).contains("scheduler_clock_confidence 2"));
+    }
+
     /// `observe` lands a value in the correct cumulative bucket and ignores
     /// non-finite inputs without corrupting the count.
     #[test]
@@ -635,5 +769,40 @@ mod tests {
         h.observe(1000.0); // overflow (+Inf only)
         h.observe(f64::NAN); // clamped to 0.0, still counted
         assert_eq!(h.count.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn fault_counters_render_both_series_and_never_grow_cardinality() {
+        use crate::fault::FaultClass;
+        let m = Metrics::new();
+        m.inc_fault(FaultClass::GpuEcc);
+        m.inc_fault(FaultClass::GpuEcc);
+        m.inc_fault(FaultClass::NanLoss);
+        m.inc_fault(FaultClass::NcclTimeout);
+        let snap = MetricsSnapshot {
+            runs_by_status: vec![],
+            tasks_by_status: vec![],
+            dead_letters: 0,
+            ready_by_class: vec![],
+        };
+        let text = m.render(&snap, None);
+
+        assert!(text.contains("scheduler_task_faults_total{class=\"gpu-ecc\",disposition=\"infrastructure\"} 2"), "{text}");
+        assert!(text.contains("scheduler_task_faults_total{class=\"nan-loss\",disposition=\"application\"} 1"));
+        // An uncorroborated collective timeout must not land in the infra
+        // bucket — that bucket is what a fault-aware retry policy acts on.
+        assert!(text.contains("scheduler_task_faults_total{class=\"nccl-timeout\",disposition=\"unknown\"} 1"));
+        assert!(text.contains("scheduler_task_faults_by_disposition_total{disposition=\"infrastructure\"} 2"));
+        assert!(text.contains("scheduler_task_faults_by_disposition_total{disposition=\"application\"} 1"));
+        assert!(text.contains("scheduler_task_faults_by_disposition_total{disposition=\"unknown\"} 1"));
+
+        // Closed taxonomy: exactly one series per class, present at zero, so
+        // increase() over a window predating the first fault still works.
+        let series = text
+            .lines()
+            .filter(|l| l.starts_with("scheduler_task_faults_total{"))
+            .count();
+        assert_eq!(series, FaultClass::ALL.len());
+        assert!(text.contains("scheduler_task_faults_total{class=\"storage\",disposition=\"infrastructure\"} 0"));
     }
 }

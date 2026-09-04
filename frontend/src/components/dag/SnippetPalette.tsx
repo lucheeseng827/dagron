@@ -7,6 +7,7 @@ import {
   SNIPPET_MIME,
   type Snippet,
 } from "@/lib/palette";
+import { useBlocksRail } from "@/lib/shell-prefs";
 
 /// The premade-block rail beside the spec/visual editors. Each block is a
 /// ready-made, engine-supported piece of spec — a task (chained onto the current
@@ -31,6 +32,7 @@ export default function SnippetPalette({
   /// no tasks yet).
   error?: string | null;
 }) {
+  const [rail, setRail] = useBlocksRail();
   const [query, setQuery] = useState("");
   // Case-insensitive match on label, description, and category so "s3", "ml",
   // or "parquet" each surface the right blocks from the full library.
@@ -41,6 +43,58 @@ export default function SnippetPalette({
       `${s.label} ${s.description} ${s.category}`.toLowerCase().includes(q),
     );
   }, [query]);
+
+  // Collapsed, the palette is a 30px rail carrying its own way back — the same
+  // shape the agent dock uses when closed, so the console has one vocabulary
+  // for "this panel is folded away" rather than a different gesture per panel.
+  // The editor pane beside it is `flex: 1`, so the width goes straight to the
+  // canvas with no layout change at either call site.
+  if (rail) {
+    return (
+      <aside
+        style={{
+          width: 30,
+          flexShrink: 0,
+          borderRight: "1px solid var(--border)",
+          background: "var(--side)",
+        }}
+      >
+        <button
+          type="button"
+          onClick={() => setRail(false)}
+          title="Show blocks"
+          aria-label="Show blocks"
+          aria-expanded={false}
+          style={{
+            width: "100%",
+            height: "100%",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            gap: 10,
+            paddingTop: 10,
+            background: "none",
+            border: 0,
+            color: "var(--muted)",
+            cursor: "pointer",
+          }}
+        >
+          <Chevron dir="right" />
+          <span
+            style={{
+              writingMode: "vertical-rl",
+              fontSize: 10,
+              letterSpacing: "0.2em",
+              textTransform: "uppercase",
+              color: "var(--dim)",
+            }}
+          >
+            Blocks
+          </span>
+        </button>
+      </aside>
+    );
+  }
 
   return (
     <aside
@@ -55,14 +109,37 @@ export default function SnippetPalette({
     >
       <div
         style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
           fontSize: 11,
           letterSpacing: "0.06em",
           textTransform: "uppercase",
           color: "var(--muted)",
-          padding: "0 6px 4px",
+          padding: "0 2px 4px 6px",
         }}
       >
-        Blocks
+        <span style={{ flex: 1 }}>Blocks</span>
+        <button
+          type="button"
+          onClick={() => setRail(true)}
+          title="Hide blocks"
+          aria-label="Hide blocks"
+          aria-expanded
+          style={{
+            display: "grid",
+            placeItems: "center",
+            width: 20,
+            height: 20,
+            background: "none",
+            border: 0,
+            borderRadius: 4,
+            color: "var(--dim)",
+            cursor: "pointer",
+          }}
+        >
+          <Chevron dir="left" />
+        </button>
       </div>
       <input
         value={query}
@@ -114,6 +191,25 @@ export default function SnippetPalette({
         );
       })}
     </aside>
+  );
+}
+
+/// The one glyph both states use, pointed at where the panel is going.
+function Chevron({ dir }: { dir: "left" | "right" }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width="13"
+      height="13"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {dir === "left" ? <polyline points="15 18 9 12 15 6" /> : <polyline points="9 18 15 12 9 6" />}
+    </svg>
   );
 }
 

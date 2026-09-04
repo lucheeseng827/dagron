@@ -19,6 +19,7 @@ resumes, what routes where) is the real thing.
 | [`03`](#03--sharded-batch-inference) | Batch inference | `with_param` fan-out + artifact gather |
 | [`04`](#04--llm-content-pipeline-with-sign-off) | LLM generation | durable LLM step + `type: approval` + `result_from` |
 | [`05`](#05--traineval-quality-gate) | Model promotion | `when:` on task output + `repeat:` convergence poll |
+| [`06`](#06--retry-budgets-that-follow-the-fault) | Fault-class retry budgets | `retry_budgets:` + `task_runs.fault_class` |
 | [`mcp`](#mcp--a-workflow-that-calls-an-agents-tools) | dagron driving MCP tools | `dagron-step-mcp` + retries + artifacts |
 | [`loop`](#loop--a-conversation-whose-every-turn-is-a-run) | Durable agent loop | `repeat:` on a `type: workflow` trigger |
 
@@ -82,7 +83,7 @@ The run's `train` task waits until a `spot-gpu` scheduler is live, then its
 `evaluate` task waits for the `cpu` one — watch each terminal claim only its
 stage. `resources.gpu: {count: 4}` rides along: on the Kubernetes executor it
 becomes `limits["nvidia.com/gpu"]=4` on the task pod. (Cost/preemption-aware
-placement of these pools across clouds is the dagron Enterprise layer.)
+placement of these pools across clouds is a fleet layer this build does not carry.)
 
 ## 03 — Sharded batch inference
 
@@ -118,7 +119,7 @@ curl -s "localhost:8787/runs/$RUN/wait?timeout_secs=30"        # → the publish
 
 (A hardened LLM task binary — idempotent retries, output capture, credential
 egress guard — plus natural-language *workflow generation* ship with
-[dagron Enterprise](../../README.md#dagron-enterprise).)
+[not in this build](../../README.md#what-this-build-does-not-do).)
 
 ## 05 — Train→eval quality gate
 
@@ -133,6 +134,34 @@ instead of wedging).
 $DAGRON 05_model_eval_gate.yaml           # eval scores "ship" → deploy runs
 THRESHOLD=99 $DAGRON 05_model_eval_gate.yaml   # unreachable bar → hold runs
 ```
+
+## 06 — Retry budgets that follow the fault
+
+**Scenario.** `max_attempts` spends the same budget on every failure, so an ECC
+error and a NaN loss draw from the same three attempts: infrastructure faults
+give up too early, and application faults burn GPU-hours reproducing a
+determinism nobody doubted. At 128 GPUs, three blind retries of a diverged run
+is roughly 3,000 wasted GPU-hours to learn nothing.
+
+`retry_budgets:` sizes the budget by **what actually broke**. dagron classifies
+the failure from the task's output, records the verdict on the row
+(`fault_class`, `fault_detail`, `fault_confidence`), and resolves the budget
+most-specific-first: the task's own entry for that class → the class's
+disposition default (infra 5, platform 3, application 1) → `max_attempts`. An
+unclassified failure lands on `max_attempts`, so nothing about an existing
+workflow changes.
+
+```bash
+$DAGRON 06_fault_class_retry_budgets.yaml
+# what was attributed, and how many attempts each fault was worth:
+sqlite3 dagron.db \
+  "SELECT name, attempt, fault_class, fault_confidence FROM task_runs
+    WHERE fault_class IS NOT NULL"
+```
+
+The vocabulary is `dagron-autopsy --explain`; the same taxonomy drives the
+job-autopsy binary that produces these verdicts for jobs running under Slurm
+rather than dagron ([docs/HPC_AUTOPSY.md](../../docs/HPC_AUTOPSY.md)).
 
 ---
 
@@ -243,5 +272,5 @@ rather than correctness:
 at a GPU cluster, keep the same workflows, and let `runner_class` pools map to
 real capacity. Managed multi-cloud placement, maintained ML runner images, the
 hardened LLM step, and workflow generation are the
-[dagron Enterprise](../../README.md#dagron-enterprise) layer on the same
+[fleet](../../README.md#what-this-build-does-not-do) layer on the same
 engine.

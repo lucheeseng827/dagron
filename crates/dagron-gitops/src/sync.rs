@@ -13,12 +13,29 @@
 //! scratch dir removed on drop, tokens are injected only for trusted https hosts
 //! and redacted from every surfaced error, and both git invocations are bounded
 //! by a timeout.
+//!
+//! **Two shapes of repository.** A *plain* repo is a directory of specs, each
+//! validated and upserted on its own — one bad file is a warning, the rest
+//! sync. A *signed bundle* is the same directory carrying a `manifest.json` +
+//! `manifest.sig` (see `dagron_crypto::bundle` and docs/BUNDLES.md): the
+//! presence of the manifest is the switch, and from then on the semantics are
+//! all-or-nothing — the signature must verify against `DAGRON_BUNDLE_PUBKEYS`,
+//! every listed spec must hash and parse, and the whole set lands in one
+//! transaction with a version row per workflow stamped with the bundle's
+//! provenance. A bundle that fails any check changes nothing, and
+//! `DAGRON_BUNDLE_REQUIRE=1` makes the worker refuse plain repos altogether.
 
 use std::collections::HashSet;
 use std::path::{Path as FsPath, PathBuf};
 use std::time::Duration;
 
+use dagron_crypto::bundle::{MANIFEST_FILE, PUBKEYS_ENV};
 use uuid::Uuid;
+
+/// Set to `1`/`true` to refuse repositories that carry no signed manifest —
+/// for deployments where "the workflow directory is what Git says" is not a
+/// strong enough statement of where a definition came from.
+pub const BUNDLE_REQUIRE_ENV: &str = "DAGRON_BUNDLE_REQUIRE";
 
 /// Ceiling on a single `git` invocation — an unreachable host must not wedge the
 /// poll loop.
@@ -42,6 +59,34 @@ pub struct Reconcile {
     /// parked the whole repo in a red state and buried the failures worth acting
     /// on among them.
     pub skipped: usize,
+    /// When the repo was a signed bundle: its provenance string
+    /// (`bundle:<name>@<version>#<digest>`), so the console's last-message
+    /// line names what was applied, not merely how many. `None` for a plain
+    /// repo.
+    pub bundle: Option<String>,
+}
+
+/// What a fetch produced, before anything touches the datastore.
+///
+/// The bundle arm carries the scratch checkout *by ownership*: the directory
+/// is removed when this value drops, so it must outlive
+/// [`crate::bundle::reconcile_bundle`], which reads the files from it. The
+/// plain arm has already read everything it needs and lets the checkout go.
+#[derive(Debug)]
+pub enum Fetched {
+    Plain {
+        rev: String,
+        /// `(name, yaml)` of every spec that parsed.
+        valid: Vec<(String, String)>,
+        errors: Vec<String>,
+        skipped: usize,
+    },
+    Bundle {
+        rev: String,
+        /// The bundle directory (`<checkout>/<repo.path>`), still on disk.
+        dir: PathBuf,
+        _scratch: TempDir,
+    },
 }
 
 /// One connected repo, as far as syncing is concerned.
@@ -95,7 +140,28 @@ impl std::fmt::Debug for GitAuth {
 /// one bad file doesn't block the good ones.
 pub async fn reconcile(pool: &sqlx::PgPool, repo: &Repo) -> Result<Reconcile, String> {
     let (rev, valid, mut errors, skipped) =
-        fetch_and_validate(&repo.url, &repo.branch, &repo.path, repo.auth.as_ref()).await?;
+        match fetch_and_validate(&repo.url, &repo.branch, &repo.path, repo.auth.as_ref()).await? {
+            Fetched::Plain { rev, valid, errors, skipped } => (rev, valid, errors, skipped),
+            Fetched::Bundle { rev, dir, _scratch } => {
+                // Fail closed on the worker's own configuration: a bundle on a
+                // worker with no trust set is not "unsigned, so sync it the
+                // old way" — it is an error the operator sees on the repo row.
+                let keys = dagron_crypto::bundle::pubkeys_from_env().map_err(|e| {
+                    format!(
+                        "'{}' carries a {MANIFEST_FILE} but this worker cannot verify it: {e} — set {PUBKEYS_ENV} on the dagron-gitops worker",
+                        repo.path
+                    )
+                })?;
+                let applied = crate::bundle::reconcile_bundle(pool, &dir, &keys).await?;
+                return Ok(Reconcile {
+                    rev,
+                    synced: applied.synced,
+                    errors: Vec::new(),
+                    skipped: 0,
+                    bundle: Some(applied.provenance),
+                });
+            }
+        };
     let mut synced = Vec::new();
     let mut seen = HashSet::new();
     for (name, yaml) in valid {
@@ -110,18 +176,20 @@ pub async fn reconcile(pool: &sqlx::PgPool, repo: &Repo) -> Result<Reconcile, St
             Err(e) => errors.push(format!("{name}: {e}")),
         }
     }
-    Ok(Reconcile { rev, synced, errors, skipped })
+    Ok(Reconcile { rev, synced, errors, skipped, bundle: None })
 }
 
-/// Clone the branch and validate every workflow YAML under `path`, returning
-/// `(rev, valid [(name, yaml)], per-file errors)`. No datastore access, so this
-/// half is testable offline against a `file://` repo.
+/// Clone the branch and look under `path`. A directory carrying a
+/// `manifest.json` is returned as [`Fetched::Bundle`] with the checkout still
+/// on disk for the verifier; otherwise every workflow YAML is validated here
+/// and returned as [`Fetched::Plain`]. No datastore access, so this half is
+/// testable offline against a `file://` repo.
 async fn fetch_and_validate(
     url: &str,
     branch: &str,
     path: &str,
     auth: Option<&GitAuth>,
-) -> Result<(String, Vec<(String, String)>, Vec<String>, usize), String> {
+) -> Result<Fetched, String> {
     // dagron-api vets a URL when the repo is connected, but this worker clones
     // whatever `git_repos.url` holds — a row written before that check existed,
     // or straight into the datastore, has never been through it. `git` reads
@@ -135,7 +203,7 @@ async fn fetch_and_validate(
     // the key and the credential file on every exit path, including the error
     // ones.
     let work = std::env::temp_dir().join(format!("dagron-gitops-{}", Uuid::new_v4()));
-    let _guard = TempDir(work.clone());
+    let scratch_guard = TempDir(work.clone());
     std::fs::create_dir_all(&work).map_err(|e| format!("creating scratch dir: {e}"))?;
     let creds = GitCreds::prepare(&work, url, auth)?;
     let scratch = work.join("repo");
@@ -154,6 +222,26 @@ async fn fetch_and_validate(
     if !dir.is_dir() {
         return Err(format!("path '{path}' not found in {branch}"));
     }
+
+    // A manifest makes the directory a signed bundle. Its *presence* is the
+    // switch — not its validity — so a repo that meant to be signed and got
+    // it wrong is refused rather than quietly synced file by file as if the
+    // manifest were just more YAML. The checkout is handed over whole: the
+    // verifier reads and hashes the files itself, and the scratch guard
+    // travels with the value so nothing is removed underneath it.
+    match std::fs::symlink_metadata(dir.join(MANIFEST_FILE)) {
+        Ok(md) if md.file_type().is_symlink() => {
+            return Err(format!("'{path}/{MANIFEST_FILE}' is a symlink — refusing to sync"));
+        }
+        Ok(_) => return Ok(Fetched::Bundle { rev, dir, _scratch: scratch_guard }),
+        Err(_) => {}
+    }
+    if bundle_required() {
+        return Err(format!(
+            "'{path}' carries no {MANIFEST_FILE} and {BUNDLE_REQUIRE_ENV} is set — this worker only applies signed bundles (docs/BUNDLES.md)"
+        ));
+    }
+
     let mut files = Vec::new();
     collect_yaml(&dir, &mut files).map_err(|e| format!("reading '{path}': {e}"))?;
     files.sort();
@@ -182,7 +270,19 @@ async fn fetch_and_validate(
             Err(msg) => errors.push(format!("{rel}: {msg}")),
         }
     }
-    Ok((rev, valid, errors, skipped))
+    Ok(Fetched::Plain { rev, valid, errors, skipped })
+}
+
+/// Whether [`BUNDLE_REQUIRE_ENV`] asks this worker to refuse unsigned repos.
+fn bundle_required() -> bool {
+    bundle_required_from(std::env::var(BUNDLE_REQUIRE_ENV).ok().as_deref())
+}
+
+/// The pure half of [`bundle_required`]: `1` / `true` (any case) opts in;
+/// unset, empty, `0` and `false` do not. Same spelling `DAGRON_GIT_SSH_STRICT`
+/// accepts, so an operator learns one rule.
+fn bundle_required_from(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some(v) if v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 /// Whether a YAML file is a dagron workflow spec at all: a mapping carrying a
@@ -202,13 +302,32 @@ fn looks_like_spec(yaml: &str) -> bool {
 /// reference is resolved by dagron-api against saved workflows at submit, so to
 /// the engine such a task looks like a leaf with no command. They are given a
 /// placeholder command for validation only — the stored YAML is untouched.
-fn validate(yaml: &str) -> Result<String, String> {
+///
+/// `pub(crate)` so the bundle path validates through exactly the same gate.
+pub(crate) fn validate(yaml: &str) -> Result<String, String> {
     let mut doc: serde_yaml::Value =
         serde_yaml::from_str(yaml).map_err(|e| format!("invalid YAML: {e}"))?;
     if let Some(tasks) = doc.get_mut("tasks").and_then(serde_yaml::Value::as_sequence_mut) {
         for task in tasks {
             let is_ref = task.get("workflow_ref").is_some();
             let has_cmd = task.get("command").is_some();
+            let has_tpl = task.get("template").is_some();
+            // The same rule `dagron_api::routes::control::validate_graph`
+            // applies: a task is exactly one of a leaf, a sub-DAG call, or a
+            // chain. Without it a spec the API refuses could still be admitted
+            // through git — and, since `bundle::prepare` validates through here
+            // too, through a *signed* bundle, which is precisely the path whose
+            // whole claim is that it is equivalent to the API's.
+            if [has_cmd, has_tpl, is_ref].iter().filter(|set| **set).count() > 1 {
+                let name = task
+                    .get("name")
+                    .and_then(serde_yaml::Value::as_str)
+                    .unwrap_or("<unnamed>")
+                    .to_string();
+                return Err(format!(
+                    "task '{name}' sets more than one of `command` / `template` / `workflow_ref` — use exactly one"
+                ));
+            }
             if is_ref && !has_cmd {
                 if let Some(map) = task.as_mapping_mut() {
                     map.insert(
@@ -242,6 +361,99 @@ async fn upsert_workflow(pool: &sqlx::PgPool, name: &str, yaml: &str) -> Result<
     .await
     .map(|_| ())
     .map_err(|e| format!("upsert failed: {e}"))
+}
+
+/// Apply a verified set of `(name, yaml)` specs in **one transaction**, each
+/// upserted by name and each recorded as a new `workflow_versions` row with
+/// `created_by = author` — the bundle's provenance string, so the history of
+/// a workflow says which signed bundle put a definition there.
+///
+/// This is the signed-bundle counterpart of [`upsert_workflow`]. That one is
+/// per-file and best-effort because a plain repo's files are independent; a
+/// bundle is a single signed statement, so it lands whole or not at all —
+/// either every workflow moves to the bundle's definition or none does, and
+/// the reconcile reports one error for the set.
+///
+/// The version bookkeeping mirrors `dagron-api::routes::lifecycle::record_version`
+/// (that crate cannot be depended on from here). The `SELECT … FOR UPDATE`
+/// on the workflow row is what makes the per-workflow version number safe
+/// against a concurrent console edit: the edit's transaction takes the same
+/// lock, so the two serialise rather than both reading the same
+/// `MAX(version)` and colliding on the `UNIQUE (workflow_id, version)`.
+pub async fn apply_specs(
+    pool: &sqlx::PgPool,
+    specs: &[(String, String)],
+    author: &str,
+) -> Result<Vec<String>, String> {
+    let mut tx = pool.begin().await.map_err(|e| format!("beginning transaction: {e}"))?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut applied = Vec::with_capacity(specs.len());
+    for (name, yaml) in specs {
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT id FROM workflows WHERE name = $1 FOR UPDATE")
+                .bind(name)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| format!("{name}: locking the workflow row: {e}"))?;
+        let id = match existing {
+            Some(id) => {
+                sqlx::query("UPDATE workflows SET spec = $1, updated_at = $2 WHERE id = $3")
+                    .bind(yaml)
+                    .bind(&now)
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| format!("{name}: updating the workflow: {e}"))?;
+                id
+            }
+            None => {
+                let id = Uuid::new_v4().to_string();
+                sqlx::query(
+                    "INSERT INTO workflows (id, name, spec, created_at, updated_at) VALUES ($1,$2,$3,$4,$4)",
+                )
+                .bind(&id)
+                .bind(name)
+                .bind(yaml)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| format!("{name}: inserting the workflow: {e}"))?;
+                id
+            }
+        };
+        // Next per-workflow number — "version 3" is the third definition of
+        // *this* workflow, not the third in the installation.
+        let next: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM workflow_versions WHERE workflow_id = $1",
+        )
+        .bind(&id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| format!("{name}: reading the version history: {e}"))?;
+        sqlx::query(
+            "INSERT INTO workflow_versions (id, workflow_id, version, name, spec, created_at, created_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&id)
+        .bind(next)
+        .bind(name)
+        .bind(yaml)
+        .bind(&now)
+        .bind(author)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("{name}: recording version {next}: {e}"))?;
+        sqlx::query("UPDATE workflows SET version = $1 WHERE id = $2")
+            .bind(next)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("{name}: stamping version {next}: {e}"))?;
+        applied.push(name.clone());
+    }
+    tx.commit().await.map_err(|e| format!("committing the bundle: {e}"))?;
+    Ok(applied)
 }
 
 /// `git clone --depth 1 --single-branch --branch <branch> -- <url> <dir>`, with
@@ -635,8 +847,11 @@ fn collect_yaml(dir: &FsPath, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Removes a scratch clone directory on drop (best-effort).
-struct TempDir(PathBuf);
+/// Removes a scratch clone directory on drop (best-effort). `pub` only so
+/// [`Fetched::Bundle`] can carry it; the field stays private, so nothing
+/// outside this module can construct one or reach the path through it.
+#[derive(Debug)]
+pub struct TempDir(PathBuf);
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -676,6 +891,21 @@ tasks:
         assert_eq!(name, "ok");
         // A spec the engine would reject never reaches the workflows table.
         assert!(validate("name: bad\ntasks:\n  - name: a\n").is_err());
+    }
+
+    /// Parity with `dagron_api::routes::control::validate_graph`: a task that
+    /// sets two kinds is refused on both paths. Before this, git — and a signed
+    /// bundle, which validates through here — admitted what the API refused.
+    #[test]
+    fn a_task_setting_two_kinds_is_refused_like_the_api_refuses_it() {
+        let both = "name: x\ntasks:\n  - name: a\n    workflow_ref: other\n    command: [\"true\"]\n";
+        let err = validate(both).expect_err("command + workflow_ref must be refused");
+        assert!(err.contains("more than one"), "{err}");
+        assert!(err.contains("'a'"), "the message names the task: {err}");
+
+        // Each kind on its own still passes.
+        assert!(validate("name: x\ntasks:\n  - name: a\n    command: [\"true\"]\n").is_ok());
+        assert!(validate("name: x\ntasks:\n  - name: a\n    workflow_ref: other\n").is_ok());
     }
 
     /// A `workflow_ref` task is command-less on purpose — dagron-api resolves it
@@ -878,6 +1108,180 @@ tasks:
         // DAGRON_GIT_ALLOW_INSECURE says — that flag is consent to fetch over
         // http, not to send a credential in the clear.
         assert_eq!(credential_origin("http://host/o/r.git"), None);
+    }
+
+    #[test]
+    fn bundle_require_is_spelled_like_ssh_strict() {
+        assert!(bundle_required_from(Some("1")));
+        assert!(bundle_required_from(Some("true")));
+        assert!(bundle_required_from(Some(" TRUE ")));
+        assert!(!bundle_required_from(Some("0")));
+        assert!(!bundle_required_from(Some("false")));
+        assert!(!bundle_required_from(Some("")));
+        assert!(!bundle_required_from(Some("yes")));
+        assert!(!bundle_required_from(None));
+    }
+
+    /// Run `git` in `dir`, with a fixed identity so a commit works on a host
+    /// with no global config.
+    fn git(dir: &FsPath, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .expect("git is installed (this worker cannot run without it)");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// The switch between the two repository shapes is the presence of
+    /// `manifest.json` under the synced path: without it a repo is synced file
+    /// by file; with it the checkout is handed over whole, still on disk,
+    /// for the verifier. Offline, against a `file://` repo.
+    #[tokio::test]
+    async fn a_manifest_turns_the_checkout_into_a_bundle_hand_off() {
+        let root = std::env::temp_dir().join(format!("dagron-gitops-test-{}", Uuid::new_v4()));
+        let _guard = TempDir(root.clone());
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join("dagron")).unwrap();
+        std::fs::write(
+            repo.join("dagron/a.yaml"),
+            "name: a\ntasks:\n  - name: t\n    command: [\"true\"]\n",
+        )
+        .unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "plain"]);
+        let url = format!("file://{}", repo.display());
+
+        match fetch_and_validate(&url, "main", "dagron", None).await.unwrap() {
+            Fetched::Plain { valid, errors, skipped, .. } => {
+                assert_eq!(valid.len(), 1, "{errors:?}");
+                assert_eq!(valid[0].0, "a");
+                assert!(errors.is_empty());
+                assert_eq!(skipped, 0);
+            }
+            Fetched::Bundle { .. } => panic!("a plain repo was taken for a bundle"),
+        }
+
+        // The same plain repo on a worker that only accepts signed bundles is
+        // refused with the knob's name — not synced as if the knob were unset.
+        {
+            let _require = EnvGuard::set(BUNDLE_REQUIRE_ENV, "1");
+            let err = fetch_and_validate(&url, "main", "dagron", None).await.unwrap_err();
+            assert!(err.contains(BUNDLE_REQUIRE_ENV), "{err}");
+            assert!(err.contains(MANIFEST_FILE), "{err}");
+        }
+
+        // Detection is by presence, not validity: the manifest here is not
+        // even a bundle manifest. Deciding that is the verifier's job, which
+        // has the keys; this half's job is to never file-sync a directory
+        // that claims to be signed.
+        std::fs::write(repo.join("dagron").join(MANIFEST_FILE), "{}\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "manifest"]);
+        let fetched = fetch_and_validate(&url, "main", "dagron", None).await.unwrap();
+        let dir = match &fetched {
+            Fetched::Bundle { rev, dir, .. } => {
+                assert_eq!(rev.len(), 40, "{rev}");
+                assert!(dir.ends_with("dagron"), "{}", dir.display());
+                // The checkout is still there for the verifier to read.
+                assert!(dir.join(MANIFEST_FILE).is_file());
+                assert!(dir.join("a.yaml").is_file());
+                dir.clone()
+            }
+            Fetched::Plain { .. } => panic!("a directory with a manifest was file-synced"),
+        };
+        // …and gone once the hand-off value is dropped: the scratch guard
+        // travels with it.
+        drop(fetched);
+        assert!(!dir.exists(), "scratch checkout leaked at {}", dir.display());
+    }
+
+    /// Live-datastore check of the one-transaction apply, gated on
+    /// `TEST_DATABASE_URL` (a disposable Postgres; the tables are created here
+    /// with the same shape dagron-api's migrations give them).
+    #[tokio::test]
+    async fn apply_specs_writes_one_version_row_per_workflow_or_nothing() {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("TEST_DATABASE_URL unset — skipping the live apply_specs test");
+            return;
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
+        for ddl in [
+            "CREATE TABLE IF NOT EXISTS workflows (
+                id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL UNIQUE, spec TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                version BIGINT NOT NULL DEFAULT 1, state TEXT NOT NULL DEFAULT 'active')",
+            "CREATE TABLE IF NOT EXISTS workflow_versions (
+                id TEXT PRIMARY KEY NOT NULL,
+                workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+                version BIGINT NOT NULL, name TEXT NOT NULL, spec TEXT NOT NULL,
+                created_at TEXT NOT NULL, created_by TEXT, UNIQUE (workflow_id, version))",
+        ] {
+            sqlx::query(ddl).execute(&pool).await.unwrap();
+        }
+        let tag = Uuid::new_v4();
+        let a = format!("bundle-a-{tag}");
+        let b = format!("bundle-b-{tag}");
+
+        // First apply: both created at version 1, stamped with the provenance.
+        let specs = vec![(a.clone(), "name: a\ntasks: []\n".to_string()), (b.clone(), "name: b\ntasks: []\n".to_string())];
+        let applied = apply_specs(&pool, &specs, "bundle:t@1#aaaaaaaaaaaa").await.unwrap();
+        assert_eq!(applied, vec![a.clone(), b.clone()]);
+        let head = |name: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (String, i64, String, Option<String>)>(
+                    "SELECT w.id, w.version, v.spec, v.created_by FROM workflows w
+                     JOIN workflow_versions v ON v.workflow_id = w.id AND v.version = w.version
+                     WHERE w.name = $1",
+                )
+                .bind(name)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let (id_a, version, spec, by) = head(a.clone()).await;
+        assert_eq!((version, spec.as_str(), by.as_deref()), (1, "name: a\ntasks: []\n", Some("bundle:t@1#aaaaaaaaaaaa")));
+
+        // Second apply of a changed definition: same row, version 2, head
+        // spec moved, both history rows kept.
+        let specs = vec![(a.clone(), "name: a\ntasks: []\n# v2\n".to_string())];
+        apply_specs(&pool, &specs, "bundle:t@2#bbbbbbbbbbbb").await.unwrap();
+        let (id_a2, version, spec, by) = head(a.clone()).await;
+        assert_eq!(id_a2, id_a, "an upsert must keep the workflow id");
+        assert_eq!((version, by.as_deref()), (2, Some("bundle:t@2#bbbbbbbbbbbb")));
+        assert!(spec.ends_with("# v2\n"));
+        let history: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM workflow_versions WHERE workflow_id = $1")
+                .bind(&id_a)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(history, 2);
+
+        // All or nothing: a batch whose second spec Postgres refuses (a NUL
+        // byte in TEXT) must not leave the first one behind.
+        let c = format!("bundle-c-{tag}");
+        let d = format!("bundle-d-{tag}");
+        let specs = vec![(c.clone(), "name: c\ntasks: []\n".to_string()), (d.clone(), "name: d\0\n".to_string())];
+        let err = apply_specs(&pool, &specs, "bundle:t@3#cccccccccccc").await.unwrap_err();
+        assert!(err.contains(&d), "{err}");
+        let orphan: i64 = sqlx::query_scalar("SELECT count(*) FROM workflows WHERE name = $1")
+            .bind(&c)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(orphan, 0, "a failed bundle left a workflow behind");
+
+        sqlx::query("DELETE FROM workflows WHERE name LIKE $1")
+            .bind(format!("bundle-%-{tag}"))
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     /// The worker clones whatever the row holds, so the URL is re-checked here.

@@ -63,7 +63,15 @@ pub fn knobs() -> &'static [Knob] {
             K("BACKFILL_PACE_PER_TICK", "1"),
             K("CRON_CONFIG", "— (cron disabled)"),
             K("DAGRON_ARTIFACT_DIR", "— (artifacts off)"),
+            K("DAGRON_ARTIFACT_SYNC_SECS", "60 (0 disables)"),
+            K("DAGRON_ARTIFACT_TIER", "— (tiering off)"),
+            K("DAGRON_ARTIFACT_UPLINK_BYTES_PER_DAY", "— (unlimited)"),
             K("DAGRON_ARTIFACT_URL", "— (cloud artifacts off)"),
+            K("DAGRON_BUNDLE_PUBKEYS", "— (signed bundles refused)"),
+            K("DAGRON_CLOCK_CHECK_SECS", "30"),
+            K("DAGRON_CLOCK_STEP_TOLERANCE_MS", "1000"),
+            K("DAGRON_CLOCK_SYNC_FILE", "— (no positive sync evidence)"),
+            K("DAGRON_CONSOLE", "— (console mounted)"),
             // The KEK/KMS envelope family (dagron-crypto, docs/CONFIG.md
             // "Encryption at rest"): the current provider's inputs plus their
             // `*_OLD` twins, which the key-rotation sweep reads for the
@@ -89,6 +97,8 @@ pub fn knobs() -> &'static [Knob] {
             K("DAGRON_ENV_KMS_WRAP_CMD", "— (command provider only)"),
             K("DAGRON_ENV_KMS_WRAP_CMD_OLD", "—"),
             K("DAGRON_MAX_TASKS_PER_RUN", "100000 (compiled ceiling)"),
+            K("DAGRON_MIN_FREE_BYTES", "0 (off)"),
+            K("DAGRON_PRESSURE_FILE", "— (no pressure gate)"),
             K("DAGRON_READY_TIMEOUT_MS", "500 (floor 50)"),
             K("DAGRON_REDACT_ENV", "true"),
             K("DAGRON_SECRETS_DIR", "—"),
@@ -130,6 +140,18 @@ pub fn knobs() -> &'static [Knob] {
             K("LOG_SPAN_EVENTS", "— (off)"),
             K("MAX_INFLIGHT_RUNS", "64 (0 disables)"),
             K("MAX_INFLIGHT_TASKS", "0 (off)"),
+            K("MQTT_CLEAN_SESSION", "false with MQTT_CLIENT_ID, else true"),
+            K("MQTT_CLIENT_ID", "dagron-<uuid>"),
+            K("MQTT_DLQ_TOPIC", "— (datastore dead_letters only)"),
+            K("MQTT_KEEPALIVE_SECS", "30"),
+            KR("MQTT_PASSWORD", "—"),
+            K("MQTT_POSITION_FIELD", "— (at-least-once)"),
+            K("MQTT_QOS", "1"),
+            K("MQTT_TOPIC", "dagron/workflows"),
+            // An MQTT origin can carry userinfo (mqtt://user:pass@broker), so it
+            // is redacted like every other credential-bearing URL in this registry.
+            KR("MQTT_URL", "mqtt://127.0.0.1:1883"),
+            K("MQTT_USERNAME", "—"),
             K("OPENLINEAGE_NAMESPACE", "dagron"),
             KR("OPENLINEAGE_URL", "— (lineage off)"),
             KR("OTEL_EXPORTER_OTLP_ENDPOINT", "— (otel export off)"),
@@ -156,6 +178,7 @@ pub fn knobs() -> &'static [Knob] {
             K("WAIT_URL_DENY_PRIVATE", "— (off)"),
             K("WORKER_COUNT", "16 (min 1)"),
             K("WORKFLOW_DIR", "/workflows"),
+            K("DIR_POLL_MS", "2000 (floor 100)"),
         ]
     })
 }
@@ -183,6 +206,9 @@ const FOREIGN_PREFIXES: &[&str] = &[
     "DAGRON_KEK",
     "DAGRON_MCP_",
     "DAGRON_API_",
+    // The fleet-link worker (an optional sidecar loop, not the engine) reads its
+    // own family; registering it here keeps a unit's shell quiet.
+    "DAGRON_FLEET_",
 ];
 
 /// Prefix families the typo scan claims: an env var starting with one of these
@@ -191,6 +217,7 @@ const FOREIGN_PREFIXES: &[&str] = &[
 const OUR_PREFIXES: &[&str] = &[
     "DAGRON_",
     "STREAM_",
+    "MQTT_",
     "GC_ARCHIVE_",
     "READY_AGE_",
     "MAX_INFLIGHT_",
@@ -246,6 +273,17 @@ fn profile_preset(name: &str) -> Option<&'static [(&'static str, &'static str)]>
             ("LEASE_SECS", "5"),
         ]),
         "throughput" => Some(&[]),
+        // docs/CONFIG.md — constrained gateways, robots, vehicles: few workers,
+        // slow ticks, small in-flight caps, and a free-disk floor so a full
+        // flash device refuses new runs instead of corrupting the datastore.
+        "edge" => Some(&[
+            ("WORKER_COUNT", "2"),
+            ("POLL_INTERVAL_MS", "1000"),
+            ("SWEEP_INTERVAL_MS", "5000"),
+            ("MAX_INFLIGHT_RUNS", "4"),
+            ("MAX_INFLIGHT_TASKS", "64"),
+            ("DAGRON_MIN_FREE_BYTES", "67108864"),
+        ]),
         _ => None,
     }
 }
@@ -279,13 +317,13 @@ pub fn apply_file_layer() -> Result<&'static FileLayer> {
                 let Some(profile) = profile.as_str() else {
                     bail!(
                         "DAGRON_CONFIG file '{path}': 'profile' must be a string \
-                         (known: low-latency, throughput), got {profile:?}"
+                         (known: low-latency, throughput, edge), got {profile:?}"
                     );
                 };
                 let preset = profile_preset(profile).with_context(|| {
                     format!(
                         "DAGRON_CONFIG names unknown profile '{profile}' \
-                         (known: low-latency, throughput)"
+                         (known: low-latency, throughput, edge)"
                     )
                 })?;
                 for (k, v) in preset {

@@ -26,7 +26,7 @@ export default function SubmitPage() {
     setError(null);
     try {
       const { run_id } = await submitRun(yaml);
-      router.push(`/runs/${run_id}`);
+      router.push(`/runs/detail/?id=${run_id}`);
     } catch (e) {
       // Server is the authoritative validator (cycle/dup/unknown-dep → 400).
       setError(errMsg(e));

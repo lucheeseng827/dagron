@@ -64,7 +64,7 @@ Edit [`prometheus/prometheus.yml`](prometheus/prometheus.yml) `targets`:
 | `grafana/provisioning/` | datasource + dashboard auto-provisioning |
 | `grafana/dashboards/dagron-overview.json` | the dashboard model |
 
-> The dashboard uses only OSS metrics. Enterprise builds additionally expose
+> The dashboard uses only metrics this build emits. Feature-on builds also expose
 > `scheduler_catchup_runs_total`, `scheduler_auto_reruns_total`,
 > `scheduler_overdue_schedules`, `scheduler_schedule_lag_seconds`, and
 > `scheduler_incomplete_runs` — add panels for those if you run that build.

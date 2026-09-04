@@ -1,0 +1,88 @@
+# 11 — Lifecycle nurture as a bounded loop over a child workflow.
+#
+#   segment ─▶ repeat( child run: send one step, wait, measure ) ─▶ promote | recycle
+#
+# A nurture track is a loop, and loops are where automation platforms quietly
+# lose the plot: a HubSpot workflow that re-enrols a contact on a bad condition
+# will happily email them nine times before anyone notices.
+#
+# `repeat:` on a `type: workflow` task runs the child **once per turn — one
+# child run per iteration**, so every step of the sequence is separately
+# inspectable, retryable, and attributable. And it is bounded three ways:
+#
+#   repeat.max_iterations   hard cap on turns; exhausting it FAILS the task
+#   max_active_runs (child) how many turns may be in flight across all tracks
+#   budget.tasks (child)    how big one turn may get
+#
+# The practical sizing question is `max_iterations × tasks-per-turn`: 8 turns of
+# a 5-task child is 40 tasks and 8 runs from one submission. Write that number
+# down before turning it on — it is the first thing to look at when the queue
+# fills up.
+name: mktg_lifecycle_nurture_loop
+tags: [marketing, lifecycle, nurture, loop]
+environment: prod
+run_timeout_secs: 2592000        # a 30-day track
+max_active_runs: 4               # four tracks at a time, not forty
+parameters:
+  track: "plg-trial-to-paid"
+  max_steps: "8"
+  segment_query: "lifecyclestage=lead AND icp_tier IN ('A','B')"
+
+task_defaults:
+  max_attempts: 3
+  retry_delay_secs: 10
+  timeout_secs: 600
+  env:
+    - { name: HUBSPOT_TOKEN, value_from: { secret: HUBSPOT_PRIVATE_APP_TOKEN } }
+    - { name: SEGMENT_WRITE_KEY, value_from: { secret: SEGMENT_WRITE_KEY } }
+
+tasks:
+  - name: build_segment
+    pool: crm-api
+    produces: ["hubspot://crm/lists/{{ track }}"]
+    command: ["sh", "-c", "hubspot-search --query \"{{ segment_query }}\" --out \"$DAGRON_ARTIFACTS/cohort.ndjson\" --list {{ track }}"]
+
+  - name: suppression_check
+    depends_on: [build_segment]
+    max_attempts: 1
+    command: ["sh", "-c", "suppression-filter --in \"$DAGRON_ARTIFACTS/cohort.ndjson\" --lists unsubscribed,customers,competitors --out \"$DAGRON_ARTIFACTS/eligible.ndjson\""]
+
+  # One turn = one child run of the step workflow: send, wait for the window,
+  # measure engagement, decide whether the track continues. The loop stops when
+  # the child prints `done` (converted, unsubscribed, or out of steps).
+  - name: nurture_steps
+    type: workflow
+    workflow: mktg_nurture_step
+    depends_on: [suppression_check]
+    arguments:
+      track: "{{ track }}"
+      cohort: "eligible.ndjson"
+    repeat:
+      until: "{{ output }} == done"
+      max_iterations: 8            # never more than eight emails. Ever.
+      delay_secs: 259200           # three days between turns
+
+  # Prints `promote` or `recycle`.
+  - name: evaluate_track
+    depends_on: [nurture_steps]
+    trigger_rule: all_done         # an exhausted loop is a result to act on, not a hole
+    max_attempts: 1
+    command: ["sh", "-c", "nurture-outcome --track {{ track }} --cohort \"$DAGRON_ARTIFACTS/eligible.ndjson\""]
+
+  - name: promote_to_mql
+    depends_on: [evaluate_track]
+    when: "{{ tasks.evaluate_track.output }} == promote"
+    pool: crm-api
+    produces: ["hubspot://crm/contacts/mql"]
+    command: ["sh", "-c", "hubspot-set-lifecycle --stage marketingqualifiedlead --cohort \"$DAGRON_ARTIFACTS/eligible.ndjson\""]
+
+  - name: recycle_to_cold
+    depends_on: [evaluate_track]
+    when: "{{ tasks.evaluate_track.output }} != promote"
+    pool: crm-api
+    command: ["sh", "-c", "hubspot-set-lifecycle --stage other --cohort \"$DAGRON_ARTIFACTS/eligible.ndjson\" --reason nurture-exhausted"]
+
+  - name: track_report
+    hook: on_exit
+    max_attempts: 1
+    command: ["sh", "-c", "post-slack lifecycle \"track {{ track }} finished - run $DAGRON_RUN_ID\""]

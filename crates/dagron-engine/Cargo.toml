@@ -19,6 +19,8 @@ postgres = ["dagron-core/postgres"]
 ops = ["dep:axum", "dep:cron", "dep:chrono-tz", "dagron-core/ops", "dagron-logging/logfilter"]
 # Kubernetes pod executor (EXECUTOR=kubernetes).
 kubernetes = ["dagron-executor/kubernetes"]
+# MQTT ingestion source (SOURCE=mqtt) — forwards to dagron-source.
+mqtt = ["dagron-source/mqtt"]
 # OpenTelemetry integration (#28): inject a W3C `traceparent` into each
 # dispatched task's env so its own instrumentation joins an external trace
 # (external-trace embedding), and — via `dagron-logging/otel` — install an OTLP
@@ -78,6 +80,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 dagron-crypto = { path = "../dagron-crypto" }
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
+# statvfs for the free-disk floor / pressure gate (constrained hosts).
+libc = "0.2"
 tracing = "0.1"
 async-trait = "0.1"
 ractor = "0.10"

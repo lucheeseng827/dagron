@@ -18,11 +18,17 @@
 //!   was stored and advertised in the UI, but no loop existed anywhere.
 //! * **Requested syncs.** The console's Sync button stamps `sync_requested_at`
 //!   (dagron-api no longer runs git itself); this loop claims and clears it.
+//! * **Signed bundles.** A repo path carrying `manifest.json` + `manifest.sig`
+//!   is verified against `DAGRON_BUNDLE_PUBKEYS` and applied whole, in one
+//!   transaction, with a version row per workflow naming the bundle
+//!   (`sync::Fetched::Bundle` → `bundle::reconcile_bundle`;
+//!   docs/BUNDLES.md). `DAGRON_BUNDLE_REQUIRE=1` refuses anything unsigned.
 //!
 //! Schema is owned by dagron-api, which creates `git_repos` and the tables here
 //! on startup — one owner, no duplicate DDL to drift. This worker waits for them
 //! rather than creating them.
 
+mod bundle;
 mod sync;
 
 use std::time::Duration;
@@ -84,16 +90,26 @@ async fn main() -> anyhow::Result<()> {
 /// Block until dagron-api has created the tables. Starting order is not
 /// guaranteed in compose or k8s, and creating them here would mean two owners of
 /// one schema — the drift that has bitten this codebase repeatedly.
+///
+/// `workflow_versions` is on the list because a signed bundle writes a
+/// version row per workflow inside the same transaction as the upsert: were
+/// the table still missing, the first bundle sync after a fresh deploy would
+/// fail — and, being all-or-nothing, apply none of its workflows — for a
+/// reason that has nothing to do with the bundle.
 async fn wait_for_schema(pool: &sqlx::PgPool) {
     loop {
         let ready = sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM information_schema.tables
-             WHERE table_name IN ('git_repos', 'gitops_workers', 'workflows')",
+            // Scoped to the search path and counted DISTINCT: the same table name
+            // in a second visible schema would otherwise push the count past four
+            // and wedge this loop forever on a schema that is in fact ready.
+            "SELECT count(DISTINCT table_name) FROM information_schema.tables
+             WHERE table_schema = ANY (current_schemas(false))
+               AND table_name IN ('git_repos', 'gitops_workers', 'workflows', 'workflow_versions')",
         )
         .fetch_one(pool)
         .await;
         match ready {
-            Ok(3) => return,
+            Ok(n) if n >= 4 => return,
             Ok(_) => info!("waiting for dagron-api to create the GitOps schema"),
             Err(e) => warn!(error = %e, "schema probe failed"),
         }
@@ -303,10 +319,14 @@ async fn run_one(pool: &sqlx::PgPool, repo: &Due) {
         Ok(report) => {
             let count = report.synced.len() as i64;
             let at = sync::short(&report.rev);
-            let mut msg = if count == 0 {
-                format!("no workflow files under '{}' at {at}", repo.path)
-            } else {
-                format!("synced {count} workflow(s) at {at}")
+            // A signed bundle names itself: the operator reading the row
+            // should see *which* signed statement is live, not just a count.
+            // Its errors are empty by construction (a bundle with any is
+            // never applied), so only the plain message gets the suffixes.
+            let mut msg = match &report.bundle {
+                Some(bundle) => format!("applied signed bundle {bundle}: {count} workflow(s) at {at}"),
+                None if count == 0 => format!("no workflow files under '{}' at {at}", repo.path),
+                None => format!("synced {count} workflow(s) at {at}"),
             };
             if report.skipped > 0 {
                 msg.push_str(&format!(" · {} non-workflow file(s) ignored", report.skipped));

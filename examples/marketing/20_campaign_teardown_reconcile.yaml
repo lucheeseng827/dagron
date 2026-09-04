@@ -1,0 +1,134 @@
+# 20 — Campaign teardown: the workflow nobody writes, and everybody needs.
+#
+#   freeze ─▶ reconcile spend vs pipeline ─▶ archive ─▶ approval ─▶ decommission ─▶ retro
+#
+# Campaigns get launched carefully and switched off carelessly. Six weeks later
+# somebody finds a paused-but-still-charging LinkedIn campaign, a landing page with a
+# dead form, and a UTM nobody can map to a budget line. This is that cleanup,
+# declared once and run at the end of every campaign.
+#
+# It is also the GitOps demonstration. These twenty files live in a Git repo
+# that dagron syncs — so changing a workflow is a pull request, and CI runs
+#
+#   dagron validate examples/marketing/          # offline lint: no DB, no server
+#   dagron-plan --git main..HEAD examples/marketing/   # what the change does to the DAG
+#
+# before anything merges. `notify.git` reports this run back as a commit status,
+# so the PR that retires a campaign shows the teardown actually succeeded.
+name: mktg_campaign_teardown_reconcile
+tags: [marketing, campaign, finops, gitops]
+environment: prod
+run_timeout_secs: 86400
+budget: { tasks: 120 }
+parameters:
+  campaign_id: "2026-q3-platform-launch"
+  commit_sha: ""
+  slack_webhook: ""              # notify: URLs template against run PARAMETERS,
+                                 # not {{ env.* }} — set an instance-wide default
+                                 # in the console instead (sidebar -> Notifications).
+
+task_defaults:
+  max_attempts: 3
+  retry_delay_secs: 15
+  retry_max_delay_secs: 180
+  timeout_secs: 900
+  priority: -5
+  env:
+    - { name: HUBSPOT_TOKEN, value_from: { secret: HUBSPOT_PRIVATE_APP_TOKEN } }
+    - { name: GOOGLE_ADS_TOKEN, value_from: { secret: GOOGLE_ADS_REFRESH_TOKEN } }
+    - { name: META_ADS_TOKEN, value_from: { secret: META_ADS_ACCESS_TOKEN } }
+    - { name: LINKEDIN_TOKEN, value_from: { secret: LINKEDIN_ADS_TOKEN } }
+    - { name: SNOWFLAKE_PWD, value_from: { secret: SNOWFLAKE_PASSWORD } }
+    - { name: LAKE_BUCKET, value: "{{ env.LAKE_BUCKET }}" }
+
+notify:
+  git:
+    provider: github
+    repo: acme/marketing-workflows
+    sha: "{{ commit_sha }}"
+    context: dagron/campaign-teardown
+  slack:
+    webhook_url: "{{ slack_webhook }}"
+    on: [succeeded, failed, cancelled, deadline_exceeded]
+
+tasks:
+  # Stop the spend first, then account for it. In that order, always.
+  - name: freeze_spend
+    with_items:
+      - { network: google-ads, tool: gads-pause }
+      - { network: meta-ads, tool: meta-pause }
+      - { network: linkedin-ads, tool: li-pause }
+    instance_key: "{{ item.network }}"
+    pool: ads-api
+    max_attempts: 6                # this one really does have to succeed
+    command: ["sh", "-c", "{{ item.tool }} --campaign {{ campaign_id }}"]
+
+  # Wait for the ad networks' final charges to settle before reconciling.
+  # 48 hours of doing nothing, holding no worker slot.
+  - name: wait_for_final_charges
+    type: wait
+    depends_on: [freeze_spend]
+    wait: { for: "48h" }
+
+  - name: reconcile
+    depends_on: [wait_for_final_charges]
+    timeout_secs: 1800
+    produces: ["snowflake://analytics/marketing/fact_campaign_pl"]
+    command: ["sh", "-c", "campaign-pl --id {{ campaign_id }} --spend snowflake --pipeline hubspot --out \"$DAGRON_ARTIFACTS/pl.json\""]
+
+  # Prints `profitable` or `underwater` — the retro reads differently for each,
+  # and so does whether the creative gets archived or promoted to the library.
+  - name: verdict
+    depends_on: [reconcile]
+    max_attempts: 1
+    command: ["sh", "-c", "campaign-verdict --pl \"$DAGRON_ARTIFACTS/pl.json\" --target-roas 3.0 | tee \"$DAGRON_ARTIFACTS/verdict.txt\""]
+
+  - name: promote_creative
+    depends_on: [verdict]
+    when: "{{ tasks.verdict.output }} == profitable"
+    command: ["sh", "-c", "creative-library-add --campaign {{ campaign_id }} --tag winner"]
+
+  - name: archive_assets
+    depends_on: [verdict]
+    timeout_secs: 3600
+    produces: ["s3://acme-lake/marketing/campaign-archive"]
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        campaign-export --id {{ campaign_id }} --out "$DAGRON_ARTIFACTS/archive/"
+        aws s3 sync "$DAGRON_ARTIFACTS/archive/" "s3://$LAKE_BUCKET/marketing/campaign-archive/{{ campaign_id }}/"
+        aws s3api put-object-tagging --bucket "$LAKE_BUCKET" \
+          --key "marketing/campaign-archive/{{ campaign_id }}/manifest.json" \
+          --tagging 'TagSet=[{Key=lifecycle,Value=glacier-after-90d}]'
+
+  # Decommissioning is irreversible — landing pages come down, forms stop
+  # accepting, UTMs get retired. A human confirms after reading the P&L.
+  - name: approve_decommission
+    type: approval
+    depends_on: [archive_assets, reconcile]
+    approval_timeout_secs: 172800     # 48h
+    approval_on_timeout: reject       # leave it standing rather than guess
+
+  - name: decommission
+    depends_on: [approve_decommission]
+    with_items:
+      - { asset: landing-pages, tool: cms-redirect }
+      - { asset: forms, tool: hubspot-form-close }
+      - { asset: lists, tool: hubspot-list-archive }
+      - { asset: utms, tool: utm-registry-retire }
+    instance_key: "{{ item.asset }}"
+    allow_failure: true               # one stuck redirect must not strand the rest
+    command: ["sh", "-c", "{{ item.tool }} --campaign {{ campaign_id }}"]
+
+  - name: retro
+    depends_on: [decommission, promote_creative]
+    trigger_rule: all_done
+    produces: ["hubspot://marketing/campaigns/{{ campaign_id }}/retro"]
+    command: ["sh", "-c", "campaign-retro --id {{ campaign_id }} --pl \"$DAGRON_ARTIFACTS/pl.json\" --publish notion && post-slack marketing \"{{ campaign_id }} retro published ($(cat \"$DAGRON_ARTIFACTS/verdict.txt\"))\""]
+
+  - name: leftovers_report
+    hook: on_exit
+    max_attempts: 1
+    command: ["sh", "-c", "orphan-scan --campaign {{ campaign_id }} --report \"$DAGRON_ARTIFACTS/orphans.json\" || true"]

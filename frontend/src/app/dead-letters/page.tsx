@@ -35,7 +35,7 @@ export default function DeadLettersPage() {
     setError(null);
     try {
       const { run_id } = await redriveDeadLetter(id);
-      router.push(`/runs/${run_id}`);
+      router.push(`/runs/detail/?id=${run_id}`);
     } catch (e) {
       setError(errMsg(e));
       setBusy(null);

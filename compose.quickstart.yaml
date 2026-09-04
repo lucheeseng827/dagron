@@ -3,7 +3,8 @@
 #   podman compose -f compose.quickstart.yaml up -d
 #   docker compose -f compose.quickstart.yaml up -d
 #
-# Then open http://localhost:3000 and sign in with admin@local / dagron-admin.
+# Then open http://localhost:8080 and sign in with admin@local / dagron-admin.
+# (One port: dagron-api serves the console at / and the API under /api.)
 #
 # Use this to *try* dagron. `compose.yaml` next to it builds every service from
 # source, which is right when you are changing dagron and wrong when you are
@@ -45,7 +46,7 @@ services:
     #
     # For docker/kubernetes execution the task runs in its own image and the
     # distroless engine is the right one. See docs/OPERATIONS.md.
-    image: docker.io/mancube/dagron-engine-localdev:${DAGRON_VERSION:-0.8.1}
+    image: docker.io/mancube/dagron-engine-localdev:${DAGRON_VERSION:-0.9.0}
     environment:
       DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
       API_ADDR: 0.0.0.0:8787
@@ -63,10 +64,16 @@ services:
     #
     # It must be a *file*: the default `file` source (SOURCE, unset = "file") is
     # `FileSource`, which emits one YAML **once** at startup and then drains.
-    # It is not a directory reader and not a watcher — pointing it at /workflows
-    # gives "Is a directory", and a YAML dropped in later is never picked up.
-    # Submit further workflows through the UI or POST /api/runs (docs/HOWTO.md
-    # §2); that is the path this quickstart is built around.
+    #
+    # To make /workflows a live inbox instead — drop a YAML in and it runs, edit
+    # one and the next scan re-submits it — set `SOURCE: dir` in `environment:`
+    # above and delete the `command:` line. It watches WORKFLOW_DIR (this mount),
+    # scanning every DIR_POLL_MS (2 s). Left on `file` here so the console has
+    # exactly one finished run in it on first open, rather than everything the
+    # image seeds.
+    #
+    # Either way, further workflows go in through the console or POST /api/runs
+    # (docs/HOWTO.md §2).
     #
     # Naming one bundled example here means the dashboard has a finished run in
     # it the first time you open it, instead of being empty.
@@ -127,7 +134,7 @@ services:
         condition: service_started
 
   dagron-api:
-    image: docker.io/mancube/dagron-api:${DAGRON_VERSION:-0.8.1}
+    image: docker.io/mancube/dagron-api:${DAGRON_VERSION:-0.9.0}
     environment:
       DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
       # Dev credentials, seeded on first start. Change them for anything that
@@ -142,10 +149,10 @@ services:
       DAGRON_JWT_SECRET: ${DAGRON_JWT_SECRET:-quickstart-only-not-a-real-secret-change-me}
       RUST_LOG: info
     ports:
+      # API *and* console. dagron-api serves the exported console at / and the
+      # API under /api, so there is one port, one origin, and no proxy — which
+      # is also why live updates work here (see crates/dagron-api/Dockerfile).
       - "127.0.0.1:8080:8080"
-      # The console's port is published here, not on the frontend service —
-      # see the note under `frontend`, which shares this container's network.
-      - "127.0.0.1:3000:3000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -153,35 +160,12 @@ services:
       schema-gate:
         condition: service_completed_successfully
 
-  frontend:
-    image: docker.io/mancube/dagron-frontend:${DAGRON_VERSION:-0.8.1}
-    # Shares dagron-api's network namespace, which is what makes the published
-    # image usable here at all.
-    #
-    # The frontend proxies /api to a target baked in at build time (Next
-    # `rewrites()` are resolved when the standalone bundle is built, not read
-    # from the environment at boot). The published image carries the default,
-    # `http://localhost:8080` — so out of the box it can only reach an API on
-    # its own localhost.
-    #
-    # That is not a bug in the image: the Helm chart never uses this proxy,
-    # because its ingress routes /api straight to the API service and / to the
-    # frontend. compose.yaml gets it right by passing DAGRON_API_URL as a
-    # *build* arg, which a pull-don't-build quickstart cannot do.
-    #
-    # Sharing the namespace makes `localhost:8080` true, with no second image
-    # and no reverse proxy in front. The cost is that `ports:` must live on the
-    # service that owns the namespace, above.
-    network_mode: "service:dagron-api"
-    depends_on:
-      - dagron-api
-
   # Opt in with `--profile gitops`. Off by default because it is only useful
   # once you have connected a repository, and a worker idling against nothing
   # is noise in the logs of someone still finding their way around.
   gitops:
     profiles: ["gitops"]
-    image: docker.io/mancube/dagron-gitops:${DAGRON_VERSION:-0.8.1}
+    image: docker.io/mancube/dagron-gitops:${DAGRON_VERSION:-0.9.0}
     environment:
       DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
       GITOPS_POLL_SECS: "60"

@@ -1,0 +1,115 @@
+# 18 — Churn risk in, win-back out. Marketing's half of retention.
+#
+#   wait(dataset: usage) ─▶ risk model ─▶ segment ─▶ (high) CS handoff | (mid) win-back | (low) advocacy
+#
+# Demand gen is the expensive half of growth and the loud half; this is the
+# cheap half. It runs on the same engine, off the same warehouse, with the same
+# review gates — which is the argument for one runner rather than a marketing
+# automation tool plus a CS tool plus a notebook someone runs on Thursdays.
+#
+# `environment: prod` is doing real work here. The same file runs against
+# staging by changing one line: `{{ env.* }}` variables and every `value_from:
+# { secret: ... }` resolve from the named environment at dispatch, so a dry run
+# against a sandbox HubSpot portal is a one-word diff, not a forked YAML.
+name: mktg_churn_winback_playbook
+tags: [marketing, retention, lifecycle]
+environment: prod
+run_timeout_secs: 21600
+deadline: { in: 3h }
+max_active_runs: 1
+parameters:
+  risk_model: "churn-v5"
+  offer_code: "WINBACK25"
+
+task_defaults:
+  max_attempts: 4
+  retry_delay_secs: 20
+  retry_max_delay_secs: 240
+  timeout_secs: 900
+  env:
+    - { name: HUBSPOT_TOKEN, value_from: { secret: HUBSPOT_PRIVATE_APP_TOKEN } }
+    - { name: STRIPE_KEY, value_from: { secret: STRIPE_RESTRICTED_KEY } }
+    - { name: SNOWFLAKE_PWD, value_from: { secret: SNOWFLAKE_PASSWORD } }
+    - { name: ZENDESK_TOKEN, value_from: { secret: ZENDESK_API_TOKEN } }
+    - { name: PORTAL, value: "{{ env.HUBSPOT_PORTAL_ID }}" }
+
+tasks:
+  # Start when the product-usage rollup is fresh. A churn model scored against
+  # last week's usage is worse than no model: it flags accounts that already
+  # came back and misses the ones that just left.
+  - name: wait_for_usage
+    type: wait
+    wait: { dataset: "snowflake://analytics/product/fact_daily_usage" }
+
+  - name: assemble_signals
+    depends_on: [wait_for_usage]
+    with_items:
+      - { src: usage, tool: snowflake-unload }
+      - { src: payments, tool: stripe-export }
+      - { src: support, tool: zendesk-export }
+      - { src: engagement, tool: hubspot-engagement-export }
+    instance_key: "{{ item.src }}"
+    allow_failure: true
+    command: ["sh", "-c", "{{ item.tool }} --window 90d --out \"$DAGRON_ARTIFACTS/{{ item.src }}.parquet\""]
+
+  - name: score_risk
+    depends_on: [assemble_signals]
+    trigger_rule: all_done
+    timeout_secs: 1800
+    docker_image: ghcr.io/acme/retention-models:2.2
+    produces: ["snowflake://analytics/marketing/fact_churn_risk"]
+    command: ["sh", "-c", "score-churn --model {{ risk_model }} --in \"$DAGRON_ARTIFACTS\" --out \"$DAGRON_ARTIFACTS/risk.ndjson\""]
+
+  # Prints `escalate` when the high-risk cohort is large enough that a campaign
+  # is the wrong instrument and a human should look first, else `campaign`.
+  - name: triage_cohort
+    depends_on: [score_risk]
+    max_attempts: 1
+    command: ["sh", "-c", "cohort-triage --in \"$DAGRON_ARTIFACTS/risk.ndjson\" --escalate-above 200 | tee \"$DAGRON_ARTIFACTS/triage.txt\""]
+
+  - name: exec_review
+    type: approval
+    depends_on: [triage_cohort]
+    when: "{{ tasks.triage_cohort.output }} == escalate"
+    approval_timeout_secs: 14400
+    approval_on_timeout: reject
+
+  # The three plays, all downstream of the gate. `exec_review` is a *runtime*
+  # `when:` (it reads an upstream task's output), so it always exists in the DAG
+  # and resolves to one of three statuses: `succeeded` when a human approved,
+  # `skipped` when there was no escalation to review, `failed` when a human
+  # rejected or the 4h timeout expired. `none_failed` treats the first two as
+  # go and the third as stop — which is the whole point of putting a person in
+  # front of a send. Depending on `triage_cohort` alone would start these in
+  # parallel with the approval, and the cohort would have its email before
+  # anyone looked.
+  - name: cs_handoff
+    depends_on: [triage_cohort, exec_review]
+    trigger_rule: none_failed
+    pool: crm-api
+    produces: ["hubspot://crm/tasks/churn-risk"]
+    command: ["sh", "-c", "hubspot-create-tasks --from \"$DAGRON_ARTIFACTS/risk.ndjson\" --filter 'risk_band=high' --owner-from csm_owner --due '+2 days'"]
+
+  - name: winback_campaign
+    depends_on: [triage_cohort, exec_review]
+    trigger_rule: none_failed
+    pool: crm-api
+    produces: ["hubspot://marketing/emails/winback"]
+    command: ["sh", "-c", "send-sequence --template winback --offer {{ offer_code }} --segment \"$DAGRON_ARTIFACTS/risk.ndjson\" --filter 'risk_band=medium'"]
+
+  - name: advocacy_invite
+    depends_on: [triage_cohort, exec_review]
+    trigger_rule: none_failed
+    pool: crm-api
+    command: ["sh", "-c", "send-sequence --template advocacy-invite --segment \"$DAGRON_ARTIFACTS/risk.ndjson\" --filter 'risk_band=low AND nps>=9'"]
+
+  - name: writeback
+    depends_on: [cs_handoff, winback_campaign, advocacy_invite, exec_review]
+    trigger_rule: none_failed
+    produces: ["hubspot://crm/companies/churn-risk"]
+    command: ["sh", "-c", "hubspot-batch-upsert --object companies --id-property domain --properties churn_risk_band,churn_score,scored_at --input \"$DAGRON_ARTIFACTS/risk.ndjson\""]
+
+  - name: retention_digest
+    hook: on_exit
+    max_attempts: 1
+    command: ["sh", "-c", "post-slack retention \"churn pass complete ({{ risk_model }}) - run $DAGRON_RUN_ID\""]

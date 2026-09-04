@@ -1,0 +1,3 @@
+88123|train_llama_70b|FAILED|1:0|2026-08-26T02:11:03|2026-08-26T09:58:41|07:47:38|node-[40-55]|cpu=1024,gres/gpu=128,mem=8000G,node=16|None
+88123.batch|batch|FAILED|1:0|2026-08-26T02:11:03|2026-08-26T09:58:41|07:47:38|node-40|cpu=64,gres/gpu=8,mem=500G,node=1|None
+88123.0|python|FAILED|1:0|2026-08-26T02:11:05|2026-08-26T09:58:41|07:47:36|node-[40-55]|cpu=1024,gres/gpu=128,mem=8000G,node=16|None

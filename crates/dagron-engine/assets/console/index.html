@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>dagron</title>
+<!--
+  The single-binary console.
+
+  Deliberately dependency-free: no framework, no bundler, no Node in the engine
+  image. It is one file embedded with include_str! (the same trick /docs already
+  uses for Swagger), so `dagron` stays one static binary that works air-gapped and
+  on SQLite — the deployment the full console cannot reach, because that one needs
+  dagron-api, Postgres, and until recently a second container.
+
+  It is NOT the dagron-api console trimmed down. That app speaks a different
+  dialect: /api/runs returns a bare RunSummary[] carrying definition_id,
+  trigger_kind and triage fields, while the ops API here returns {"runs": [...]}
+  of {id,name,status,created_at,finished_at}; it also assumes an auth surface the
+  engine has none of. Reconciling those is worth doing, and is not a prerequisite
+  for an operator being able to see a run on a box with 2 GB of RAM.
+
+  Scope is exactly what the ops API can back, and no more: runs, run detail with
+  its tasks, logs, the run and task actions, dead letters, config, metrics. No
+  workflow authoring — that is what the editor in the full console is for, and
+  Monaco alone is 14 MB against this file's ~40 KB.
+-->
+<style>
+:root{
+  --bg:#faf8f5; --panel:#fff; --panel2:#f1eee8; --fg:#1c1814; --fg2:#4a423a;
+  --fg3:#7a7066; --rule:#ded8cf; --accent:#b8720c; --accent-bg:#f5e6ce;
+  --ok:#2f7a4e; --ok-bg:#ddede3; --bad:#a63a2e; --bad-bg:#f6dfdb;
+  --run:#3c5a6e; --run-bg:#dfe8ed; --warn:#8a6d1f; --warn-bg:#f4ecd6;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme=light]){
+    --bg:#121013; --panel:#1a171c; --panel2:#221e24; --fg:#efe9e1; --fg2:#b6aca0;
+    --fg3:#857b70; --rule:#332d36; --accent:#e8a33d; --accent-bg:#3a2c16;
+    --ok:#5fbe84; --ok-bg:#17301f; --bad:#e5796a; --bad-bg:#361d1a;
+    --run:#8fb3c9; --run-bg:#1e2a33; --warn:#d9b45c; --warn-bg:#332a12;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:14px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-variant-numeric:tabular-nums}
+a{color:var(--accent)}
+header{display:flex;align-items:center;gap:14px;padding:12px 20px;
+  border-bottom:1px solid var(--rule);background:var(--panel);flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:9px;font-weight:700;letter-spacing:-.02em;font-size:16px}
+.mark{width:22px;height:22px;border-radius:5px;background:var(--accent);color:#1c1814;
+  display:grid;place-items:center;font-size:13px;font-weight:800}
+.ver{font-size:10px;color:var(--fg3);letter-spacing:.1em;text-transform:uppercase}
+nav{display:flex;gap:2px;margin-left:8px;flex-wrap:wrap}
+nav button{background:none;border:0;padding:6px 11px;border-radius:6px;cursor:pointer;
+  color:var(--fg2);font:inherit;font-size:13px}
+nav button:hover{background:var(--panel2)}
+nav button[aria-current=page]{background:var(--accent-bg);color:var(--accent);font-weight:600}
+.spacer{flex:1}
+.pill{font-size:11px;padding:3px 9px;border-radius:20px;border:1px solid var(--rule);
+  color:var(--fg3);display:inline-flex;align-items:center;gap:6px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--fg3)}
+.dot.live{background:var(--ok)}
+main{padding:20px;max-width:1180px;margin:0 auto}
+h2{font-size:17px;margin:0 0 3px;letter-spacing:-.01em}
+.sub{color:var(--fg3);font-size:12.5px;margin-bottom:14px}
+.bar{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+select,input,button.act{font:inherit;font-size:13px;padding:5px 10px;border-radius:6px;
+  border:1px solid var(--rule);background:var(--panel);color:var(--fg)}
+button.act{cursor:pointer}
+button.act:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+button.act:disabled{opacity:.45;cursor:not-allowed}
+button.act.danger:hover:not(:disabled){border-color:var(--bad);color:var(--bad)}
+.card{border:1px solid var(--rule);border-radius:9px;background:var(--panel);overflow:hidden}
+.tw{overflow-x:auto}
+table{border-collapse:collapse;width:100%;min-width:560px}
+th,td{text-align:left;padding:9px 14px;border-bottom:1px solid var(--rule);font-size:13px;
+  vertical-align:top}
+th{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--fg3);font-weight:600}
+tr:last-child td{border-bottom:0}
+tbody tr:hover{background:var(--panel2)}
+.st{font-size:11px;padding:2px 8px;border-radius:20px;font-weight:600;white-space:nowrap;
+  display:inline-block}
+.st-succeeded{background:var(--ok-bg);color:var(--ok)}
+.st-failed,.st-cancelled,.st-rejected{background:var(--bad-bg);color:var(--bad)}
+.st-running,.st-claimed{background:var(--run-bg);color:var(--run)}
+.st-pending,.st-awaiting_approval,.st-waiting{background:var(--warn-bg);color:var(--warn)}
+.st-skipped{background:var(--panel2);color:var(--fg3)}
+.lk{color:var(--accent);cursor:pointer;text-decoration:none;background:none;border:0;
+  font:inherit;padding:0}
+.lk:hover{text-decoration:underline}
+pre.log{margin:0;padding:14px;background:var(--panel2);color:var(--fg2);font-size:12px;
+  line-height:1.5;max-height:460px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:1px;
+  background:var(--rule);border:1px solid var(--rule);border-radius:9px;overflow:hidden}
+.kv{background:var(--panel);padding:11px 14px}
+.kv .k{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--fg3)}
+.kv .v{font-size:14px;margin-top:2px;word-break:break-all}
+.empty{padding:34px;text-align:center;color:var(--fg3);font-size:13px}
+.err{background:var(--bad-bg);color:var(--bad);padding:10px 14px;border-radius:7px;
+  font-size:13px;margin-bottom:12px}
+.toast{position:fixed;bottom:18px;right:18px;background:var(--panel);
+  border:1px solid var(--rule);border-left:3px solid var(--accent);
+  padding:11px 16px;border-radius:7px;font-size:13px;box-shadow:0 8px 24px -10px rgba(0,0,0,.4);
+  opacity:0;transform:translateY(6px);transition:opacity .18s,transform .18s;pointer-events:none}
+.toast.show{opacity:1;transform:none}
+@media (prefers-reduced-motion:reduce){.toast{transition:none}}
+.back{margin-bottom:10px}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="mark">&raquo;</span> dagron</div>
+  <span class="ver" id="ver">engine</span>
+  <nav>
+    <button data-view="runs">Runs</button>
+    <button data-view="dead">Dead letters</button>
+    <button data-view="config">Config</button>
+    <button data-view="metrics">Metrics</button>
+  </nav>
+  <span class="spacer"></span>
+  <span class="pill"><span class="dot" id="hdot"></span><span id="htxt">checking…</span></span>
+</header>
+<main id="main"></main>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const $ = (s, r) => (r || document).querySelector(s);
+const el = (t, a, kids) => {
+  const n = document.createElement(t);
+  for (const k in (a || {})) {
+    if (k === "class") n.className = a[k];
+    else if (k === "text") n.textContent = a[k];
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), a[k]);
+    else n.setAttribute(k, a[k]);
+  }
+  for (const c of (kids || [])) if (c) n.appendChild(c);
+  return n;
+};
+const esc = (s) => String(s == null ? "" : s);
+
+/* ---- api ------------------------------------------------------------- */
+// Same origin as the engine's ops API; no auth surface exists here, by design.
+async function api(path, opts) {
+  // Content-Type only when there IS a body. `rerun_run` takes
+  // `Option<Json<RerunBody>>`, and axum treats a declared `application/json`
+  // with an empty body as malformed JSON rather than as "no body" — so
+  // announcing it on the bodyless Rerun POST rejected the request before the
+  // handler ran.
+  const o = opts || {};
+  const headers = o.body
+    ? Object.assign({ "content-type": "application/json" }, o.headers)
+    : o.headers;
+  const res = await fetch(path, Object.assign({}, o, headers ? { headers } : {}));
+  const body = await res.text();
+  if (!res.ok) throw new Error(body.slice(0, 300) || (res.status + " " + res.statusText));
+  return body ? JSON.parse(body) : null;
+}
+async function apiText(path) {
+  const res = await fetch(path);
+  const body = await res.text();
+  if (!res.ok) throw new Error(body.slice(0, 300));
+  return body;
+}
+
+/* ---- shared ---------------------------------------------------------- */
+const status = (s) => el("span", { class: "st st-" + esc(s), text: esc(s) });
+function when(ts) {
+  if (!ts) return "—";
+  const d = new Date(ts);
+  if (isNaN(d)) return esc(ts);
+  const secs = Math.round((Date.now() - d.getTime()) / 1000);
+  if (secs < 60) return secs + "s ago";
+  if (secs < 3600) return Math.round(secs / 60) + "m ago";
+  if (secs < 86400) return Math.round(secs / 3600) + "h ago";
+  return d.toISOString().slice(0, 16).replace("T", " ");
+}
+function took(a, b) {
+  if (!a || !b) return "—";
+  const ms = new Date(b) - new Date(a);
+  if (isNaN(ms) || ms < 0) return "—";
+  if (ms < 1000) return ms + "ms";
+  if (ms < 60000) return (ms / 1000).toFixed(1) + "s";
+  return Math.floor(ms / 60000) + "m " + Math.round((ms % 60000) / 1000) + "s";
+}
+let toastTimer;
+function toast(msg) {
+  const t = $("#toast");
+  t.textContent = msg; t.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove("show"), 2600);
+}
+function fail(e) {
+  return el("div", { class: "err", text: "Could not load: " + (e && e.message ? e.message : e) });
+}
+function card(kids) { return el("div", { class: "card" }, kids); }
+function tbl(heads, rows) {
+  return el("div", { class: "tw" }, [
+    el("table", {}, [
+      el("thead", {}, [el("tr", {}, heads.map((h) => el("th", { text: h })))]),
+      el("tbody", {}, rows),
+    ]),
+  ]);
+}
+
+/* ---- runs ------------------------------------------------------------ */
+const STATES = ["", "running", "pending", "succeeded", "failed", "cancelled"];
+let runFilter = "", autoTimer = null, auto = true;
+
+async function viewRuns(main) {
+  main.textContent = "";
+  main.appendChild(el("h2", { text: "Runs" }));
+  main.appendChild(el("div", { class: "sub", text: "Every run this engine knows about, newest first." }));
+
+  const sel = el("select", { onchange: (e) => { runFilter = e.target.value; viewRuns(main); } },
+    STATES.map((s) => el("option", { value: s, text: s || "All statuses", selected: s === runFilter ? "selected" : null })));
+  const autoBtn = el("button", { class: "act", text: auto ? "Auto-refresh: on" : "Auto-refresh: off",
+    onclick: () => { auto = !auto; viewRuns(main); } });
+  main.appendChild(el("div", { class: "bar" }, [sel, autoBtn,
+    el("button", { class: "act", text: "Refresh", onclick: () => viewRuns(main) })]));
+
+  const host = el("div"); main.appendChild(host);
+  try {
+    const q = runFilter ? "?status=" + encodeURIComponent(runFilter) + "&limit=100" : "?limit=100";
+    const data = await api("/runs" + q);
+    const runs = (data && data.runs) || [];
+    if (!runs.length) { host.appendChild(card([el("div", { class: "empty", text: "No runs yet." })])); }
+    else {
+      host.appendChild(card([tbl(["", "Workflow", "Run", "Started", "Duration"], runs.map((r) =>
+        el("tr", {}, [
+          el("td", {}, [status(r.status)]),
+          el("td", {}, [el("b", { text: esc(r.name) || "—" })]),
+          el("td", {}, [el("button", { class: "lk mono", text: String(r.id).slice(0, 8),
+            onclick: () => go("run", r.id) })]),
+          el("td", { class: "mono", text: when(r.created_at) }),
+          el("td", { class: "mono", text: took(r.created_at, r.finished_at) }),
+        ])))]));
+    }
+  } catch (e) { host.appendChild(fail(e)); }
+
+  clearTimeout(autoTimer);
+  if (auto) autoTimer = setTimeout(() => { if (route.view === "runs") viewRuns(main); }, 4000);
+}
+
+/* ---- one run --------------------------------------------------------- */
+async function viewRun(main, id) {
+  clearTimeout(autoTimer);
+  main.textContent = "";
+  main.appendChild(el("div", { class: "back" }, [
+    el("button", { class: "lk", text: "← All runs", onclick: () => go("runs") })]));
+
+  let data;
+  try { data = await api("/runs/" + encodeURIComponent(id)); }
+  catch (e) { main.appendChild(fail(e)); return; }
+  const run = data.run || {}, tasks = data.tasks || [];
+
+  main.appendChild(el("h2", {}, [document.createTextNode("Run "),
+    el("span", { class: "mono", text: String(id).slice(0, 8) })]));
+  main.appendChild(el("div", { class: "sub", text: tasks.length + " task" + (tasks.length === 1 ? "" : "s") }));
+
+  const act = async (label, path) => {
+    try { await api(path, { method: "POST" }); toast(label); viewRun(main, id); }
+    catch (e) { toast("Failed: " + e.message); }
+  };
+  const terminal = ["succeeded", "failed", "cancelled"].indexOf(run.status) >= 0;
+  main.appendChild(el("div", { class: "bar" }, [
+    el("button", { class: "act danger", text: "Cancel run", disabled: terminal ? "disabled" : null,
+      onclick: () => act("Run cancelled", "/runs/" + encodeURIComponent(id) + "/cancel") }),
+    el("button", { class: "act", text: "Rerun",
+      onclick: () => act("Rerun submitted", "/runs/" + encodeURIComponent(id) + "/rerun") }),
+    el("button", { class: "act", text: "Refresh", onclick: () => viewRun(main, id) }),
+  ]));
+
+  main.appendChild(el("div", { class: "grid" }, [
+    el("div", { class: "kv" }, [el("div", { class: "k", text: "Status" }), el("div", { class: "v" }, [status(run.status)])]),
+    el("div", { class: "kv" }, [el("div", { class: "k", text: "Started" }), el("div", { class: "v mono", text: when(run.created_at) })]),
+    el("div", { class: "kv" }, [el("div", { class: "k", text: "Duration" }), el("div", { class: "v mono", text: took(run.created_at, run.finished_at) })]),
+    el("div", { class: "kv" }, [el("div", { class: "k", text: "Definition" }), el("div", { class: "v mono", text: esc(run.definition_id).slice(0, 12) || "—" })]),
+  ]));
+
+  main.appendChild(el("div", { style: "height:16px" }));
+  main.appendChild(card([tbl(["", "Task", "Attempt", "Finished", "Actions"], tasks.map((t) => {
+    const p = "/runs/" + encodeURIComponent(id) + "/tasks/" + encodeURIComponent(t.id);
+    const btns = [el("button", { class: "act", text: "Logs", onclick: () => showLogs(main, id, t) })];
+    if (t.status === "awaiting_approval") {
+      btns.push(el("button", { class: "act", text: "Approve", onclick: () => act("Approved", p + "/approve") }));
+      btns.push(el("button", { class: "act danger", text: "Reject", onclick: () => act("Rejected", p + "/reject") }));
+    } else if (["succeeded", "failed", "skipped", "cancelled"].indexOf(t.status) >= 0) {
+      btns.push(el("button", { class: "act", text: "Clear + rerun", onclick: () => act("Task cleared", p + "/clear") }));
+    }
+    return el("tr", {}, [
+      el("td", {}, [status(t.status)]),
+      el("td", {}, [el("b", { text: esc(t.name) })]),
+      el("td", { class: "mono", text: String(t.attempt == null ? "—" : t.attempt) }),
+      el("td", { class: "mono", text: when(t.finished_at) }),
+      el("td", {}, [el("div", { class: "bar", style: "margin:0" }, btns)]),
+    ]);
+  }))]));
+
+  main.appendChild(el("div", { style: "height:16px" }));
+  const logHost = el("div"); main.appendChild(logHost);
+  logHost.appendChild(el("div", { class: "bar" }, [
+    el("button", { class: "act", text: "Show whole-run log", onclick: async () => {
+      logHost.textContent = "";
+      try {
+        const txt = await apiText("/runs/" + encodeURIComponent(id) + "/logs");
+        logHost.appendChild(card([el("pre", { class: "log", text: txt || "(empty)" })]));
+      } catch (e) { logHost.appendChild(fail(e)); }
+    } }),
+  ]));
+}
+
+async function showLogs(main, runId, task) {
+  try {
+    const txt = await apiText("/runs/" + encodeURIComponent(runId) + "/tasks/" + encodeURIComponent(task.id) + "/logs");
+    const box = card([
+      el("div", { class: "kv" }, [el("div", { class: "k", text: "Task log" }),
+        el("div", { class: "v", text: esc(task.name) })]),
+      el("pre", { class: "log", text: txt || "(empty)" }),
+    ]);
+    main.appendChild(el("div", { style: "height:16px" }));
+    main.appendChild(box);
+    box.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  } catch (e) { toast("No logs: " + e.message); }
+}
+
+/* ---- dead letters ---------------------------------------------------- */
+async function viewDead(main) {
+  clearTimeout(autoTimer);
+  main.textContent = "";
+  main.appendChild(el("h2", { text: "Dead letters" }));
+  main.appendChild(el("div", { class: "sub", text: "Submissions the engine could not turn into a run. Redrive replays one." }));
+  try {
+    const data = await api("/dead-letters");
+    const rows = (data && (data.dead_letters || data.items || data.rows)) || (Array.isArray(data) ? data : []);
+    if (!rows.length) { main.appendChild(card([el("div", { class: "empty", text: "Nothing here — good." })])); return; }
+    main.appendChild(card([tbl(["Id", "Reason", "Seen", ""], rows.map((d) =>
+      el("tr", {}, [
+        el("td", { class: "mono", text: String(d.id ?? "").slice(0, 8) }),
+        el("td", { text: esc(d.error || d.reason || d.message) }),
+        el("td", { class: "mono", text: when(d.created_at) }),
+        el("td", {}, [el("button", { class: "act", text: "Redrive", onclick: async () => {
+          try { await api("/dead-letters/" + encodeURIComponent(d.id) + "/redrive", { method: "POST" });
+            toast("Redriven"); viewDead(main); }
+          catch (e) { toast("Failed: " + e.message); }
+        } })]),
+      ])))]));
+  } catch (e) { main.appendChild(fail(e)); }
+}
+
+/* ---- config / metrics ------------------------------------------------ */
+async function viewConfig(main) {
+  clearTimeout(autoTimer);
+  main.textContent = "";
+  main.appendChild(el("h2", { text: "Configuration" }));
+  main.appendChild(el("div", { class: "sub", text: "Every knob this process resolved, with where the value came from. Secrets are redacted by the engine." }));
+  try {
+    const txt = await apiText("/config");
+    main.appendChild(card([el("pre", { class: "log", text: txt })]));
+  } catch (e) { main.appendChild(fail(e)); }
+}
+async function viewMetrics(main) {
+  clearTimeout(autoTimer);
+  main.textContent = "";
+  main.appendChild(el("h2", { text: "Metrics" }));
+  main.appendChild(el("div", { class: "sub", text: "The Prometheus exposition this engine serves at /metrics." }));
+  try {
+    const txt = await apiText("/metrics");
+    main.appendChild(card([el("pre", { class: "log", text: txt })]));
+  } catch (e) { main.appendChild(fail(e)); }
+}
+
+/* ---- health ---------------------------------------------------------- */
+async function poll() {
+  try {
+    await apiText("/healthz");
+    $("#hdot").classList.add("live"); $("#htxt").textContent = "engine live";
+  } catch {
+    $("#hdot").classList.remove("live"); $("#htxt").textContent = "unreachable";
+  }
+  setTimeout(poll, 5000);
+}
+
+/* ---- routing --------------------------------------------------------- */
+// Hash routing so the whole console stays one file with no server rules.
+let route = { view: "runs", id: null };
+function go(view, id) {
+  location.hash = view === "run" ? "#run/" + encodeURIComponent(id) : "#" + view;
+}
+function render() {
+  const h = (location.hash || "#runs").slice(1);
+  const [view, id] = h.split("/");
+  route = { view: view || "runs", id: id ? decodeURIComponent(id) : null };
+  for (const b of document.querySelectorAll("nav button")) {
+    const on = b.dataset.view === route.view || (route.view === "run" && b.dataset.view === "runs");
+    if (on) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
+  }
+  const main = $("#main");
+  if (route.view === "run" && route.id) return viewRun(main, route.id);
+  if (route.view === "dead") return viewDead(main);
+  if (route.view === "config") return viewConfig(main);
+  if (route.view === "metrics") return viewMetrics(main);
+  return viewRuns(main);
+}
+for (const b of document.querySelectorAll("nav button")) {
+  b.addEventListener("click", () => go(b.dataset.view));
+}
+window.addEventListener("hashchange", render);
+render();
+poll();
+</script>
+</body>
+</html>

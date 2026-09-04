@@ -1,10 +1,17 @@
 //! Programmatic artifact store API (the live G-C2 path): PUT/GET/exists artifacts
-//! by `(run_id, task, name)`.
+//! by `(run_id, task, name)`, plus the two admin sweeps (key rotation, tier sync).
 //!
 //! Bytes are **envelope-encrypted at rest** when a KEK provider is configured —
 //! transparently, via `dagron_artifact::store_from_env` (see `AppState`). This is
 //! the sealed checkpoint/output channel a confidential task uses to persist state
 //! the operator cannot read. Disabled (503) when `DAGRON_ARTIFACT_DIR` is unset.
+//!
+//! With `DAGRON_ARTIFACT_TIER=1` the store is tiered: writes land on the local
+//! tier and move to `DAGRON_ARTIFACT_URL` under the daily uplink budget when the
+//! store is drained — periodically from `main.rs` (`DAGRON_ARTIFACT_SYNC_SECS`)
+//! or on demand through `POST /api/artifacts/sync`. Reads fall back to the remote
+//! tier; a key missing from both is still a `404` (the tier preserves the local
+//! `NotFound`).
 
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -36,8 +43,9 @@ fn internal(what: &str, e: impl std::fmt::Display) -> (StatusCode, String) {
 }
 
 /// True when a store error is an underlying filesystem "not found" (→ 404, not
-/// 500) — works through the `EncryptedStore` decorator since it propagates the
-/// inner error unchanged.
+/// 500) — works through the `EncryptedStore` and `TieredStore` decorators since
+/// both propagate the (local) inner error unchanged; the tier returns exactly the
+/// local `io::Error` when the remote tier misses too.
 fn is_not_found(e: &anyhow::Error) -> bool {
     e.downcast_ref::<std::io::Error>()
         .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
@@ -138,4 +146,35 @@ pub async fn artifact_exists(
     let key = ArtifactKey::new(run_id, task, name);
     let exists = s.exists(&key).await.map_err(|e| internal("artifact exists check failed", e))?;
     Ok(Json(json!({ "exists": exists })))
+}
+
+/// `POST /api/artifacts/sync` (admin) — drain the tiered store now: scan the
+/// local tier for task-written files, then move pending artifacts to the remote
+/// tier under today's uplink budget. The periodic loop in `main.rs`
+/// (`DAGRON_ARTIFACT_SYNC_SECS`) is the default; this is the on-demand path for a
+/// unit that just docked. Returns `{ "moved": N }` — uploads plus dedup aliases;
+/// `{ "moved": 0 }` on a store that is not tiered (the trait default).
+///
+/// Shares `rotation_lock` with key rotation on purpose (single-flight across both
+/// sweeps → `409`): a drain overlapping a re-key would upload objects still
+/// wrapped under the retiring KEK. A remote-tier fault mid-drain is a logged
+/// `500`; what already moved stays ledgered and the next drain resumes from
+/// there — the tier is resume-safe, so retrying is always correct.
+pub async fn sync_artifacts(
+    AuthUser(claims): AuthUser,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !claims.groups.iter().any(|g| g == "admin") {
+        return Err((StatusCode::FORBIDDEN, "admin group required".to_string()));
+    }
+    let s = store(&state)?;
+    let _guard = state.rotation_lock.try_lock().map_err(|_| {
+        (StatusCode::CONFLICT, "a store-wide sweep is already in progress".to_string())
+    })?;
+    let moved = s
+        .sync()
+        .await
+        .map_err(|e| internal("artifact tier sync failed", e))?;
+    tracing::info!(moved, "artifact tier sync (on demand)");
+    Ok(Json(json!({ "moved": moved })))
 }

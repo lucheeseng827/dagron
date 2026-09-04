@@ -62,6 +62,134 @@ impl std::fmt::Display for TaskBudgetExceeded {
 
 impl std::error::Error for TaskBudgetExceeded {}
 
+/// A run was refused because the SQLite datastore's filesystem is under the
+/// free-space floor (`DAGRON_MIN_FREE_BYTES`, constrained hosts).
+///
+/// A full flash device does not fail cleanly: a WAL commit needs headroom,
+/// and past zero the failure mode is a torn datastore, not a refused write.
+/// The floor refuses *new runs* while there is still room for the runs
+/// already in flight to finish and for the WAL to checkpoint — admission is
+/// the one write it is safe to say no to.
+///
+/// Typed like [`MaxActiveRunsReached`], and for the same reason: this is a
+/// capacity condition, not a fault in the submission. The ingest actor nacks
+/// the message and throttles (a valid spec is never dead-lettered for a full
+/// disk), the ops API answers `507 Insufficient Storage` + `Retry-After`, and
+/// the engine's own creators (sub-workflow triggers, dataset fires) retry on
+/// a later tick. Only the SQLite backend ever produces it — a Postgres
+/// datastore's disk is not the unit's to probe.
+#[derive(Debug, Clone)]
+pub struct DatastoreLowOnDisk {
+    /// Bytes available to this process on the datastore's filesystem.
+    pub free: u64,
+    /// The floor it fell under (`DAGRON_MIN_FREE_BYTES`).
+    pub floor: u64,
+}
+
+impl std::fmt::Display for DatastoreLowOnDisk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "datastore filesystem has {} bytes free, under the DAGRON_MIN_FREE_BYTES floor of {}",
+            self.free, self.floor
+        )
+    }
+}
+
+impl std::error::Error for DatastoreLowOnDisk {}
+
+/// Whether `e` is a **capacity refusal** — the datastore declining a new run
+/// because there is no room right now, rather than rejecting the submission
+/// itself.
+///
+/// The distinction decides what happens to the payload. A capacity refusal is
+/// a "try later": the caller nacks it back to its source, throttles, and the
+/// same spec starts once a slot or some disk frees. Anything else is a fault
+/// in the submission, and repeating it forever is worse than parking it, so it
+/// counts toward the dead-letter threshold.
+///
+/// This is a function rather than a downcast at each call site because getting
+/// it wrong is silent and expensive: the ingest actor used to test only
+/// [`MaxActiveRunsReached`], so a [`DatastoreLowOnDisk`] refusal — the one that
+/// arrives on a full flash device, in bursts, for every message at once — was
+/// dead-lettered after three redeliveries, acked off the broker, and left for
+/// an operator to redrive by hand. Every new capacity condition belongs here,
+/// and every classifier belongs on this function.
+pub fn is_capacity_refusal(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<MaxActiveRunsReached>().is_some()
+        || e.downcast_ref::<DatastoreLowOnDisk>().is_some()
+}
+
+/// Whether the engine's wall clock was trustworthy when a record was written
+/// (clock discipline on disconnected units). Stamped on every run at creation
+/// from [`crate::clock::current`].
+///
+/// Three states, deliberately not two. `Unknown` is the honest default on a
+/// host nothing has assessed, and it must stay distinguishable from
+/// `Drifted` — something looked and found the clock wrong. A regulator asks
+/// different questions about each, and collapsing them would turn "we never
+/// checked" into a verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClockConfidence {
+    /// Positive evidence of synchronisation (the host's time daemon left
+    /// `DAGRON_CLOCK_SYNC_FILE` behind).
+    Synced,
+    /// The wall clock stepped against the monotonic clock, or read earlier
+    /// than the newest record on disk at boot.
+    Drifted,
+    /// No assessment has been made.
+    #[default]
+    Unknown,
+}
+
+impl ClockConfidence {
+    /// Every state, in gauge order.
+    pub const ALL: [ClockConfidence; 3] = [Self::Synced, Self::Drifted, Self::Unknown];
+
+    /// The stored / serialized spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Synced => "synced",
+            Self::Drifted => "drifted",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// The `scheduler_clock_confidence` gauge value: `0` synced, `1` drifted,
+    /// `2` unknown — ascending in how much a reader should worry, so `> 0`
+    /// is the alert expression and no rule has to enumerate the states.
+    pub fn gauge(self) -> u64 {
+        match self {
+            Self::Synced => 0,
+            Self::Drifted => 1,
+            Self::Unknown => 2,
+        }
+    }
+}
+
+impl std::fmt::Display for ClockConfidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ClockConfidence {
+    type Err = anyhow::Error;
+
+    /// Parse the stored lowercase spelling back — exactly that spelling, so a
+    /// row a different writer produced with a different casing surfaces as an
+    /// error rather than being silently reinterpreted.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "synced" => Self::Synced,
+            "drifted" => Self::Drifted,
+            "unknown" => Self::Unknown,
+            other => anyhow::bail!("unknown clock confidence '{other}'"),
+        })
+    }
+}
+
 /// The trigger rules a task may declare (`trigger_rule:`), deciding whether it
 /// runs once all its dependencies are terminal. `all_success` is the default
 /// (and the historical behavior). Unknown values are rejected at validation.
@@ -113,6 +241,73 @@ pub fn should_retry_failed(
         return false;
     }
     attempt < max_attempts as i64
+}
+
+/// Decide whether a failed attempt should be retried **given what broke**.
+///
+/// The [`should_retry_failed`] rule spends the same budget on every failure,
+/// which is the behaviour every scheduler ships and the reason teams write
+/// bespoke bash around it: an ECC error and a NaN loss get the same three
+/// attempts, so infra faults give up too early and application faults burn
+/// GPU-hours proving a determinism nobody doubted.
+///
+/// This resolves the budget in one place, most specific first:
+///
+/// 1. the task's own `retry_budgets:` entry for this class (author's word);
+/// 2. the class's *disposition* default — infra 5, platform 3, application 1;
+/// 3. `max_attempts`, when the failure is unclassified or the class declines
+///    to have an opinion (`Unknown`).
+///
+/// The `retry_on_timeout` carve-out from #24 still applies first and still
+/// wins: a deadline kill the author opted out of retrying is not resurrected
+/// by a fault class.
+///
+/// `budget_override` is the workflow's `retry_budgets` lookup already
+/// performed by the caller (the engine holds the parsed spec; this function
+/// stays free of the DAG types so it can be unit-tested and reused by the
+/// autopsy tool).
+pub fn should_retry_failed_with_class(
+    attempt: i64,
+    max_attempts: u32,
+    timed_out: bool,
+    retry_on_timeout: bool,
+    class: Option<crate::fault::FaultClass>,
+    budget_override: Option<u32>,
+) -> bool {
+    if timed_out && !retry_on_timeout {
+        return false;
+    }
+    attempt < effective_budget(max_attempts, class, budget_override) as i64
+}
+
+/// The attempt budget actually in force for a failure. Split out from
+/// [`should_retry_failed_with_class`] so the engine can log the number it used
+/// — "not retrying, budget 1 for nan-loss" is an answer; "not retrying" is not.
+pub fn effective_budget(
+    max_attempts: u32,
+    class: Option<crate::fault::FaultClass>,
+    budget_override: Option<u32>,
+) -> u32 {
+    // 1. The author said so for this exact class.
+    if let Some(n) = budget_override {
+        return n;
+    }
+    // 2. The class's disposition has an opinion (0 = it does not).
+    if let Some(c) = class {
+        let d = c.default_budget();
+        if d > 0 {
+            return d;
+        }
+    }
+    // 3. Unclassified, *or* a class that declines: the task's own budget.
+    //    "Declines" is the unknown disposition, whose default is 0 — today
+    //    `nccl-timeout` and `unknown`. Those reach this line just as an
+    //    unmatched failure does, which is deliberate for `nccl-timeout`: an
+    //    uncorroborated collective timeout is a symptom, and a symptom must not
+    //    set a retry policy. So this is the pre-attribution behaviour for those
+    //    three cases only — a class with a real disposition took its default at
+    //    step 2 whether or not the workflow asked for one.
+    max_attempts
 }
 
 /// A claimed transactional-outbox event, handed to a delivery worker. Written in
@@ -281,6 +476,21 @@ pub struct TaskRun {
     pub wait_dataset: Option<String>,
     #[sqlx(default)]
     pub sub_run_id: Option<String>,
+    /// Fault attribution for the attempt that failed (migration 040/050):
+    /// the kebab-case [`crate::fault::FaultClass`], the line that produced it,
+    /// and how much the verdict should be trusted.
+    ///
+    /// `None` = unclassified, which is **not** the same as
+    /// `Some("unknown")`: the first means nothing has looked, the second means
+    /// something looked and could not tell. The retry budget treats them
+    /// identically (both fall back to `max_attempts`), but an operator chasing
+    /// coverage needs to tell them apart.
+    #[sqlx(default)]
+    pub fault_class: Option<String>,
+    #[sqlx(default)]
+    pub fault_detail: Option<String>,
+    #[sqlx(default)]
+    pub fault_confidence: Option<String>,
 }
 
 // Constructed only by the ops read API (`db::get_run`); a lean build never
@@ -295,6 +505,19 @@ pub struct WorkflowRun {
     pub output: Option<String>,
     pub created_at: String,
     pub finished_at: Option<String>,
+    /// Clock confidence at creation (migration 041/052): `synced` /
+    /// `drifted` / `unknown` as [`ClockConfidence::as_str`] spells them, the
+    /// signed offset (ms) behind a `drifted` verdict, and what produced it
+    /// (`sync-file` / `step` / `behind-datastore`). `None` only for a row
+    /// written before the columns existed. All `#[sqlx(default)]`, so every
+    /// other projection of `workflow_runs` — including the API gateway's —
+    /// keeps mapping without selecting them.
+    #[sqlx(default)]
+    pub clock_confidence: Option<String>,
+    #[sqlx(default)]
+    pub clock_offset_ms: Option<i64>,
+    #[sqlx(default)]
+    pub clock_source: Option<String>,
 }
 
 /// One row of the run-list view (v5 management API). Joins
@@ -526,5 +749,125 @@ mod tests {
         // attempts to spare — the #24 behavior.
         assert!(!should_retry_failed(1, 3, true, false), "opted-out timeout fails at once");
         assert!(!should_retry_failed(1, 10, true, false));
+    }
+
+    #[test]
+    fn an_unclassified_failure_keeps_the_tasks_own_budget() {
+        // The compatibility guarantee: every workflow that predates fault
+        // attribution retries exactly as it did before.
+        assert_eq!(effective_budget(3, None, None), 3);
+        assert!(should_retry_failed_with_class(1, 3, false, true, None, None));
+        assert!(!should_retry_failed_with_class(3, 3, false, true, None, None));
+    }
+
+    #[test]
+    fn an_infra_fault_gets_a_wider_budget_than_the_task_asked_for() {
+        use crate::fault::FaultClass;
+        // max_attempts=1 (the default: no retries) but the GPU fell off the
+        // bus. The task did nothing wrong and the retry lands elsewhere.
+        assert_eq!(effective_budget(1, Some(FaultClass::GpuFallenOffBus), None), 5);
+        assert!(should_retry_failed_with_class(
+            1, 1, false, true,
+            Some(FaultClass::GpuFallenOffBus), None
+        ));
+    }
+
+    #[test]
+    fn an_application_fault_is_not_retried_however_generous_max_attempts_is() {
+        use crate::fault::FaultClass;
+        // The money case. max_attempts=10 on a thousand-GPU job whose loss went
+        // NaN: nine more attempts reproduce it exactly, at full cluster cost.
+        assert_eq!(effective_budget(10, Some(FaultClass::NanLoss), None), 1);
+        assert!(!should_retry_failed_with_class(
+            1, 10, false, true,
+            Some(FaultClass::NanLoss), None
+        ));
+    }
+
+    #[test]
+    fn an_uncorroborated_collective_timeout_falls_back_rather_than_guessing() {
+        use crate::fault::FaultClass;
+        // NcclTimeout has an Unknown disposition on purpose: it must neither
+        // claim the infra budget nor be starved to one attempt. It defers.
+        assert_eq!(effective_budget(4, Some(FaultClass::NcclTimeout), None), 4);
+        assert!(should_retry_failed_with_class(
+            2, 4, false, true,
+            Some(FaultClass::NcclTimeout), None
+        ));
+    }
+
+    #[test]
+    fn an_explicit_per_class_budget_beats_the_disposition_default() {
+        use crate::fault::FaultClass;
+        // The author overrides both directions: infra down to 2, and an
+        // application fault they genuinely want retried once more.
+        assert_eq!(effective_budget(3, Some(FaultClass::GpuEcc), Some(2)), 2);
+        assert_eq!(effective_budget(1, Some(FaultClass::NanLoss), Some(2)), 2);
+        assert!(!should_retry_failed_with_class(
+            2, 3, false, true,
+            Some(FaultClass::GpuEcc), Some(2)
+        ));
+    }
+
+    #[test]
+    fn the_no_retry_on_timeout_carve_out_still_wins_over_any_class() {
+        use crate::fault::FaultClass;
+        // #24's rule is about a deadline the author declared un-retryable. A
+        // fault class must not resurrect it, even an infrastructural one.
+        assert!(!should_retry_failed_with_class(
+            1, 5, true, false,
+            Some(FaultClass::GpuFallenOffBus), None
+        ));
+        // ...and a timeout that *is* retryable still respects the class budget.
+        assert!(should_retry_failed_with_class(
+            1, 1, true, true,
+            Some(FaultClass::FabricIb), None
+        ));
+    }
+
+    #[test]
+    fn a_zero_budget_stops_the_task_without_underflowing() {
+        use crate::fault::FaultClass;
+        // An author writing `retry_budgets: { nan-loss: 0 }` means "never run
+        // this again", including the attempt that just ran.
+        assert_eq!(effective_budget(5, Some(FaultClass::NanLoss), Some(0)), 0);
+        assert!(!should_retry_failed_with_class(
+            1, 5, false, true,
+            Some(FaultClass::NanLoss), Some(0)
+        ));
+    }
+
+    /// Clock confidence round-trips through its stored spelling, defaults to
+    /// `unknown` (a value, never a guess), rejects any other spelling, and
+    /// orders its gauge so `> 0` means "not synced".
+    #[test]
+    fn clock_confidence_round_trips_and_gauges() {
+        for c in ClockConfidence::ALL {
+            assert_eq!(c.as_str().parse::<ClockConfidence>().unwrap(), c);
+            assert_eq!(c.to_string(), c.as_str());
+        }
+        assert_eq!(ClockConfidence::default(), ClockConfidence::Unknown);
+        assert!("Synced".parse::<ClockConfidence>().is_err(), "stored spelling is lowercase, exactly");
+        assert!("".parse::<ClockConfidence>().is_err());
+        assert_eq!(ClockConfidence::Synced.gauge(), 0);
+        assert!(ClockConfidence::Drifted.gauge() > 0);
+        assert!(ClockConfidence::Unknown.gauge() > ClockConfidence::Drifted.gauge());
+        assert_eq!(serde_json::to_string(&ClockConfidence::Drifted).unwrap(), "\"drifted\"");
+    }
+
+    /// The disk-floor refusal names both numbers and the knob, so whoever
+    /// reads a 507 (or a nack log line) knows what to free or raise — and it
+    /// travels through anyhow as a typed error, which is how every caller
+    /// tells it from a real failure.
+    #[test]
+    fn datastore_low_on_disk_names_both_numbers_and_the_knob() {
+        let e = DatastoreLowOnDisk { free: 12_345, floor: 67_108_864 };
+        let msg = e.to_string();
+        assert!(msg.contains("12345"), "{msg}");
+        assert!(msg.contains("67108864"), "{msg}");
+        assert!(msg.contains("DAGRON_MIN_FREE_BYTES"), "{msg}");
+        let any = anyhow::Error::new(e);
+        assert!(any.downcast_ref::<DatastoreLowOnDisk>().is_some());
+        assert!(any.downcast_ref::<MaxActiveRunsReached>().is_none());
     }
 }

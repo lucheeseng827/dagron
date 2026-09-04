@@ -1,33 +1,105 @@
 //! dagron MCP server core — Model Context Protocol over stdio.
 //!
 //! Exposes the dagron management API as MCP **tools** so an AI agent (an MCP
-//! client) can submit, list, inspect, and cancel workflow runs and read task logs.
-//! The catalogue also surfaces cluster-internal signals — `dagron_get_metrics`
-//! (run/task counts + dead-letter total), `dagron_list_dead_letters` (the poison
-//! queue), and `dagron_get_run_events` (a bounded read of the per-run SSE event
-//! channel) — so the engine itself is the communication seam between the AI
-//! agent and the live state of the Dagron cluster, not just a CRUD façade.
+//! client) can author, run, recover and inspect workflows without a human
+//! dropping to `curl`. The catalogue spans the whole loop: register and run a
+//! named workflow, submit ad-hoc YAML (idempotently), wait on a run, read its
+//! logs and artifacts, resolve an approval gate, rerun or redrive a failure, and
+//! write down what it concluded — plus the cluster-internal signals
+//! (`dagron_get_metrics`, `dagron_get_health`, `dagron_list_dead_letters`,
+//! `dagron_get_run_events`) that let it reason about what the engine is doing,
+//! not just send commands.
+//!
 //! [`handle`] dispatches one JSON-RPC message; [`DagronClient`] is the thin
-//! dagron-api HTTP adapter the tools call.
+//! dagron-api HTTP adapter the tools call; [`tools`] owns the catalogue and its
+//! dispatch.
+//!
+//! **Read-only mode.** P0/P1 turned this server from mostly-read into read-write
+//! against a live scheduler. `DAGRON_MCP_READONLY=1` hides every mutating tool
+//! from `tools/list` and refuses it on call, so the earlier safe-by-default
+//! posture stays one env var away.
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::time::Duration;
 
+mod tools;
+
+pub use tools::{call_tool, tool_access, tool_defs, tool_defs_for, Access};
+
 /// MCP protocol revision this server implements.
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 pub const SERVER_NAME: &str = "dagron-mcp";
+
+/// Inline cap for [`DagronClient::max_artifact_bytes`], overridable with
+/// `DAGRON_MCP_MAX_ARTIFACT_BYTES`. Matches the SSE window's cap: comfortably
+/// past a log file or a JSON result, far short of a context window.
+const DEFAULT_MAX_ARTIFACT_BYTES: usize = 256 * 1024;
+
+/// HTTP method, so one [`DagronClient::request`] serves every tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Method {
+    Get,
+    Post,
+    Put,
+    Delete,
+}
+
+/// One dagron-api response, status intact.
+///
+/// The status is carried rather than collapsed into `Result` because a `409`
+/// ("that workflow is paused") is an answer the agent should reason about, not a
+/// malfunction — see `tools::render`.
+#[derive(Debug, Clone)]
+pub struct ApiResponse {
+    pub status: u16,
+    pub body: String,
+}
+
+impl ApiResponse {
+    pub fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+
+    /// The body on 2xx, an error otherwise. The shape the pre-P0 tools wanted,
+    /// and what [`DagronClient::get`] and [`DagronClient::post`] still give a
+    /// composing server.
+    pub fn into_success(self) -> Result<String> {
+        if self.is_success() {
+            Ok(self.body)
+        } else {
+            anyhow::bail!("dagron-api returned {}: {}", self.status, self.body)
+        }
+    }
+}
+
+/// A response whose body is bytes, not text — artifacts are arbitrary files.
+#[derive(Debug, Clone)]
+pub struct BytesResponse {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
+impl BytesResponse {
+    pub fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+}
 
 /// Thin client for the dagron management API (`dagron-api`).
 pub struct DagronClient {
     http: reqwest::Client,
     base: String,
     token: Option<String>,
+    readonly: bool,
+    max_artifact_bytes: usize,
 }
 
 impl DagronClient {
     /// `DAGRON_API_URL` (default `http://localhost:8080`) + optional
-    /// `DAGRON_MCP_TOKEN` (sent as `Authorization: Bearer …`).
+    /// `DAGRON_MCP_TOKEN` (sent as `Authorization: Bearer …`),
+    /// `DAGRON_MCP_READONLY` and `DAGRON_MCP_MAX_ARTIFACT_BYTES`.
     ///
     /// Fails when the token would cross the network in the clear — see
     /// [`plaintext_token_verdict`] for the reasoning and the opt-out.
@@ -35,11 +107,48 @@ impl DagronClient {
         let base = std::env::var("DAGRON_API_URL")
             .unwrap_or_else(|_| "http://localhost:8080".to_string());
         let token = std::env::var("DAGRON_MCP_TOKEN").ok().filter(|t| !t.is_empty());
-        let opted_in = std::env::var("DAGRON_MCP_ALLOW_PLAINTEXT_TOKEN")
-            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
+        let opted_in = env_flag("DAGRON_MCP_ALLOW_PLAINTEXT_TOKEN");
         plaintext_token_verdict(&base, token.is_some(), opted_in)?;
-        Ok(Self { http: reqwest::Client::new(), base, token })
+        let max_artifact_bytes = std::env::var("DAGRON_MCP_MAX_ARTIFACT_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_MAX_ARTIFACT_BYTES);
+        Ok(Self {
+            http: reqwest::Client::new(),
+            base,
+            token,
+            readonly: env_flag("DAGRON_MCP_READONLY"),
+            max_artifact_bytes,
+        })
+    }
+
+    /// A client against an explicit base URL. For tests and for a composing
+    /// server that resolves its configuration some other way.
+    pub fn new(base: impl Into<String>, token: Option<String>) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            base: base.into(),
+            token,
+            readonly: false,
+            max_artifact_bytes: DEFAULT_MAX_ARTIFACT_BYTES,
+        }
+    }
+
+    /// Hide and refuse every mutating tool.
+    pub fn with_readonly(mut self, readonly: bool) -> Self {
+        self.readonly = readonly;
+        self
+    }
+
+    /// Whether the write tools are hidden and refused.
+    pub fn readonly(&self) -> bool {
+        self.readonly
+    }
+
+    /// Largest artifact returned inline to the agent, in bytes.
+    pub fn max_artifact_bytes(&self) -> usize {
+        self.max_artifact_bytes
     }
 
     fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -49,26 +158,89 @@ impl DagronClient {
         }
     }
 
-    /// GET `path` against dagron-api. Public so a composing server can add tools
-    /// without re-implementing base-URL and auth handling.
-    pub async fn get(&self, path: &str) -> Result<String> {
+    fn build(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<(String, &'static str)>,
+        headers: &[(&str, String)],
+    ) -> reqwest::RequestBuilder {
+        let url = format!("{}{path}", self.base);
+        let mut rb = match method {
+            Method::Get => self.http.get(url),
+            Method::Post => self.http.post(url),
+            Method::Put => self.http.put(url),
+            Method::Delete => self.http.delete(url),
+        };
+        rb = self.auth(rb);
+        for (name, value) in headers {
+            rb = rb.header(*name, value);
+        }
+        if let Some((b, ct)) = payload {
+            rb = rb.header("content-type", ct).body(b);
+        }
+        rb
+    }
+
+    /// One request against dagron-api, status preserved.
+    ///
+    /// Public so a composing server can add tools without re-implementing
+    /// base-URL, auth and status handling.
+    pub async fn request(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<(String, &'static str)>,
+        headers: &[(&str, String)],
+    ) -> Result<ApiResponse> {
         let r = self
-            .auth(self.http.get(format!("{}{path}", self.base)))
+            .build(method, path, payload, headers)
             .send()
             .await
             .context("dagron-api request failed")?;
-        body_or_status(r).await
+        let status = r.status().as_u16();
+        // Propagate a failed body read rather than defaulting to "". A
+        // connection that breaks after the status line would otherwise arrive
+        // here as a 2xx with an empty body, which `tools::render` reports as
+        // `{"status":200,"ok":true}` — telling the agent the call succeeded and
+        // simply returned nothing. A transport failure has to stay a failure.
+        let body = r.text().await.context("dagron-api response body read failed")?;
+        Ok(ApiResponse { status, body })
     }
 
-    /// POST `path` with an optional `(body, content-type)`. Public for the same
-    /// reason as [`DagronClient::get`].
+    /// [`DagronClient::request`] for a body that is not text — an artifact.
+    pub async fn request_bytes(&self, path: &str) -> Result<BytesResponse> {
+        let r = self
+            .build(Method::Get, path, None, &[])
+            .send()
+            .await
+            .context("dagron-api request failed")?;
+        let status = r.status().as_u16();
+        let content_type = r
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        // Same reasoning as `request`, and it bites harder here: a truncated
+        // download defaulting to empty would be described to the agent as a
+        // complete zero-byte artifact.
+        let bytes = r
+            .bytes()
+            .await
+            .context("dagron-api artifact body read failed")?
+            .to_vec();
+        Ok(BytesResponse { status, content_type, bytes })
+    }
+
+    /// GET `path`, body on 2xx and an error otherwise.
+    pub async fn get(&self, path: &str) -> Result<String> {
+        self.request(Method::Get, path, None, &[]).await?.into_success()
+    }
+
+    /// POST `path` with an optional `(body, content-type)`, body on 2xx and an
+    /// error otherwise.
     pub async fn post(&self, path: &str, body: Option<(String, &'static str)>) -> Result<String> {
-        let mut rb = self.auth(self.http.post(format!("{}{path}", self.base)));
-        if let Some((b, ct)) = body {
-            rb = rb.header("content-type", ct).body(b);
-        }
-        let r = rb.send().await.context("dagron-api request failed")?;
-        body_or_status(r).await
+        self.request(Method::Post, path, body, &[]).await?.into_success()
     }
 
     /// Bounded read of an SSE endpoint: open the connection, then pull chunks
@@ -76,7 +248,7 @@ impl DagronClient {
     /// Returns the raw text accumulated. The caller is responsible for parsing
     /// SSE framing — keeping the I/O primitive small means the same helper
     /// works for any future stream endpoint we expose.
-    async fn read_sse(&self, path: &str, budget: Duration) -> Result<String> {
+    pub(crate) async fn read_sse(&self, path: &str, budget: Duration) -> Result<String> {
         let mut r = self
             .auth(self.http.get(format!("{}{path}", self.base)))
             .header("accept", "text/event-stream")
@@ -121,6 +293,13 @@ impl DagronClient {
         }
         Ok(String::from_utf8_lossy(&buf).into_owned())
     }
+}
+
+/// A boolean env var, in the one spelling set this crate accepts.
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
 }
 
 /// Refuse a configuration that would put the bearer token on the wire in the
@@ -184,324 +363,6 @@ fn plaintext_remote_host(base: &str) -> Option<String> {
     (!is_loopback).then(|| host.to_string())
 }
 
-async fn body_or_status(r: reqwest::Response) -> Result<String> {
-    let status = r.status();
-    let text = r.text().await.unwrap_or_default();
-    if status.is_success() {
-        Ok(text)
-    } else {
-        anyhow::bail!("dagron-api returned {status}: {text}")
-    }
-}
-
-/// Query params of the shared log filter grammar
-/// (`dagron_logging::logfilter`), as MCP tool arguments. Listed once so the
-/// per-task and whole-run log tools can't drift into offering different filters
-/// over the same data — and so an agent that learns one has learned both.
-const LOG_FILTER_ARGS: &[(&str, &str)] = &[
-    ("q", "keep only lines containing this text"),
-    ("exclude", "drop lines containing this text"),
-    ("regex", "keep only lines matching this regular expression"),
-    ("level", "keep only these inferred levels, comma-separated (error,warn,info,debug,trace,plain)"),
-    ("case", "match case-sensitively ('1' to enable; default is insensitive)"),
-    ("context", "also keep this many lines either side of each match"),
-    ("limit", "maximum lines to return"),
-    ("tail", "when capped, keep the last lines instead of the first ('1' to enable)"),
-];
-
-/// Build a log tool's `properties` map: `run_id`, the filter args, plus whatever
-/// is specific to that tool.
-fn log_tool_props(extra: &[(&str, Value)]) -> Value {
-    let mut props = serde_json::Map::new();
-    props.insert("run_id".into(), json!({ "type": "string" }));
-    for (name, value) in extra {
-        props.insert((*name).into(), value.clone());
-    }
-    for (name, description) in LOG_FILTER_ARGS {
-        props.insert((*name).into(), json!({ "type": "string", "description": description }));
-    }
-    Value::Object(props)
-}
-
-/// Collect the log filter args present in a tool call into a query string.
-///
-/// Values are passed through as strings and validated by the engine, which owns
-/// the grammar — re-implementing the parse here would give an agent two places
-/// to be told a regex is invalid, with two different messages.
-fn log_filter_query(args: &Value) -> Result<String> {
-    let mut parts: Vec<String> = Vec::new();
-    let mut push = |key: &str| -> Result<()> {
-        match args.get(key) {
-            None | Some(Value::Null) => Ok(()),
-            Some(Value::String(s)) if s.is_empty() => Ok(()),
-            Some(Value::String(s)) => {
-                parts.push(format!("{key}={}", urlencode(s)));
-                Ok(())
-            }
-            Some(other) => anyhow::bail!("`{key}` must be a string, got {other}"),
-        }
-    };
-    for (name, _) in LOG_FILTER_ARGS {
-        push(name)?;
-    }
-    push("task")?;
-    Ok(if parts.is_empty() { String::new() } else { format!("?{}", parts.join("&")) })
-}
-
-/// Percent-encode a query value. Only unreserved characters pass through, so a
-/// regex containing `&`, `+` or `[` reaches the engine as one intact value.
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
-/// The MCP tool catalogue (name, description, JSON-Schema input).
-pub fn tool_defs() -> Vec<Value> {
-    vec![
-        json!({
-            "name": "dagron_list_runs",
-            "description": "List recent workflow runs (id, status, timing).",
-            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
-        }),
-        json!({
-            "name": "dagron_get_run",
-            "description": "Get one workflow run's detail by id.",
-            "inputSchema": {
-                "type": "object",
-                "properties": { "run_id": { "type": "string" } },
-                "required": ["run_id"], "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "dagron_submit_run",
-            "description": "Submit a new workflow run from a DAG YAML spec.",
-            "inputSchema": {
-                "type": "object",
-                "properties": { "yaml": { "type": "string", "description": "the DAG spec (YAML)" } },
-                "required": ["yaml"], "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "dagron_cancel_run",
-            "description": "Cancel a running workflow by id.",
-            "inputSchema": {
-                "type": "object",
-                "properties": { "run_id": { "type": "string" } },
-                "required": ["run_id"], "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "dagron_get_task_logs",
-            "description": "Read a task's captured logs/output within a run. Accepts the same log filter as dagron_get_run_logs.",
-            "inputSchema": {
-                "type": "object",
-                "properties": log_tool_props(&[("task_id", json!({ "type": "string" }))]),
-                "required": ["run_id", "task_id"], "additionalProperties": false
-            }
-        }),
-        json!({
-            // The tool an agent should reach for first when a run failed: one
-            // call returns every task's output, attributed and filtered, instead
-            // of N calls to guess which task printed the error.
-            "name": "dagron_get_run_logs",
-            "description": "Read the whole run's logs as one attributed stream, filtered server-side. \
-Use `level`/`q`/`regex`/`exclude` to narrow, `task` to restrict to specific tasks, and `context` \
-to keep surrounding lines. Prefer this over per-task reads when diagnosing a failure.",
-            "inputSchema": {
-                "type": "object",
-                "properties": log_tool_props(&[(
-                    "task",
-                    json!({ "type": "string", "description": "restrict to these task names or ids (comma-separated)" }),
-                )]),
-                "required": ["run_id"], "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "dagron_get_metrics",
-            "description": "Cluster-internal snapshot: run/task counts by status and dead-letter total.",
-            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
-        }),
-        json!({
-            "name": "dagron_list_dead_letters",
-            "description": "Inspect the poison queue (parked submissions). `limit` defaults to 100, capped server-side at 500.",
-            "inputSchema": {
-                "type": "object",
-                "properties": { "limit": { "type": "integer", "minimum": 1, "maximum": 500 } },
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "dagron_get_run_events",
-            "description": "Bounded read of the run's live event channel (SSE). Connects, collects events emitted within `wait_ms`, then returns them. `wait_ms` defaults to 2000 and is capped at 10000 so the call always returns promptly.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "run_id": { "type": "string" },
-                    "wait_ms": { "type": "integer", "minimum": 100, "maximum": 10000 }
-                },
-                "required": ["run_id"], "additionalProperties": false
-            }
-        }),
-    ]
-}
-
-/// Execute a tool against dagron-api, returning the response text.
-pub async fn call_tool(client: &DagronClient, name: &str, args: &Value) -> Result<String> {
-    let s = |k: &str| -> Result<String> {
-        args.get(k)
-            .and_then(|v| v.as_str())
-            .map(|v| v.to_string())
-            .with_context(|| format!("missing required string argument `{k}`"))
-    };
-    // Path-segment ids are interpolated into request URLs, so restrict them to a
-    // safe alphabet — a crafted id with slashes or query fragments must not be
-    // able to reshape which dagron-api endpoint we call with our auth token.
-    let safe_id = |k: &str| -> Result<String> {
-        let v = s(k)?;
-        if v.is_empty() || !v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-            anyhow::bail!("invalid `{k}`: only non-empty [A-Za-z0-9_-] allowed");
-        }
-        Ok(v)
-    };
-    match name {
-        "dagron_list_runs" => client.get("/api/runs").await,
-        "dagron_get_run" => client.get(&format!("/api/runs/{}", safe_id("run_id")?)).await,
-        "dagron_submit_run" => {
-            // `POST /api/runs` takes a JSON envelope (`{"yaml": "…"}`), not a raw
-            // YAML body: its handler binds `Json<SubmitBody>`, which rejects any
-            // request that isn't `application/json` with a 415 before the handler
-            // runs. Posting the spec as `application/yaml` meant the one tool an
-            // agent needs most — submit a workflow — never reached the engine.
-            let body = json!({ "yaml": s("yaml")? }).to_string();
-            client.post("/api/runs", Some((body, "application/json"))).await
-        }
-        "dagron_cancel_run" => {
-            client
-                .post(&format!("/api/runs/{}/cancel", safe_id("run_id")?), None)
-                .await
-        }
-        "dagron_get_task_logs" => {
-            client
-                .get(&format!(
-                    "/api/runs/{}/tasks/{}/logs{}",
-                    safe_id("run_id")?,
-                    safe_id("task_id")?,
-                    log_filter_query(args)?
-                ))
-                .await
-        }
-        "dagron_get_run_logs" => {
-            client
-                .get(&format!(
-                    "/api/runs/{}/logs{}",
-                    safe_id("run_id")?,
-                    log_filter_query(args)?
-                ))
-                .await
-        }
-        "dagron_get_metrics" => client.get("/api/metrics").await,
-        "dagron_list_dead_letters" => {
-            // `limit` is optional — when present the server clamps to 1..=500,
-            // but we still parse it here so a bogus type fails fast as a tool
-            // error rather than confusing the AI agent with an HTTP 400.
-            let path = match args.get("limit") {
-                Some(v) if !v.is_null() => {
-                    let n = v.as_i64().with_context(|| "`limit` must be an integer")?;
-                    if !(1..=500).contains(&n) {
-                        anyhow::bail!("`limit` must be between 1 and 500");
-                    }
-                    format!("/api/dead-letters?limit={n}")
-                }
-                _ => "/api/dead-letters".to_string(),
-            };
-            client.get(&path).await
-        }
-        "dagron_get_run_events" => {
-            // Bounded poll over the per-run SSE channel. The budget is hard-capped
-            // so an MCP tool call always returns promptly — even a never-emitting
-            // run won't block the AI agent past `wait_ms`.
-            let run_id = safe_id("run_id")?;
-            let wait_ms = match args.get("wait_ms") {
-                Some(v) if !v.is_null() => v
-                    .as_i64()
-                    .with_context(|| "`wait_ms` must be an integer")?,
-                _ => 2000,
-            };
-            if !(100..=10000).contains(&wait_ms) {
-                anyhow::bail!("`wait_ms` must be between 100 and 10000");
-            }
-            let raw = client
-                .read_sse(
-                    &format!("/api/runs/{run_id}/stream"),
-                    Duration::from_millis(wait_ms as u64),
-                )
-                .await?;
-            let events = parse_sse(&raw);
-            Ok(json!({
-                "run_id": run_id,
-                "wait_ms": wait_ms,
-                "event_count": events.len(),
-                "events": events,
-            })
-            .to_string())
-        }
-        other => anyhow::bail!("unknown tool `{other}`"),
-    }
-}
-
-/// Minimal SSE parser: split on blank lines and gather `event:` / `data:` lines
-/// per event. Multi-line `data:` is joined with `\n` per the spec. Comment
-/// lines (leading `:`) and unknown fields are ignored.
-fn parse_sse(raw: &str) -> Vec<Value> {
-    let mut out = Vec::new();
-    let mut name: Option<String> = None;
-    let mut data: Vec<String> = Vec::new();
-    let flush = |name: &mut Option<String>, data: &mut Vec<String>, out: &mut Vec<Value>| {
-        if name.is_none() && data.is_empty() {
-            return;
-        }
-        let joined = data.join("\n");
-        let parsed = serde_json::from_str::<Value>(&joined).unwrap_or(Value::String(joined));
-        out.push(json!({
-            "event": name.clone().unwrap_or_else(|| "message".to_string()),
-            "data": parsed,
-        }));
-        *name = None;
-        data.clear();
-    };
-    for line in raw.split('\n') {
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        if line.is_empty() {
-            flush(&mut name, &mut data, &mut out);
-            continue;
-        }
-        if line.starts_with(':') {
-            continue;
-        }
-        let (field, value) = match line.split_once(':') {
-            Some((f, v)) => (f, v.strip_prefix(' ').unwrap_or(v)),
-            None => (line, ""),
-        };
-        match field {
-            "event" => name = Some(value.to_string()),
-            "data" => data.push(value.to_string()),
-            _ => {}
-        }
-    }
-    // The final event may not be terminated by a blank line if the read window
-    // closed mid-frame — flush so the agent still sees it.
-    flush(&mut name, &mut data, &mut out);
-    out
-}
-
 /// Handle one JSON-RPC message. Returns `Some(response)` for a request, `None` for
 /// a notification (no `id`) that needs no reply.
 pub async fn handle(client: &DagronClient, msg: &Value) -> Option<Value> {
@@ -523,7 +384,7 @@ pub async fn handle(client: &DagronClient, msg: &Value) -> Option<Value> {
             }),
         )),
         "ping" => Some(ok(id, json!({}))),
-        "tools/list" => Some(ok(id, json!({ "tools": tool_defs() }))),
+        "tools/list" => Some(ok(id, json!({ "tools": tool_defs_for(client.readonly()) }))),
         "tools/call" => {
             let params = msg.get("params").cloned().unwrap_or(Value::Null);
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -554,11 +415,7 @@ mod tests {
     use super::*;
 
     fn client() -> DagronClient {
-        DagronClient {
-            http: reqwest::Client::new(),
-            base: "http://unused.test".into(),
-            token: None,
-        }
+        DagronClient::new("http://unused.test", None)
     }
 
     #[tokio::test]
@@ -578,9 +435,9 @@ mod tests {
             .unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        // CRUD surface plus the cluster-internal triple — metrics, dead letters,
-        // and the bounded SSE event read — that lets the AI agent observe the
-        // engine, not just drive it.
+        // The pre-P0 surface: CRUD plus the cluster-internal triple — metrics,
+        // dead letters, and the bounded SSE event read — that lets the AI agent
+        // observe the engine, not just drive it.
         for expected in [
             "dagron_list_runs",
             "dagron_get_run",
@@ -601,99 +458,49 @@ mod tests {
         }
     }
 
-    #[test]
-    fn log_filter_query_encodes_only_what_was_passed() {
-        assert_eq!(log_filter_query(&json!({ "run_id": "r1" })).unwrap(), "");
-        assert_eq!(
-            log_filter_query(&json!({ "run_id": "r1", "level": "error", "context": "2" })).unwrap(),
-            "?level=error&context=2",
-        );
-        // An empty string is "not set", not "match the empty string" — an agent
-        // filling in a blank argument must not accidentally filter.
-        assert_eq!(log_filter_query(&json!({ "q": "" })).unwrap(), "");
-        // A regex with query-significant characters must survive as one value.
-        assert_eq!(
-            log_filter_query(&json!({ "regex": "a&b[0-9]+" })).unwrap(),
-            "?regex=a%26b%5B0-9%5D%2B",
-        );
-        // Wrong types fail locally with a clear message rather than as an
-        // opaque HTTP 400 from dagron-api.
-        assert!(log_filter_query(&json!({ "limit": 100 })).is_err());
-    }
-
-    #[test]
-    fn both_log_tools_offer_the_same_filter() {
-        let defs = tool_defs();
-        let props = |name: &str| -> Vec<String> {
-            let t = defs.iter().find(|t| t["name"] == name).expect("tool present");
-            let mut k: Vec<String> =
-                t["inputSchema"]["properties"].as_object().unwrap().keys().cloned().collect();
-            k.sort();
-            k
-        };
-        let task = props("dagron_get_task_logs");
-        let run = props("dagron_get_run_logs");
-        for (key, _) in LOG_FILTER_ARGS {
-            assert!(task.contains(&key.to_string()), "task tool missing {key}");
-            assert!(run.contains(&key.to_string()), "run tool missing {key}");
-        }
-        assert!(task.contains(&"task_id".to_string()));
-        assert!(run.contains(&"task".to_string()));
-    }
-
     #[tokio::test]
-    async fn dead_letters_limit_is_validated_before_request() {
-        // Out-of-range limits must fail locally so the AI agent gets a clear
-        // tool error rather than an opaque HTTP 400 from dagron-api.
-        for bad in [json!(0), json!(501), json!("ten")] {
-            let resp = handle(
-                &client(),
-                &json!({"jsonrpc":"2.0","id":4,"method":"tools/call",
-                        "params":{"name":"dagron_list_dead_letters","arguments":{"limit":bad}}}),
-            )
+    async fn readonly_hides_every_write_tool() {
+        let ro = client().with_readonly(true);
+        let resp = handle(&ro, &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
             .await
             .unwrap();
-            assert_eq!(resp["result"]["isError"], true, "expected error for {bad}");
+        let names: Vec<String> = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        for hidden in [
+            "dagron_submit_run",
+            "dagron_cancel_run",
+            "dagron_create_workflow",
+            "dagron_delete_workflow",
+            "dagron_approve_task",
+            "dagron_put_artifact",
+        ] {
+            assert!(!names.contains(&hidden.to_string()), "{hidden} must be hidden read-only");
+        }
+        // Reads still work, or the mode would be useless.
+        for shown in ["dagron_list_runs", "dagron_get_run_logs", "dagron_get_health"] {
+            assert!(names.contains(&shown.to_string()), "{shown} must stay available");
         }
     }
 
     #[tokio::test]
-    async fn run_events_rejects_out_of_range_wait() {
+    async fn readonly_refuses_a_write_tool_even_if_it_was_advertised() {
+        // Fail closed: a composing server that advertises the full catalogue
+        // must not be able to smuggle a write past the switch.
+        let ro = client().with_readonly(true);
         let resp = handle(
-            &client(),
-            &json!({"jsonrpc":"2.0","id":5,"method":"tools/call",
-                    "params":{"name":"dagron_get_run_events",
-                              "arguments":{"run_id":"abc","wait_ms":50}}}),
+            &ro,
+            &json!({"jsonrpc":"2.0","id":8,"method":"tools/call",
+                    "params":{"name":"dagron_cancel_run","arguments":{"run_id":"abc"}}}),
         )
         .await
         .unwrap();
         assert_eq!(resp["result"]["isError"], true);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("wait_ms"), "want wait_ms in error, got {text:?}");
-    }
-
-    #[test]
-    fn sse_parser_handles_multi_line_and_named_events() {
-        let raw = "event: task\ndata: {\"run_id\":\"r1\"}\n\n\
-                   : keepalive\n\n\
-                   data: line1\ndata: line2\n\n";
-        let events = parse_sse(raw);
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["event"], "task");
-        assert_eq!(events[0]["data"]["run_id"], "r1");
-        assert_eq!(events[1]["event"], "message");
-        assert_eq!(events[1]["data"], "line1\nline2");
-    }
-
-    #[test]
-    fn sse_parser_flushes_unterminated_tail() {
-        // Bounded read may close the connection mid-frame; the last event
-        // must not be dropped silently.
-        let raw = "event: resync\ndata: lagged";
-        let events = parse_sse(raw);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["event"], "resync");
-        assert_eq!(events[0]["data"], "lagged");
+        assert!(text.contains("DAGRON_MCP_READONLY"), "got {text:?}");
     }
 
     #[tokio::test]
@@ -714,91 +521,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsafe_ids_are_rejected_before_any_request() {
-        // Crafted ids with path/query characters must not reach the HTTP client.
-        for bad in ["../secrets", "1/cancel", "a?b", "x y", ""] {
-            let resp = handle(
-                &client(),
-                &json!({"jsonrpc":"2.0","id":7,"method":"tools/call",
-                        "params":{"name":"dagron_get_run","arguments":{"run_id":bad}}}),
-            )
+    async fn unknown_method_errors() {
+        let resp = handle(&client(), &json!({"jsonrpc":"2.0","id":9,"method":"bogus"}))
             .await
             .unwrap();
-            assert_eq!(resp["result"]["isError"], true, "expected error for {bad:?}");
-            // Assert the *local* validation message so a regression that lets the
-            // id reach the HTTP client (which would also set isError) is caught.
-            let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-            assert!(
-                text.contains("invalid `run_id`"),
-                "expected local run_id validation before any request for {bad:?}, got {text:?}"
-            );
-        }
-    }
-
-    /// Serve exactly one HTTP request on an ephemeral port and hand back the
-    /// request head and body. Small enough to keep in-crate, and the only way to
-    /// assert the *wire shape* of a tool call — which is where a submit that
-    /// dagron-api answers with 415 hides from every other kind of test.
-    async fn capture_one_request() -> (String, tokio::task::JoinHandle<(String, String)>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let handle = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut raw = Vec::new();
-            let mut buf = [0u8; 1024];
-            // Read the head, then exactly Content-Length bytes of body.
-            loop {
-                let n = sock.read(&mut buf).await.unwrap();
-                if n == 0 {
-                    break;
-                }
-                raw.extend_from_slice(&buf[..n]);
-                let text = String::from_utf8_lossy(&raw).into_owned();
-                let Some((head, body)) = text.split_once("\r\n\r\n") else { continue };
-                let len: usize = head
-                    .lines()
-                    .find_map(|l| {
-                        let (k, v) = l.split_once(':')?;
-                        k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse().ok())?
-                    })
-                    .unwrap_or(0);
-                if body.len() >= len {
-                    break;
-                }
-            }
-            let text = String::from_utf8_lossy(&raw).into_owned();
-            let (head, body) = text.split_once("\r\n\r\n").unwrap();
-            sock.write_all(
-                b"HTTP/1.1 201 Created\r\ncontent-type: application/json\r\n\
-                  content-length: 21\r\n\r\n{\"run_id\":\"run-0001\"}",
-            )
-            .await
-            .unwrap();
-            sock.flush().await.unwrap();
-            (head.to_string(), body.to_string())
-        });
-        (base, handle)
+        assert_eq!(resp["error"]["code"], -32601);
     }
 
     #[tokio::test]
-    async fn submit_posts_the_spec_as_json() {
-        let (base, server) = capture_one_request().await;
-        let client = DagronClient { http: reqwest::Client::new(), base, token: None };
-        let out =
-            call_tool(&client, "dagron_submit_run", &json!({ "yaml": "name: w\ntasks: []\n" }))
-                .await
-                .unwrap();
-        assert!(out.contains("run-0001"), "got {out}");
-
-        let (head, body) = server.await.unwrap();
-        assert!(head.starts_with("POST /api/runs "), "got {head}");
-        assert!(
-            head.to_lowercase().contains("content-type: application/json"),
-            "submit must be application/json or dagron-api answers 415; head: {head}"
-        );
-        let sent: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(sent["yaml"], "name: w\ntasks: []\n");
+    async fn unknown_tool_is_reported_as_tool_error() {
+        let resp = handle(
+            &client(),
+            &json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"nope","arguments":{}}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
     }
 
     #[test]
@@ -886,24 +624,5 @@ mod tests {
                 "{base} (token={has_token}) should be allowed"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn unknown_method_errors() {
-        let resp = handle(&client(), &json!({"jsonrpc":"2.0","id":9,"method":"bogus"}))
-            .await
-            .unwrap();
-        assert_eq!(resp["error"]["code"], -32601);
-    }
-
-    #[tokio::test]
-    async fn unknown_tool_is_reported_as_tool_error() {
-        let resp = handle(
-            &client(),
-            &json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"nope","arguments":{}}}),
-        )
-        .await
-        .unwrap();
-        assert_eq!(resp["result"]["isError"], true);
     }
 }

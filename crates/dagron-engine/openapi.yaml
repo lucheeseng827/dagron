@@ -836,7 +836,7 @@ paths:
       summary: List datasets
       description: >
         The dataset registry (data-aware scheduling, docs/DATASETS.md): every
-        dataset a `produces:` task (or, with dagron Enterprise, an external
+        dataset a `produces:` task (or, where it is available, an external
         event) ever updated, with its latest update, most recent first.
       operationId: listDatasets
       parameters:
@@ -896,12 +896,12 @@ paths:
           $ref: "#/components/responses/Error"
     post:
       tags: [datasets]
-      summary: Record an external dataset event (Enterprise)
+      summary: Record an external dataset event (not in this build)
       description: >
         Declare that a dataset was updated by a producer outside dagron (CDC,
         an object-store notification, another orchestrator), waking dataset
         sensors and firing `on_datasets:` triggers. Ships with dagron
-        Enterprise; the open build answers `403` with a signpost — its datasets
+        Feature-gated; this build answers `403` with a signpost — its datasets
         update via `produces:` tasks (docs/DATASETS.md).
       operationId: postDatasetEvent
       requestBody:
@@ -929,7 +929,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "403":
-          description: External dataset events require dagron Enterprise (signposted)
+          description: External dataset events are not in this build (signposted)
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1114,7 +1114,7 @@ components:
         workflow: { type: string, nullable: true, description: Producing workflow (null for external events) }
         run_id: { type: string, nullable: true }
         task_name: { type: string, nullable: true }
-        source: { type: string, enum: [task, external], description: "`task` = a produces: success; `external` = posted via the API (Enterprise)" }
+        source: { type: string, enum: [task, external], description: "`task` = a produces: success; `external` = posted via the API (feature-gated)" }
         at: { type: string, format: date-time }
 
     RunStatus:

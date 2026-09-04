@@ -6,7 +6,7 @@
 //! `DAGRON_ARTIFACTS`) to pass files; the trait is the programmatic surface the API
 //! and alternate builds use to read/write artifacts by key.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -14,7 +14,10 @@ use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 /// Identifies one artifact: produced by `task` in `run_id`, under a logical `name`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serde derives because the tiered store's ledger records keys verbatim (the
+/// raw components, not the sanitized locator — `rel_path()` is recomputed).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ArtifactKey {
     pub run_id: String,
     pub task: String,
@@ -52,6 +55,11 @@ impl ArtifactKey {
 /// features.
 #[cfg(feature = "cloud")]
 pub mod cloud;
+/// Tiered store (local tier + budgeted deferred upload to a remote tier +
+/// ledger + dedup) — the capture → uplink primitive for units on a metered
+/// link. Opted in via `DAGRON_ARTIFACT_TIER=1` (see [`store_from_env`]).
+pub mod tiered;
+pub use tiered::{TieredStore, UplinkBudget};
 
 /// Sanitize one artifact path component the way every backend keys artifacts —
 /// exposed so callers composing artifact *locations* (e.g. the engine's
@@ -123,6 +131,14 @@ pub trait ArtifactStore: Send + Sync {
     async fn rotate_from(&self, _old: &dyn dagron_crypto::KeyProvider) -> Result<usize> {
         anyhow::bail!("key rotation requires an encrypted artifact store")
     }
+
+    /// Drain deferred work — for the tiered store, the budgeted upload of
+    /// locally-captured artifacts to the remote tier. Returns how many artifacts
+    /// moved. Default: nothing to drain. Resume-safe: a sweep interrupted partway
+    /// re-runs without error.
+    async fn sync(&self) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 /// Artifacts disabled — the default when unconfigured. Every operation errors
@@ -161,6 +177,12 @@ impl LocalFsStore {
             .ok()
             .filter(|d| !d.is_empty())
             .map(Self::new)
+    }
+
+    /// The root directory (`base/<run_id>/<task>/<name>` below it). The tiered
+    /// store keeps its ledger under here (`<base>/.tiered/`).
+    pub fn base(&self) -> &Path {
+        &self.base
     }
 
     /// Create (if needed) and return the per-run directory that tasks share. This
@@ -449,7 +471,63 @@ impl<S: ArtifactStore> ArtifactStore for EncryptedStore<S> {
         }
         Ok(keys.len())
     }
+
+    /// Forward the deferred-work drain to the wrapped store. Without this the
+    /// trait default (`Ok(0)`) would silently swallow the tiered store's uplink
+    /// whenever encryption is on — the exact composition an edge unit runs
+    /// (`EncryptedStore<TieredStore<…>>`, both tiers holding ciphertext).
+    async fn sync(&self) -> Result<usize> {
+        self.inner.sync().await
+    }
 }
+
+/// Pointer types are stores in their own right, forwarding every method — so a
+/// type-erased `Box<dyn ArtifactStore>` / `Arc<dyn ArtifactStore>` can be the
+/// remote tier of a [`TieredStore`] (and any decorator can wrap a shared store)
+/// without a second trait. `?Sized` is what admits the `dyn` case.
+macro_rules! forward_artifact_store {
+    ($ptr:ident) => {
+        #[async_trait]
+        impl<T: ArtifactStore + ?Sized> ArtifactStore for $ptr<T> {
+            async fn put(&self, key: &ArtifactKey, bytes: &[u8]) -> Result<String> {
+                (**self).put(key, bytes).await
+            }
+            async fn get(&self, key: &ArtifactKey) -> Result<Vec<u8>> {
+                (**self).get(key).await
+            }
+            async fn exists(&self, key: &ArtifactKey) -> Result<bool> {
+                (**self).exists(key).await
+            }
+            fn run_location(&self, run_id: &str) -> Option<String> {
+                (**self).run_location(run_id)
+            }
+            async fn list(&self) -> Result<Vec<ArtifactKey>> {
+                (**self).list().await
+            }
+            async fn put_stream(
+                &self,
+                key: &ArtifactKey,
+                reader: Box<dyn AsyncRead + Send + Unpin>,
+            ) -> Result<String> {
+                (**self).put_stream(key, reader).await
+            }
+            async fn get_stream(
+                &self,
+                key: &ArtifactKey,
+            ) -> Result<Box<dyn AsyncRead + Send + Unpin>> {
+                (**self).get_stream(key).await
+            }
+            async fn rotate_from(&self, old: &dyn dagron_crypto::KeyProvider) -> Result<usize> {
+                (**self).rotate_from(old).await
+            }
+            async fn sync(&self) -> Result<usize> {
+                (**self).sync().await
+            }
+        }
+    };
+}
+forward_artifact_store!(Box);
+forward_artifact_store!(Arc);
 
 // ── stream-blob framing (length-delimited: [u32 len][bytes]…) ─────────────────
 
@@ -554,33 +632,69 @@ fn rotate_stream_blob(
 
 /// Build the configured programmatic (`put`/`get`) artifact store:
 ///
-/// 1. `DAGRON_ARTIFACT_URL` (s3:// / gs:// / az://) → the [`cloud`] backend —
+/// 0. `DAGRON_ARTIFACT_TIER=1` → the [`TieredStore`]: `DAGRON_ARTIFACT_DIR` is
+///    the local tier, `DAGRON_ARTIFACT_URL` the remote tier and
+///    `DAGRON_ARTIFACT_UPLINK_BYTES_PER_DAY` the per-UTC-day budget. Both
+///    locations are **required** (a tier with one side is a misconfiguration,
+///    not a fall-back) and the build must carry a cloud backend feature.
+/// 1. else `DAGRON_ARTIFACT_URL` (s3:// / gs:// / az://) → the [`cloud`] backend —
 ///    the multi-cloud checkpoint substrate. Takes precedence when both are set
 ///    (the local dir can still serve the engine's task-visible scratch).
 /// 2. else `DAGRON_ARTIFACT_DIR` → the local-FS store.
 /// 3. neither → `None` (artifacts unconfigured).
 ///
-/// Either store is transparently wrapped in an [`EncryptedStore`] when a KEK
-/// provider is configured (`DAGRON_ENV_KEK_PROVIDER` — BYOK/KMS), so a cloud
-/// bucket holds ciphertext. A `DAGRON_ARTIFACT_URL` in a build without the
-/// matching backend feature is a hard error, never a silent local fall-back.
+/// Whichever store results is transparently wrapped in an [`EncryptedStore`]
+/// when a KEK provider is configured (`DAGRON_ENV_KEK_PROVIDER` — BYOK/KMS), so a
+/// cloud bucket — and under tiering *both* tiers — holds ciphertext. A
+/// `DAGRON_ARTIFACT_URL` in a build without the matching backend feature is a
+/// hard error, never a silent local fall-back.
 ///
 /// This is the seam for put/get consumers (an artifact API / alternate builds).
 /// It intentionally does **not** touch the engine's per-run *shared directory*
 /// (`prepare_run_dir` / `DAGRON_ARTIFACTS`) — that plaintext-on-disk file-passing
 /// path is a separate mechanism a decorator cannot seal (tasks write raw files
-/// straight to the dir).
+/// straight to the dir). Under tiering the drain does *scan* that directory, so
+/// task-written files reach the remote tier too (see [`tiered`]) — **except**
+/// when a KEK provider is configured, where they would go up in the clear and
+/// are therefore kept local instead. Ciphertext at rest wins over reach: to
+/// uplink a capture from an encrypted deployment, write it through the store.
 pub fn store_from_env() -> Result<Option<Arc<dyn ArtifactStore>>> {
     let provider = dagron_crypto::provider_from_env()?;
-    if let Some(url) = std::env::var("DAGRON_ARTIFACT_URL").ok().filter(|u| !u.trim().is_empty())
-    {
+    let url = std::env::var("DAGRON_ARTIFACT_URL").ok().filter(|u| !u.trim().is_empty());
+    if tier_enabled(std::env::var("DAGRON_ARTIFACT_TIER").ok().as_deref())? {
+        let local = LocalFsStore::from_env().context(
+            "DAGRON_ARTIFACT_TIER=1 needs DAGRON_ARTIFACT_DIR (the local tier); set it or unset DAGRON_ARTIFACT_TIER",
+        )?;
+        let url = url.context(
+            "DAGRON_ARTIFACT_TIER=1 needs DAGRON_ARTIFACT_URL (the remote tier); set it or unset DAGRON_ARTIFACT_TIER",
+        )?;
+        #[cfg(feature = "cloud")]
+        {
+            let remote: Box<dyn ArtifactStore> = Box::new(cloud::CloudStore::from_url(&url)?);
+            let budget = UplinkBudget::from_env()?;
+            tracing::info!(
+                dir = %local.base().display(),
+                %url,
+                budget = ?budget.bytes_per_day,
+                "tiered artifact store: local tier + budgeted uplink to the remote tier"
+            );
+            return Ok(build_store(Some(local), Some((remote, budget)), provider));
+        }
+        #[cfg(not(feature = "cloud"))]
+        {
+            let _ = local;
+            anyhow::bail!(
+                "DAGRON_ARTIFACT_TIER=1 with DAGRON_ARTIFACT_URL='{url}' but this build has no cloud \
+                 artifact backend for the remote tier — enable the `s3`, `gcs`, or `azure` feature \
+                 on dagron-artifact (or unset DAGRON_ARTIFACT_TIER)"
+            );
+        }
+    }
+    if let Some(url) = url {
         #[cfg(feature = "cloud")]
         {
             let store = cloud::CloudStore::from_url(&url)?;
-            return Ok(Some(match provider {
-                Some(p) => Arc::new(EncryptedStore::new(store, p)),
-                None => Arc::new(store),
-            }));
+            return Ok(Some(wrap(store, provider)));
         }
         #[cfg(not(feature = "cloud"))]
         anyhow::bail!(
@@ -589,19 +703,52 @@ pub fn store_from_env() -> Result<Option<Arc<dyn ArtifactStore>>> {
              (or unset it to use DAGRON_ARTIFACT_DIR)"
         );
     }
-    Ok(build_store(LocalFsStore::from_env(), provider))
+    Ok(build_store(LocalFsStore::from_env(), None, provider))
 }
 
-/// Pure assembly (no env reads) so the wiring is unit-testable: wrap `local` in an
-/// [`EncryptedStore`] iff a `provider` is present.
+/// `DAGRON_ARTIFACT_TIER` parser: `1`/`true`/`yes`/`on` opt in; unset, empty,
+/// `0`/`false`/`no`/`off` leave tiering off; anything else is a hard error (a
+/// typo must not silently mean "off" on a unit that was meant to uplink).
+fn tier_enabled(raw: Option<&str>) -> Result<bool> {
+    match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("" | "0" | "false" | "no" | "off") => Ok(false),
+        Some("1" | "true" | "yes" | "on") => Ok(true),
+        Some(other) => anyhow::bail!("DAGRON_ARTIFACT_TIER must be 1 or 0, got '{other}'"),
+    }
+}
+
+/// Wrap `store` in an [`EncryptedStore`] iff a `provider` is present.
+fn wrap<S: ArtifactStore + 'static>(
+    store: S,
+    provider: Option<Box<dyn dagron_crypto::KeyProvider>>,
+) -> Arc<dyn ArtifactStore> {
+    match provider {
+        Some(p) => Arc::new(EncryptedStore::new(store, p)),
+        None => Arc::new(store),
+    }
+}
+
+/// Pure assembly (no env reads) so the wiring is unit-testable: `local` alone is
+/// the local-FS store; with a `remote` tier (+ budget) it becomes a
+/// [`TieredStore`] whose ledger lives under the local base. Either is wrapped in
+/// an [`EncryptedStore`] iff a `provider` is present — encryption sits *outside*
+/// the tier so both tiers hold ciphertext. Because it sits outside, the tier is
+/// also told that it is sealed: with a provider present its scan stops adopting
+/// task-written plaintext, which it could otherwise only uplink in the clear.
 fn build_store(
     local: Option<LocalFsStore>,
+    remote: Option<(Box<dyn ArtifactStore>, UplinkBudget)>,
     provider: Option<Box<dyn dagron_crypto::KeyProvider>>,
 ) -> Option<Arc<dyn ArtifactStore>> {
     let local = local?;
-    Some(match provider {
-        Some(p) => Arc::new(EncryptedStore::new(local, p)),
-        None => Arc::new(local),
+    Some(match remote {
+        Some((remote, budget)) => {
+            let ledger_root = local.base().to_path_buf();
+            let tier = TieredStore::new(local, remote, ledger_root, budget)
+                .sealed_by_outer_encryption(provider.is_some());
+            wrap(tier, provider)
+        }
+        None => wrap(local, provider),
     })
 }
 
@@ -702,6 +849,7 @@ mod tests {
         // With a provider → ciphertext at rest.
         let enc = build_store(
             Some(LocalFsStore::new(&base)),
+            None,
             Some(Box::new(dagron_crypto::LocalKekProvider::new([8u8; 32]))),
         )
         .unwrap();
@@ -711,12 +859,12 @@ mod tests {
 
         // Without a provider → plaintext (unchanged behavior).
         let key2 = ArtifactKey::new("r", "t", "b.bin");
-        let plain = build_store(Some(LocalFsStore::new(&base)), None).unwrap();
+        let plain = build_store(Some(LocalFsStore::new(&base)), None, None).unwrap();
         plain.put(&key2, b"weights").await.unwrap();
         assert_eq!(LocalFsStore::new(&base).get(&key2).await.unwrap(), b"weights");
 
         // No local dir → no store.
-        assert!(build_store(None, None).is_none());
+        assert!(build_store(None, None, None).is_none());
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -881,6 +1029,133 @@ mod tests {
                 .is_err(),
             "straggler rotated off the old KEK",
         );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── tiering wiring (the tier itself is tested in `tiered`) ───────────────
+
+    #[test]
+    fn tier_opt_in_parses_strictly() {
+        assert!(!tier_enabled(None).unwrap());
+        for off in ["", "0", "false", "no", "off", " OFF "] {
+            assert!(!tier_enabled(Some(off)).unwrap(), "{off:?} must be off");
+        }
+        for on in ["1", "true", "yes", "on", " On "] {
+            assert!(tier_enabled(Some(on)).unwrap(), "{on:?} must be on");
+        }
+        let err = tier_enabled(Some("maybe")).unwrap_err().to_string();
+        assert!(err.contains("DAGRON_ARTIFACT_TIER"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn build_store_tiers_when_a_remote_is_given() {
+        use crate::tiered::testing::MemStore;
+        let base = std::env::temp_dir().join(format!("dagron-fac-tier-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = Arc::new(MemStore::new());
+        let key = ArtifactKey::new("r", "t", "a.bin");
+
+        // Plain tier: local now, remote on sync, ledger under the local base,
+        // run_location still the local dir.
+        let store = build_store(
+            Some(LocalFsStore::new(&base)),
+            Some((Box::new(Arc::clone(&remote)), UplinkBudget::UNLIMITED)),
+            None,
+        )
+        .unwrap();
+        store.put(&key, b"bytes").await.unwrap();
+        assert!(!remote.has(&key), "nothing on the remote tier before sync");
+        assert!(base.join(".tiered").join("ledger.ndjson").is_file(), "ledger under the local base");
+        assert_eq!(store.sync().await.unwrap(), 1);
+        assert_eq!(remote.raw(&key).unwrap(), b"bytes");
+        assert_eq!(store.run_location("r"), LocalFsStore::new(&base).run_location("r"));
+
+        // Encrypted tier: ciphertext on both tiers, sync still reaches the tier,
+        // no plaintext task dir.
+        let base2 = std::env::temp_dir().join(format!("dagron-fac-tier-enc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base2);
+        let remote2 = Arc::new(MemStore::new());
+        let enc = build_store(
+            Some(LocalFsStore::new(&base2)),
+            Some((Box::new(Arc::clone(&remote2)), UplinkBudget::UNLIMITED)),
+            Some(Box::new(dagron_crypto::LocalKekProvider::new([3u8; 32]))),
+        )
+        .unwrap();
+        enc.put(&key, b"secret").await.unwrap();
+        let on_disk = LocalFsStore::new(&base2).get(&key).await.unwrap();
+        assert_ne!(on_disk, b"secret");
+        assert_eq!(enc.sync().await.unwrap(), 1);
+        assert_eq!(remote2.raw(&key).unwrap(), on_disk, "remote tier holds the same ciphertext");
+        assert_eq!(enc.get(&key).await.unwrap(), b"secret");
+        assert!(enc.run_location("r").is_none());
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base2);
+    }
+
+    #[tokio::test]
+    async fn encrypted_store_forwards_sync_to_the_inner_store() {
+        use crate::tiered::testing::MemStore;
+        let base = std::env::temp_dir().join(format!("dagron-enc-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = Arc::new(MemStore::new());
+        let key = ArtifactKey::new("r", "t", "a.bin");
+
+        let enc = EncryptedStore::new(
+            TieredStore::new(LocalFsStore::new(&base), Arc::clone(&remote), &base, UplinkBudget::UNLIMITED),
+            Box::new(dagron_crypto::LocalKekProvider::new([4u8; 32])),
+        );
+        enc.put(&key, b"payload").await.unwrap();
+        assert_eq!(remote.put_count(), 0);
+        assert_eq!(enc.sync().await.unwrap(), 1, "the decorator forwards sync (moved > 0)");
+        assert_eq!(remote.put_count(), 1);
+
+        // Over a plain store the trait default still applies: nothing to drain.
+        let plain = EncryptedStore::new(
+            LocalFsStore::new(base.join("plain")),
+            Box::new(dagron_crypto::LocalKekProvider::new([4u8; 32])),
+        );
+        plain.put(&key, b"payload").await.unwrap();
+        assert_eq!(plain.sync().await.unwrap(), 0);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn boxed_and_arced_stores_forward_every_method() {
+        use crate::tiered::testing::MemStore;
+        let base = std::env::temp_dir().join(format!("dagron-ptr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = Arc::new(MemStore::new());
+        let (k1, k2) = (ArtifactKey::new("r", "t", "one"), ArtifactKey::new("r", "t", "two"));
+
+        let boxed: Box<dyn ArtifactStore> = Box::new(TieredStore::new(
+            LocalFsStore::new(&base),
+            Arc::clone(&remote),
+            &base,
+            UplinkBudget::UNLIMITED,
+        ));
+        boxed.put(&k1, b"x").await.unwrap();
+        boxed.put_stream(&k2, reader(b"yy".to_vec())).await.unwrap();
+        assert!(boxed.exists(&k1).await.unwrap());
+        assert_eq!(boxed.get(&k1).await.unwrap(), b"x");
+        let mut out = Vec::new();
+        boxed.get_stream(&k2).await.unwrap().read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"yy");
+        assert_eq!(boxed.list().await.unwrap().len(), 2);
+        assert_eq!(boxed.run_location("r"), LocalFsStore::new(&base).run_location("r"));
+        let old = dagron_crypto::LocalKekProvider::new([1u8; 32]);
+        assert!(
+            boxed.rotate_from(&old).await.is_err(),
+            "the (unencrypted) tier's rotate_from default is what comes back"
+        );
+        assert_eq!(boxed.sync().await.unwrap(), 2, "Box forwards sync to the tier");
+        assert_eq!(remote.put_count(), 2);
+
+        let arced: Arc<dyn ArtifactStore> = Arc::from(boxed);
+        assert_eq!(arced.get(&k1).await.unwrap(), b"x");
+        assert_eq!(arced.sync().await.unwrap(), 0, "Arc forwards too (nothing left)");
 
         let _ = std::fs::remove_dir_all(&base);
     }

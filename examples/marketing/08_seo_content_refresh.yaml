@@ -1,0 +1,105 @@
+# 08 — SEO decay sweep: find pages losing ground, rewrite the ones worth it.
+#
+#   crawl ─▶ score decay ─▶ (per URL) triage ─▶ refresh via 07 | leave alone
+#
+# The width of this graph is data, not YAML. `with_param` reads the URL list from
+# a parameter holding a JSON array, so the same file sweeps 12 pages in a dry run
+# and 400 on the quarterly pass — and a rerun can target exactly the three that
+# failed, by submitting with a three-element array.
+#
+# The refresh itself is not reimplemented here: a decayed page is handed to
+# `mktg_content_engine_llm` (07), which already owns drafting, compliance and the
+# editor gate. One content-quality bar, one place to change it.
+name: mktg_seo_content_refresh
+tags: [marketing, seo, content]
+environment: prod
+run_timeout_secs: 86400
+budget: { tasks: 500 }
+parameters:
+  # Override per run: POST /api/runs {"yaml": ..., "parameters": {"urls": "[\"/blog/a\"]"}}
+  urls: '["/blog/attribution-guide", "/blog/lead-scoring-101", "/blog/mql-vs-sql", "/pricing"]'
+  decay_threshold: "0.15"
+  scheduled_time: ""
+
+task_defaults:
+  max_attempts: 4
+  retry_delay_secs: 10
+  retry_max_delay_secs: 120
+  timeout_secs: 600
+  env:
+    - { name: GSC_SA_JSON, value_from: { secret: GSC_SERVICE_ACCOUNT_JSON } }
+    - { name: AHREFS_TOKEN, value_from: { secret: AHREFS_API_TOKEN } }
+    - { name: HUBSPOT_TOKEN, value_from: { secret: HUBSPOT_PRIVATE_APP_TOKEN } }
+    - { name: DAGRON_API, value: "{{ env.DAGRON_API_URL }}" }
+    - { name: DAGRON_TOKEN, value_from: { secret: DAGRON_API_TOKEN } }
+
+templates:
+  # One URL's triage. Everything a page needs decided about it, in a unit small
+  # enough to read — and reused by the quarterly sweep and the weekly spot-check.
+  #
+  # Note where the branch lives. `when:` over an upstream task's *output* is a
+  # graph edge (03 and 06 use it), but it resolves against a task name in the
+  # same DAG — inside a fanned-out template each instance's tasks are renamed
+  # (`triage.2.decide`), so a per-instance runtime branch is expressed by
+  # dispatching a child run instead. Each dispatch is a real run of 07 with its
+  # own id, logs, retries and approval gate, visible in Runs on its own row —
+  # which is what you want anyway when a rewrite needs an editor's sign-off.
+  - name: triage_url
+    parameters: { url: "/" }
+    tasks:
+      # Prints `refresh` or `keep`.
+      - name: decide
+        max_attempts: 2
+        command: ["sh", "-c", "seo-decay --url '{{ url }}' --window 90d --threshold {{ decay_threshold }} | tee \"$DAGRON_ARTIFACTS/decision.txt\""]
+      - name: dispatch_rewrite
+        depends_on: [decide]
+        timeout_secs: 120
+        command:
+          - sh
+          - -c
+          - |
+            set -eu
+            [ "$(cat "$DAGRON_ARTIFACTS/decision.txt")" = refresh ] || { echo "keep - no rewrite"; exit 0; }
+            page-snapshot '{{ url }}' --out "$DAGRON_ARTIFACTS/snapshot.html"
+            # Saved workflows are started by id: resolve the name, then run it
+            # with this URL's parameters.
+            wf=$(curl -sf -H "Authorization: Bearer $DAGRON_TOKEN" "$DAGRON_API/api/workflows" \
+                 | jq -r '.[] | select(.name=="mktg_content_engine_llm") | .id')
+            curl -sf -X POST "$DAGRON_API/api/workflows/$wf/run" \
+              -H "Authorization: Bearer $DAGRON_TOKEN" \
+              -H 'content-type: application/json' \
+              -d '{"parameters":{"topic":"refresh of {{ url }}","target_keyword":"{{ url }}","funnel_stage":"mofu"}}'
+
+tasks:
+  - name: crawl
+    pool: seo-api
+    command: ["sh", "-c", "gsc-export --property https://acme.com --days 90 --out \"$DAGRON_ARTIFACTS/gsc.parquet\""]
+
+  - name: backlinks
+    pool: seo-api
+    allow_failure: true            # a vendor outage should not cancel the sweep
+    command: ["sh", "-c", "ahrefs-export --target acme.com --out \"$DAGRON_ARTIFACTS/backlinks.json\""]
+
+  - name: rank_pages
+    depends_on: [crawl, backlinks]
+    trigger_rule: all_done
+    command: ["sh", "-c", "rank-decay --gsc \"$DAGRON_ARTIFACTS/gsc.parquet\" --out \"$DAGRON_ARTIFACTS/decay.json\""]
+
+  # Data-driven width. Each instance is a whole sub-DAG (decide →
+  # dispatch_rewrite), so the run's graph shows per URL which pages were
+  # refreshed and which were left alone, without a log to grep.
+  - name: triage
+    template: triage_url
+    with_param: "{{ urls }}"
+    arguments: { url: "{{ item }}" }
+    depends_on: [rank_pages]
+
+  - name: resubmit_sitemap
+    depends_on: [triage]
+    trigger_rule: all_done
+    produces: ["hubspot://cms/blog-posts"]
+    command: ["sh", "-c", "gsc-submit-sitemap https://acme.com/sitemap.xml"]
+
+  - name: report
+    depends_on: [resubmit_sitemap]
+    command: ["sh", "-c", "post-slack content \"SEO sweep done - $(jq -r '.refreshed' \"$DAGRON_ARTIFACTS/decay.json\") pages refreshed\""]

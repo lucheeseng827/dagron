@@ -1,0 +1,109 @@
+# 04 — Multi-channel campaign launch behind one human gate.
+#
+#   assemble ─▶ preflight ×4 ─▶ legal_review (approval) ─▶ 4 child workflows ─▶ verify
+#
+# This is the dag-of-dags. Each channel publisher is its *own* registered
+# workflow, submitted as a child run by a `type: workflow` task that parks —
+# holding no worker slot — until the child is terminal, then succeeds or fails
+# with it. Channel teams own and version their publisher independently; this
+# workflow owns the order, the gate, and the way back.
+#
+# `type: approval` with `approval_on_timeout: reject` is the launch gate. A gate
+# that defaults to *yes* when nobody is awake is not a gate: a campaign that
+# misses its window is recoverable, one that ships unapproved claims is not.
+# Approve from the console, or over the API — the approve endpoint addresses the
+# task by its run-scoped **id**, not by the name in this file, so look the id up
+# from the run first:
+#
+#   TASK=$(curl -s localhost:8787/runs/$RUN_ID \
+#          | jq -r '.tasks[] | select(.name == "legal_review") | .id')
+#   curl -X POST localhost:8787/runs/$RUN_ID/tasks/$TASK/approve
+name: mktg_campaign_launch_gate
+tags: [marketing, campaign, approval]
+environment: prod
+run_timeout_secs: 43200        # a launch may legitimately wait half a day on a human
+budget: { tasks: 200 }         # backstop on what one submission may create
+max_active_runs: 2
+parameters:
+  campaign_id: "2026-q3-platform-launch"
+  offer_url: "https://acme.com/platform"
+  slack_webhook: ""              # notify: URLs template against run PARAMETERS,
+                                 # not {{ env.* }} — set an instance-wide default
+                                 # in the console instead (sidebar -> Notifications).
+
+task_defaults:
+  docker_image: ghcr.io/acme/marketing-toolbox:2.4   # one pinned image, every task
+  max_attempts: 3
+  retry_delay_secs: 10
+  timeout_secs: 600
+  env:
+    - { name: HUBSPOT_TOKEN, value_from: { secret: HUBSPOT_PRIVATE_APP_TOKEN } }
+
+notify:
+  slack:
+    webhook_url: "{{ slack_webhook }}"
+    on: [succeeded, failed, cancelled, deadline_exceeded]
+
+tasks:
+  - name: assemble
+    command: ["sh", "-c", "campaign-assemble --id {{ campaign_id }} --out \"$DAGRON_ARTIFACTS/campaign.json\""]
+
+  # Four independent checks. A broken tracking link and missing alt text are both
+  # blockers, so this join keeps the default all_success.
+  - name: preflight
+    depends_on: [assemble]
+    with_items:
+      - { check: links, tool: link-check }
+      - { check: utm, tool: utm-lint }
+      - { check: brand, tool: brand-lint }
+      - { check: a11y, tool: a11y-lint }
+    instance_key: "{{ item.check }}"
+    command: ["sh", "-c", "{{ item.tool }} \"$DAGRON_ARTIFACTS/campaign.json\""]
+
+  - name: legal_review
+    type: approval
+    depends_on: [preflight]
+    approval_timeout_secs: 28800        # 8h
+    approval_on_timeout: reject         # silence is not consent
+
+  - name: publish_email
+    type: workflow
+    workflow: mktg_publish_email
+    depends_on: [legal_review]
+    arguments: { campaign_id: "{{ campaign_id }}" }
+
+  - name: publish_ads
+    type: workflow
+    workflow: mktg_publish_paid_ads
+    depends_on: [legal_review]
+    arguments: { campaign_id: "{{ campaign_id }}" }
+
+  - name: publish_web
+    type: workflow
+    workflow: mktg_publish_landing_page
+    depends_on: [legal_review]
+    arguments: { campaign_id: "{{ campaign_id }}", offer_url: "{{ offer_url }}" }
+
+  - name: publish_social
+    type: workflow
+    workflow: mktg_publish_social
+    depends_on: [legal_review]
+    arguments: { campaign_id: "{{ campaign_id }}" }
+
+  # An HTTP sensor: park until the landing page actually serves 2xx through the
+  # CDN, then continue. Polled by the scheduler every WAIT_POLL_SECS — no worker
+  # slot is held for the wait, however long the cache purge takes.
+  - name: wait_for_cdn
+    type: wait
+    depends_on: [publish_web]
+    wait: { url: "{{ offer_url }}" }
+
+  - name: verify
+    depends_on: [publish_email, publish_ads, publish_social, wait_for_cdn]
+    produces: ["hubspot://marketing/campaigns/{{ campaign_id }}"]
+    command: ["sh", "-c", "campaign-verify --id {{ campaign_id }} --expect email,ads,web,social"]
+
+  - name: pause_and_report
+    hook: on_failure
+    max_attempts: 1
+    command: ["sh", "-c", "campaign-pause --id {{ campaign_id }} && post-slack demand-gen \"launch {{ campaign_id }} paused - see run $DAGRON_RUN_ID\""]

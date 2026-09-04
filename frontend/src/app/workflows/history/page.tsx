@@ -4,7 +4,8 @@
 // status grid (spot a task that's been flaky for a week at a glance) — the
 // editor stays at /workflows/[id].
 
-import { use, useCallback, useEffect, useMemo, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { useRouteId } from "@/lib/route-id";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import TriggerBadge from "@/components/TriggerBadge";
@@ -26,8 +27,18 @@ function runSecs(r: RunSummary): number | null {
   return (e - s) / 1000;
 }
 
-export default function WorkflowHistoryPage({ params }: { params: Promise<{ id: string }> }) {
-  const { id } = use(params);
+export default function WorkflowHistoryPage() {
+  // useRouteId() calls useSearchParams(), which suspends during prerender;
+  // the static export build fails without this boundary.
+  return (
+    <Suspense fallback={null}>
+      <WorkflowHistoryPageInner />
+    </Suspense>
+  );
+}
+
+function WorkflowHistoryPageInner() {
+  const id = useRouteId();
   const router = useRouter();
   const toast = useToast();
   const [wf, setWf] = useState<Workflow | null>(null);
@@ -102,7 +113,7 @@ export default function WorkflowHistoryPage({ params }: { params: Promise<{ id: 
     try {
       const { run_id } = await runWorkflow(id);
       toast("Run started");
-      router.push(`/runs/${run_id}`);
+      router.push(`/runs/detail/?id=${run_id}`);
     } catch (e) {
       toast(errMsg(e), "error");
       setBusy(false);
@@ -122,7 +133,7 @@ export default function WorkflowHistoryPage({ params }: { params: Promise<{ id: 
           <button onClick={onRun} disabled={busy} className="dy-btn dy-btn-primary">
             ▶ Run now
           </button>
-          <Link href={`/workflows/${id}`} className="dy-btn">
+          <Link href={`/workflows/detail/?id=${id}`} className="dy-btn">
             ✎ Edit
           </Link>
         </div>
@@ -172,7 +183,7 @@ export default function WorkflowHistoryPage({ params }: { params: Promise<{ id: 
               return (
                 <Link
                   key={r.id}
-                  href={`/runs/${r.id}`}
+                  href={`/runs/detail/?id=${r.id}`}
                   title={`${r.id.slice(0, 8)} — ${r.status}${secs != null ? ` · ${humanSecs(secs)}` : ""} · ${absTime(r.created_at)}`}
                   style={{
                     flex: 1,
@@ -202,7 +213,7 @@ export default function WorkflowHistoryPage({ params }: { params: Promise<{ id: 
                 <th style={{ textAlign: "left", fontSize: 11, color: "var(--dim)", fontWeight: 600, padding: "4px 12px 4px 0" }}>Task</th>
                 {gridRuns.map((r) => (
                   <th key={r.id} style={{ padding: "4px 3px" }} title={`${r.id.slice(0, 8)} · ${absTime(r.created_at)}`}>
-                    <Link href={`/runs/${r.id}`} className="mono" style={{ fontSize: 9.5, color: "var(--dim)" }}>
+                    <Link href={`/runs/detail/?id=${r.id}`} className="mono" style={{ fontSize: 9.5, color: "var(--dim)" }}>
                       {r.id.slice(0, 4)}
                     </Link>
                   </th>
@@ -221,7 +232,7 @@ export default function WorkflowHistoryPage({ params }: { params: Promise<{ id: 
                       <td key={r.id} style={{ padding: 3, textAlign: "center" }}>
                         {node ? (
                           <Link
-                            href={`/runs/${r.id}?task=${encodeURIComponent(name)}`}
+                            href={`/runs/detail/?id=${r.id}&task=${encodeURIComponent(name)}`}
                             title={`${name} — ${statusLabel(node.status)}${node.attempt > 1 ? ` · try ${node.attempt}` : ""}`}
                             style={{ display: "inline-block", width: 16, height: 16, borderRadius: 4, background: statusColor(node.status) }}
                           />
@@ -248,7 +259,7 @@ export default function WorkflowHistoryPage({ params }: { params: Promise<{ id: 
           <div>Trigger</div>
         </div>
         {runs.map((r) => (
-          <Link key={r.id} href={`/runs/${r.id}`} className="dy-runrow" style={{ display: "grid", gridTemplateColumns: "24px 1.2fr 1fr 1fr 1fr", gap: 12 }}>
+          <Link key={r.id} href={`/runs/detail/?id=${r.id}`} className="dy-runrow" style={{ display: "grid", gridTemplateColumns: "24px 1.2fr 1fr 1fr 1fr", gap: 12 }}>
             <span className="dy-dot" style={{ width: 9, height: 9, background: statusColor(r.status as TaskStatus) }} title={r.status} />
             <span className="mono" style={{ color: "var(--blue)" }}>
               {r.id.slice(0, 8)}

@@ -1,0 +1,58 @@
+# Sensor micro-batch window, published by a plant gateway over MQTT.
+#
+# Each time a line's gateway closes a batch of readings it publishes this spec
+# (with the parameters filled in — see publish.sh) to `plant/<line>/jobs`. The
+# engine, subscribed with SOURCE=mqtt MQTT_TOPIC='plant/+/jobs', turns every
+# message into one durable run: the window is aggregated on the machine, and
+# the run — its retries, its logs, its outcome — is what gets inspected, not
+# the bus. The readings travel inside the message so the job is self-contained;
+# a gateway that stages them on disk instead points `readings` at a file path
+# and swaps the awk input.
+#
+# An optional top-level `seq:` line (publish.sh --seq N) is the exactly-once
+# id: with MQTT_POSITION_FIELD=seq the engine commits it with the run and skips
+# a redelivered duplicate. DagSpec ignores keys it does not know, so the same
+# file is valid with or without it.
+name: sensor_window
+parameters:
+  line: "line1"               # which line's gateway published this window
+  window_end: ""              # RFC-3339 close of the window (informational)
+  readings: "21.4,21.6,21.9,22.3,22.1,21.8"   # celsius, comma-separated
+tasks:
+  - name: window
+    command:
+      - sh
+      - -c
+      # Comma-separated readings → n / min / max / avg, portable awk only.
+      # A batch with no readings FAILS the task rather than reporting a window
+      # of zeros: an empty batch from a gateway is a fault worth a red run.
+      - |
+        readings="{{ readings }}"
+        [ -n "$readings" ] || { echo "empty readings batch for line {{ line }}" >&2; exit 1; }
+        row=$(printf '%s\n' "$readings" | awk -F, '
+          { for (i = 1; i <= NF; i++) { c = $i + 0; n++; sum += c
+              if (min == "" || c < min) min = c
+              if (max == "" || c > max) max = c } }
+          END { if (n) printf "%d,%s,%s,%.2f", n, min, max, sum/n }')
+        [ -n "$row" ] || { echo "no numeric readings in batch" >&2; exit 1; }
+        # Idempotent by (line, window_end): a retry or a redelivered message
+        # REPLACES its window file instead of appending a duplicate row.
+        key=$(printf '%s' "{{ line }}-{{ window_end }}" | tr -c 'A-Za-z0-9_-' '_')
+        mkdir -p data/windows
+        # A run-unique temp file: a redelivery can put a second run on this
+        # same key concurrently, and a shared .tmp path would let one run's mv
+        # fail after the other had already moved it away.
+        tmp=$(mktemp "data/windows/$key.row.XXXXXX")
+        printf '%s,%s,%s\n' "{{ line }}" "{{ window_end }}" "$row" > "$tmp"
+        mv "$tmp" "data/windows/$key.row"
+        echo "window {{ line }} @ {{ window_end }}: n,min,max,avg = $row"
+    timeout_secs: 30
+  - name: report
+    depends_on: [window]
+    command:
+      - sh
+      - -c
+      - |
+        cat data/windows/*.row 2>/dev/null | sort > data/sensor_windows.csv
+        echo "windows so far: $(wc -l < data/sensor_windows.csv)"
+    timeout_secs: 30

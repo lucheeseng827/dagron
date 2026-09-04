@@ -34,12 +34,20 @@ pub struct RunSummary {
     pub triage_note: Option<String>,
     pub triaged_at: Option<String>,
     pub triaged_by: Option<String>,
+    /// Whether the engine's wall clock was trustworthy when this run was
+    /// recorded: `synced` / `drifted` / `unknown`, or `null` for a run the
+    /// engine never assessed (API-submitted runs are stamped by the engine
+    /// host, not this gateway). A disconnected unit that boots without a
+    /// clock still keeps its schedule; this says whether its timestamps are
+    /// evidence.
+    pub clock_confidence: Option<String>,
 }
 
 /// SELECT list + joins shared by the run list and per-workflow runs: summary
 /// columns, the definition name, and the derived trigger kind.
 pub(crate) const SUMMARY_SELECT: &str = "SELECT wr.id, wr.definition_id, wr.status, wr.created_at, wr.finished_at, d.name,
         wr.triage_state, wr.triage_note, wr.triaged_at, wr.triaged_by,
+        wr.clock_confidence,
         CASE WHEN sb.run_id IS NOT NULL THEN 'backfill'
              WHEN wr.schedule_id IS NOT NULL THEN 'schedule'
              ELSE 'manual' END AS trigger_kind
@@ -219,6 +227,17 @@ pub struct RunDetail {
     pub triage_note: Option<String>,
     pub triaged_at: Option<String>,
     pub triaged_by: Option<String>,
+    /// Whether the engine's wall clock was trustworthy when this run was
+    /// recorded: `synced` / `drifted` / `unknown`, or `null` for a run the
+    /// engine never assessed (API-submitted runs are stamped by the engine
+    /// host, not this gateway). A disconnected unit that boots without a
+    /// clock still keeps its schedule; this says whether its timestamps are
+    /// evidence.
+    pub clock_confidence: Option<String>,
+    /// Measured wall-vs-monotonic offset (ms) behind a `drifted` verdict.
+    pub clock_offset_ms: Option<i64>,
+    /// What produced the verdict: `sync-file`, `step`, `behind-datastore`.
+    pub clock_source: Option<String>,
     /// Why this run failed, when it did (G-AG6) — `null` otherwise, so a
     /// caller can branch on presence without inspecting `status`.
     pub failure: Option<RunFailure>,
@@ -281,6 +300,7 @@ pub async fn get_run(
         "SELECT wr.id, wr.definition_id, wr.status, wr.input, wr.output,
                 wr.created_at, wr.finished_at, d.name,
                 wr.triage_state, wr.triage_note, wr.triaged_at, wr.triaged_by,
+                wr.clock_confidence, wr.clock_offset_ms, wr.clock_source,
                 CASE WHEN sb.run_id IS NOT NULL THEN 'backfill'
                      WHEN wr.schedule_id IS NOT NULL THEN 'schedule'
                      ELSE 'manual' END AS trigger_kind
@@ -319,6 +339,9 @@ pub async fn get_run(
         triage_note: run.triage_note,
         triaged_at: run.triaged_at,
         triaged_by: run.triaged_by,
+        clock_confidence: run.clock_confidence,
+        clock_offset_ms: run.clock_offset_ms,
+        clock_source: run.clock_source,
         failure,
         tasks,
     }))
@@ -368,6 +391,9 @@ struct RunSummaryFull {
     triage_note: Option<String>,
     triaged_at: Option<String>,
     triaged_by: Option<String>,
+    clock_confidence: Option<String>,
+    clock_offset_ms: Option<i64>,
+    clock_source: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

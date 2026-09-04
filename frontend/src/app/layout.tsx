@@ -2,6 +2,7 @@ import "./globals.css";
 import type { Metadata } from "next";
 import { Archivo } from "next/font/google";
 import AuthGuard from "@/components/AuthGuard";
+import { LEGACY_REDIRECT } from "@/lib/legacy-redirect";
 import ToastProvider from "@/components/Toasts";
 
 // Self-hosted at build time. globals.css used to @import this family from
@@ -25,6 +26,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en" data-theme="dark" className={archivo.variable}>
       <body>
+        {/* Pre-0.9 bookmarks (/runs/<id>) -> their query-param homes. Inline and
+            blocking so it lands before hydration: no flash, and no dependence on
+            how the client router treats a path that was never exported. */}
+        <script dangerouslySetInnerHTML={{ __html: LEGACY_REDIRECT }} />
         {/* AuthGuard gates + chooses shell (protected) vs bare (login). */}
         <ToastProvider>
           <AuthGuard>{children}</AuthGuard>

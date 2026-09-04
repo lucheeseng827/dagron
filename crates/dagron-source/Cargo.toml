@@ -2,7 +2,7 @@
 name = "dagron-source"
 version = "0.1.0"
 edition = "2021"
-description = "dagron workflow ingestion: the WorkflowSource trait + File/Stream/Channel built-in sources (SOURCE=stream follows an NDJSON file/pipe with a durable offset checkpoint), a SourceFactory extension seam, and the ractor IngestActor that turns submissions into runs. Managed broker connectors (Redis/SQS/Kafka/NATS) plug in behind the SourceFactory seam."
+description = "dagron workflow ingestion: the WorkflowSource trait + File/Dir/Stream/Channel built-in sources (SOURCE=dir watches a directory of YAML, re-submitting a spec when its file changes) (SOURCE=stream follows an NDJSON file/pipe with a durable offset checkpoint), a SourceFactory extension seam, and the ractor IngestActor that turns submissions into runs. Managed broker connectors (Redis/SQS/Kafka/NATS) plug in behind the SourceFactory seam."
 
 [lib]
 name = "dagron_source"
@@ -15,6 +15,9 @@ path = "src/lib.rs"
 # core's required backend, since core has no default here (default-features=false).
 sqlite = ["dagron-core/sqlite"]
 postgres = ["dagron-core/postgres"]
+# MQTT source (SOURCE=mqtt): the open protocol adapter for plant floors, gateways
+# and robot fleets. Off by default so a stock build links no broker client.
+mqtt = ["dep:rumqttc", "dep:rustls"]
 
 [dependencies]
 # The ingest actor turns submissions into runs via the core datastore facade and
@@ -30,6 +33,13 @@ serde_json = "1"
 serde_yaml = "0.9"
 uuid = { version = "1", features = ["v4"] }
 ractor = "0.10"
+# `use-rustls-no-provider`, not the default `use-rustls`: the default enables
+# rustls's aws-lc-rs provider next to the ring provider reqwest already links,
+# which both drags aws-lc-sys (cmake + C) into the build and makes rustls panic
+# at runtime for lack of a single process-level provider. The source installs
+# the ring provider itself before opening an `mqtts://` connection.
+rumqttc = { version = "0.25.1", optional = true, default-features = false, features = ["use-rustls-no-provider"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 
 [dev-dependencies]
 # The ingest test creates a real SQLite datastore + reads back row counts, so it

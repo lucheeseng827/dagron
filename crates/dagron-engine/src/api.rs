@@ -48,6 +48,19 @@ use tracing::{error, info};
 /// The OpenAPI spec, embedded at compile time so the binary is self-describing.
 const OPENAPI_YAML: &str = include_str!("../openapi.yaml");
 
+/// The operator console, embedded so `dagron` stays ONE static binary with a UI.
+///
+/// This is the deployment the full console cannot reach: it needs `dagron-api`,
+/// Postgres, and a Node build. Here there is no second process and no network
+/// fetch, so it works air-gapped and against SQLite on a gateway.
+///
+/// One dependency-free file (~19 KB) rather than the dagron-api console trimmed
+/// down, because that app speaks a different dialect — `/api/runs` returns a bare
+/// `RunSummary[]` with `definition_id`/`trigger_kind`/triage fields, this API
+/// returns `{"runs": [...]}` — and assumes an auth surface the engine has none of.
+/// Its Monaco editor alone is 14 MB; authoring is not what an operator needs here.
+const CONSOLE_HTML: &str = include_str!("../assets/console/index.html");
+
 /// Swagger UI assets, vendored and embedded so `/docs` renders with no outbound
 /// internet (air-gap). Pinned version in `assets/swagger-ui/VERSION`.
 const SWAGGER_UI_CSS: &[u8] = include_bytes!("../assets/swagger-ui/swagger-ui.css");
@@ -77,17 +90,53 @@ pub struct ApiState {
 }
 
 /// Bind `addr` and serve the management API until the process exits.
+///
+/// The exposure warning is not about the console. **This API has never had
+/// authentication** — `/runs/{id}/cancel`, `/rerun`, the task `clear`/`approve`
+/// endpoints and dead-letter redrive are all reachable by anyone who can reach the
+/// socket, and always have been. `API_ADDR` is expected to be a loopback or private
+/// address with authentication in front of it if it is published.
+///
+/// What the console changes is *discoverability*: the same capability is now one
+/// browser tab away rather than behind reading the OpenAPI. That is a good reason to
+/// say so out loud on a non-loopback bind, and a reason for `DAGRON_CONSOLE=off` —
+/// which hides the UI, and hides nothing else. An operator who needs the API closed
+/// needs a network boundary, not that switch.
 pub async fn serve(addr: SocketAddr, state: ApiState) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!(%addr, "management API listening");
+    if !addr.ip().is_loopback() {
+        tracing::warn!(
+            %addr,
+            "management API bound to a non-loopback address and has NO authentication: anyone who can reach it can cancel, rerun and approve work. Put a network boundary in front of it, or bind 127.0.0.1."
+        );
+    }
+    info!(%addr, console = console_enabled(), "management API listening");
     axum::serve(listener, router(state)).await?;
     Ok(())
 }
 
+/// Whether to serve the console. Opt *out* (`DAGRON_CONSOLE=off|false|0`), because
+/// the API it drives is already served here — hiding the UI does not reduce what the
+/// socket can do, so defaulting it off would trade a real convenience for the
+/// appearance of safety.
+fn console_enabled() -> bool {
+    !matches!(
+        std::env::var("DAGRON_CONSOLE").unwrap_or_default().to_ascii_lowercase().as_str(),
+        "off" | "false" | "0" | "no"
+    )
+}
+
 /// Build the router. Split out so tests can exercise handlers without a socket.
 pub fn router(state: ApiState) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
+    let r = Router::new();
+    // The console owns `/` and `/console`; every API path below is unchanged, so an
+    // existing client sees no difference whether it is mounted or not.
+    let r = if console_enabled() {
+        r.route("/", get(console)).route("/console", get(console))
+    } else {
+        r
+    };
+    r.route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/config", get(config_effective))
         .route("/metrics", get(metrics))
@@ -221,6 +270,11 @@ async fn docs() -> Html<&'static str> {
     )
 }
 
+/// The operator console (`CONSOLE_HTML`), served at `/` and `/console`.
+async fn console() -> Response {
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], CONSOLE_HTML).into_response()
+}
+
 /// Vendored Swagger UI assets, served locally so `/docs` needs no CDN (air-gap).
 async fn swagger_ui_css() -> Response {
     ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], SWAGGER_UI_CSS).into_response()
@@ -341,6 +395,41 @@ fn run_result_json(run: &crate::models::WorkflowRun) -> serde_json::Value {
     })
 }
 
+/// Map an admission refusal from `db::create_run` to the status + body it
+/// answers with, or `None` for any other error (which keeps the default 500).
+///
+/// Two capacity conditions, two codes, one `Retry-After: 1`: `429` for the
+/// per-workflow concurrency cap (#21) and `507 Insufficient Storage` for the
+/// datastore's free-disk floor (`DAGRON_MIN_FREE_BYTES`). A full flash device
+/// is a storage condition, not a rate one — a client that reads 429 as "slow
+/// down" would keep offering work to a unit whose disk is what needs relief,
+/// while 507 tells it (and any fleet plane behind it) exactly what to wait
+/// for. Pure, so the mapping is testable without a full disk.
+fn admission_refusal(e: &anyhow::Error) -> Option<(StatusCode, serde_json::Value)> {
+    if let Some(m) = e.downcast_ref::<dagron_core::models::MaxActiveRunsReached>() {
+        return Some((
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({
+                "error": "max_active_runs reached",
+                "workflow": m.name,
+                "active": m.active,
+                "max_active_runs": m.max,
+            }),
+        ));
+    }
+    if let Some(d) = e.downcast_ref::<dagron_core::models::DatastoreLowOnDisk>() {
+        return Some((
+            StatusCode::INSUFFICIENT_STORAGE,
+            json!({
+                "error": "datastore low on disk",
+                "free_bytes": d.free,
+                "min_free_bytes": d.floor,
+            }),
+        ));
+    }
+    None
+}
+
 async fn submit_run(
     State(st): State<ApiState>,
     Query(q): Query<SubmitQuery>,
@@ -410,22 +499,16 @@ async fn submit_run(
     let run_id = match db::create_run(&st.pool, &dag, &body).await {
         Ok(id) => id,
         Err(e) => {
-            // Per-workflow concurrency cap (#21): a capacity condition, not a
-            // failure — answer 429 + Retry-After (like the inflight valve above),
-            // never 500. Any other error keeps the default 500 mapping.
-            if let Some(m) = e.downcast_ref::<dagron_core::models::MaxActiveRunsReached>() {
-                info!(workflow = %m.name, active = m.active, cap = m.max, "run rejected — at max_active_runs");
-                return Ok((
-                    StatusCode::TOO_MANY_REQUESTS,
-                    [(header::RETRY_AFTER, "1")],
-                    Json(json!({
-                        "error": "max_active_runs reached",
-                        "workflow": m.name,
-                        "active": m.active,
-                        "max_active_runs": m.max,
-                    })),
-                )
-                    .into_response());
+            // Capacity conditions — the per-workflow cap (#21) and the
+            // free-disk floor — are answered with a retryable status +
+            // Retry-After (like the inflight valve above), never 500. Any
+            // other error keeps the default 500 mapping.
+            if let Some((status, refusal)) = admission_refusal(&e) {
+                if status == StatusCode::INSUFFICIENT_STORAGE {
+                    st.metrics.inc_admission_refused_disk();
+                }
+                info!(status = status.as_u16(), reason = %e, "run rejected — admission refused");
+                return Ok((status, [(header::RETRY_AFTER, "1")], Json(refusal)).into_response());
             }
             return Err(e.into());
         }
@@ -940,7 +1023,7 @@ async fn list_dataset_events(
     Ok(Json(json!({ "events": events })))
 }
 
-/// Body for the external dataset-event POST (dagron Enterprise).
+/// Body for the external dataset-event POST (not in this build).
 #[derive(serde::Deserialize)]
 struct DatasetEventBody {
     uri: String,
@@ -949,7 +1032,7 @@ struct DatasetEventBody {
 /// Record an **external** dataset event — a producer outside dagron (CDC, an
 /// object-store notification, another orchestrator) declaring "this dataset
 /// updated", waking dataset sensors and firing `on_datasets:` triggers.
-/// Ships with dagron Enterprise; the open build answers with a signpost
+/// Not in this build, which answers with a signpost
 /// (the SOURCE-connector funnel pattern) — its datasets update via `produces:`.
 async fn post_dataset_event(
     State(st): State<ApiState>,
@@ -960,8 +1043,8 @@ async fn post_dataset_event(
     if !cfg!(feature = "enterprise") {
         return Err(ApiError(
             StatusCode::FORBIDDEN,
-            "external dataset events ship with dagron Enterprise — \
-             https://github.com/lucheeseng827/dagron#dagron-enterprise. This build \
+            "external dataset events are not in this build — \
+             https://github.com/lucheeseng827/dagron#what-this-build-does-not-do. This build \
              records dataset updates from `produces:` tasks; to signal external data, \
              run a small task that produces the dataset (see docs/DATASETS.md)."
                 .to_string(),
@@ -977,7 +1060,7 @@ async fn post_dataset_event(
 async fn redrive_dead_letter(
     State(st): State<ApiState>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let Some(dl) = db::get_dead_letter(&st.pool, &id).await? else {
         return Err(ApiError(StatusCode::NOT_FOUND, format!("dead letter '{id}' not found")));
     };
@@ -997,6 +1080,71 @@ async fn redrive_dead_letter(
     let run_id = match db::create_run(&st.pool, &dag, &dl.payload).await {
         Ok(run_id) => run_id,
         Err(e) => {
+            // The free-disk floor is a capacity condition, and the row is
+            // already claimed (deleted): re-park the payload as a fresh
+            // dead-letter row — same payload, source and failure count, the
+            // floor as its error — rather than lose it, and answer 507 so the
+            // caller retries once the disk has headroom. If even the re-park
+            // fails, fall through to the loud path below.
+            if let Some(low) = e.downcast_ref::<dagron_core::models::DatastoreLowOnDisk>() {
+                st.metrics.inc_admission_refused_disk();
+                match db::record_dead_letter(&st.pool, &dl.payload, &low.to_string(), &dl.source, dl.failures)
+                    .await
+                {
+                    Ok(new_id) => {
+                        tracing::warn!(
+                            dead_letter_id = %id, reparked_as = %new_id, free = low.free, floor = low.floor,
+                            "redrive refused — datastore low on disk; dead letter re-parked"
+                        );
+                        return Ok((
+                            StatusCode::INSUFFICIENT_STORAGE,
+                            [(header::RETRY_AFTER, "1")],
+                            Json(json!({
+                                "error": "datastore low on disk — dead letter re-parked",
+                                "dead_letter_id": new_id,
+                                "free_bytes": low.free,
+                                "min_free_bytes": low.floor,
+                            })),
+                        )
+                            .into_response());
+                    }
+                    Err(park_err) => {
+                        error!(dead_letter_id = %id, error = ?park_err, "could not re-park the dead letter after a disk-floor refusal");
+                    }
+                }
+            } else if let Some(cap) = e.downcast_ref::<dagron_core::models::MaxActiveRunsReached>() {
+                // The run cap is the other capacity refusal, and it lands here
+                // with the row already claimed. Losing the payload to a
+                // condition that clears on its own would be the worse outcome,
+                // so it re-parks exactly like the disk floor does — 503 rather
+                // than 507, because it is concurrency and not storage.
+                match db::record_dead_letter(&st.pool, &dl.payload, &cap.to_string(), &dl.source, dl.failures)
+                    .await
+                {
+                    Ok(new_id) => {
+                        tracing::warn!(
+                            dead_letter_id = %id, reparked_as = %new_id,
+                            workflow = %cap.name, max = cap.max, active = cap.active,
+                            "redrive refused — workflow at its active-run cap; dead letter re-parked"
+                        );
+                        return Ok((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            [(header::RETRY_AFTER, "1")],
+                            Json(json!({
+                                "error": "workflow at its active-run cap — dead letter re-parked",
+                                "dead_letter_id": new_id,
+                                "workflow": cap.name,
+                                "max_active_runs": cap.max,
+                                "active_runs": cap.active,
+                            })),
+                        )
+                            .into_response());
+                    }
+                    Err(park_err) => {
+                        error!(dead_letter_id = %id, error = ?park_err, "could not re-park the dead letter after a run-cap refusal");
+                    }
+                }
+            }
             // The row is already claimed (deleted); surface the payload so the
             // operator can recover it rather than losing it silently.
             error!(dead_letter_id = %id, payload = %dl.payload, error = ?e, "redrive create_run failed after claim");
@@ -1005,7 +1153,7 @@ async fn redrive_dead_letter(
     };
     st.metrics.inc_runs_created();
     info!(dead_letter_id = %id, %run_id, "dead letter redriven into a run");
-    Ok(Json(json!({ "run_id": run_id, "redriven_from": id })))
+    Ok(Json(json!({ "run_id": run_id, "redriven_from": id })).into_response())
 }
 
 async fn delete_dead_letter(

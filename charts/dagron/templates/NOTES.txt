@@ -34,6 +34,11 @@ Reach the UI:
   then open http://localhost:3000. Note: /api calls only work if the frontend is
   configured to reach dagron-api (port-forwarded above on :8080) — the clean
   same-origin setup is ingress.enabled with a host.
+{{- else }}
+  Ingress is disabled. dagron-api serves the console at / and the API under /api on
+  the same origin, so one port-forward is enough:
+    kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "dagron.fullname" . }}-api 8080:{{ .Values.dagronApi.port }}
+  then open http://localhost:8080.
 {{- end }}
 
 {{- if .Values.dagronApi.admin.email }}

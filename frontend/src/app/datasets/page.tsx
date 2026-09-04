@@ -93,7 +93,7 @@ export default function DatasetsPage() {
             </span>
             <div style={{ flex: 1 }} />
             {d.last_run_id && (
-              <Link href={`/runs/${d.last_run_id}`} className="dy-pill" style={{ cursor: "pointer" }}>
+              <Link href={`/runs/detail/?id=${d.last_run_id}`} className="dy-pill" style={{ cursor: "pointer" }}>
                 Last run
               </Link>
             )}
@@ -152,7 +152,7 @@ export default function DatasetsPage() {
                       <td>{e.task_name ?? "—"}</td>
                       <td>
                         {e.run_id ? (
-                          <Link href={`/runs/${e.run_id}`} className="mono" style={{ color: "var(--blue)" }}>
+                          <Link href={`/runs/detail/?id=${e.run_id}`} className="mono" style={{ color: "var(--blue)" }}>
                             {e.run_id.slice(0, 8)}
                           </Link>
                         ) : (

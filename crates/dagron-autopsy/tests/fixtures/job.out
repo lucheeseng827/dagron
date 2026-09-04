@@ -1,0 +1,8 @@
+node-40:41221:41310 [0] NCCL INFO Bootstrap : Using ib0:10.4.0.40<0>
+node-40:41221:41310 [0] NCCL INFO NET/IB : Using [0]mlx5_0:1/IB nranks=128
+step 100 loss 2.4471
+step 200 loss 2.1130
+[rank0]: [E ProcessGroupNCCL.cpp:563] [Rank 0] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=88214, OpType=ALLREDUCE, Timeout(ms)=600000) ran for 600351 milliseconds before timing out.
+[rank1]: [E ProcessGroupNCCL.cpp:563] [Rank 1] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=88214, OpType=ALLREDUCE, Timeout(ms)=600000) ran for 600349 milliseconds before timing out.
+[rank2]: [E ProcessGroupNCCL.cpp:563] [Rank 2] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=88214, OpType=ALLREDUCE, Timeout(ms)=600000) ran for 600347 milliseconds before timing out.
+node-47:41999:42088 [3] NCCL WARN Call to ncclUnhandledCudaError failed

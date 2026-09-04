@@ -1,0 +1,23 @@
+# Line health — a gateway's periodic self-check, shipped as part of a signed
+# bundle (../README.md, docs/BUNDLES.md).
+#
+# Nothing here is bundle-specific: a bundle is an ordinary directory of specs
+# plus a manifest that names each one by path and SHA-256. Change one byte of
+# this file after signing and the whole bundle is refused — that is the point.
+name: line_health
+tags: [edge, health]
+parameters:
+  line: line-a
+tasks:
+  - name: probe_plc
+    command: ["sh", "-c", "echo probing the PLC on {{ line }}"]
+    timeout_secs: 30
+    max_attempts: 3
+    retry_delay_secs: 5
+  - name: probe_sensors
+    command: ["sh", "-c", "echo probing the sensor bus on {{ line }}"]
+    timeout_secs: 30
+  - name: summarise
+    depends_on: [probe_plc, probe_sensors]
+    command: ["sh", "-c", "echo {{ line }} healthy"]
+    timeout_secs: 10

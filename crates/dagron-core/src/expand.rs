@@ -147,6 +147,14 @@ fn apply_task_defaults(tasks: &mut [TaskSpec], d: &crate::dag::TaskDefaults) {
         if t.retry_on_timeout.is_none() {
             t.retry_on_timeout = d.retry_on_timeout;
         }
+        // Per class, not wholesale (see TaskDefaults::retry_budgets): the task
+        // wins for the classes it names and inherits the rest. Merging
+        // all-or-nothing would let a task that overrides `nan-loss` silently
+        // drop the workflow's `gpu-ecc` budget — the exact failure this
+        // feature exists to prevent.
+        for (class, budget) in &d.retry_budgets {
+            t.retry_budgets.entry(class.clone()).or_insert(*budget);
+        }
         if t.timeout_secs.is_none() {
             t.timeout_secs = d.timeout_secs;
         }
@@ -479,6 +487,10 @@ fn build_leaf(
         retry_delay_secs: task.retry_delay_secs,
         retry_max_delay_secs: task.retry_max_delay_secs,
         retry_on_timeout: task.retry_on_timeout,
+        // Per-class budgets survive matrix/call expansion: every leaf of a
+        // matrix inherits the same retry policy, or a fanned-out training
+        // sweep would apply it to exactly one shard.
+        retry_budgets: task.retry_budgets.clone(),
         timeout_secs: task.timeout_secs,
         docker_image: task.docker_image.as_ref().map(|s| substitute(s, ctx)),
         env: task

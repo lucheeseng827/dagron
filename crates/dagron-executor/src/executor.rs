@@ -157,10 +157,76 @@ impl Executor for LocalExecutor {
     }
 }
 
+// ── Task wall clock ──────────────────────────────────────────────────────────
+
+/// What a task gets when it names no `timeout_secs` of its own.
+pub const DEFAULT_TASK_TIMEOUT_SECS: u64 = 25;
+
+/// The wall clock a task actually gets: what it asked for, the default when it
+/// asked for nothing, and never more than `DAGRON_MAX_TASK_TIMEOUT_SECS` where
+/// that is set.
+///
+/// **Why a ceiling exists.** `timeout_secs` comes from the workflow, so before
+/// this the longest a task could run was whatever its author typed. That is
+/// correct when the engine and the workflows share an owner — it is your
+/// hardware — and wrong the moment the operator of the engine is not the author
+/// of every DAG on it. Caps on *how many* runs or tasks an installation admits
+/// say nothing about worst-case compute while a single task can run for a week.
+///
+/// **Unset means unlimited**, so an existing deployment behaves exactly as it
+/// did. Where a ceiling is set, a workflow asking for longer is clamped rather
+/// than rejected, because the alternative is a DAG that validated yesterday
+/// failing to admit today with nothing in the task itself having changed.
+///
+/// A present-but-unusable value (unparseable, or `0`, which would time every task
+/// out instantly) is treated as unset and **said out loud once** — a ceiling that
+/// silently is not a ceiling is the failure this function exists to prevent.
+pub fn effective_timeout_secs(requested: Option<u64>) -> u64 {
+    // Read once. The two halves below are split out and pure so they can be tested
+    // for every input, which a function consulting a process-wide cache cannot be:
+    // the first test to run would fix the ceiling for all the others.
+    static CEILING: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let ceiling = *CEILING
+        .get_or_init(|| parse_ceiling(std::env::var("DAGRON_MAX_TASK_TIMEOUT_SECS").ok().as_deref()));
+    clamp_to(requested, ceiling)
+}
+
+/// `DAGRON_MAX_TASK_TIMEOUT_SECS` as a ceiling, or `None` for no ceiling.
+fn parse_ceiling(raw: Option<&str>) -> Option<u64> {
+    let raw = raw?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    match raw.trim().parse::<u64>() {
+        Ok(n) if n > 0 => Some(n),
+        _ => {
+            // Not silent. `0` would time every task out instantly and a typo would
+            // leave the fleet uncapped — either way the operator set this variable
+            // believing it did something.
+            tracing::warn!(
+                value = %raw,
+                "DAGRON_MAX_TASK_TIMEOUT_SECS is not a positive integer; \
+                 no task-duration ceiling is in force"
+            );
+            None
+        }
+    }
+}
+
+/// What the task asked for (or the default), never above the ceiling.
+fn clamp_to(requested: Option<u64>, ceiling: Option<u64>) -> u64 {
+    let wanted = requested.unwrap_or(DEFAULT_TASK_TIMEOUT_SECS);
+    match ceiling {
+        Some(max) => wanted.min(max),
+        None => wanted,
+    }
+}
+
 // ── Low-level subprocess runner ───────────────────────────────────────────────
 
 /// Spawns `command[0]` with `command[1..]` as args.
-/// `timeout_secs` caps execution; falls back to 25 s (inside the 30 s lease).
+/// `timeout_secs` caps execution; falls back to [`DEFAULT_TASK_TIMEOUT_SECS`]
+/// (inside the 30 s lease) and is clamped by [`effective_timeout_secs`].
 /// `env` is layered on top of the inherited environment.
 /// `kill_on_drop` ensures the child is reaped if the future is dropped.
 pub async fn run_command(
@@ -171,7 +237,7 @@ pub async fn run_command(
     if command.is_empty() {
         bail!("empty command");
     }
-    let secs = timeout_secs.unwrap_or(25);
+    let secs = effective_timeout_secs(timeout_secs);
     if secs == 0 {
         bail!("timeout_secs must be >= 1 when provided");
     }
@@ -190,11 +256,72 @@ pub async fn run_command(
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if !stderr.is_empty() {
         // Mask sensitive env values out of the live stderr log too (#8); the
-        // stored stdout is redacted centrally in the worker.
+        // stored output is redacted centrally in the worker.
         let redactor = crate::redact::Redactor::from_task_env(env);
         tracing::warn!(stderr = %redactor.redact(stderr.trim()), "subprocess stderr");
     }
-    Ok((exit_code, stdout))
+    Ok((exit_code, with_stderr_on_failure(exit_code, stdout, &stderr)))
+}
+
+/// How much of a failing task's stderr rides along in the stored output.
+///
+/// Unbounded would be wrong — a task that dies in a retry loop can emit
+/// megabytes, and this string lands in a database column, once per attempt.
+/// The **tail** rather than the head because the fatal error is the last thing
+/// a process prints; the head is startup banners.
+const STDERR_TAIL_LIMIT: usize = 16 * 1024;
+
+/// Append a failing command's stderr to its stored output.
+///
+/// **Only on failure**, which is the whole care here. `output` is load-bearing
+/// on the success path — `repeat.until` decides loop termination from it, the
+/// memoization store caches it, and `produces:` lineage reads it — so a
+/// successful task's output stays byte-identical to what it has always been.
+/// A failing task's output is only ever an error message, and it was missing
+/// the half that says what went wrong: stderr was logged and then discarded,
+/// so `RuntimeError`, `CUDA error`, and every NCCL warning — all of which are
+/// written to stderr — never reached the stored record or the fault
+/// classifier that now reads it.
+///
+/// This also makes the local backend agree with the other two: DockerExecutor
+/// interleaves both streams into `output`, and KubeExecutor stores the pod's
+/// combined log. Local was the odd one out.
+fn with_stderr_on_failure(exit_code: i32, stdout: String, stderr: &str) -> String {
+    if exit_code == 0 || stderr.trim().is_empty() {
+        return stdout;
+    }
+    let trimmed = stderr.trim_end();
+    let tail = if trimmed.len() > STDERR_TAIL_LIMIT {
+        // Cut on a char boundary, then forward to the next line break so the
+        // first retained line is whole rather than starting mid-token.
+        //
+        // When the tail contains no line break at all — one enormous line, which
+        // a JSON-logging framework produces — there is no boundary to forward
+        // to and the retained text does start mid-line. That is deliberate:
+        // truncating from the front of a single line keeps the end, and the end
+        // is where the error is. Dropping it entirely to preserve a "whole
+        // line" property would discard the only diagnostic there is.
+        let start = trimmed.len() - STDERR_TAIL_LIMIT;
+        let start = (start..trimmed.len())
+            .find(|i| trimmed.is_char_boundary(*i))
+            .unwrap_or(trimmed.len());
+        let rest = &trimmed[start..];
+        match rest.find('\n') {
+            Some(nl) => &rest[nl + 1..],
+            None => rest,
+        }
+    } else {
+        trimmed
+    };
+    if stdout.trim().is_empty() {
+        return tail.to_string();
+    }
+    let mut out = stdout;
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(tail);
+    out
 }
 
 /// Streaming variant of [`run_command`] (#17): pipes stdout and forwards each
@@ -214,7 +341,7 @@ async fn run_command_streaming(
     if command.is_empty() {
         bail!("empty command");
     }
-    let secs = timeout_secs.unwrap_or(25);
+    let secs = effective_timeout_secs(timeout_secs);
     if secs == 0 {
         bail!("timeout_secs must be >= 1 when provided");
     }
@@ -262,7 +389,46 @@ async fn run_command_streaming(
         let redactor = crate::redact::Redactor::from_task_env(env);
         tracing::warn!(stderr = %redactor.redact(stderr_s.trim()), "subprocess stderr");
     }
-    Ok((status.code().unwrap_or(-1), stdout_s))
+    let code = status.code().unwrap_or(-1);
+    Ok((code, with_stderr_on_failure(code, stdout_s, &stderr_s)))
+}
+
+#[cfg(test)]
+mod timeout_ceiling_tests {
+    use super::{clamp_to, parse_ceiling, DEFAULT_TASK_TIMEOUT_SECS};
+
+    /// Unset must mean unlimited. A self-hosted engine runs on its owner's
+    /// hardware, and a ceiling appearing there because the cloud wanted one would
+    /// break workflows that have been correct for as long as they have existed.
+    #[test]
+    fn no_ceiling_leaves_the_task_alone() {
+        assert_eq!(parse_ceiling(None), None);
+        assert_eq!(clamp_to(Some(86_400), None), 86_400);
+        assert_eq!(clamp_to(None, None), DEFAULT_TASK_TIMEOUT_SECS);
+    }
+
+    /// The point of the whole change: what a workflow asks for is a request, not a
+    /// grant, once an operator has set a ceiling.
+    #[test]
+    fn a_ceiling_binds_the_request_and_the_default() {
+        assert_eq!(clamp_to(Some(86_400), Some(600)), 600);
+        assert_eq!(clamp_to(Some(5), Some(600)), 5, "under the ceiling is untouched");
+        assert_eq!(clamp_to(None, Some(10)), 10, "the default is clamped too");
+        assert_eq!(clamp_to(None, Some(600)), DEFAULT_TASK_TIMEOUT_SECS);
+    }
+
+    /// A ceiling that silently is not a ceiling is the failure this exists to
+    /// prevent, so every unusable value resolves to "no ceiling" — loudly, via the
+    /// warning in `parse_ceiling` — rather than to something arbitrary. `0` matters
+    /// most: read as a ceiling it would time out every task in the fleet instantly.
+    #[test]
+    fn an_unusable_ceiling_is_no_ceiling() {
+        for raw in ["0", "abc", "-1", "12s", " ", ""] {
+            assert_eq!(parse_ceiling(Some(raw)), None, "{raw:?} must not become a ceiling");
+        }
+        assert_eq!(parse_ceiling(Some("600")), Some(600));
+        assert_eq!(parse_ceiling(Some("  600  ")), Some(600), "whitespace is trimmed");
+    }
 }
 
 #[cfg(test)]
@@ -347,5 +513,110 @@ mod tests {
         let ctx = ExecContext::new(vec!["false".to_string()], Some(10), None);
         let out = LocalExecutor.execute(&ctx).await.expect("false exits cleanly, non-zero");
         assert!(!out.success, "`false` exits non-zero");
+    }
+
+    /// A successful task's stored output must stay byte-identical: `repeat.until`
+    /// terminates loops from it, the memo store caches it, and `produces:`
+    /// lineage reads it. Folding stderr in on success would change all three.
+    #[tokio::test]
+    async fn a_successful_command_still_stores_only_its_stdout() {
+        let ctx = ExecContext {
+            command: vec!["sh".into(), "-c".into(), "echo out; echo noise >&2".into()],
+            timeout_secs: Some(10),
+            docker_image: None,
+            env: vec![],
+            resources: None,
+            service_account: None,
+            log_sink: None,
+        };
+        let out = LocalExecutor.execute(&ctx).await.unwrap();
+        assert!(out.success);
+        assert_eq!(out.output.trim(), "out", "stderr must not leak into a success");
+    }
+
+    /// A failing task's stderr is the half that says what went wrong — and on a
+    /// GPU fleet it is where every CUDA error, NCCL warning and Python traceback
+    /// is written. It was logged and then discarded, so the stored record (and
+    /// the fault classifier that reads it) never saw any of it.
+    #[tokio::test]
+    async fn a_failing_command_carries_its_stderr_into_the_stored_output() {
+        let ctx = ExecContext {
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "echo step 100; echo 'RuntimeError: CUDA out of memory' >&2; exit 1".into(),
+            ],
+            timeout_secs: Some(10),
+            docker_image: None,
+            env: vec![],
+            resources: None,
+            service_account: None,
+            log_sink: None,
+        };
+        let out = LocalExecutor.execute(&ctx).await.unwrap();
+        assert!(!out.success);
+        assert!(out.output.contains("step 100"), "stdout is kept: {:?}", out.output);
+        assert!(out.output.contains("CUDA out of memory"), "stderr is appended: {:?}", out.output);
+        // And it is now classifiable, which is the point.
+        let c = dagron_core::fault::classify_text(&out.output).unwrap();
+        assert_eq!(c.class, dagron_core::fault::FaultClass::GpuOom);
+    }
+
+    /// The streaming path (#17) must behave identically — a task with live logs
+    /// enabled is not a task with worse diagnostics.
+    #[tokio::test]
+    async fn the_streaming_path_appends_stderr_on_failure_too() {
+        let (tx, _rx) = mpsc::unbounded_channel::<LogChunk>();
+        let sink = LogSink::new(tx, "task-1".to_string(), 1, crate::redact::Redactor::default());
+        let ctx = ExecContext {
+            command: vec!["sh".into(), "-c".into(), "echo hi; echo 'Xid 79' >&2; exit 1".into()],
+            timeout_secs: Some(10),
+            docker_image: None,
+            env: vec![],
+            resources: None,
+            service_account: None,
+            log_sink: Some(sink),
+        };
+        let out = LocalExecutor.execute(&ctx).await.unwrap();
+        assert!(!out.success);
+        assert!(out.output.contains("hi"));
+        assert!(out.output.contains("Xid 79"), "{:?}", out.output);
+    }
+
+    #[test]
+    fn the_stderr_tail_is_bounded_and_starts_on_a_whole_line() {
+        // A task dying in a loop can emit megabytes, once per attempt, into a
+        // database column. The tail — not the head — because the fatal error is
+        // the last thing a process prints.
+        let noise = "startup banner line\n".repeat(4000);
+        let err = format!("{noise}FATAL: Xid 79, GPU has fallen off the bus");
+        let out = with_stderr_on_failure(1, String::new(), &err);
+        assert!(out.len() <= STDERR_TAIL_LIMIT + 64, "bounded: {}", out.len());
+        assert!(out.contains("Xid 79"), "the end is what is kept");
+        assert!(out.starts_with("startup banner line"), "starts on a line: {:?}", &out[..40]);
+    }
+
+    #[test]
+    fn a_single_oversized_line_keeps_its_end_rather_than_being_dropped() {
+        // One line, no breaks, well over the limit. There is no line boundary
+        // to cut on, so the tail starts mid-line — and that is the right
+        // trade: the end of the line is where the error is.
+        let err = format!("{}CUDA error: device-side assert triggered", "x".repeat(40_000));
+        let out = with_stderr_on_failure(1, String::new(), &err);
+        assert!(out.len() <= STDERR_TAIL_LIMIT + 64, "still bounded: {}", out.len());
+        assert!(out.ends_with("device-side assert triggered"), "the end survives");
+        // And it is still classifiable, which is the reason any of this is kept.
+        assert_eq!(
+            dagron_core::fault::classify_text(&out).unwrap().class,
+            dagron_core::fault::FaultClass::UserCode
+        );
+    }
+
+    #[test]
+    fn stderr_is_not_appended_when_there_is_none_or_when_the_task_succeeded() {
+        assert_eq!(with_stderr_on_failure(0, "out".into(), "noise"), "out");
+        assert_eq!(with_stderr_on_failure(1, "out".into(), "   \n "), "out");
+        // No stdout at all: the output is just the stderr, with no stray blank line.
+        assert_eq!(with_stderr_on_failure(1, String::new(), "boom"), "boom");
     }
 }

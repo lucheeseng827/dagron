@@ -1,0 +1,117 @@
+# 15 — Form-submission guard: keep the junk out of the CRM, keep the humans in.
+#
+#   verify(captcha) ─▶ risk checks ×4 ─▶ decide ─▶ accept | challenge | reject
+#
+# Every demo-request form eventually gets found by a bot, a competitor, and a
+# lead-gen agency buying your keywords. Filtering them in HubSpot is too late —
+# the contact already exists, already counts as an MQL, and already skewed the
+# conversion rate the board sees.
+#
+# Two dagron behaviours matter here:
+#
+# * `retry_on_timeout: false` on the vendor checks. A risk vendor that hangs is
+#   giving an answer — "not in time" — and burning the remaining attempts on a
+#   20-second form submission just makes a real user wait longer. Fail fast,
+#   fall through to `challenge`.
+# * `allow_failure` + `all_done`. Four independent signals; the decision is
+#   designed to work with three. A vendor outage must degrade the filter, never
+#   block the form.
+#
+# Submitted per event from the same NDJSON stream as 14, so a malformed payload
+# becomes a dead letter (inspectable and redrivable in the console) instead of a
+# crash-looping consumer.
+name: mktg_form_abuse_guard
+tags: [marketing, forms, anti-abuse, realtime]
+environment: prod
+result_from: decide
+deadline: { in: 30s }
+run_timeout_secs: 180
+parameters:
+  submission_id: ""
+  email: ""
+  ip: ""
+  captcha_token: ""
+  form_guid: ""
+
+task_defaults:
+  max_attempts: 3
+  retry_delay_secs: 1
+  retry_max_delay_secs: 4
+  timeout_secs: 8
+  retry_on_timeout: false        # a slow answer is a no answer, at this latency
+  priority: 150
+  env:
+    - { name: RECAPTCHA_SECRET, value_from: { secret: RECAPTCHA_SECRET_KEY } }
+    - { name: IPQS_KEY, value_from: { secret: IPQUALITYSCORE_KEY } }
+    - { name: ZEROBOUNCE_KEY, value_from: { secret: ZEROBOUNCE_API_KEY } }
+    - { name: HUBSPOT_TOKEN, value_from: { secret: HUBSPOT_PRIVATE_APP_TOKEN } }
+    # A form submission is the least trusted input in the pack: these five values
+    # are whatever a stranger typed, and this workflow exists because some of
+    # those strangers are hostile. Parameters substitute into the command string
+    # verbatim, and single quotes are no defence — one `'` in an `email` closes
+    # the quote and the rest of the field is shell source. Bound to the
+    # environment instead, they are arguments and nothing else.
+    - { name: SUBMISSION_ID, value: "{{ submission_id }}" }
+    - { name: FORM_EMAIL, value: "{{ email }}" }
+    - { name: FORM_IP, value: "{{ ip }}" }
+    - { name: CAPTCHA_TOKEN, value: "{{ captcha_token }}" }
+    - { name: FORM_GUID, value: "{{ form_guid }}" }
+
+tasks:
+  - name: verify_captcha
+    max_attempts: 2
+    command: ["sh", "-c", "curl -sf -X POST https://www.google.com/recaptcha/api/siteverify -d secret=\"$RECAPTCHA_SECRET\" -d response=\"$CAPTCHA_TOKEN\" | jq -e .success > /dev/null"]
+
+  # Four cheap, independent signals. Each writes a score file; none of them is
+  # allowed to be the single point of failure for the form.
+  - name: risk_checks
+    depends_on: [verify_captcha]
+    with_items:
+      - { check: email-validity, tool: zerobounce-check }
+      - { check: ip-reputation, tool: ipqs-check }
+      - { check: domain-policy, tool: freemail-and-competitor-check }
+      - { check: velocity, tool: submission-velocity }
+    instance_key: "{{ item.check }}"
+    allow_failure: true
+    command: ["sh", "-c", "{{ item.tool }} --email \"$FORM_EMAIL\" --ip \"$FORM_IP\" > \"$DAGRON_ARTIFACTS/{{ item.check }}.json\""]
+
+  # Prints `accept`, `challenge`, or `reject`, and tees it for the tasks below.
+  - name: decide
+    depends_on: [risk_checks]
+    trigger_rule: all_done
+    max_attempts: 1
+    command: ["sh", "-c", "abuse-score --in \"$DAGRON_ARTIFACTS\" --policy strict-b2b | tee \"$DAGRON_ARTIFACTS/verdict.txt\""]
+
+  # `verify_captcha` as well as `decide`, with the default `all_success`: `decide`
+  # is `all_done`, so it runs even when the captcha failed and the risk checks
+  # skipped — on an empty artifacts directory, where `abuse-score` has nothing to
+  # judge. Only the *accept* path needs the hard gate; `challenge` and `reject`
+  # are the safe outcomes and stay reachable, which is the fall-through the
+  # header promises.
+  - name: accept
+    depends_on: [decide, verify_captcha]
+    when: "{{ tasks.decide.output }} == accept"
+    pool: crm-api
+    produces: ["hubspot://crm/contacts"]
+    command: ["sh", "-c", "hubspot-form-submit --guid \"$FORM_GUID\" --email \"$FORM_EMAIL\" --token \"$HUBSPOT_TOKEN\""]
+
+  # Not rejected, not trusted: park it in a review list rather than throwing
+  # away a real buyer with a corporate VPN and a strict ad blocker.
+  - name: challenge
+    depends_on: [decide]
+    when: "{{ tasks.decide.output }} == challenge"
+    pool: crm-api
+    command: ["sh", "-c", "hubspot-list-add --list form-manual-review --email \"$FORM_EMAIL\" --note \"$(cat \"$DAGRON_ARTIFACTS/verdict.txt\")\""]
+
+  - name: reject
+    depends_on: [decide]
+    when: "{{ tasks.decide.output }} == reject"
+    max_attempts: 1
+    produces: ["s3://acme-lake/marketing/form-rejects"]
+    command: ["sh", "-c", "abuse-log --submission \"$SUBMISSION_ID\" --email \"$FORM_EMAIL\" --ip \"$FORM_IP\" --sink s3://acme-lake/marketing/form-rejects/"]
+
+  - name: emit_rates
+    hook: on_exit
+    max_attempts: 1
+    timeout_secs: 5
+    command: ["sh", "-c", "emit-metric mktg.form.verdict 1 --tag \"verdict=$(cat \"$DAGRON_ARTIFACTS/verdict.txt\" 2>/dev/null || echo error)\""]

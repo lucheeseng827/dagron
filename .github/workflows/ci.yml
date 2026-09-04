@@ -72,6 +72,11 @@ jobs:
       # worlds separately, which is also how the images are actually built. Every
       # member is covered exactly once; a new member that picks postgres belongs in
       # the second command of each pair.
+      #
+      # A third command covers the `mqtt` feature world. `SOURCE=mqtt` is behind a
+      # non-default Cargo feature, so neither command above ever compiles that
+      # module: without this line a broken MQTT source is invisible to CI, and the
+      # first person to find out is whoever builds `--features mqtt`.
       - name: Clippy (advisory — see the note above)
         continue-on-error: true
         run: |
@@ -79,6 +84,7 @@ jobs:
           cargo clippy --locked --workspace --exclude dagron-api --exclude dagron-gitops \
             --all-targets -- -D warnings
           cargo clippy --locked -p dagron-api -p dagron-gitops --all-targets -- -D warnings
+          cargo clippy --locked -p dagron-source --features mqtt,sqlite --all-targets -- -D warnings
 
       # --locked, so a PR that edits a Cargo.toml without refreshing Cargo.lock fails
       # here with a clear message rather than drifting the published lockfile.
@@ -93,3 +99,6 @@ jobs:
           set -euo pipefail
           cargo test --locked --workspace --exclude dagron-api --exclude dagron-gitops
           cargo test --locked -p dagron-api -p dagron-gitops
+          # The mqtt feature world (see the clippy note): feature-gated code that
+          # no default build compiles, together with its tests.
+          cargo test --locked -p dagron-source --features mqtt,sqlite

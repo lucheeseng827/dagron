@@ -1,0 +1,112 @@
+# 12 — CRM hygiene: normalise, dedupe, and merge — with the merge behind a gate.
+#
+#   export ─▶ normalise ─▶ candidates ─▶ dry-run report ─▶ approval ─▶ merge ─▶ verify
+#
+# The destructive workflow in the pack, and the one to copy when you write your
+# own. Three things make an irreversible bulk operation safe to automate:
+#
+# 1. `dry_run` is a *parameter* with a `when:` branch, so the same file produces
+#    a report-only run and a real one. The report run is the default.
+# 2. `type: approval` sits between the report and the merge. Someone reads the
+#    number of merges before 40,000 records change owner.
+# 3. `pool: crm-api` and a low `priority` keep a 40,000-record merge from
+#    starving the speed-to-lead router (03, priority 100) of API budget. The
+#    hygiene job is important; it is never urgent.
+#
+# Run the report first:
+#   curl -sS -b cookies.txt -X POST http://localhost:8080/api/runs \
+#     -H 'content-type: application/json' \
+#     -d "$(jq -Rn --arg y "$(cat 12_crm_hygiene_dedupe.yaml)" \
+#            '{yaml:$y, parameters:{dry_run:"true"}}')"
+name: mktg_crm_hygiene_dedupe
+tags: [marketing, crm, data-quality]
+environment: prod
+run_timeout_secs: 86400
+max_active_runs: 1               # never two merges against the same CRM at once
+parameters:
+  dry_run: "true"                # the safe default. Set false deliberately.
+  batch_size: "500"
+
+task_defaults:
+  max_attempts: 3
+  retry_delay_secs: 30
+  retry_max_delay_secs: 300
+  timeout_secs: 1800
+  priority: -10                  # yields to anything user-facing
+  pool: crm-api
+  env:
+    - { name: HUBSPOT_TOKEN, value_from: { secret: HUBSPOT_PRIVATE_APP_TOKEN } }
+    - { name: LAKE_BUCKET, value: "{{ env.LAKE_BUCKET }}" }
+
+tasks:
+  # Snapshot before touching anything. This is the undo.
+  - name: export_snapshot
+    timeout_secs: 5400
+    produces: ["s3://acme-lake/marketing/crm-snapshots"]
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        hubspot-export --objects contacts,companies --out "$DAGRON_ARTIFACTS/crm.ndjson"
+        aws s3 cp "$DAGRON_ARTIFACTS/crm.ndjson" \
+          "s3://$LAKE_BUCKET/marketing/crm-snapshots/$(date -u +%F)/$DAGRON_RUN_ID.ndjson"
+
+  - name: normalise
+    depends_on: [export_snapshot]
+    command: ["sh", "-c", "crm-normalise --in \"$DAGRON_ARTIFACTS/crm.ndjson\" --rules country,job-title,domain,phone --out \"$DAGRON_ARTIFACTS/normalised.ndjson\""]
+
+  - name: find_duplicates
+    depends_on: [normalise]
+    timeout_secs: 3600
+    command: ["sh", "-c", "dedupe-candidates --in \"$DAGRON_ARTIFACTS/normalised.ndjson\" --keys email,domain+name --threshold 0.92 --out \"$DAGRON_ARTIFACTS/candidates.json\""]
+
+  - name: dry_run_report
+    depends_on: [find_duplicates]
+    max_attempts: 1
+    command: ["sh", "-c", "dedupe-report --in \"$DAGRON_ARTIFACTS/candidates.json\" --out \"$DAGRON_ARTIFACTS/report.md\" && post-slack marketing-ops \"$(head -5 \"$DAGRON_ARTIFACTS/report.md\")\""]
+
+  # Everything below exists only when dry_run is false — the condition is over a
+  # parameter, so it is decided at run creation and a report run's DAG genuinely
+  # has no merge task in it. Nothing to accidentally approve.
+  - name: approve_merge
+    type: approval
+    depends_on: [dry_run_report]
+    when: "{{ dry_run }} == false"
+    approval_timeout_secs: 43200
+    approval_on_timeout: reject
+
+  - name: merge_duplicates
+    depends_on: [approve_merge]
+    when: "{{ dry_run }} == false"
+    timeout_secs: 7200
+    max_attempts: 2
+    retry_on_timeout: false        # a half-finished merge must not be retried blind
+    produces: ["hubspot://crm/contacts"]
+    command: ["sh", "-c", "dedupe-merge --in \"$DAGRON_ARTIFACTS/candidates.json\" --batch {{ batch_size }} --token \"$HUBSPOT_TOKEN\" --journal \"$DAGRON_ARTIFACTS/merge-journal.ndjson\""]
+
+  - name: verify_merge
+    depends_on: [merge_duplicates]
+    when: "{{ dry_run }} == false"
+    max_attempts: 1
+    command: ["sh", "-c", "dedupe-verify --journal \"$DAGRON_ARTIFACTS/merge-journal.ndjson\" --expect-loss 0"]
+
+  # The journal is the only record of which contacts were merged into which, so
+  # `|| true` on the upload was the wrong shape: it turned a lost audit trail into
+  # a green task. The dry-run case it existed for is the *missing file*, which is
+  # tested for explicitly; an upload that actually fails now fails the task.
+  - name: publish_journal
+    hook: on_exit
+    max_attempts: 2
+    timeout_secs: 600
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        journal="$DAGRON_ARTIFACTS/merge-journal.ndjson"
+        # A dry run merges nothing and writes no journal. Nothing to publish is
+        # not the same as failing to publish.
+        [ -f "$journal" ] || exit 0
+        aws s3 cp "$journal" \
+          "s3://$LAKE_BUCKET/marketing/merge-journals/$DAGRON_RUN_ID.ndjson"

@@ -23,10 +23,57 @@ mod backfill_jobs;
 mod cron;
 #[cfg(feature = "ops")]
 mod gc;
-#[cfg(feature = "ops")]
 // Environment integration: `{{ env.* }}` template params at run creation +
-// DB-backed secret resolution at dispatch.
+// DB-backed secret resolution at dispatch. Both halves read ops-only datastore
+// queries (`environment_vars`, `run_environment`, `environment_secret`), so
+// the real module is ops-gated and the lean build gets the shim below.
+#[cfg(feature = "ops")]
 mod environments;
+/// Lean-build (`--no-default-features --features sqlite`) stand-in for
+/// [`environments`]: the same two signatures the run loop calls, minus the
+/// datastore-backed environment store a lean daemon does not carry.
+///
+/// `template_params` yields no `{{ env.* }}` keys — a spec that declares
+/// `environment:` runs as-is, its templates unexpanded, because there is no
+/// store to resolve them from. `resolve_secrets` still resolves every
+/// `value_from: {secret: NAME}` reference from the process environment /
+/// `DAGRON_SECRETS_DIR` through the executor's resolver — the tier that
+/// predates the DB store, and the ops module's own fallback. A task must not
+/// run with an empty credential in any build.
+#[cfg(not(feature = "ops"))]
+mod environments {
+    use std::collections::BTreeMap;
+
+    use anyhow::Result;
+
+    use crate::{dag, db};
+
+    pub(crate) async fn template_params(
+        _pool: &db::Pool,
+        _yaml: &str,
+    ) -> Result<BTreeMap<String, String>> {
+        Ok(BTreeMap::new())
+    }
+
+    pub(crate) async fn resolve_secrets(
+        _pool: &db::Pool,
+        _run_id: &str,
+        env: &mut [dag::EnvVar],
+    ) -> Result<()> {
+        if !env.iter().any(|e| e.value_from.is_some()) {
+            return Ok(());
+        }
+        let resolved = dagron_executor::secrets::resolve(env)?;
+        for (var, done) in env.iter_mut().zip(resolved) {
+            var.value = done.value;
+        }
+        Ok(())
+    }
+}
+// Leadership (the `leader_election` lease row) only gates the ops loops —
+// cron, GC, DB schedules, backfill pacing, the stale-ready alarm — and its
+// datastore call is ops-only, so a lean build carries neither.
+#[cfg(feature = "ops")]
 mod leadership;
 // Outbound run notifications (`notify.webhook` / `notify.slack`), fired on run
 // finalization and soft-deadline breach. Best-effort, like forge feedback.
@@ -54,6 +101,10 @@ mod validate;
 // DAGRON_CONFIG file/profile layer, typo warnings, the fleet fingerprint, and
 // `dagron config` introspection.
 mod config;
+// Constrained-host gates: pressure file + free-disk floor (docs/CONFIG.md).
+mod pressure;
+// Wall-clock confidence on disconnected units (docs/CONFIG.md).
+mod clock;
 
 // Network policy for `wait.url` sensors: the opt-in `WAIT_URL_DENY_PRIVATE`
 // guard that keeps a scheduler-issued poll from reaching addresses the task
@@ -577,6 +628,37 @@ pub async fn run(seams: Seams) -> Result<()> {
 
     let pool = db::init_pool(&db_target).await?;
 
+    // Clock discipline: assess the wall clock against the datastore NOW —
+    // awaited, so the first run this process creates already carries a
+    // truthful `clock_confidence` — then keep a step detector running for the
+    // life of the process. Nothing downstream is gated on the verdict.
+    clock::start(pool.clone(), Arc::clone(&metrics), clock::Config::from_env()).await;
+
+    // Free-disk admission floor (`DAGRON_MIN_FREE_BYTES`; SQLite only — a
+    // Postgres datastore's disk is not this host's to probe). Enforced inside
+    // `db::create_run`; reported here once, through the same probe, so an
+    // operator sees the headroom the floor will be judged against.
+    #[cfg(feature = "sqlite")]
+    {
+        let floor = pressure::min_free_bytes();
+        if floor > 0 {
+            let dir = std::path::Path::new(&db_target)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            match pressure::free_bytes(dir) {
+                Ok(free) => info!(
+                    dir = %dir.display(), free_bytes = free, min_free_bytes = floor,
+                    "free-disk admission floor armed"
+                ),
+                Err(e) => tracing::warn!(
+                    dir = %dir.display(), error = %e, min_free_bytes = floor,
+                    "free-disk probe failed — the admission floor fails open"
+                ),
+            }
+        }
+    }
+
     // Lease heartbeat: workers renew a running task's lease every few seconds,
     // so a task may run for hours under the short claim-time lease — the
     // long-task keystone (training jobs, stream consumers). A task whose worker
@@ -943,7 +1025,7 @@ pub async fn run(seams: Seams) -> Result<()> {
     // later drops `on_datasets:` is cleared once instead of every sweep.
     let mut subscribed_workflows: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    // Workflows already signposted for Enterprise-only dataset composition —
+    // Workflows already signposted for feature-gated dataset composition —
     // warn once each, not twelve times a minute forever.
     let mut warned_dataset_composition: std::collections::HashSet<String> =
         std::collections::HashSet::new();
@@ -970,6 +1052,13 @@ pub async fn run(seams: Seams) -> Result<()> {
     let mut oversized_gang_check: Option<std::time::Instant> = None;
     let mut warned_oversized_gangs: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+
+    // Constrained-host claim gate (`DAGRON_PRESSURE_FILE`): polled once per
+    // tick, transitions logged once. See `pressure` for the contract.
+    let mut pressure_gate = pressure::PressureGate::from_env();
+    if let Some(p) = pressure_gate.path() {
+        info!(path = %p.display(), "pressure gate armed — task claims pause while this file exists");
+    }
 
     loop {
         // Tick timer — the recover→advance→dispatch→collect→reap span. A tick
@@ -1135,7 +1224,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                 //    forever. `subscribed` remembers who we synced, so a workflow that
                 //    *drops* its `on_datasets:` still gets its rows cleared exactly
                 //    once (and the orphan prune below is the backstop for the rest).
-                //    Multi-dataset / all-of composition is the Enterprise data-aware
+                //    Multi-dataset / all-of composition is the feature-gated data-aware
                 //    scheduler — an open build skips such specs with a signpost
                 //    instead of silently subscribing to a subset, warning once per
                 //    workflow rather than on every sweep.
@@ -1152,7 +1241,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                                         if warned_dataset_composition.insert(name.clone()) {
                                             tracing::warn!(
                                                 workflow = %name, datasets = uris.len(), mode = %mode,
-                                                "multi-dataset trigger composition ships with dagron Enterprise — subscription skipped (docs/DATASETS.md#enterprise)"
+                                                "multi-dataset trigger composition is not in this build — subscription skipped (docs/DATASETS.md#limits-of-this-build)"
                                             );
                                         }
                                         if subscribed_workflows.contains(&name) {
@@ -1225,12 +1314,14 @@ pub async fn run(seams: Seams) -> Result<()> {
                                 );
                             }
                             Err(e)
-                                if e.downcast_ref::<dagron_core::models::MaxActiveRunsReached>()
-                                    .is_some() =>
+                                if dagron_core::models::is_capacity_refusal(&e) =>
                             {
+                                // Capacity, not fault (the workflow's cap or the
+                                // datastore's free-disk floor): roll the cursors
+                                // back quietly and let a later sweep retry.
                                 db::unclaim_dataset_trigger(&pool, &fire.workflow_name, &fire.advanced)
                                     .await?;
-                                info!(workflow = %fire.workflow_name, "dataset fire at max_active_runs — will retry");
+                                info!(workflow = %fire.workflow_name, reason = %e, "dataset fire refused admission (capacity) — will retry");
                             }
                             Err(e) => {
                                 db::unclaim_dataset_trigger(&pool, &fire.workflow_name, &fire.advanced)
@@ -1277,7 +1368,14 @@ pub async fn run(seams: Seams) -> Result<()> {
             }
         }
 
-        let capacity = workers.size().saturating_sub(in_flight);
+        // Pressure file present ⇒ capacity 0: nothing new is claimed, runs
+        // stay queued in the datastore, in-flight tasks finish, and the
+        // sweeps above keep running (recovery is never gated). A one-shot run
+        // cannot drain while paused, so the process stays resident until the
+        // file is removed — which is the point of a maintenance hold.
+        let claims_paused = pressure_gate.poll();
+        metrics.set_claims_paused(claims_paused);
+        let capacity = if claims_paused { 0 } else { workers.size().saturating_sub(in_flight) };
         if capacity > 0 {
             // Both claim paths take the same `pool_caps` (#21) and order by
             // priority (#25), so gang co-scheduling never bypasses either.
@@ -1542,12 +1640,14 @@ pub async fn run(seams: Seams) -> Result<()> {
                                     info!(task = %task.name, task_id = %task.id, workflow = %child_name, %child_run, "sub-workflow triggered — parking until it finishes");
                                 }
                                 Err(e)
-                                    if e.downcast_ref::<dagron_core::models::MaxActiveRunsReached>().is_some() =>
+                                    if dagron_core::models::is_capacity_refusal(&e) =>
                                 {
-                                    // Child at its concurrency cap — release the
-                                    // task back to ready and retry on a later tick.
+                                    // Child refused on capacity — its concurrency
+                                    // cap, or the datastore's free-disk floor —
+                                    // not on fault: release the task back to ready
+                                    // and retry on a later tick.
                                     db::release_subworkflow_task(&pool, &task.id, fence).await?;
-                                    info!(task = %task.name, workflow = %child_name, "child workflow at max_active_runs — will retry");
+                                    info!(task = %task.name, workflow = %child_name, reason = %e, "child workflow refused admission (capacity) — will retry");
                                 }
                                 Err(e) => {
                                     db::mark_task_failed(&pool, &task.id, &worker_id, fence, Some(format!("failed to start child workflow '{child_name}': {e}"))).await?;
@@ -1612,7 +1712,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                 // Kubernetes, a headless Service per gang_id). Not gated on
                 // `gangs_on`: the spec, the expansion into member rows, and this
                 // env are the open programming model — only the all-or-nothing
-                // *claimer* is Enterprise. A member row carries its rank however
+                // *claimer* is feature-gated. A member row carries its rank however
                 // it was scheduled, so ranks must be readable in either build.
                 if let Some(member) = gang_member {
                     for (name, value) in [
@@ -2024,14 +2124,73 @@ pub async fn run(seams: Seams) -> Result<()> {
                 // attempt + 1 = the attempt number that just ran (claim_ready increments
                 // the counter in the DB, but the snapshot we received is pre-claim).
                 let actual_attempt = result.attempt + 1;
-                // Normally retry while attempts remain, but a `timeout_secs`
+
+                // ── Fault attribution ────────────────────────────────────────
+                // What broke, decided before whether another attempt is worth
+                // anything. The classifier reads the failure text the executor
+                // already handed back, so this costs one scan of a string that
+                // is in hand — no extra DB read, no log fetch, nothing that can
+                // make the retry path slower or more fallible than it was.
+                //
+                // Classification never *blocks* the transition: an unmatched
+                // failure is `None`, which resolves the budget to
+                // `max_attempts` — exactly the pre-attribution behaviour.
+                let classification = result
+                    .output
+                    .as_deref()
+                    .and_then(dagron_core::fault::classify_text);
+                let fault_class = classification.as_ref().map(|c| c.class);
+                // The author's per-class budget, if they wrote one for *this*
+                // class. Read off the spec that already rode the dispatch
+                // payload (B-4) — no re-parse of the row's input JSON.
+                let budget_override = fault_class.and_then(|c| {
+                    result
+                        .spec
+                        .as_ref()
+                        .and_then(|s| s.retry_budgets.get(c.as_str()).copied())
+                });
+                if let Some(c) = classification.as_ref() {
+                    metrics.inc_fault(c.class);
+                    // Fenced like the transition below it, and best-effort: a
+                    // lost breadcrumb must never cost a state transition, and a
+                    // stale attempt's write is rejected by the fence rather
+                    // than relabelling the newer attempt's failure.
+                    if let Err(e) = db::record_task_fault(
+                        &pool,
+                        &result.task_id,
+                        &result.worker_id,
+                        result.fence,
+                        c.class,
+                        Some(c.evidence.as_str()),
+                        c.confidence,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            error = %e, task_id = %result.task_id,
+                            "recording fault attribution failed (best-effort)"
+                        );
+                    }
+                }
+                // The budget actually in force, resolved once so the log can
+                // say which number it used: "not retrying, budget 1 for
+                // nan-loss" is an answer; "not retrying" is not.
+                let budget = dagron_core::models::effective_budget(
+                    result.max_attempts,
+                    fault_class,
+                    budget_override,
+                );
+
+                // Normally retry while the budget allows, but a `timeout_secs`
                 // deadline kill on a task with `retry_on_timeout: false` fails at
                 // once — a timeout usually recurs (#24).
-                if dagron_core::models::should_retry_failed(
+                if dagron_core::models::should_retry_failed_with_class(
                     actual_attempt,
                     result.max_attempts,
                     result.timed_out,
                     result.retry_on_timeout,
+                    fault_class,
+                    budget_override,
                 ) {
                     // Exponential backoff: base * 2^(attempt-1), capped at 2^10 doublings
                     // and clamped to the spec's optional retry_max_delay_secs ceiling.
@@ -2048,6 +2207,8 @@ pub async fn run(seams: Seams) -> Result<()> {
                         task_id = %result.task_id,
                         attempt = actual_attempt,
                         max_attempts = result.max_attempts,
+                        budget,
+                        fault_class = fault_class.map(|c| c.as_str()).unwrap_or("unclassified"),
                         retry_in_secs = delay_secs,
                         "task failed — scheduling retry"
                     );
@@ -2071,6 +2232,14 @@ pub async fn run(seams: Seams) -> Result<()> {
                         task_id = %result.task_id,
                         attempt = actual_attempt,
                         max_attempts = result.max_attempts,
+                        // The budget in force and what set it — the difference
+                        // between "we gave up" and "we deliberately did not
+                        // spend eight more GPU-hours reproducing a NaN".
+                        budget,
+                        fault_class = fault_class.map(|c| c.as_str()).unwrap_or("unclassified"),
+                        fault_disposition = fault_class
+                            .map(|c| c.disposition().as_str())
+                            .unwrap_or("unclassified"),
                         timed_out = result.timed_out,
                         not_retried_due_to_timeout,
                         "task failed — not retrying"

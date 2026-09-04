@@ -27,17 +27,17 @@ The same topology as Mermaid, for diffing and for editing the drawing from:
 
 ```mermaid
 flowchart LR
-    yaml([DAG YAML file])
-    browser([Browser · dagron frontend])
+    yaml([DAG YAML · a file, or a watched directory])
+    browser([Browser])
     agent([AI agent · MCP client])
     subgraph edge["UI gateway (1..N, stateless)"]
-        gw["dagron-api<br/>axum · self-contained JWT auth · SSE"]
+        gw["dagron-api<br/>axum · self-contained JWT auth · SSE<br/>serves the console at / · API under /api"]
     end
     subgraph mcp["Agent gateway (stdio, per-agent)"]
         mc["dagron-mcp<br/>JSON-RPC 2024-11-05 · stdio · stderr-only logs"]
     end
     subgraph schedulers["Scheduler processes (1..N, identical)"]
-        s1["scheduler A<br/>reconcile loop + worker pool<br/>(api.rs ops — internal)"]
+        s1["scheduler A<br/>reconcile loop + worker pool<br/>(api.rs ops + built-in console — internal)"]
         s2["scheduler B<br/>reconcile loop + worker pool"]
     end
     subgraph store["Datastore (source of truth)"]
@@ -45,8 +45,8 @@ flowchart LR
     end
     targets([Task targets:<br/>subprocess / Docker / Pod])
 
-    yaml -->|"DagGraph::from_yaml → create_run"| s1
-    browser -->|"HTTP + Bearer JWT"| gw
+    yaml -->|"SOURCE=file (once) · SOURCE=dir (on change) → create_run"| s1
+    browser -->|"HTTPS · console at / · API at /api (session JWT)"| gw
     agent <-->|"MCP JSON-RPC (stdio)"| mc
     mc -->|"HTTP + Bearer JWT (same edge)"| gw
     gw <-->|"read / control · LISTEN→SSE"| db
@@ -94,9 +94,10 @@ compiles in exactly one backend. That single seam is where horizontal scale slot
 | `dagron-engine` | `crates/dagron-engine` | env config, the reconcile loop + `in_flight` accounting, the `Seams` seam (`hooks.rs`), and the ops modules (`api`/`cron`/`gc`/`leadership`/`schedule`, feature `ops`) that wire the libs together |
 | `dagron-core` | `crates/dagron-core` | DAG model + validation, matrix/call expansion, the datastore facade (SQLite/Postgres + migrations), the metrics registry |
 | `dagron-executor` | `crates/dagron-executor` | the `Executor` trait + Local/Docker/Kube backends + the ractor worker pool |
-| `dagron-source` | `crates/dagron-source` | the `WorkflowSource` trait, the built-in File/Channel backends, the `source::build` factory, and the ingest actor — Redis/SQS/Kafka/NATS backends plug in via a `SourceFactory` seam |
+| `dagron-source` | `crates/dagron-source` | the `WorkflowSource` trait, the built-in File/Dir/Stream/Channel backends, the `source::build` factory, and the ingest actor — Redis/SQS/Kafka/NATS backends plug in via a `SourceFactory` seam |
 | `dagron-api` | `crates/dagron-api` | the authenticated public UI gateway (separate crate, Postgres-only) — see [§2a](#2a-two-http-surfaces--engine-ops-api-vs-ui-gateway) |
 | `dagron-mcp` | `crates/dagron-mcp` | the per-agent stdio MCP adapter fronting `dagron-api` — see [§5.8](#58-mcp-agent-event-call--submit--bounded-sse-event-poll) and [`docs/MCP.md`](MCP.md) |
+| `dagron-autopsy` | `crates/dagron-autopsy` | offline job autopsy, out of the run path entirely: reads `sacct` + DCGM + NCCL logs + IB counters off disk and emits a fault-attributed record. Shares the `dagron_core::fault` taxonomy with the engine's retry budgets so the tool and the scheduler cannot disagree about what a failure was — see [`docs/HPC_AUTOPSY.md`](HPC_AUTOPSY.md) |
 | seam crates | `crates/dagron-{identity,artifact,import,lineage,logging}` | `dagron-api`'s auth seam (argon2 local login, IdP-swappable) · artifact-store seam (local FS today) · Argo→dagron YAML importer · OpenLineage emitter (best-effort, on run finalization) · shared `tracing` bootstrap |
 
 Feature flags keep their original names on the bin but **forward** through `dagron-engine`
@@ -115,7 +116,7 @@ flowchart TB
         direction TB
         run["lib.rs — run(Seams)<br/>env config · reconcile loop · in_flight accounting"]
         hooks["hooks.rs — Seams<br/>extra sources · run-lifecycle hooks (default: no-op)"]
-        api["api.rs<br/>axum ops API · list/inspect/submit/cancel (feature: ops)"]
+        api["api.rs<br/>axum ops API + embedded operator console<br/>list/inspect/submit/cancel (feature: ops)"]
         cronm["cron.rs<br/>cron-triggered create_run (leadership-gated)"]
         lead["leadership.rs<br/>leader_election lease · cluster singleton"]
         gcm["gc.rs<br/>retention sweep (leadership-gated)"]
@@ -146,7 +147,7 @@ flowchart TB
     subgraph srcc["dagron-source · crates/dagron-source"]
         direction TB
         ig["ingest.rs<br/>IngestActor (ractor) · create_run + backpressure"]
-        src["source.rs<br/>WorkflowSource trait · File/Channel · source::build"]
+        src["source.rs<br/>WorkflowSource trait · File/Dir/Stream/Channel · source::build"]
     end
 
     q["queue sources (SourceFactory backends)<br/>Redis · SQS · Kafka · NATS"]
@@ -190,7 +191,7 @@ flowchart TB
 | `executor.rs` (executor) | `Executor` trait, `LocalExecutor` (tokio subprocess), `run_command` helper |
 | `docker_executor.rs` (executor) | `DockerExecutor` — per-task container, hard timeout, log capture, force-remove |
 | `kube_executor.rs` (executor, v3) | `KubeExecutor` — per-task one-shot Pod, phase poll under timeout, log capture, pod delete; `--features kubernetes` |
-| `source.rs` (source, v4) | `WorkflowSource` trait; `FileSource`/`ChannelSource`; `source::build` selects the backend |
+| `source.rs` (source, v4) | `WorkflowSource` trait; `FileSource` (one spec, then drain) / `DirSource` (`SOURCE=dir` — polls `WORKFLOW_DIR`, re-submits on change, per-file cursor in `source_offsets`) / `StreamSource` (NDJSON, exactly-once offset) / `ChannelSource`; `source::build` selects the backend |
 | queue sources (SourceFactory backends) | the Redis/SQS/Kafka/NATS queue backends (each behind its own feature) with at-least-once ack semantics + native dead-letter routing; registered via the `SourceFactory` seam |
 | `ingest.rs` (source, v4) | `IngestActor` (ractor) — pulls the source → `create_run`; `MAX_INFLIGHT_RUNS` admission backpressure; dead-letters poison submissions (parse failure → immediate; `create_run` failure → after `DEAD_LETTER_MAX_ATTEMPTS`) |
 | `api.rs` (engine, v5) | **internal, unauthenticated** `axum` ops API — list/inspect/submit/cancel runs + `/metrics`, `/healthz`, OpenAPI (`/openapi.{yaml,json}`, `/docs`), dead-letter list/redrive/discard; thin shell over the `dagron_core::db` facade. Bind cluster-private; user traffic goes through `dagron-api` instead |
@@ -209,14 +210,21 @@ separate stateless crate — the authenticated public edge the browser uses. Aut
 **self-contained** (argon2 password hashing + HS256 session JWT in an HttpOnly
 cookie — no external IdP). It adds what the UI needs (per-run **SSE**, **DAG
 graph**, **task logs**, **task retry**) and re-surfaces the ops capabilities
-(metrics, dead-letters) behind auth, so the frontend has one coherent backend.
+(metrics, dead-letters) behind auth.
+
+Since 0.9 it also **serves the console itself**, as a `ServeDir` fallback under
+every `/api` route: one port, one origin, no proxy and no second image (the
+`dagron-frontend` image is deprecated). And the engine carries a **second, smaller
+console of its own** — one embedded HTML file on the ops API — for the deployment
+`dagron-api` cannot reach: SQLite, air-gapped, one binary.
 
 ```mermaid
 flowchart TB
-    browser([Browser · dagron frontend])
+    browser([Browser])
 
     subgraph gw["dagron-api — authenticated UI edge (separate crate, Postgres-only)"]
         direction TB
+        gconsole["console (ServeDir fallback at /)<br/>DAGRON_CONSOLE_DIR · unmatched /api → 404 JSON"]
         gauth["auth.rs<br/>AuthUser · self-contained argon2 + HS256 session JWT"]
         gread["routes/runs · graph<br/>list/detail · nodes+edges · task logs"]
         gctl["routes/control<br/>submit (cycle-check) · cancel · retry"]
@@ -225,14 +233,15 @@ flowchart TB
     end
 
     subgraph engine["dagron engine (in-process)"]
-        eapi["api.rs (ops, --features ops)<br/>/metrics · OpenAPI · dead-letters · runs<br/>UNAUTHENTICATED — bind cluster-private"]
+        eapi["api.rs (ops, --features ops)<br/>/metrics · OpenAPI · dead-letters · runs<br/>built-in console at / and /console (DAGRON_CONSOLE=off)<br/>UNAUTHENTICATED — bind cluster-private"]
         loop["reconcile loop + workers"]
     end
 
     db[("Postgres<br/>source of truth · LISTEN/NOTIFY 'task_events'")]
     prom([Prometheus]):::ext
 
-    browser -->|"Bearer JWT"| gauth
+    browser -->|"GET / — the console"| gconsole
+    browser -->|"/api/... · session JWT"| gauth
     gauth --> gread & gctl & gstream & gops
     gread & gctl & gops -->|"read / write (write_pool)"| db
     gstream -->|"LISTEN task_events"| db
@@ -250,6 +259,7 @@ flowchart TB
 | Auth | none — cluster-private | self-contained JWT (argon2 + HS256 cookie) |
 | Backend | engine's compiled feature | Postgres only (SSE needs LISTEN/NOTIFY) |
 | Unique surface | Prometheus `/metrics`, OpenAPI/`/docs`, in-process | SSE stream, DAG graph, task logs, task retry, `/api/me` |
+| Console | one embedded HTML file (~19 KB, `include_str!`) at `/` and `/console`; runs, tasks, logs, cancel/rerun/approve, dead letters. Opt out with `DAGRON_CONSOLE=off` | the full console (workflow editor, approvals, settings) served from `DAGRON_CONSOLE_DIR` at `/`, API under `/api` |
 | Shared | runs list/detail, submit, cancel, dead-letters, metrics |
 
 > `dagron-api` is a **standalone** crate (it builds from its own dir, depending only
@@ -457,6 +467,13 @@ store holds the backlog, never the scheduler. The reconcile loop runs
 concurrently, draining all active runs and `reap_completed_runs()` finalizing each,
 which frees admission slots.
 
+The built-in sources implement the same contract in-process, so the diagram below
+describes them too: a nack redelivers (`SOURCE=dir` hands the same file back on the
+next pull rather than dropping it), and a source with a resumable coordinate — the
+stream's byte offset, a watched file's `(mtime, len)` — commits that coordinate in
+the *same transaction* as the run it becomes, which is what makes a restart resume
+instead of replay.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -534,7 +551,10 @@ agent needs to *observe* the engine, not just drive it. The `dagron_get_run_even
 tool opens the same SSE channel the browser uses and reads it for a bounded
 window (`wait_ms`, capped at 10 s / 256 KiB), parses the SSE frames into JSON
 events, and returns them as a single tool response. The same edge enforces JWT;
-ids are validated locally so a crafted argument can't reshape the request path.
+uuid-shaped ids are validated locally and free-form segments (an artifact's
+`task`/`name`) are percent-encoded, so a crafted argument can't reshape the
+request path. `DAGRON_MCP_READONLY=1` reduces the 42-tool catalogue to its 24
+read tools, hidden from `tools/list` and refused in the dispatcher both.
 
 ```mermaid
 sequenceDiagram
@@ -545,7 +565,7 @@ sequenceDiagram
     participant DB as Postgres (LISTEN/NOTIFY)
     participant Lp as scheduler reconcile loop
 
-    Note over Ag,Mc: JSON-RPC over stdio (2024-11-05); logs to stderr only
+    Note over Ag,Mc: JSON-RPC over stdio (2024-11-05)#59; logs to stderr only
     Ag->>Mc: tools/call dagron_submit_run, yaml
     Mc->>Mc: validate args, no path-segment escapes
     Mc->>Gw: POST api/runs Authorization Bearer JWT
@@ -586,8 +606,9 @@ stateDiagram-v2
     Reconcile --> Done: source exhausted and in flight equals 0 and active runs equals 0
     Done --> [*]: pool close
     note right of Reconcile
-        Streaming queue sources never exhaust
-        the daemon runs until killed.
+        Streaming queue sources never exhaust, and neither
+        does SOURCE=dir, a watched directory is idle not empty.
+        The daemon runs until killed.
     end note
 ```
 

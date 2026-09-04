@@ -21,7 +21,7 @@ Back up everything in the first table. Everything in the second is re-creatable.
 | **The database** | Postgres `workflow` DB, or the SQLite file | you lose runs, task history, workflow definitions, schedules, dead letters, users, environments, git-repo config, audit rows |
 | **`DAGRON_ENV_SECRET_KEY`** | env var on engine **and** dagron-api | every stored environment secret is **permanently undecryptable** — the ciphertext is in the DB, the key is not |
 | **`DAGRON_JWT_SECRET`** | env var on dagron-api | every existing session is invalidated (users re-login). Not fatal, but rotate deliberately |
-| **Artifact KEK** (`dagron-crypto` provider config) — *Enterprise* | env / KMS | encrypted artifacts at rest become unreadable. Open builds have no KEK: artifacts are stored as written, and only `DAGRON_ENV_SECRET_KEY` above applies |
+| **Artifact KEK** (`dagron-crypto` provider config) — *not in this build* | env / KMS | encrypted artifacts at rest become unreadable. Open builds have no KEK: artifacts are stored as written, and only `DAGRON_ENV_SECRET_KEY` above applies |
 | **Artifact store** (`DAGRON_ARTIFACT_DIR` or object store) | filesystem / bucket | run outputs and checkpoints that tasks wrote |
 | **GC archive** (`GC_ARCHIVE_DIR` / `GC_ARCHIVE_URL`) | filesystem / bucket | runs the retention GC already moved out of the DB — `/api/archive/*` stops resolving them |
 
@@ -108,7 +108,7 @@ Four facts decide every procedure below.
 2. **They are forward-only.** sqlx has no down-migrations here, so "rolling back
    a schema change" is not a thing. Rollback = restore the pre-upgrade backup.
 3. **Two migration sets share one ledger.** Base (`migrations_pg`, versions
-   1–042) and Enterprise (`migrations_pg_ee`, 900+) both write sqlx's single
+   1–042) and the feature-gated set (`migrations_pg_ee`, 900+) both write sqlx's single
    `_sqlx_migrations` table, and both run with `set_ignore_missing(true)` so
    neither trips over the other's rows.
 4. **A failed migration is fail-fast, not half-applied.** Postgres DDL is
@@ -248,7 +248,7 @@ previous version (§3, fact 4). Then:
 
 ### 6.5 Startup complains about an unknown/newer migration
 
-Expected and tolerated (`ignore_missing`), including the OSS↔Enterprise case
+Expected and tolerated (`ignore_missing`), including the two-migrator case
 where the 900+ rows belong to a migrator this binary doesn't have. If you see it
 as an *error* rather than a start-up, you are on a build predating that fix —
 upgrade.

@@ -1,0 +1,24 @@
+# Nightly report — the second spec in the example bundle (../README.md).
+#
+# Two specs rather than one so the walkthrough shows what "all or nothing"
+# means: break this file after signing and line_health.yaml is not applied
+# either, even though it is untouched. A bundle is one signed statement.
+name: nightly_report
+tags: [edge, report]
+parameters:
+  scheduled_time: ""          # injected by a cron schedule (RFC 3339)
+  out_dir: data/reports
+tasks:
+  - name: collect
+    command: ["sh", "-c", "mkdir -p {{ out_dir }} && date -u +%FT%TZ > {{ out_dir }}/latest.txt"]
+    timeout_secs: 60
+  - name: summarise
+    depends_on: [collect]
+    command: ["sh", "-c", "echo collected at $(cat {{ out_dir }}/latest.txt)"]
+    timeout_secs: 30
+  - name: publish
+    depends_on: [summarise]
+    command: ["sh", "-c", "echo report ready for window {{ scheduled_time }}"]
+    timeout_secs: 30
+    max_attempts: 3
+    retry_delay_secs: 10

@@ -1,0 +1,52 @@
+# Schedules for the marketing pack — point the engine at this file:
+#
+#   CRON_CONFIG=examples/marketing/cron.yaml.example POOLS=crm-api=8,ads-api=4,enrich-api=4,activation-api=6,seo-api=2 dagron
+#
+# Only six of the twenty are time-triggered, and that is the argument. The rest
+# start because *something happened*: a dataset updated (02, 06, 18), an event
+# arrived on the stream (14, 15), a human or a form called the API (03, 07, 16),
+# or a parent workflow submitted them (04, 08, 11, 19).
+#
+# Cron expressions are 6- or 7-field: sec min hour day-of-month month day-of-week [year].
+# Every fire hands its run `{{ scheduled_time }}` (RFC-3339), which is what makes
+# these workflows backfillable rather than "whatever now happens to be".
+schedules:
+  # Hourly lead sweep. The stream (14) handles urgency; this catches everything
+  # that arrives through systems without webhooks.
+  - name: lead-capture-hourly
+    cron: "0 5 * * * *"
+    dag: examples/marketing/01_lead_capture_multisource.yaml
+
+  # Ad platforms finalise the previous day around 05:00 local. Run after that,
+  # in the finance team's timezone, so "yesterday" means the same thing to both.
+  - name: paid-media-cost-daily
+    cron: "0 30 6 * * *"
+    timezone: America/New_York
+    dag: examples/marketing/05_paid_media_cost_sync.yaml
+
+  # Audience activation, business hours only — a customer-match push at 03:00
+  # helps nobody and burns the same API budget the morning sync needs.
+  - name: audience-sync-hourly
+    cron: "0 0 * * * *"
+    timezone: America/New_York
+    when: "{{ weekday }} <= 5"
+    dag: examples/marketing/13_reverse_etl_audience_sync.yaml
+
+  # Monday 06:00 New York — before the leadership meeting, after the warehouse
+  # has finished the weekend loads.
+  - name: weekly-funnel-report
+    cron: "0 0 6 * * 1"
+    timezone: America/New_York
+    dag: examples/marketing/17_weekly_funnel_report.yaml
+
+  # Weekly competitive sweep. Thursday, so product marketing has Friday to act.
+  - name: competitor-intel-weekly
+    cron: "0 0 9 * * 4"
+    timezone: America/New_York
+    dag: examples/marketing/19_competitor_intel_agent.yaml
+
+  # Quarterly SEO decay sweep: 09:00 on the first of Jan/Apr/Jul/Oct.
+  - name: seo-refresh-quarterly
+    cron: "0 0 9 1 1,4,7,10 *"
+    timezone: America/New_York
+    dag: examples/marketing/08_seo_content_refresh.yaml
