@@ -10,7 +10,7 @@
 # source, which is right when you are changing dagron and wrong when you are
 # meeting it: a first run should not begin with compiling four Rust crates.
 #
-# Pin a version with DAGRON_VERSION=0.5.1 (defaults below). Floating :latest is
+# Pin a version with DAGRON_VERSION=0.9.1 (defaults below). Floating :latest is
 # deliberately not the default — a quickstart that silently changes under you is
 # worse than one you have to bump.
 #

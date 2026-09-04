@@ -604,6 +604,12 @@ positional arg, Cargo feature and config file in one table.
 [`docs/API.md`](docs/API.md) — both HTTP surfaces, endpoint by endpoint.
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — deploy, upgrade, backup per
 backend, monitoring, security posture, symptom-first troubleshooting.
+[`docs/EDGE_PROFILE.md`](docs/EDGE_PROFILE.md) — what `profile: edge` sets, the
+constrained-host gates, SQLite on flash, clock confidence.
+[`docs/RASPBERRY_PI.md`](docs/RASPBERRY_PI.md) — the whole stack measured on a
+Pi 4B, with the rig, so you can re-run it and disagree with a number:
+**4 runs/s (~40 tasks/s) sustained** with nothing shed, **~340 MB of 3.7 GB**
+at peak, Postgres the bottleneck rather than the engine.
 
 ## What this build does not do
 

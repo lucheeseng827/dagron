@@ -1,0 +1,24 @@
+# 8-wide fan-out / fan-in — the shape that stresses the ready-set.
+#
+#   extract ──> transform-0..7 ──> load
+#
+# Tasks are `true`, deliberately. On a Pi the question is what the *control
+# plane* costs — ingest, dependency advance, claim, lease, status write — and a
+# task that does real work would bury that under its own CPU. With EXECUTOR=local
+# each task is still a real fork+exec inside the engine container, so the per-task
+# floor being measured is the one this deployment actually pays.
+name: pi-fanout
+tasks:
+  - { name: extract, command: ["true"] }
+  - { name: transform-0, command: ["true"], depends_on: [extract] }
+  - { name: transform-1, command: ["true"], depends_on: [extract] }
+  - { name: transform-2, command: ["true"], depends_on: [extract] }
+  - { name: transform-3, command: ["true"], depends_on: [extract] }
+  - { name: transform-4, command: ["true"], depends_on: [extract] }
+  - { name: transform-5, command: ["true"], depends_on: [extract] }
+  - { name: transform-6, command: ["true"], depends_on: [extract] }
+  - { name: transform-7, command: ["true"], depends_on: [extract] }
+  - name: load
+    command: ["true"]
+    depends_on: [transform-0, transform-1, transform-2, transform-3,
+                 transform-4, transform-5, transform-6, transform-7]

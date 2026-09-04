@@ -1,0 +1,59 @@
+# Load-test profiles for a single Raspberry Pi 4 running the compose quickstart.
+#
+#   python3 loadtest/harness/run_fleet.py --config loadtest/pi/profiles.yaml \
+#       --profile ramp --base-url http://<engine-ip>:8787
+#
+# Same driver as the EKS fleet (harness/run_fleet.py) — only the target, the
+# workflows and the rates differ. The fleet DAGs need the S3-backed etl-task
+# image; these two need nothing but the engine.
+#
+# base_url is the ENGINE's management API (:8787), not dagron-api (:8080). The
+# harness posts raw `application/yaml` to `POST /runs` with no auth, which is
+# the engine's route; dagron-api's `/api/runs` wants a JWT and a JSON envelope.
+# The quickstart does not publish 8787, so pass the container IP with
+# --base-url (see loadtest/pi/run.sh).
+dagron:
+  base_url: http://127.0.0.1:8787
+  workflows_dir: ../pi/workflows      # relative to harness/profiles.yaml's dir
+  # No `image:` key: these DAGs carry no `docker_image:`, so there is nothing to
+  # rewrite. Setting one here would be a no-op that reads like configuration.
+
+fleet:
+  - { workflow: fanout.yaml, weight: 3 }   # wide ready-set
+  - { workflow: chain.yaml,  weight: 2 }   # per-hop latency
+
+profiles:
+  # Does the rig work at all. 30 runs, 300 tasks.
+  smoke:
+    kind: sustained
+    rate_per_sec: 1
+    duration_secs: 30
+
+  # Find the knee. 1 → 15 runs/s is 10 → 150 tasks/s on four Cortex-A72 cores;
+  # the ceiling is expected inside that band, and MAX_INFLIGHT_RUNS=64 will start
+  # answering 429 before the box itself falls over — which is the admission valve
+  # doing its job, not a failure. Watch `rejected` and the resource sampler
+  # together: a rising 429 rate with flat CPU means the cap is the limit, and
+  # raising it is a decision; a rising 429 rate with pegged CPU means the Pi is.
+  ramp:
+    kind: ramp
+    start_rate: 1
+    end_rate: 15
+    duration_secs: 300
+
+  # Hold below the knee to prove it is sustainable rather than a burst the queue
+  # absorbed. Override the rate with --profile steady after reading the ramp.
+  steady:
+    kind: sustained
+    rate_per_sec: 4
+    duration_secs: 180
+
+  # Past the knee on purpose, to separate "the admission cap is the limit" from
+  # "the Pi is". Run it once at the default MAX_INFLIGHT_RUNS=64 and once with the
+  # cap and worker pool raised (compose.tune.yaml): if accepted throughput does
+  # not move, the hardware is the ceiling and raising the cap only converts 429s
+  # — which a client can back off on — into queue latency, which it cannot.
+  push:
+    kind: sustained
+    rate_per_sec: 8
+    duration_secs: 120

@@ -256,10 +256,18 @@ the run for your own pipeline to act on.
 ## 5. Measurements
 
 Every number below was taken on **one** host with the commands shown, and is
-that host's. What it is *not*: an arm64 or armv7 figure (not measured — no
-such hardware here), a figure for a different feature set (see 5b), or a
-measurement of real flash or real power cuts (§3 says why a container cannot
+that host's. What it is *not*: a figure for a different feature set (see 5b), or
+a measurement of real flash or real power cuts (§3 says why a container cannot
 provide one). Re-measure on the board you ship.
+
+> **arm64, under load, is measured separately.**
+> [`RASPBERRY_PI.md`](RASPBERRY_PI.md) runs the whole quickstart stack — engine,
+> API and Postgres — on a Raspberry Pi 4B and attaches a ceiling: sustained
+> **4 runs/s (~40 tasks/s)** with nothing shed, shedding from **~5.5 runs/s**,
+> and a degraded floor of **~3.3 runs/s** under overload with zero failures.
+> Peak memory ~340 MB of 3.7 GB. The binding resource there is Postgres CPU and
+> disk I/O, not the engine. This page is one engine on a constrained host; that
+> page is the full stack with a database under it.
 
 **Host and toolchain.** x86_64 (Intel Xeon @ 2.80 GHz), a 4-vCPU container,
 16 GB RAM, no swap, Linux 6.18. `rustc 1.94.1 (e408947bf 2026-03-25)`,

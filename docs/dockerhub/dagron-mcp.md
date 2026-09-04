@@ -28,16 +28,14 @@ refuse all eighteen, leaving the 24 read tools.
 | Tag | Notes |
 |---|---|
 | `latest` | newest release |
-| `0.7.0` | pinned version |
-| `0.7` | floating minor — newest `0.7.x` |
+| `0.9.1` | pinned version (= current `latest`) |
+| `0.9` | floating minor — newest `0.9.x` |
 
 Pin in production — pick the newest published tag rather than copying a version
 from this page, which ages.
 
-> **The 42-tool catalogue above is not in a published image yet.** It ships in
-> the next release; `0.7.0` and `latest` currently carry the earlier nine-tool
-> surface, and they are no longer the same image. Build from source
-> (`cargo run -p dagron-mcp`) if you need the expanded catalogue before then.
+> The 42-tool catalogue above ships in **0.9.0 and later**. `0.7.0` and `0.8.x`
+> carry the earlier nine-tool surface.
 
 ## Run
 

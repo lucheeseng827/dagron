@@ -1,0 +1,15 @@
+# Deep chain — one ready task at a time, so it measures scheduler *latency* per
+# hop (claim → run → status → advance) rather than width. Same task count as the
+# fan-out, so the two shapes are comparable per run.
+name: pi-chain
+tasks:
+  - { name: s0, command: ["true"] }
+  - { name: s1, command: ["true"], depends_on: [s0] }
+  - { name: s2, command: ["true"], depends_on: [s1] }
+  - { name: s3, command: ["true"], depends_on: [s2] }
+  - { name: s4, command: ["true"], depends_on: [s3] }
+  - { name: s5, command: ["true"], depends_on: [s4] }
+  - { name: s6, command: ["true"], depends_on: [s5] }
+  - { name: s7, command: ["true"], depends_on: [s6] }
+  - { name: s8, command: ["true"], depends_on: [s7] }
+  - { name: s9, command: ["true"], depends_on: [s8] }

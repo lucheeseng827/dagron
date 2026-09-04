@@ -12,12 +12,12 @@ A Helm chart published as an **OCI artifact**. It wires the dagron images togeth
 
 | Version | Notes |
 |---|---|
-| `0.7.0` | pulls the `0.7.0` images |
+| `0.9.1` | pulls the `0.9.1` images |
 
 ## Install
 
 ```bash
-helm install dagron oci://registry-1.docker.io/mancube/dagron --version 0.7.0 \
+helm install dagron oci://registry-1.docker.io/mancube/dagron --version 0.9.1 \
   -n dagron --create-namespace \
   --set ingress.enabled=true --set-string ingress.host='dagron.your-host.example.com' \
   --set ingress.tls.enabled=true --set-string ingress.tls.secretName='dagron-tls' \
@@ -28,15 +28,15 @@ helm install dagron oci://registry-1.docker.io/mancube/dagron --version 0.7.0 \
 Inspect first:
 
 ```bash
-helm show values oci://registry-1.docker.io/mancube/dagron --version 0.7.0
-helm template dagron oci://registry-1.docker.io/mancube/dagron --version 0.7.0   # render without installing
+helm show values oci://registry-1.docker.io/mancube/dagron --version 0.9.1
+helm template dagron oci://registry-1.docker.io/mancube/dagron --version 0.9.1   # render without installing
 ```
 
 ## Common values
 
 | Value | Meaning |
 |---|---|
-| `engine.image` / `dagronApi.image` / `frontend.image` | image refs (default the matching `0.7.0` tags). |
+| `engine.image` / `dagronApi.image` | image refs (default the matching `0.9.1` tags). `frontend.image` is pinned to `0.8.1` and off by default — the console ships in `dagron-api`. |
 | `dagronApi.jwtSecret` | **required** — session-cookie signing key (≥32 chars). |
 | `dagronApi.admin.{email,password,name}` | bootstrap admin user. |
 | `ingress.*` | host + TLS for the console. |

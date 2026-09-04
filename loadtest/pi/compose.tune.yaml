@@ -1,0 +1,12 @@
+# Overlay for the cap-vs-hardware experiment (profile `push`):
+#
+#   docker compose -f compose.quickstart.yaml -f loadtest/pi/compose.tune.yaml up -d engine
+#
+# Raises the two knobs that bound concurrency so the admission valve stops being
+# the binding constraint. Not a recommended Pi configuration — the point is to
+# find out what the box does when nothing is holding it back.
+services:
+  engine:
+    environment:
+      WORKER_COUNT: "32"
+      MAX_INFLIGHT_RUNS: "256"
