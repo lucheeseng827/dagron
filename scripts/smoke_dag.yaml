@@ -1,0 +1,6 @@
+name: ui_smoke
+tasks:
+  - { name: a, command: ["echo", "task a"] }
+  - { name: b, command: ["echo", "task b"], depends_on: ["a"] }
+  - { name: c, command: ["echo", "task c"], depends_on: ["a"] }
+  - { name: d, command: ["echo", "task d"], depends_on: ["b", "c"] }

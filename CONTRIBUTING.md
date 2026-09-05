@@ -26,6 +26,14 @@ cargo fmt
 cargo clippy --all-targets -- -D warnings
 ```
 
+`make ci` runs all four the way CI does, which is not quite the way they read
+above: this workspace cannot be built as one unit (`dagron-core` compiles exactly
+one sqlx backend, the engine wants sqlite and `dagron-api`/`dagron-gitops` want
+postgres), so each command covers the two feature worlds separately plus the
+`mqtt` one that no default build compiles. A bare `cargo test` is still useful
+while you work; `make ci` is what tells you whether the PR will be green.
+`make` on its own lists every other target.
+
 CI runs on every PR. **Build and test must pass** — those are the gate. `fmt` and
 `clippy` also run but are advisory for now: there is no `rustfmt.toml` yet, so stock
 rustfmt disagrees with this tree in about 960 places, and clippy has a small standing

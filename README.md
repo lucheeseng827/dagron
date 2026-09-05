@@ -67,6 +67,12 @@ the single-binary case (see [below](#the-console-without-the-stack)).
 > **New here?** The [**how-to guide**](docs/HOWTO.md) has copy-paste recipes:
 > start a workflow via the CLI and via REST, chain one workflow from another,
 > monitor runs, and wire secrets/environment variables.
+>
+> **Or don't copy-paste at all.** `make` prints every command on this page and in
+> those recipes as a target — `make up`, `make dev`, `make submit DAG=…`,
+> `make run-logs RUN=…`, `make ci`. Each one runs the documented command
+> unchanged, so nothing you learn from it stops being true when you type it by
+> hand. Start with `make` on its own for the grouped list.
 
 **Option A — the full stack with UI** (needs podman or docker). This pulls
 published images and builds nothing — a first run should not begin with

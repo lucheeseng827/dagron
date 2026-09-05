@@ -6,6 +6,30 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- **A `Makefile`: every command the docs tell you to paste, as a target.**
+  Getting a first run out of dagron meant transcribing a compose invocation from
+  the README, a login-then-submit pair from `docs/HOWTO.md`, and a `curl` with a
+  run id in the middle of it from the monitoring section — and the two submit
+  paths are *different* (the engine's management API takes raw YAML on `:8787`
+  with no auth; `dagron-api` wants a session and a JSON envelope on `:8080`),
+  which is exactly the kind of distinction a copy-paste loses. `make` prints the
+  grouped list; `make up`, `make dev`, `make submit DAG=…`, `make run-logs
+  RUN=…`, `make backup`, `make pi-load PROFILE=ramp` and `make ci` run the
+  documented command **unchanged**, so the shortcut never becomes a second way
+  to operate dagron that the docs do not describe.
+
+  `make ci` is the one worth knowing if you are changing code: it runs the two
+  feature worlds and the `mqtt` one in CI's order, which a bare `cargo test`
+  does not — `--workspace` cannot compile this tree at all, and the split is
+  easy to get wrong by hand.
+
+  Per-invocation arguments (`NAME`, `PROFILE`, `DIR`, `DB`, `LEVEL`, …) are
+  assigned empty rather than with `?=`, because make imports the caller's
+  environment and those names are common in it: with `?=`, a shell `NAME` leaks
+  into `make runs` as a query filter, and a shell `DB` picks the database
+  `make restore` overwrites. A command-line `make runs NAME=etl` still wins.
+
 ## [0.9.1] - 2026-09-04
 
 A release-pipeline fix. 0.9.0 mirrored and tagged cleanly but **published no
