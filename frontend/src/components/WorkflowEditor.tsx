@@ -8,6 +8,10 @@ import Editor from "@monaco-editor/react";
 import "@/lib/monaco"; // self-host the Monaco runtime (air-gap; no CDN)
 import ScheduleDrawer from "@/components/ScheduleDrawer";
 import EditableDag from "@/components/dag/EditableDag";
+// `@ee/*` resolves to src/ee here and to the src/ee-stub signpost in the public
+// mirror, where src/ee is stripped. That fallback — not an import guard — is why
+// this file can name the enterprise control and still build open.
+import RecipeImageField from "@ee/RecipeImageField";
 import { modelToYaml, parseModel } from "@/lib/spec-model";
 import { visualSupport } from "@/lib/spec-support";
 import { STARTERS } from "@/lib/starters";
@@ -262,7 +266,11 @@ export default function WorkflowEditor({ id }: { id?: string }) {
             options={{ minimap: { enabled: false }, fontSize: 13, tabSize: 2, scrollBeyondLastLine: false }}
           />
         ) : parsed.model ? (
-          <EditableDag model={parsed.model} onChange={(m) => setSpec(modelToYaml(m))} />
+          <EditableDag
+            model={parsed.model}
+            onChange={(m) => setSpec(modelToYaml(m))}
+            imageField={(ctx) => <RecipeImageField {...ctx} />}
+          />
         ) : (
           <div style={{ padding: 16, color: "var(--red)" }}>
             Can&apos;t render graph: {parsed.error}. Fix it in the YAML view.

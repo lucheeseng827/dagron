@@ -44,9 +44,34 @@ import {
 
 const nodeTypes = { status: StatusNode, sentinel: SentinelNode };
 
+/// What a filler of {@link EditableDagProps.imageField} is handed.
+///
+/// The image field is the one place an extension needs more than the string it
+/// is editing: an image that the workflow builds is two facts, not one — the
+/// reference a task pulls, and the task that produces it — and they have to be
+/// written together or the spec is briefly wrong in a way that saves.
+export interface ImageFieldContext {
+  /// The task whose image is being edited.
+  task: Task;
+  /// Every task in the workflow, so a filler can find one it added before.
+  tasks: Task[];
+  /// Write the image, and optionally the tasks that produce it, in one update.
+  /// One call rather than two because two would each start from the model this
+  /// panel was rendered with, and the second would drop the first.
+  apply: (change: { image?: string; addTasks?: Task[]; dependsOn?: string[] }) => void;
+}
+
 export interface EditableDagProps {
   model: WorkflowModel;
   onChange: (model: WorkflowModel) => void;
+  /// Render an extra control under a selected task's Docker-image field.
+  ///
+  /// A slot rather than an import: this component is mirrored to the public
+  /// repo and must build with `src/ee` absent, so it cannot reach into the
+  /// enterprise tree. The enterprise build fills this with "Build from recipe";
+  /// an open build passes nothing and the field is a plain text input, which is
+  /// exactly what it was before.
+  imageField?: (ctx: ImageFieldContext) => React.ReactNode;
 }
 
 /// Editable DAG: drag to lay out, drag handles to connect (adds a dependency),
@@ -63,7 +88,7 @@ export default function EditableDag(props: EditableDagProps) {
   );
 }
 
-function EditableDagInner({ model, onChange }: EditableDagProps) {
+function EditableDagInner({ model, onChange, imageField }: EditableDagProps) {
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [selected, setSelected] = useState<string | null>(null);
@@ -343,6 +368,40 @@ function EditableDagInner({ model, onChange }: EditableDagProps) {
         task={sel}
         allTasks={model.tasks}
         templates={model.templates}
+        imageField={imageField}
+        onApplyImage={(taskName, change) => {
+          // One pass over the model: set the image on the task being edited,
+          // append any task that produces it, and add the dependency. Doing it
+          // in three `onChange` calls would have each start from this render's
+          // `model` and the last would win.
+          const added = (change.addTasks ?? []).filter(
+            (t) => !model.tasks.some((existing) => existing.name === t.name),
+          );
+          // Never add an edge that makes the graph invalid. A self-edge is the
+          // easy case; the real one is a task the new dependency already depends
+          // on, transitively — the engine refuses a cycle, and the editor would
+          // have written one silently.
+          const reachable = dependencyClosure(model.tasks, added);
+          const wanted = (change.dependsOn ?? []).filter(
+            (d) => d !== taskName && !reachable(d).has(taskName),
+          );
+          const next: WorkflowModel = {
+            ...model,
+            tasks: [
+              ...model.tasks.map((t) => {
+                if (t.name !== taskName) return t;
+                const deps = new Set([...(t.depends_on ?? []), ...wanted]);
+                return {
+                  ...t,
+                  ...(change.image !== undefined ? { docker_image: change.image || undefined } : {}),
+                  ...(deps.size ? { depends_on: [...deps] } : {}),
+                };
+              }),
+              ...added,
+            ],
+          };
+          onChange(next);
+        }}
         onChange={(updated, prevName) => {
           const next = applyTaskEdit(model, prevName, updated);
           onChange(next);
@@ -408,6 +467,35 @@ function applyTaskEdit(model: WorkflowModel, prevName: string, updated: Task): W
   return next;
 }
 
+/// Everything a task depends on, transitively, over the tasks that exist plus
+/// the ones about to be added. Used to refuse a dependency edge that would close
+/// a cycle; memoised because the caller asks about several candidates.
+function dependencyClosure(existing: Task[], adding: Task[]) {
+  const byName = new Map<string, Task>();
+  for (const t of [...existing, ...adding]) byName.set(t.name, t);
+  const cache = new Map<string, Set<string>>();
+  const walk = (name: string, seen: Set<string>): Set<string> => {
+    const hit = cache.get(name);
+    if (hit) return hit;
+    const out = new Set<string>();
+    if (seen.has(name)) return out; // already on the stack: a pre-existing cycle
+    seen.add(name);
+    for (const dep of byName.get(name)?.depends_on ?? []) {
+      out.add(dep);
+      for (const d of walk(dep, seen)) out.add(d);
+    }
+    seen.delete(name);
+    cache.set(name, out);
+    return out;
+  };
+  return (name: string) => walk(name, new Set());
+}
+
+/// Nothing but a remount boundary — see the `key` where it is used.
+function ImageFieldSlot({ children }: { children?: React.ReactNode }) {
+  return <>{children}</>;
+}
+
 function TaskPanel({
   task,
   allTasks,
@@ -415,6 +503,8 @@ function TaskPanel({
   onChange,
   onDelete,
   onSelectName,
+  imageField,
+  onApplyImage,
 }: {
   task: Task | null;
   allTasks: Task[];
@@ -424,6 +514,11 @@ function TaskPanel({
   onChange: (updated: Task, prevName: string) => void;
   onDelete: (name: string) => void;
   onSelectName: (name: string) => void;
+  imageField?: (ctx: ImageFieldContext) => React.ReactNode;
+  onApplyImage: (
+    taskName: string,
+    change: { image?: string; addTasks?: Task[]; dependsOn?: string[] },
+  ) => void;
 }) {
   if (!task) {
     return (
@@ -490,6 +585,18 @@ function TaskPanel({
             placeholder="(runs on host — e.g. alpine:3.20)"
             title="Container image to pull and run the command in; empty runs on the host executor"
           />
+          {/*
+            Keyed on the task: the filler holds its own draft state, and without a
+            remount an open form would follow the selection onto a different task
+            and apply itself there.
+          */}
+          <ImageFieldSlot key={task.name}>
+            {imageField?.({
+              task,
+              tasks: allTasks,
+              apply: (change) => onApplyImage(task.name, change),
+            })}
+          </ImageFieldSlot>
         </>
       )}
 

@@ -1,0 +1,60 @@
+[package]
+name = "dagron-state"
+version = "0.1.0"
+edition = "2021"
+description = "dagron-state — compile a backfill planner's state plan into a dagron run graph. A separable component: speaks the planner's frozen JSON wire contract, links nothing from the planner or from dagron."
+
+[lib]
+name = "dagron_state"
+path = "src/lib.rs"
+
+# The offline CLI: explain a plan as markdown + Mermaid, or compile it to YAML.
+# Follows this module's one-binary-per-concern convention (dagron-plan,
+# dagron-import, dagron-autopsy) rather than a subcommand on a CLI that does not
+# exist. It is also the component's split-out path made literal.
+[[bin]]
+name = "dagron-state"
+path = "src/main.rs"
+
+[dependencies]
+# NOTE: this crate deliberately depends on NEITHER the backfill planner nor
+# dagron-core. See README.md.
+#
+#  * Not the planner: `crates/` is mirrored wholesale to the public dagron repo
+#    (.ossync.yaml), where the planner's source does not exist. The planner is
+#    consumed over its frozen JSON contract instead.
+#  * Not dagron-core: `dagron-api` links this crate and pins dagron-core to
+#    `postgres`, while the rest of the workspace takes the `sqlite` default.
+#    dagron-core's "exactly one backend" compile_error! fires if both unify, which
+#    is why CI builds dagron-api in its own step. A build-time dagron-core dep here
+#    would drag that collision into dagron-api.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+axum = { version = "0.8", optional = true }
+anyhow = "1"
+
+[features]
+default = ["http"]
+# The axum Router. Off => a pure compile library with no web dependency, which is
+# what a non-HTTP embedder (the CLI, a future standalone binary) wants.
+http = ["dep:axum"]
+
+[dev-dependencies]
+# Dev-only ON PURPOSE (see the note above): the compatibility test parses this
+# crate's emitted YAML through dagron's REAL parser + validator, proving the two
+# spec models agree, without ever entering dagron-api's build graph. Takes
+# dagron-core's default `sqlite` backend, which is fine because dev-dependencies
+# are not built when this crate is used as a library dependency.
+dagron-core = { path = "../dagron-core" }
+# `net` is for examples/dev_server.rs, which binds its own listener. axum's
+# `serve` already enables it transitively, but naming it here means the example
+# does not depend on feature unification happening to go our way.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+
+# The dev dagron the planner CLI's `submit` demo posts to. Needs the router, so it
+# cannot build in the no-web configuration; `required-features` skips it there
+# rather than failing the build.
+[[example]]
+name = "dev_server"
+required-features = ["http"]

@@ -20,5 +20,6 @@ pub mod dag;
 pub mod db;
 pub mod expand;
 pub mod fault;
+pub mod isolation;
 pub mod metrics;
 pub mod models;

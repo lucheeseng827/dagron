@@ -60,9 +60,13 @@ tasks:
       - { src: revenue, tool: stripe-export }
       - { src: product-usage, tool: amplitude-export }
     instance_key: "{{ item.src }}"
-    cache:
-      key: "week-{{ item.src }}-{{ scheduled_time }}"
-      max_age_secs: 259200
+    # No `cache:` here, and that is the point. This task's real output is the file it
+    # writes into $DAGRON_ARTIFACTS, and that directory is PER RUN
+    # (dagron-engine/src/lib.rs:997). A cache hit reuses the recorded stdout and never
+    # runs the command (lib.rs:1775), so on the next run the file is sitting in the
+    # previous run's directory and the transform step reads a
+    # `{{ item.src }}.parquet` that is not there.
+    # Memoize a task whose result IS its output; not one whose result is a file.
     command:
       - sh
       - -c

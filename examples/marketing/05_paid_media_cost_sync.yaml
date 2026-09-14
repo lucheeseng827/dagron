@@ -63,9 +63,14 @@ tasks:
       - { network: bing-ads }
     instance_key: "{{ item.network }}"
     pool: ads-api
-    cache:
-      key: "adspend-{{ item.network }}-{{ scheduled_time }}"
-      max_age_secs: 604800      # a closed day never changes; a week is generous
+    # No `cache:` here, and that is the point. This task's real output is the file it
+    # writes into $DAGRON_ARTIFACTS, and that directory is PER RUN
+    # (dagron-engine/src/lib.rs:997). A cache hit reuses the recorded stdout and never
+    # runs the command (lib.rs:1775), so on the next run the file is sitting in the
+    # previous run's directory and `conform` scans an empty
+    # $DAGRON_ARTIFACTS and writes a spend.ndjson missing that network — which then
+    # lands in S3 and is pushed to HubSpot. Wrong numbers, silently, not a failure.
+    # Memoize a task whose result IS its output; not one whose result is a file.
     command:
       - sh
       - -c

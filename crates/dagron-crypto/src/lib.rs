@@ -21,6 +21,7 @@
 //! shared by all three is the only way "verified" means one thing. Keygen and
 //! signing live in the `bundle_sign` example; docs/BUNDLES.md is the contract.
 
+pub mod attest;
 pub mod bundle;
 
 /// Serializes the tests that mutate the process environment. `setenv` is not

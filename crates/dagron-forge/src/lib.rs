@@ -73,6 +73,37 @@ pub struct GitTarget {
     pub context: String,
     /// Optional link back to the run in the dagron UI.
     pub target_url: Option<String>,
+    /// The check's one line of text. `None` uses the state's own wording.
+    /// Already substituted by the caller, like every other field here.
+    pub description: Option<String>,
+}
+
+/// GitHub rejects a commit status whose description exceeds 140 characters, so
+/// a description built from a template — a list of image references, say — has
+/// to be cut rather than lose the whole status. Cut on a character boundary,
+/// with an ellipsis, because a truncated reference that looks whole is worse
+/// than one that visibly is not.
+const DESCRIPTION_MAX: usize = 140;
+
+fn clamp(description: &str) -> String {
+    if description.chars().count() <= DESCRIPTION_MAX {
+        return description.to_string();
+    }
+    let mut out: String = description.chars().take(DESCRIPTION_MAX - 1).collect();
+    out.push('…');
+    out
+}
+
+impl GitTarget {
+    /// What the check should say: the author's line if they wrote one, else the
+    /// state's. An author's line that resolved to nothing (an empty parameter)
+    /// falls back too — a blank check is worse than a generic one.
+    fn text(&self, state: CommitState) -> String {
+        match self.description.as_deref().map(str::trim) {
+            Some(d) if !d.is_empty() => clamp(d),
+            _ => state.description().to_string(),
+        }
+    }
 }
 
 /// Posts commit statuses to whichever forge(s) have a token configured.
@@ -174,7 +205,7 @@ pub fn github_request(base: &str, t: &GitTarget, state: CommitState) -> (String,
     let mut body = json!({
         "state": state.github(),
         "context": t.context,
-        "description": state.description(),
+        "description": t.text(state),
     });
     if let Some(u) = &t.target_url {
         body["target_url"] = json!(u);
@@ -193,7 +224,7 @@ pub fn gitlab_request(base: &str, t: &GitTarget, state: CommitState) -> (String,
     let mut body = json!({
         "state": state.gitlab(),
         "name": t.context,
-        "description": state.description(),
+        "description": t.text(state),
     });
     if let Some(u) = &t.target_url {
         body["target_url"] = json!(u);
@@ -230,7 +261,80 @@ mod tests {
             sha: "deadbeef".to_string(),
             context: "dagron/nightly".to_string(),
             target_url: Some("https://dagron.example/runs/1".to_string()),
+            description: None,
         }
+    }
+
+    /// The default wording is unchanged for a target that says nothing — every
+    /// workflow that already has a `notify.git` block keeps the check it had.
+    #[test]
+    fn a_target_without_a_description_reads_as_it_always_did() {
+        let (_, body) = github_request(GITHUB_DEFAULT, &target("github"), CommitState::Success);
+        assert_eq!(body["description"], "dagron run succeeded");
+        let (_, body) = gitlab_request(GITLAB_DEFAULT, &target("gitlab"), CommitState::Failure);
+        assert_eq!(body["description"], "dagron run failed");
+    }
+
+    /// The point of the field: a check that names what the run produced. Both
+    /// forges carry it, because a recipe change reviewed on GitLab deserves the
+    /// same answer as one reviewed on GitHub.
+    #[test]
+    fn a_description_replaces_the_generic_wording_on_both_forges() {
+        let mut t = target("github");
+        t.description = Some("built registry.local/ws/etl:r-d086f3af2829d4cf".into());
+        let (_, body) = github_request(GITHUB_DEFAULT, &t, CommitState::Success);
+        assert_eq!(body["description"], "built registry.local/ws/etl:r-d086f3af2829d4cf");
+
+        let mut t = target("gitlab");
+        t.description = Some("built registry.local/ws/etl:r-d086f3af2829d4cf".into());
+        let (_, body) = gitlab_request(GITLAB_DEFAULT, &t, CommitState::Success);
+        assert_eq!(body["description"], "built registry.local/ws/etl:r-d086f3af2829d4cf");
+    }
+
+    /// A template that resolved to nothing must not produce a blank check —
+    /// that reads as a broken integration rather than a passing run.
+    #[test]
+    fn an_empty_description_falls_back_rather_than_blanking_the_check() {
+        for d in ["", "   "] {
+            let mut t = target("github");
+            t.description = Some(d.into());
+            let (_, body) = github_request(GITHUB_DEFAULT, &t, CommitState::Success);
+            assert_eq!(body["description"], "dagron run succeeded", "for {d:?}");
+        }
+    }
+
+    /// GitHub rejects a status whose description is over 140 characters, and a
+    /// list of image references reaches that easily. Losing the whole check to
+    /// a validation error would be worse than losing the tail of the text.
+    #[test]
+    fn a_long_description_is_cut_rather_than_rejected() {
+        let long: String = std::iter::repeat("registry.local/ws/etl:r-d086f3af2829d4cf, ")
+            .take(10)
+            .collect();
+        let mut t = target("github");
+        t.description = Some(long.clone());
+        let (_, body) = github_request(GITHUB_DEFAULT, &t, CommitState::Success);
+        let got = body["description"].as_str().unwrap();
+        assert_eq!(got.chars().count(), 140);
+        assert!(got.ends_with('…'), "a cut must be visible: {got}");
+        assert!(long.starts_with(&got[..got.len() - '…'.len_utf8()]));
+
+        // Exactly at the limit is left alone — an off-by-one here would put an
+        // ellipsis on text that fitted.
+        let exact: String = "x".repeat(140);
+        t.description = Some(exact.clone());
+        let (_, body) = github_request(GITHUB_DEFAULT, &t, CommitState::Success);
+        assert_eq!(body["description"], exact);
+    }
+
+    /// Cut on a character boundary: a multi-byte description must not panic or
+    /// emit a broken code point.
+    #[test]
+    fn cutting_respects_character_boundaries() {
+        let long: String = "é".repeat(200);
+        let out = clamp(&long);
+        assert_eq!(out.chars().count(), 140);
+        assert!(out.starts_with("éé"));
     }
 
     #[test]

@@ -1,8 +1,11 @@
 # The durable agent loop — a conversation whose every turn is a run.
 #
-#   # 1. register the turn (see the header of agent_turn.yaml)
-#   # 2. run the conversation
-#   dagron submit examples/ai/agent_loop.yaml
+#   # 1. log in — docs/HOWTO.md §2 writes the session to cookies.txt
+#   # 2. register the turn (see the header of agent_turn.yaml)
+#   # 3. run the conversation
+#   curl -fsS -b cookies.txt -X POST localhost:8080/api/runs \
+#     -H 'content-type: application/json' \
+#     --data "$(jq -Rn --rawfile s examples/ai/agent_loop.yaml '{yaml:$s}')"
 #
 # One task. Everything that makes this durable is already in the engine:
 #

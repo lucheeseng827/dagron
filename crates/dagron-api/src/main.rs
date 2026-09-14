@@ -25,6 +25,7 @@ mod pwhash;
 mod ratelimit;
 mod routes;
 mod state;
+mod state_plane;
 mod stream;
 
 use std::sync::Arc;
@@ -92,6 +93,10 @@ async fn api_not_found() -> (axum::http::StatusCode, Json<serde_json::Value>) {
         Json(serde_json::json!({ "error": "not found" })),
     )
 }
+
+/// Body cap for the core API surface (submit YAML and friends). Shared by the
+/// blanket layer and by any router nested after it, which the layer cannot reach.
+const CORE_BODY_LIMIT: usize = 1024 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -423,11 +428,16 @@ async fn main() -> Result<()> {
     // the open build answers with a signpost naming the edition, not a 404 —
     // the user hits it at the exact moment they feel the need.
     let app = app.route("/api/fleet", get(routes::fleet::list_fleet));
+    // Fleet link (enrol this instance as a unit; licence state). Same shape as
+    // /api/fleet: registered everywhere, signposted on the open build.
+    let app = app
+        .route("/api/link", get(routes::link::get_link))
+        .route("/api/link/enrol", post(routes::link::enrol));
     // Tiered artifact drain on demand (the periodic loop below is the default).
     let app = app.route("/api/artifacts/sync", post(routes::artifacts::sync_artifacts));
 
     // Core routes keep the tight 1 MiB body cap (submit YAML etc.) to resist abuse.
-    let app = app.layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024));
+    let app = app.layer(tower_http::limit::RequestBodyLimitLayer::new(CORE_BODY_LIMIT));
 
     // Artifact PUT carries data blobs (checkpoints/outputs) that legitimately
     // exceed the core cap, so its routes get a larger, separately-configured limit
@@ -465,6 +475,22 @@ async fn main() -> Result<()> {
     let app = app
         .merge(login)
         .merge(artifacts)
+        // The `state` noun (dagron-state): compile a backfill planner's state plan
+        // into a run graph. Nested as a service, not merged, because the component
+        // owns mount-relative paths and its own state — the two lines here plus
+        // `state_plane.rs` are its entire coupling to dagron, so it can be split
+        // into its own service without touching the rest of this file.
+        // See crates/dagron-state/README.md.
+        // The core body cap is layered ABOVE (before this router is built), and a
+        // `layer` only wraps routes registered before it — so this nested service
+        // would otherwise fall back to the Json extractor's own default. Carry the
+        // same cap in explicitly: a plan submission is YAML-shaped, exactly what
+        // that cap exists to bound.
+        .nest_service(
+            dagron_state::MOUNT_PREFIX,
+            state_plane::router(state.clone())
+                .layer(tower_http::limit::RequestBodyLimitLayer::new(CORE_BODY_LIMIT)),
+        )
         // Before the console fallback: /api is the API's namespace even where no
         // route matched. See `api_not_found`. Three routes, not one: an axum
         // wildcard will not match an empty capture, so `/api/{*rest}` covers

@@ -9,7 +9,10 @@
 # The binary must be on the task's PATH (`cargo build -p dagron-step-mcp`), and
 # so must whatever MCP server it spawns.
 #
-#   dagron submit examples/ai/mcp_tool_step.yaml
+#   # log in first — docs/HOWTO.md §2 writes the session to cookies.txt
+#   curl -fsS -b cookies.txt -X POST localhost:8080/api/runs \
+#     -H 'content-type: application/json' \
+#     --data "$(jq -Rn --rawfile s examples/ai/mcp_tool_step.yaml '{yaml:$s, parameters:{doc:"/data/report.md"}}')"
 name: mcp-tool-step
 parameters:
   # The document to work on. Overridable per run:

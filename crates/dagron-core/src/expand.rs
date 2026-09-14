@@ -528,6 +528,10 @@ fn build_leaf(
         // gang_member is engine-stamped at run creation, never authored.
         gang: task.gang.clone(),
         gang_member: None,
+        // The trust envelope survives expansion unsubstituted: every field is a
+        // fixed enum, bool or uid, and letting a template interpolate one would
+        // make the privileges a task runs under depend on a caller's argument.
+        isolation: task.isolation.clone(),
         // Produced datasets template per instance (`{{ item }}` / `{{ params.* }}`),
         // so a fan-out can record per-shard dataset updates.
         produces: task.produces.iter().map(|u| substitute(u, ctx)).collect(),

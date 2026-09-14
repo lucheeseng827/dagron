@@ -597,3 +597,104 @@ export interface SearchResponse {
   runs: SearchRunHit[];
   schedules: SearchScheduleHit[];
 }
+
+// ── fleet link (enterprise routes; this build signposts) ────────────────────
+
+/// The offline licence as this API verified it. `present && !valid` is the case
+/// that stops the control plane at start — `error` says why.
+export interface LicenceState {
+  present: boolean;
+  valid: boolean;
+  /// "env" | "file" | "none"
+  source: string;
+  required: boolean;
+  error?: string;
+  subject?: string;
+  plan?: string;
+  /// `-1` means unlimited, the licence's own spelling.
+  max_workspaces?: number;
+  max_tasks_per_day?: number;
+  max_concurrent_runs?: number;
+  max_units?: number;
+  iat?: number;
+  exp?: number;
+}
+
+export interface LinkState {
+  edition: string;
+  fleet: {
+    /// `DAGRON_FLEET_URL` is set in this instance's environment.
+    configured: boolean;
+    url: string | null;
+    host: string | null;
+    token_set: boolean;
+    /// Outbox evidence: is anything actually leaving? Null when the table is unreadable.
+    outbox: { pending: number; dead: number; last_delivered_at: string | null } | null;
+  };
+  licence: LicenceState;
+  /// A suggestion for the serial field (pod/host name); never a decision.
+  serial_hint: string;
+}
+
+export interface EnrolInput {
+  control_plane_url: string;
+  join_token: string;
+  serial: string;
+  labels?: Record<string, string>;
+}
+
+/// The unit credential, returned exactly once, with the configuration to apply
+/// rendered in the three shapes an operator actually writes it down in.
+///
+/// The *open* half of the shape: what any build can describe. The tenancy
+/// identity a control plane stamps on a unit is not here — no open build ever
+/// sees it (`POST /api/link/enrol` answers `403` without the `enterprise`
+/// feature), and this file ships to the public repo. The enterprise console
+/// widens the shape on its own side, which is why `enrolUnit` is generic in
+/// its result rather than asserting one here.
+export interface EnrolResult {
+  unit_id: string | null;
+  workspace_id: string | null;
+  serial: string;
+  re_enrolled: boolean;
+  control_plane_url: string;
+  token: string;
+  config: { env: string; helm_values: string; systemd: string };
+}
+
+// ── state plans (dagron-state) ───────────────────────────────────────────────
+/// One model's line in a state-plan explanation. `model` is the name the planner
+/// knows; `task` is the sanitized name it becomes in the run, and the two differ
+/// whenever a model name carries characters a dagron task name cannot.
+export interface StateExplainRow {
+  model: string;
+  task: string;
+  reason: "directly_changed" | "downstream";
+  because_of: string | null;
+  via_columns: string[];
+  unit: string;
+  depends_on: string[];
+}
+
+/// The rendered explanation of a state plan. `markdown` and `mermaid` are for
+/// pasting into a pull request; `rows` is what the console lays out itself.
+export interface StateExplanation {
+  summary: string;
+  markdown: string;
+  mermaid: string;
+  rows: StateExplainRow[];
+}
+
+/// A compiled-but-unsubmitted state plan.
+export interface StateCompiled {
+  yaml: string;
+  model_count: number;
+  models: string[];
+}
+
+/// A state plan that became a run.
+export interface StateSubmitted {
+  run_id: string;
+  model_count: number;
+  models: string[];
+}

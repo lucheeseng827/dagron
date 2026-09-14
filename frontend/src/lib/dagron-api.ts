@@ -12,6 +12,9 @@ import type {
   CreatedToken,
   DayBucket,
   DeadLetter,
+  EnrolInput,
+  EnrolResult,
+  LinkState,
   EnvironmentView,
   GitAuthInput,
   GitRepo,
@@ -28,6 +31,9 @@ import type {
   RunSummary,
   Schedule,
   ScheduleOptions,
+  StateCompiled,
+  StateExplanation,
+  StateSubmitted,
   TaskLogs,
   TaskResolution,
   UserView,
@@ -95,15 +101,20 @@ export async function checkSession(): Promise<SessionState> {
   }
 }
 
-function defaultHeaders(): Record<string, string> {
-  return { "Content-Type": "application/json" };
+// Only when a body is actually going out: a bodyless call (runWorkflow,
+// deleteWorkflow, syncWorkflowToGit, …) must not claim Content-Type: application/json
+// with zero bytes behind it — an `Option<Json<_>>` extractor on the server tells a
+// bodyless call apart from a malformed one by that header's absence, and a stray
+// "application/json" on an empty request turns "no body" into a 400 JSON parse error.
+function defaultHeaders(hasBody: boolean): Record<string, string> {
+  return hasBody ? { "Content-Type": "application/json" } : {};
 }
 
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     credentials: "same-origin",
     ...options,
-    headers: { ...defaultHeaders(), ...(options?.headers as Record<string, string>) },
+    headers: { ...defaultHeaders(options?.body != null), ...(options?.headers as Record<string, string>) },
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -564,7 +575,7 @@ export async function probeAiGenerator(): Promise<boolean> {
     const res = await fetch(`${BASE}/ai/generate`, {
       method: "GET",
       credentials: "same-origin",
-      headers: defaultHeaders(),
+      headers: defaultHeaders(false),
     });
     return res.status === 405 || res.ok;
   } catch {
@@ -593,3 +604,35 @@ export async function aiGenerate(prompt: string): Promise<string> {
 /// when the run is still live.
 export const archiveRun = (id: string): Promise<{ run_id: string; archived: boolean; purged: number }> =>
   apiFetch(`/runs/${encodeURIComponent(id)}/archive`, { method: "POST" });
+
+// ── fleet link (enterprise; OSS answers 403 with a signpost) ────────────────
+
+/// Link + licence state of this instance. Admin only.
+export const getLinkState = (): Promise<LinkState> => apiFetch(`/link`);
+
+/// Enrol this instance as a unit of a control plane's org. The API makes the one
+/// outbound call; the credential comes back once and is never stored here.
+///
+/// Generic in the result: `EnrolResult` is the shape an open build can describe,
+/// and the enterprise console asks for its own wider one. Keeping the widening
+/// on the caller's side is what lets this file, and the type it names, ship
+/// without carrying enterprise-only fields.
+export const enrolUnit = <R extends EnrolResult = EnrolResult>(input: EnrolInput): Promise<R> =>
+  apiFetch(`/link/enrol`, { method: "POST", body: JSON.stringify(input) });
+
+// ── state plans (dagron-state) ───────────────────────────────────────────────
+/// Explain a state plan: why each model rebuilds. Read-only — this is the surface
+/// a reviewer hits from a pull request, so it never has a side effect.
+///
+/// `envelope` is the planner's own JSON, either bare or wrapped as
+/// `{plan, graph?, options?}`; the caller wraps it before sending.
+export const explainStatePlan = (envelope: unknown): Promise<StateExplanation> =>
+  apiFetch(`/state/plans/explain`, { method: "POST", body: JSON.stringify(envelope) });
+
+/// Compile a state plan to workflow YAML without submitting it.
+export const compileStatePlan = (envelope: unknown): Promise<StateCompiled> =>
+  apiFetch(`/state/plans`, { method: "POST", body: JSON.stringify(envelope) });
+
+/// Compile and submit a state plan, returning the created run.
+export const submitStatePlan = (envelope: unknown): Promise<StateSubmitted> =>
+  apiFetch(`/state/plans/submit`, { method: "POST", body: JSON.stringify(envelope) });

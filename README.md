@@ -268,9 +268,23 @@ notify:
     repo: acme/etl          # owner/repo (github) or project path (gitlab)
     sha: "{{ commit_sha }}"
     context: dagron/ci      # optional check name (default "dagron")
+    description: "built {{ run.images }}"   # optional; default "dagron run succeeded"
 tasks:
-  - { name: build, command: ["make"] }
+  # `run.images` is the distinct `docker_image` of every task, so a workflow
+  # whose tasks name none renders `built ` — the example has to run somewhere
+  # for the description above to say anything.
+  - { name: build, docker_image: golang:1.23, command: ["make"] }
 ```
+
+Every field there is `{{ param }}`-templated, which is how `sha` picks up the
+SHA the CI caller submitted. Four `run.*` names also resolve, because the things
+worth putting in a check are the ones only the engine knows: `{{ run.id }}` (so
+`target_url` can link to the run without the caller passing an id it cannot
+know), `{{ run.workflow }}`, `{{ run.status }}`, and `{{ run.images }}` — the
+distinct task images the spec declares. `description` is worth setting when the
+run *produces* something the reviewer is looking for; left out, the check reads
+`dagron run succeeded` as it always has. Over GitHub's 140-character ceiling the
+text is cut rather than the status being rejected.
 
 Operator notifications ride the same `notify:` block: a **Slack incoming
 webhook** (`notify.slack`, fires on `failed` + `deadline_exceeded` by default)

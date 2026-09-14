@@ -105,6 +105,13 @@ pub struct ExecContext {
     pub resources: Option<dagron_core::dag::ResourceRequirements>,
     /// ServiceAccount (IRSA) for the task pod. KubeExecutor only.
     pub service_account: Option<String>,
+    /// The **effective** trust envelope for this task — already raised to the
+    /// operator's floor by the engine. KubeExecutor shapes the pod's security
+    /// context from it; the Local and Docker executors cannot enforce it, which
+    /// is why the engine refuses such a task before dispatch rather than
+    /// letting it run believing itself sandboxed
+    /// (`IsolationSpec::require_enforceable_by`).
+    pub isolation: Option<dagron_core::isolation::IsolationSpec>,
     /// Optional live-log sink (#17). When set, the executor streams incremental
     /// output here as it arrives; when `None` the output is only returned in full
     /// at exit (the original behaviour). The worker wires this up per attempt.
@@ -122,6 +129,7 @@ impl ExecContext {
             env: Vec::new(),
             resources: None,
             service_account: None,
+            isolation: None,
             log_sink: None,
         }
     }
@@ -224,10 +232,47 @@ fn clamp_to(requested: Option<u64>, ceiling: Option<u64>) -> u64 {
 
 // ── Low-level subprocess runner ───────────────────────────────────────────────
 
+/// Build the `Command` for a task, under whatever this pool permits.
+///
+/// One place, so the buffered and streaming paths cannot drift: a rule that
+/// held on one of them and not the other would be a hole shaped like "whether a
+/// live-log sink happened to be wired", and the streaming path is the one a
+/// real task takes.
+///
+/// With neither pool knob set this is what it always was — spawn `command[0]`,
+/// layer `env` over the inherited environment. See [`crate::pool`] for what the
+/// knobs do and why the allowlist matches a resolved path rather than a word.
+fn build_command(command: &[String], env: &[dagron_core::dag::EnvVar]) -> Result<Command> {
+    let policy = crate::pool::policy();
+    let program = policy.program(&command[0], |name| {
+        crate::pool::resolve_on_path(name, std::env::var("PATH").ok().as_deref())
+    })?;
+
+    let mut cmd = Command::new(program);
+    cmd.args(&command[1..]).kill_on_drop(true);
+    match policy.child_env(env, |name| std::env::var(name).ok())? {
+        // Isolated: the child gets exactly this, and nothing it was not given.
+        Some(pairs) => {
+            cmd.env_clear();
+            for (name, value) in pairs {
+                cmd.env(name, value);
+            }
+        }
+        // Unisolated: inherit, and layer the task's env on top.
+        None => {
+            for e in env {
+                cmd.env(&e.name, &e.value);
+            }
+        }
+    }
+    Ok(cmd)
+}
+
 /// Spawns `command[0]` with `command[1..]` as args.
 /// `timeout_secs` caps execution; falls back to [`DEFAULT_TASK_TIMEOUT_SECS`]
 /// (inside the 30 s lease) and is clamped by [`effective_timeout_secs`].
-/// `env` is layered on top of the inherited environment.
+/// `env` is layered on top of the inherited environment — or replaces it, where
+/// the pool isolates ([`crate::pool`]).
 /// `kill_on_drop` ensures the child is reaped if the future is dropped.
 pub async fn run_command(
     command: &[String],
@@ -241,11 +286,7 @@ pub async fn run_command(
     if secs == 0 {
         bail!("timeout_secs must be >= 1 when provided");
     }
-    let mut cmd = Command::new(&command[0]);
-    cmd.args(&command[1..]).kill_on_drop(true);
-    for e in env {
-        cmd.env(&e.name, &e.value);
-    }
+    let mut cmd = build_command(command, env)?;
 
     let output = timeout(Duration::from_secs(secs), cmd.output())
         .await
@@ -345,14 +386,8 @@ async fn run_command_streaming(
     if secs == 0 {
         bail!("timeout_secs must be >= 1 when provided");
     }
-    let mut cmd = Command::new(&command[0]);
-    cmd.args(&command[1..])
-        .kill_on_drop(true)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for e in env {
-        cmd.env(&e.name, &e.value);
-    }
+    let mut cmd = build_command(command, env)?;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = cmd.spawn()?;
     let stdout = child.stdout.take().expect("piped stdout");
@@ -449,6 +484,7 @@ mod tests {
             env: vec![],
             resources: None,
             service_account: None,
+            isolation: None,
             log_sink: Some(sink),
         };
 
@@ -500,6 +536,7 @@ mod tests {
             env: vec![],
             resources: None,
             service_account: None,
+            isolation: None,
             log_sink: Some(sink),
         };
         let err = LocalExecutor.execute(&ctx).await.expect_err("must time out");
@@ -527,6 +564,7 @@ mod tests {
             env: vec![],
             resources: None,
             service_account: None,
+            isolation: None,
             log_sink: None,
         };
         let out = LocalExecutor.execute(&ctx).await.unwrap();
@@ -551,6 +589,7 @@ mod tests {
             env: vec![],
             resources: None,
             service_account: None,
+            isolation: None,
             log_sink: None,
         };
         let out = LocalExecutor.execute(&ctx).await.unwrap();
@@ -575,6 +614,7 @@ mod tests {
             env: vec![],
             resources: None,
             service_account: None,
+            isolation: None,
             log_sink: Some(sink),
         };
         let out = LocalExecutor.execute(&ctx).await.unwrap();

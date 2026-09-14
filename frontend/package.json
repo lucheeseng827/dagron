@@ -8,7 +8,8 @@
     "prebuild": "node scripts/copy-monaco.mjs",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "check:recipe": "node --experimental-strip-types scripts/check-recipe-vectors.mjs"
   },
   "dependencies": {
     "@dagrejs/dagre": "^1.1.8",

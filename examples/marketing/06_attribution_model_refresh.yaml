@@ -63,7 +63,13 @@ tasks:
   - name: assemble_journeys
     depends_on: [pull_touchpoints]
     timeout_secs: 7200
-    cache: { key: "journeys-{{ lookback_days }}-{{ model_version }}", max_age_secs: 43200 }
+    # No `cache:` here, and that is the point. This task's real output is the file it
+    # writes into $DAGRON_ARTIFACTS, and that directory is PER RUN
+    # (dagron-engine/src/lib.rs:997). A cache hit reuses the recorded stdout and never
+    # runs the command (lib.rs:1775), so on the next run the file is sitting in the
+    # previous run's directory and `embed_journeys` and
+    # everything downstream of it read a journeys.parquet that is not there.
+    # Memoize a task whose result IS its output; not one whose result is a file.
     command: ["sh", "-c", "build-journeys --in \"$DAGRON_ARTIFACTS\" --out \"$DAGRON_ARTIFACTS/journeys.parquet\""]
 
   # Preemptible GPU. `max_attempts: 8` is not optimism about the code — it is the

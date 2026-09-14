@@ -1,7 +1,7 @@
 {
   "name": "@dagron/sdk",
-  "version": "0.4.0",
-  "description": "Define dagron DAGs in TypeScript/JavaScript and submit them to dagron-api.",
+  "version": "0.9.0",
+  "description": "Define dagron DAGs in TypeScript/JavaScript and drive the dagron-api control plane (runs, workflows, schedules, environments, datasets, artifacts).",
   "type": "module",
   "main": "index.mjs",
   "types": "index.d.ts",

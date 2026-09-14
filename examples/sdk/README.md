@@ -38,6 +38,9 @@ python 01_quickstart.py
 | `02_workflow_and_schedule.py` | Save a reusable workflow, attach a cron schedule, trigger it. Cleans up after itself. |
 | `03_stream_run.py` | Follow a run's task transitions live over Server-Sent Events. |
 | `04_rerun_failed.py` | Fail a run mid-graph, then cascade-`rerun` to recover the failure frontier. |
+| `05_build_image.py` | Pass a `Recipe` as a task's `image=` and let the SDK add and wire up the build task for you. |
+| `06_advanced_dag.py` | **New in 0.9.** The Dag builder's full `TaskSpec` surface in one run: fan-out (`with_items`), a sensor, an approval gate resolved programmatically, and a sub-workflow trigger — plus a reference snippet for `pool`/`priority`/`gang`/`cache`/`produces`. |
+| `07_notify_and_automation.py` | **New in 0.9.** A CI-shaped run: mint a token with `create_token`/`from_env` instead of holding a password, a `notify.git.description` commit-status check templated with `{{ run.* }}`, and the account-wide `stream_events` feed. |
 
 To use the published package instead of the in-tree copy:
 
@@ -58,6 +61,8 @@ node 01_quickstart.mjs
 | Script | Shows |
 |---|---|
 | `01_quickstart.mjs` | Build a DAG, log in, submit a run, poll it to a terminal state. |
+| `02_advanced_dag.mjs` | **New in 0.9.** TypeScript twin of `06_advanced_dag.py` — fan-out, a sensor, an approval gate, and a sub-workflow trigger, now that `@dagron/sdk`'s `Dag`/`task()` covers the whole `TaskSpec`. |
+| `03_notify_and_automation.mjs` | **New in 0.9.** TypeScript twin of `07_notify_and_automation.py` — `createToken`/`fromEnv`, `notify.git.description`, and `streamEvents`. |
 
 ## 3. Point them at a real deployment
 
@@ -82,6 +87,16 @@ python 01_quickstart.py
 - The DAGs use plain `echo`/`sh` commands so they run on the engine's **local
   executor** with no container images. To exercise the Docker executor instead,
   bring the stack up with `compose.docker-executor.yaml` and give tasks an `image`.
+- `06_advanced_dag.py`/`02_advanced_dag.mjs` run to completion against the local
+  compose stack with no extra setup — the sub-workflow trigger registers its own
+  child workflow, and the approval gate is resolved by the script itself.
+  `pool`/`gang` route to engine replicas that must already exist on your
+  deployment, so those fields are shown as a reference snippet rather than
+  submitted.
+- `07_notify_and_automation.py`/`03_notify_and_automation.mjs` also run to
+  completion with no extra setup: the `notify.git` commit-status update is
+  best-effort and a documented no-op without `GITHUB_TOKEN`/`GITLAB_TOKEN`
+  configured on the server (see `docs/CONFIG.md`).
 - A `params=` override on `rerun` (fix-forward rerun) is gated behind the
   `enterprise` build feature; the default engine rejects it, so
   `04_rerun_failed.py` uses a plain cascade rerun.

@@ -15,6 +15,10 @@ enterprise = [
     "dagron-core/enterprise",
     "dagron-artifact/enterprise",
     "dagron-crypto/enterprise",
+    # Fleet link: verify the offline licence (ed25519 over base64url) the way
+    # the control plane does, so the console shows a verified state.
+    "dep:ed25519-dalek",
+    "dep:hex",
 ]
 # Fetch archived run documents from cloud object storage (`GC_ARCHIVE_URL`) for
 # the /api/archive endpoints — same env contract and feature names as the
@@ -74,6 +78,10 @@ dagron-artifact = { path = "../dagron-artifact" }
 # resources, wait, cache, pool, priority, produces, …). `postgres` only — this
 # binary is Postgres-only and the two backends are mutually exclusive.
 dagron-core = { path = "../dagron-core", default-features = false, features = ["postgres", "ops"] }
+# The `state` noun: compile a backfill planner's state plan into a run graph.
+# Links neither the planner nor dagron-core (see that crate's Cargo.toml), so it
+# adds nothing to this binary's feature resolution. Mounted in `state_plane.rs`.
+dagron-state = { path = "../dagron-state" }
 tokio-util = { version = "0.7", features = ["io"] }
 async-trait = "0.1"
 chrono = "0.4"
@@ -86,3 +94,6 @@ chrono-tz = "0.10"
 # Cloud fetch for archived run documents (features `archive-s3`/`-gcs`/`-azure`).
 # Backend sub-features (aws/gcp/azure) are enabled by those features.
 object_store = { version = "0.11", optional = true }
+# Enterprise fleet link (routes/link_ee.rs): licence verification.
+ed25519-dalek = { version = "2", optional = true }
+hex = { version = "0.4", optional = true }

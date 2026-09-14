@@ -72,9 +72,50 @@ if [ ${#need_apt[@]} -gt 0 ]; then
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${need_apt[@]}"
 fi
 
-if ! command -v docker >/dev/null; then
-  echo "installing docker (get.docker.com)…"
-  curl -fsSL https://get.docker.com | sh
+# Docker's own apt repository, not the `get.docker.com` shell pipe this used to run.
+#
+# That one-liner pipes a remote script straight into a root shell: whatever the URL
+# returns at that moment is executed with no signature, no pin and no chance to read
+# it first. This script is handed to people to run on a machine they have just been
+# given — `sudo bash rpi-smoke.sh` — so it should not be the thing that teaches that
+# habit.
+#
+# The repository route gets the same packages with apt's guarantees: the release file
+# is signed, the key is pinned to the keyring below, and the install is reproducible
+# and auditable afterwards. `docker-compose-plugin` is named explicitly because the
+# check below needs `docker compose`, which the old installer pulled in as a side effect.
+#
+# The guard asks for both, and that is the point rather than belt-and-braces: a host with
+# docker-ce from some earlier route but no compose plugin skipped this whole block and
+# then died on `docker compose version` a few lines down — a setup script refusing to
+# perform the setup it exists for. Testing only `docker` made the guard and the
+# requirement two different questions.
+if ! command -v docker >/dev/null || ! docker compose version >/dev/null 2>&1; then
+  echo "installing docker from download.docker.com (apt)…"
+  # Raspberry Pi OS 64-bit reports ID=debian; older Raspbian reports ID=raspbian with
+  # ID_LIKE=debian. Docker publishes arm64 under linux/debian for both. Ubuntu on a Pi
+  # is the only other realistic case here.
+  . /etc/os-release
+  case "${ID:-debian}" in
+    ubuntu) DOCKER_DISTRO=ubuntu ;;
+    *)      DOCKER_DISTRO=debian ;;
+  esac
+  [ -n "${VERSION_CODENAME:-}" ] || die "/etc/os-release has no VERSION_CODENAME; cannot pick a docker suite"
+
+  apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates curl gnupg
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL "https://download.docker.com/linux/$DOCKER_DISTRO/gpg" -o /etc/apt/keyrings/docker.asc \
+    || die "could not fetch docker's signing key"
+  chmod a+r /etc/apt/keyrings/docker.asc
+  printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/%s %s stable\n' \
+    "$(dpkg --print-architecture)" "$DOCKER_DISTRO" "$VERSION_CODENAME" \
+    > /etc/apt/sources.list.d/docker.list
+
+  apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+    docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+    || die "docker install failed; see /etc/apt/sources.list.d/docker.list"
 fi
 docker compose version >/dev/null || die "docker compose plugin missing"
 docker version --format '{{.Server.Version}}' | sed 's/^/docker: /'

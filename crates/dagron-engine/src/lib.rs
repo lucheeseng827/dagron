@@ -306,11 +306,41 @@ fn seed_workflow_dir() {
     }
 }
 
+/// The distinct images a spec's tasks declare, in first-appearance order, as
+/// one comma-separated line — what `{{ run.images }}` resolves to.
+///
+/// This is what makes a check on a pull request that changed an image recipe
+/// say which image came out of it. The reference is content-addressed, so it is
+/// in the spec rather than discovered at run time, and reading it here means an
+/// author who wants it in their check does not have to plumb it through as a
+/// parameter they would have to compute themselves.
+///
+/// Empty when no task names an image, which is the ordinary local-executor
+/// workflow; a template that mentions `{{ run.images }}` then renders it as
+/// nothing, which is the honest answer.
+fn run_images(spec: &dag::DagSpec) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    let defaulted = spec
+        .task_defaults
+        .as_ref()
+        .and_then(|d| d.docker_image.as_deref());
+    for task in &spec.tasks {
+        let Some(image) = task.docker_image.as_deref().or(defaulted) else {
+            continue;
+        };
+        if !image.is_empty() && !seen.contains(&image) {
+            seen.push(image);
+        }
+    }
+    seen.join(", ")
+}
+
 /// Post a terminal commit status for a finalized run, if its spec declares a
 /// `notify.git` target. Best-effort: any failure (spec missing, no notify block,
-/// forge error) is logged and swallowed so run execution is never affected. The
-/// target's `{{ param }}` fields are resolved against the spec's `parameters`
-/// (e.g. `sha: "{{ commit_sha }}"` from the CI caller's submitted parameters).
+/// forge error) is logged and swallowed so run execution is never affected.
+/// [`git_target`] does the resolution — templates against the spec's
+/// `parameters` (e.g. `sha: "{{ commit_sha }}"` from the CI caller), plus the
+/// `run.*` names only the engine can fill in.
 async fn post_forge_status(
     forge: &dagron_forge::ForgeClient,
     pool: &db::Pool,
@@ -324,26 +354,54 @@ async fn post_forge_status(
         Ok(s) => s,
         Err(_) => return, // a spec this build can't parse; nothing to notify
     };
-    let Some(git) = spec.notify.and_then(|n| n.git) else {
-        return; // no notify.git block — the common case
-    };
-    // Resolve templated fields against the workflow parameters.
-    let sub = |s: &str| dagron_core::expand::substitute(s, &spec.parameters);
-    let target = dagron_forge::GitTarget {
-        provider: git.provider,
-        repo: sub(&git.repo),
-        sha: sub(&git.sha),
-        context: git.context.as_deref().map(sub).unwrap_or_else(|| "dagron".to_string()),
-        target_url: git.target_url.as_deref().map(sub),
-    };
-    if target.sha.is_empty() || target.sha.contains("{{") {
-        tracing::warn!(%run_id, "notify.git sha did not resolve (missing parameter?) — skipping forge status");
+    let Some(target) = git_target(&spec, run_id, status) else {
         return;
-    }
+    };
     let state = dagron_forge::CommitState::from_run_status(status);
     if let Err(e) = forge.post_status(&target, state).await {
         tracing::warn!(error = %e, %run_id, "forge commit status post failed");
     }
+}
+
+/// Resolve a spec's `notify.git` block into the target to post to. `None` when
+/// there is no block (the common case) or when the SHA did not resolve.
+///
+/// Split out from the posting so the resolution — which is where the templates
+/// and the run-scoped names are decided — can be tested without a database or a
+/// forge.
+fn git_target(spec: &dag::DagSpec, run_id: &str, status: &str) -> Option<dagron_forge::GitTarget> {
+    let git = spec.notify.as_ref()?.git.as_ref()?;
+
+    // Resolve templated fields against the workflow parameters, plus four
+    // `run.*` names the author cannot supply because only the engine knows
+    // them. The dot keeps them out of the way of ordinary parameter names; a
+    // parameter perversely named `run.status` loses to the engine's value,
+    // which is the safe direction — a status that reports whatever a caller
+    // put in a parameter would be worthless.
+    let mut ctx = spec.parameters.clone();
+    ctx.insert("run.id".into(), run_id.to_string());
+    ctx.insert("run.workflow".into(), spec.name.clone());
+    ctx.insert("run.status".into(), status.to_string());
+    ctx.insert("run.images".into(), run_images(spec));
+
+    let sub = |s: &str| dagron_core::expand::substitute(s, &ctx);
+    let target = dagron_forge::GitTarget {
+        provider: git.provider.clone(),
+        repo: sub(&git.repo),
+        sha: sub(&git.sha),
+        context: git
+            .context
+            .as_deref()
+            .map(sub)
+            .unwrap_or_else(|| "dagron".to_string()),
+        target_url: git.target_url.as_deref().map(sub),
+        description: git.description.as_deref().map(sub),
+    };
+    if target.sha.is_empty() || target.sha.contains("{{") {
+        tracing::warn!(%run_id, "notify.git sha did not resolve (missing parameter?) — skipping forge status");
+        return None;
+    }
+    Some(target)
 }
 
 /// Run the dagron scheduler daemon to completion (or until killed). `seams`
@@ -482,8 +540,24 @@ pub async fn run(seams: Seams) -> Result<()> {
     }
     let worker_id = format!("worker-{}", uuid::Uuid::new_v4());
 
-    // Executor backend: EXECUTOR=local|docker (default: local)
-    let executor_kind = std::env::var("EXECUTOR").unwrap_or_else(|_| "local".to_string());
+    // Executor backend: EXECUTOR=local|docker|k8s (default: local).
+    //
+    // Classified ONCE, here, into `ExecutorKind`. Two independent readings of
+    // this string is how the isolation guard was defeated once already: the
+    // enum's parser accepts `kube` and is case- and whitespace-insensitive,
+    // while the selection below matched exact lowercase spellings, so
+    // `EXECUTOR=kube` type-checked as Kubernetes for the isolation guard and
+    // then ran LocalExecutor — a Kubernetes-only envelope passing validation
+    // and dispatching to a bare subprocess. One classification, driving both,
+    // makes that divergence unrepresentable.
+    let executor_raw = std::env::var("EXECUTOR").unwrap_or_else(|_| "local".to_string());
+    let executor_kind = match dagron_core::isolation::ExecutorKind::parse(&executor_raw) {
+        Some(kind) => kind,
+        None => {
+            tracing::warn!(executor = %executor_raw, "unrecognized EXECUTOR value, defaulting to local");
+            dagron_core::isolation::ExecutorKind::Local
+        }
+    };
     let worker_count: usize = std::env::var("WORKER_COUNT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -507,6 +581,33 @@ pub async fn run(seams: Seams) -> Result<()> {
         dag::validate_runner_class(class)
             .map_err(|e| anyhow::anyhow!("invalid RUNNER_CLASSES entry: {e}"))?;
     }
+
+    // Trust envelope (family 3): which envelope fields this scheduler's executor
+    // can actually deliver. The same `executor_kind` the dispatch path uses, so
+    // what is validated is always what will run.
+    let executor_isolation = Some(executor_kind);
+    // The floor is the privileges no task dispatched by this scheduler may go
+    // below, however its workflow was written. Parsed at startup so a malformed
+    // floor is a boot failure — a floor discovered to be invalid at dispatch is
+    // one that was not in force for everything dispatched before it.
+    let isolation_floor = match std::env::var("DAGRON_TASK_ISOLATION_FLOOR") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let floor = dagron_core::isolation::IsolationSpec::parse_floor(&raw)
+                .map_err(|e| anyhow::anyhow!("invalid DAGRON_TASK_ISOLATION_FLOOR: {e}"))?;
+            // A floor this executor cannot deliver is a deployment mistake, and
+            // it must be found here rather than one task at a time: every task
+            // inherits the floor, so the alternative is an engine that boots
+            // cleanly and then fails literally everything it is given.
+            if let Some(kind) = executor_isolation {
+                floor.require_enforceable_by(kind).map_err(|e| {
+                    anyhow::anyhow!("DAGRON_TASK_ISOLATION_FLOOR is not enforceable here: {e}")
+                })?;
+            }
+            info!(floor = %floor.canonical().replace('\n', " "), "task isolation floor in force");
+            Some(floor)
+        }
+        _ => None,
+    };
 
     // Named concurrency pools (#21): POOLS=etl:4,db:2 caps how many tasks in each
     // pool may run at once. A task's `pool:` draws a slot; when a pool is full its
@@ -576,7 +677,7 @@ pub async fn run(seams: Seams) -> Result<()> {
         .unwrap_or(3)
         .max(1);
 
-    info!(%worker_id, %dag_path, db = %redact_conn(&db_target), %executor_kind, worker_count, %source_kind, max_inflight_runs, max_inflight_tasks, runner_classes = ?runner_classes, pools = ?pool_caps, "scheduler starting");
+    info!(%worker_id, %dag_path, db = %redact_conn(&db_target), executor_kind = ?executor_kind, worker_count, %source_kind, max_inflight_runs, max_inflight_tasks, runner_classes = ?runner_classes, pools = ?pool_caps, "scheduler starting");
 
     // rustls 0.23 needs a process-level CryptoProvider before the kube client
     // opens TLS to the apiserver (KubeExecutor); install it once at startup.
@@ -585,13 +686,13 @@ pub async fn run(seams: Seams) -> Result<()> {
         dagron_executor::install_crypto_provider();
     }
 
-    let executor: Arc<dyn executor::Executor> = match executor_kind.as_str() {
-        "docker" => {
+    let executor: Arc<dyn executor::Executor> = match executor_kind {
+        dagron_core::isolation::ExecutorKind::Docker => {
             let image = std::env::var("DOCKER_IMAGE").unwrap_or_else(|_| "alpine:latest".to_string());
             info!(%image, "using DockerExecutor");
             Arc::new(docker_executor::DockerExecutor::connect(image).await?)
         }
-        "kubernetes" | "k8s" => {
+        dagron_core::isolation::ExecutorKind::Kubernetes => {
             // Cluster-gated: only compiled with `--features kubernetes`. Without
             // it, fail clearly rather than silently downgrading to local.
             #[cfg(feature = "kubernetes")]
@@ -611,12 +712,8 @@ pub async fn run(seams: Seams) -> Result<()> {
                 )
             }
         }
-        "local" => {
+        dagron_core::isolation::ExecutorKind::Local => {
             info!("using LocalExecutor");
-            Arc::new(LocalExecutor)
-        }
-        _ => {
-            tracing::warn!(%executor_kind, "unrecognized EXECUTOR value, defaulting to local");
             Arc::new(LocalExecutor)
         }
     };
@@ -1476,6 +1573,40 @@ pub async fn run(seams: Seams) -> Result<()> {
                                     }
                                 }
                             }
+                            // Raise the task's declared envelope to the
+                            // operator's floor, then refuse it outright if this
+                            // executor cannot deliver what it now says. Both
+                            // steps happen here, at dispatch, because this is
+                            // the last point that sees the task *and* knows
+                            // which executor will run it — and because a task
+                            // that runs believing it is sandboxed when it is
+                            // not is the one outcome this must never produce.
+                            let isolation = match (&spec.isolation, &isolation_floor) {
+                                (None, None) => None,
+                                (declared, floor) => {
+                                    let declared = declared.clone().unwrap_or_default();
+                                    let (effective, tightened) = match floor {
+                                        Some(f) => declared.apply_floor(f),
+                                        None => (declared, Vec::new()),
+                                    };
+                                    let overridden: Vec<String> = tightened
+                                        .iter()
+                                        .filter(|t| t.requested != "unset")
+                                        .map(|t| t.to_string())
+                                        .collect();
+                                    if !overridden.is_empty() {
+                                        tracing::warn!(
+                                            task = %task.name,
+                                            tightened = %overridden.join("; "),
+                                            "isolation floor overrode what this task asked for"
+                                        );
+                                    }
+                                    // Enforceability is checked after this
+                                    // match, where a single task can be failed
+                                    // without taking the loop with it.
+                                    if effective.is_empty() { None } else { Some(effective) }
+                                }
+                            };
                             (
                                 ExecContext {
                                     command: spec.command,
@@ -1484,6 +1615,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                                     env,
                                     resources: spec.resources,
                                     service_account: spec.service_account,
+                                    isolation,
                                     // Wired per-attempt by the worker from `log_tx`.
                                     log_sink: None,
                                 },
@@ -1525,6 +1657,31 @@ pub async fn run(seams: Seams) -> Result<()> {
                     },
                     None => (ExecContext::new(vec!["true".to_string()], None, None), 1, 0, None, true, None, None, None, None, Vec::new(), None),
                 };
+
+                // Refuse a trust envelope this executor cannot deliver — as a
+                // terminal failure of THIS task, never of the loop. Same
+                // reasoning as the unparseable-spec arm above, with a sharper
+                // edge: in a multi-tenant engine, propagating here would let any
+                // tenant halt a scheduler running everyone else's work by
+                // submitting one workflow that asks for gVisor on a plain
+                // Docker runner.
+                if let (Some(iso), Some(kind)) = (&ctx.isolation, executor_isolation) {
+                    if let Err(e) = iso.require_enforceable_by(kind) {
+                        tracing::error!(
+                            task = %task.name, task_id = %task.id, error = %e,
+                            "declared isolation cannot be enforced — marking task failed"
+                        );
+                        db::mark_task_failed(
+                            &pool,
+                            &task.id,
+                            &worker_id,
+                            task.version.saturating_add(1),
+                            Some(e.to_string()),
+                        )
+                        .await?;
+                        continue;
+                    }
+                }
 
                 // Deferrable wait sensor (#27): park this task with no worker held
                 // and let a reconcile sweep resolve it. A `wait.url` HTTP sensor
@@ -2372,7 +2529,186 @@ pub async fn run(seams: Seams) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{new_traceparent, parse_max_inflight_runs};
+    use super::{dag, git_target, new_traceparent, parse_max_inflight_runs, run_images};
+
+    /// `{{ run.images }}` in a `notify.git` field: the distinct images the
+    /// spec's tasks declare, in the order they first appear, with the workflow's
+    /// `task_defaults` filling in for a task that names none.
+    ///
+    /// This is what puts the built image in the check on a pull request that
+    /// changed its recipe — the reference is content-addressed, so it is in the
+    /// spec rather than something the run has to report back.
+    #[test]
+    /// The README's `notify.git` example, verbatim: it advertises
+    /// `{{ run.images }}`, so its task must actually name an image or the
+    /// rendered description is the word "built" and a space.
+    #[test]
+    fn the_readme_notify_example_resolves_run_images() {
+        let spec: dag::DagSpec = serde_yaml::from_str(
+            "name: ci_build\n\
+             parameters:\n  commit_sha: \"\"\n\
+             tasks:\n\
+             - { name: build, docker_image: golang:1.23, command: [\"make\"] }\n",
+        )
+        .expect("the README example must parse as a spec");
+        assert_eq!(run_images(&spec), "golang:1.23");
+    }
+
+    fn run_images_lists_the_distinct_task_images() {
+        let spec = |yaml: &str| -> dag::DagSpec { serde_yaml::from_str(yaml).unwrap() };
+
+        // The image-build shape: one recipe, one built image, used twice.
+        let s = spec(
+            "name: etl\n\
+             tasks:\n\
+             - name: build\n  command: [dagron-build]\n  docker_image: registry.local/build:1\n\
+             - name: load\n  command: [x]\n  docker_image: registry.local/ws/etl:r-d086f3af\n\
+             - name: check\n  command: [y]\n  docker_image: registry.local/ws/etl:r-d086f3af\n",
+        );
+        assert_eq!(
+            run_images(&s),
+            "registry.local/build:1, registry.local/ws/etl:r-d086f3af",
+            "each image once, in first-appearance order"
+        );
+
+        // `task_defaults` stands in for a task that names no image, because
+        // that is where a DRY workflow puts the one image it runs everything on.
+        let s = spec(
+            "name: etl\n\
+             task_defaults:\n  docker_image: registry.local/ws/etl:r-abc\n\
+             tasks:\n\
+             - name: a\n  command: [x]\n\
+             - name: b\n  command: [y]\n",
+        );
+        assert_eq!(run_images(&s), "registry.local/ws/etl:r-abc");
+
+        // A local-executor workflow names no image at all. Empty is the honest
+        // answer; inventing one would put a lie in a commit status.
+        let s = spec("name: etl\ntasks:\n- name: a\n  command: [x]\n");
+        assert_eq!(run_images(&s), "");
+    }
+
+    /// A `notify.git` block resolved as the engine resolves it at finalization.
+    ///
+    /// The case this exists for: a pull request changes an image recipe, CI
+    /// submits the run with the commit SHA as a parameter, and the check that
+    /// lands on the PR names the image the change produced instead of saying
+    /// only that something passed.
+    #[test]
+    fn a_notify_git_block_resolves_parameters_and_run_scoped_names() {
+        let spec: dag::DagSpec = serde_yaml::from_str(
+            "name: etl\n\
+             parameters:\n  commit_sha: 9f1c2e4\n  repo: acme/etl\n\
+             notify:\n  git:\n\
+             \x20   provider: github\n\
+             \x20   repo: \"{{ repo }}\"\n\
+             \x20   sha: \"{{ commit_sha }}\"\n\
+             \x20   context: dagron/image\n\
+             \x20   target_url: \"https://dagron.example/runs/{{ run.id }}\"\n\
+             \x20   description: \"{{ run.workflow }} {{ run.status }}: built {{ run.images }}\"\n\
+             tasks:\n\
+             - name: load\n  command: [x]\n  docker_image: registry.local/ws/etl:r-d086f3af\n",
+        )
+        .unwrap();
+
+        let t = git_target(&spec, "run-42", "succeeded").expect("a resolved target");
+        assert_eq!(t.repo, "acme/etl");
+        assert_eq!(t.sha, "9f1c2e4");
+        assert_eq!(t.context, "dagron/image");
+        // run.id in target_url is the reason it is run-scoped: a caller cannot
+        // pass in an id the engine has not minted yet.
+        assert_eq!(
+            t.target_url.as_deref(),
+            Some("https://dagron.example/runs/run-42")
+        );
+        assert_eq!(
+            t.description.as_deref(),
+            Some("etl succeeded: built registry.local/ws/etl:r-d086f3af")
+        );
+
+        // And the whole chain, to the body that goes on the wire.
+        let (url, body) = dagron_forge::github_request(
+            "https://api.github.com",
+            &t,
+            dagron_forge::CommitState::Success,
+        );
+        assert_eq!(url, "https://api.github.com/repos/acme/etl/statuses/9f1c2e4");
+        assert_eq!(body["state"], "success");
+        assert_eq!(
+            body["description"],
+            "etl succeeded: built registry.local/ws/etl:r-d086f3af"
+        );
+
+        // The same spec on a failed run says so, from the same template.
+        let t = git_target(&spec, "run-42", "failed").unwrap();
+        assert!(t.description.unwrap().contains("etl failed:"));
+    }
+
+    /// A parameter cannot shadow a run-scoped name, and an unresolved `{{ … }}`
+    /// in the SHA skips the post rather than attaching a status to a commit
+    /// called `{{ commit_sha }}`.
+    #[test]
+    fn run_scoped_names_are_reserved_and_an_unresolved_sha_skips() {
+        // A workflow parameter literally named `run.status` is not reachable
+        // through `{{ run.status }}` — the engine's value wins.
+        let spec: dag::DagSpec = serde_yaml::from_str(
+            "name: etl\n\
+             parameters:\n  \"run.status\": lies\n  sha: abc\n\
+             notify:\n  git:\n\
+             \x20   provider: github\n\
+             \x20   repo: acme/etl\n\
+             \x20   sha: \"{{ sha }}\"\n\
+             \x20   description: \"{{ run.status }}\"\n\
+             tasks:\n- name: a\n  command: [x]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            git_target(&spec, "run-1", "succeeded").unwrap().description.as_deref(),
+            Some("succeeded")
+        );
+
+        // A SHA whose parameter was never supplied: skipped, because posting a
+        // status against the literal text would attach it to nothing.
+        let spec: dag::DagSpec = serde_yaml::from_str(
+            "name: etl\n\
+             notify:\n  git:\n\
+             \x20   provider: github\n\
+             \x20   repo: acme/etl\n\
+             \x20   sha: \"{{ commit_sha }}\"\n\
+             tasks:\n- name: a\n  command: [x]\n",
+        )
+        .unwrap();
+        assert!(git_target(&spec, "run-1", "succeeded").is_none());
+
+        // No notify block at all is the common case and stays silent.
+        let spec: dag::DagSpec =
+            serde_yaml::from_str("name: etl\ntasks:\n- name: a\n  command: [x]\n").unwrap();
+        assert!(git_target(&spec, "run-1", "succeeded").is_none());
+    }
+
+    /// A spec written before this field existed still parses and still gets the
+    /// wording it always got — the field is additive, not a migration.
+    #[test]
+    fn a_spec_without_a_description_keeps_the_old_check() {
+        let spec: dag::DagSpec = serde_yaml::from_str(
+            "name: etl\n\
+             notify:\n  git:\n\
+             \x20   provider: gitlab\n\
+             \x20   repo: group/etl\n\
+             \x20   sha: deadbeef\n\
+             tasks:\n- name: a\n  command: [x]\n",
+        )
+        .unwrap();
+        let t = git_target(&spec, "run-1", "succeeded").unwrap();
+        assert!(t.description.is_none());
+        assert_eq!(t.context, "dagron", "the default context is unchanged");
+        let (_, body) = dagron_forge::gitlab_request(
+            "https://gitlab.com/api/v4",
+            &t,
+            dagron_forge::CommitState::Success,
+        );
+        assert_eq!(body["description"], "dagron run succeeded");
+    }
 
     /// `MAX_INFLIGHT_RUNS` contract, as the Helm chart and `values.yaml`
     /// document it: default 64, an explicit number is honoured verbatim, and

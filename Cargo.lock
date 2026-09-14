@@ -1379,7 +1379,10 @@ dependencies = [
  "dagron-crypto",
  "dagron-identity",
  "dagron-logging",
+ "dagron-state",
+ "ed25519-dalek",
  "futures",
+ "hex",
  "jsonwebtoken",
  "object_store",
  "petgraph",
@@ -1466,6 +1469,7 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2 0.10.9",
  "tokio",
 ]
@@ -1633,6 +1637,19 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "dagron-state"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "dagron-core",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
 ]
 
 [[package]]

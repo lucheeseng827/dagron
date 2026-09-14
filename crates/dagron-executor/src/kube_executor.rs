@@ -165,6 +165,15 @@ pub struct PodHardening {
     pub read_only_root_fs: bool,
     /// `DAGRON_TASK_DROP_ALL_CAPABILITIES=1`
     pub drop_all_capabilities: bool,
+    /// `allowPrivilegeEscalation: false` on its own. Previously implied by
+    /// either of the two fields above; a per-task envelope
+    /// (`isolation.no_new_privileges`) can ask for it alone, so it needs its own
+    /// bit. No env knob: the process-wide spelling stayed as it was.
+    pub no_new_privileges: bool,
+    /// `runAsNonRoot: true` without pinning a uid — the check that a task whose
+    /// image happens to run as root is refused rather than quietly permitted.
+    /// Set from `isolation.run_as_non_root`; `run_as_user > 0` implies it too.
+    pub run_as_non_root: bool,
     /// `DAGRON_TASK_SECCOMP_RUNTIME_DEFAULT=1`
     pub seccomp_runtime_default: bool,
     /// `DAGRON_TASK_ACTIVE_DEADLINE_SECS` — a task that hangs otherwise holds a
@@ -193,6 +202,11 @@ impl PodHardening {
             run_as_user: std::env::var("DAGRON_TASK_RUN_AS_USER").ok().and_then(|v| v.parse().ok()),
             read_only_root_fs: flag("DAGRON_TASK_READ_ONLY_ROOT_FS"),
             drop_all_capabilities: flag("DAGRON_TASK_DROP_ALL_CAPABILITIES"),
+            // Deliberately not env-driven: these exist for the per-task
+            // envelope, and the process-wide knobs they would duplicate
+            // (`DROP_ALL_CAPABILITIES`, `RUN_AS_USER`) already imply them.
+            no_new_privileges: false,
+            run_as_non_root: false,
             seccomp_runtime_default: flag("DAGRON_TASK_SECCOMP_RUNTIME_DEFAULT"),
             active_deadline_secs: std::env::var("DAGRON_TASK_ACTIVE_DEADLINE_SECS")
                 .ok()
@@ -214,6 +228,51 @@ impl PodHardening {
     }
 }
 
+impl PodHardening {
+    /// Fold an **effective** trust envelope over these process-wide defaults.
+    ///
+    /// "Effective" means the spec has already been raised to the operator's
+    /// floor (`IsolationSpec::apply_floor`) — this function does not enforce a
+    /// floor and must never be handed a raw workflow-authored envelope, or a
+    /// task would be choosing its own privileges.
+    ///
+    /// A field the envelope leaves unset keeps the process-wide value, so an
+    /// operator's `DAGRON_TASK_*` settings still apply to every task that says
+    /// nothing. A field the envelope sets wins outright, including setting it
+    /// *weaker* — the floor is what prevents that being an escape, and putting
+    /// a second implicit floor here would make the effective envelope differ
+    /// from the one that was checked, reported and attested.
+    pub fn with_isolation(&self, iso: &dagron_core::isolation::IsolationSpec) -> Self {
+        use dagron_core::isolation::Seccomp;
+        let mut out = self.clone();
+        if let Some(rc) = &iso.runtime_class {
+            out.runtime_class = Some(rc.clone());
+        }
+        if let Some(sc) = iso.seccomp {
+            out.seccomp_runtime_default = matches!(sc, Seccomp::RuntimeDefault);
+        }
+        if let Some(v) = iso.read_only_root_fs {
+            out.read_only_root_fs = v;
+        }
+        if let Some(v) = iso.no_new_privileges {
+            out.no_new_privileges = v;
+        }
+        if let Some(v) = iso.drop_all_capabilities {
+            out.drop_all_capabilities = v;
+        }
+        if let Some(v) = iso.run_as_non_root {
+            out.run_as_non_root = v;
+        }
+        if let Some(u) = iso.run_as_user {
+            out.run_as_user = Some(u);
+        }
+        if let Some(v) = iso.service_account_token {
+            out.automount_sa_token = v;
+        }
+        out
+    }
+}
+
 /// Apply hardening to a built Pod manifest.
 ///
 /// Pure and `Value`-shaped, mirroring `ee/dagron-executor-ee`'s confidential
@@ -226,18 +285,25 @@ pub fn apply_hardening(pod: &mut serde_json::Value, h: &PodHardening, wants_sa: 
 
     if let Some(uid) = h.run_as_user {
         let mut sc = serde_json::json!({ "runAsUser": uid });
-        if uid > 0 {
+        if uid > 0 || h.run_as_non_root {
             sc["runAsNonRoot"] = serde_json::json!(true);
         }
         if h.seccomp_runtime_default {
             sc["seccompProfile"] = serde_json::json!({ "type": "RuntimeDefault" });
         }
         spec.insert("securityContext".to_string(), sc);
-    } else if h.seccomp_runtime_default {
-        spec.insert(
-            "securityContext".to_string(),
-            serde_json::json!({ "seccompProfile": { "type": "RuntimeDefault" } }),
-        );
+    } else if h.seccomp_runtime_default || h.run_as_non_root {
+        // `runAsNonRoot` without a uid is the useful half on its own: it refuses
+        // an image whose user resolves to root instead of picking a uid the
+        // image may have no filesystem permissions for.
+        let mut sc = serde_json::json!({});
+        if h.seccomp_runtime_default {
+            sc["seccompProfile"] = serde_json::json!({ "type": "RuntimeDefault" });
+        }
+        if h.run_as_non_root {
+            sc["runAsNonRoot"] = serde_json::json!(true);
+        }
+        spec.insert("securityContext".to_string(), sc);
     }
 
     if let Some(secs) = h.active_deadline_secs {
@@ -260,7 +326,7 @@ pub fn apply_hardening(pod: &mut serde_json::Value, h: &PodHardening, wants_sa: 
         spec.insert("automountServiceAccountToken".to_string(), serde_json::json!(false));
     }
 
-    if h.read_only_root_fs || h.drop_all_capabilities {
+    if h.read_only_root_fs || h.drop_all_capabilities || h.no_new_privileges {
         if let Some(containers) = spec.get_mut("containers").and_then(serde_json::Value::as_array_mut) {
             for c in containers.iter_mut() {
                 let csc = c
@@ -343,7 +409,12 @@ fn build_pod(name: &str, image: &str, command: &[String], ctx: &ExecContext) -> 
     // remembered. `wants_sa` distinguishes a task that asked for an identity from
     // one that did not: the former keeps its token, the latter should not be
     // handed one it never requested.
-    apply_hardening(&mut manifest, &PodHardening::from_env(), ctx.service_account.is_some());
+    let hardening = PodHardening::from_env();
+    let hardening = match &ctx.isolation {
+        Some(iso) => hardening.with_isolation(iso),
+        None => hardening,
+    };
+    apply_hardening(&mut manifest, &hardening, ctx.service_account.is_some());
 
     let pod = serde_json::from_value(manifest)
         .map_err(|e| anyhow::anyhow!("build pod manifest: {e}"))?;
@@ -382,6 +453,10 @@ mod tests {
 
     #[test]
     fn hardening_shapes_every_field_it_is_given() {
+        // `..Default::default()` rather than an exhaustive literal: the note on
+        // the ExecContext below records what happened the last time a field was
+        // added to a struct these tests spell out in full, and this test asserts
+        // on the fields it names, not on the absence of others.
         let h = PodHardening {
             run_as_user: Some(65532),
             read_only_root_fs: true,
@@ -391,6 +466,7 @@ mod tests {
             runtime_class: Some("gvisor".into()),
             node_selector: vec![("dagron.io/untrusted".into(), "true".into())],
             automount_sa_token: false,
+            ..PodHardening::default()
         };
         let mut pod = serde_json::json!({"spec": {"containers": [{"name": "task"}]}});
         apply_hardening(&mut pod, &h, false);
@@ -405,6 +481,238 @@ mod tests {
         assert_eq!(csc["allowPrivilegeEscalation"], false);
         assert_eq!(csc["readOnlyRootFilesystem"], true);
         assert_eq!(csc["capabilities"]["drop"][0], "ALL");
+    }
+
+    // ── Per-task trust envelope (family 3) ────────────────────────────────
+    //
+    // The process-wide `PodHardening` is one envelope for every task this
+    // scheduler dispatches. These cover the seam that lets one task be
+    // sandboxed while its neighbour is not.
+
+    fn iso() -> dagron_core::isolation::IsolationSpec {
+        dagron_core::isolation::IsolationSpec::default()
+    }
+
+    #[test]
+    fn a_task_envelope_hardens_one_pod_without_touching_the_process_default() {
+        use dagron_core::isolation::Seccomp;
+
+        // The operator set nothing: today every task pod is unhardened.
+        let base = PodHardening::default();
+        let untrusted = base.with_isolation(&dagron_core::isolation::IsolationSpec {
+            runtime_class: Some("gvisor".into()),
+            seccomp: Some(Seccomp::RuntimeDefault),
+            read_only_root_fs: Some(true),
+            drop_all_capabilities: Some(true),
+            run_as_non_root: Some(true),
+            ..iso()
+        });
+
+        let mut sandboxed = serde_json::json!({"spec": {"containers": [{"name": "task"}]}});
+        apply_hardening(&mut sandboxed, &untrusted, false);
+        assert_eq!(sandboxed["spec"]["runtimeClassName"], "gvisor");
+        assert_eq!(sandboxed["spec"]["securityContext"]["runAsNonRoot"], true);
+        assert_eq!(
+            sandboxed["spec"]["securityContext"]["seccompProfile"]["type"],
+            "RuntimeDefault"
+        );
+        let csc = &sandboxed["spec"]["containers"][0]["securityContext"];
+        assert_eq!(csc["readOnlyRootFilesystem"], true);
+        assert_eq!(csc["capabilities"]["drop"][0], "ALL");
+
+        // The neighbouring task, same scheduler, same process env: untouched.
+        let mut plain = serde_json::json!({"spec": {"containers": [{"name": "task"}]}});
+        apply_hardening(&mut plain, &base, false);
+        assert!(plain["spec"].get("runtimeClassName").is_none());
+        assert!(plain["spec"].get("securityContext").is_none());
+    }
+
+    #[test]
+    fn an_unset_envelope_field_leaves_the_operators_process_default_alone() {
+        let operator = PodHardening {
+            read_only_root_fs: true,
+            runtime_class: Some("gvisor".into()),
+            active_deadline_secs: Some(600),
+            ..PodHardening::default()
+        };
+        // The task asks only about capabilities.
+        let merged = operator.with_isolation(&dagron_core::isolation::IsolationSpec {
+            drop_all_capabilities: Some(true),
+            ..iso()
+        });
+        assert!(merged.read_only_root_fs, "the operator's setting must survive");
+        assert_eq!(merged.runtime_class.as_deref(), Some("gvisor"));
+        assert_eq!(merged.active_deadline_secs, Some(600));
+        assert!(merged.drop_all_capabilities);
+    }
+
+    #[test]
+    fn no_new_privileges_can_be_asked_for_on_its_own() {
+        // Previously `allowPrivilegeEscalation: false` only appeared as a side
+        // effect of a read-only root or dropped capabilities; an envelope that
+        // wants just this must get just this.
+        let h = PodHardening::default().with_isolation(&dagron_core::isolation::IsolationSpec {
+            no_new_privileges: Some(true),
+            ..iso()
+        });
+        let mut pod = serde_json::json!({"spec": {"containers": [{"name": "task"}]}});
+        apply_hardening(&mut pod, &h, false);
+        let csc = &pod["spec"]["containers"][0]["securityContext"];
+        assert_eq!(csc["allowPrivilegeEscalation"], false);
+        assert!(csc.get("readOnlyRootFilesystem").is_none());
+        assert!(csc.get("capabilities").is_none());
+    }
+
+    #[test]
+    fn run_as_non_root_without_a_uid_is_honoured() {
+        // Pinning a uid can break an image that has no filesystem permissions
+        // for it; refusing root is the half that always applies.
+        let h = PodHardening::default().with_isolation(&dagron_core::isolation::IsolationSpec {
+            run_as_non_root: Some(true),
+            ..iso()
+        });
+        let mut pod = serde_json::json!({"spec": {"containers": [{"name": "task"}]}});
+        apply_hardening(&mut pod, &h, false);
+        assert_eq!(pod["spec"]["securityContext"]["runAsNonRoot"], true);
+        assert!(pod["spec"]["securityContext"].get("runAsUser").is_none());
+    }
+
+    #[test]
+    fn an_envelope_may_grant_the_service_account_token_the_process_withholds() {
+        // `automount_sa_token` defaults false, so a task with no
+        // `service_account:` gets no token. A task that genuinely needs one --
+        // and whose envelope was already floored by the operator -- can say so.
+        let h = PodHardening::default().with_isolation(&dagron_core::isolation::IsolationSpec {
+            service_account_token: Some(true),
+            ..iso()
+        });
+        let mut pod = serde_json::json!({"spec": {"containers": [{"name": "task"}]}});
+        apply_hardening(&mut pod, &h, false);
+        assert!(
+            pod["spec"].get("automountServiceAccountToken").is_none(),
+            "the token is not withheld when the envelope asked for it"
+        );
+    }
+
+    #[test]
+    fn build_pod_applies_the_context_envelope_end_to_end() {
+        use dagron_core::isolation::Seccomp;
+
+        let mut ctx = ExecContext::new(vec!["sh".into()], None, Some("alpine:3.19".into()));
+        ctx.isolation = Some(dagron_core::isolation::IsolationSpec {
+            runtime_class: Some("kata-qemu".into()),
+            seccomp: Some(Seccomp::RuntimeDefault),
+            drop_all_capabilities: Some(true),
+            ..iso()
+        });
+        let pod = build_pod("sched-iso", "alpine:3.19", &ctx.command, &ctx).unwrap();
+        let spec = pod.spec.expect("spec");
+        assert_eq!(spec.runtime_class_name.as_deref(), Some("kata-qemu"));
+        let csc = spec.containers[0].security_context.as_ref().expect("container securityContext");
+        assert_eq!(csc.capabilities.as_ref().unwrap().drop.as_ref().unwrap()[0], "ALL");
+    }
+
+    /// The three cases `workshop/04-families/k8s/f3-floor-probe.yaml` submits,
+    /// resolved here to the exact pod shapes `verify-k3s.sh` asserts against a
+    /// live cluster.
+    ///
+    /// This test is why that script's expected values are not guesswork: the
+    /// floor string below is the one in `k8s/10-engine.yaml`, the declarations
+    /// are the ones in the probe workflow, and the assertions are what the
+    /// cluster lane looks for. Change any of the three and this fails first,
+    /// in CI, rather than as a confusing red lab on someone's EC2 box.
+    #[test]
+    fn the_floor_probe_resolves_to_the_pod_shapes_the_k3s_lane_asserts() {
+        use dagron_core::isolation::{IsolationSpec, Seccomp};
+
+        // Verbatim from workshop/04-families/k8s/10-engine.yaml.
+        let floor = IsolationSpec::parse_floor(
+            "seccomp=runtime_default,read_only_root_fs=true,no_new_privileges=true,             drop_all_capabilities=true,run_as_non_root=true,run_as_user=65534,             service_account_token=false",
+        )
+        .expect("the floor in the lab manifest must parse");
+
+        // The engine applies the floor, then the executor shapes the pod.
+        let shape = |declared: IsolationSpec| {
+            let (effective, tightened) = declared.apply_floor(&floor);
+            let h = PodHardening::default().with_isolation(&effective);
+            let mut pod = serde_json::json!({"spec": {"containers": [{"name": "task"}]}});
+            apply_hardening(&mut pod, &h, false);
+            (pod, tightened)
+        };
+
+        // 1. silent-task — declares nothing, inherits the whole floor.
+        let (silent, tightened) = shape(IsolationSpec::default());
+        assert_eq!(silent["spec"]["securityContext"]["runAsUser"], 65534);
+        assert_eq!(silent["spec"]["securityContext"]["runAsNonRoot"], true);
+        assert_eq!(
+            silent["spec"]["securityContext"]["seccompProfile"]["type"],
+            "RuntimeDefault"
+        );
+        assert_eq!(silent["spec"]["automountServiceAccountToken"], false);
+        let csc = &silent["spec"]["containers"][0]["securityContext"];
+        assert_eq!(csc["readOnlyRootFilesystem"], true);
+        assert_eq!(csc["allowPrivilegeEscalation"], false);
+        assert_eq!(csc["capabilities"]["drop"][0], "ALL");
+        assert!(
+            tightened.iter().all(|t| t.requested == "unset"),
+            "a silent task disagrees with nothing: {tightened:?}"
+        );
+
+        // 2. greedy-task — every field set weak. The floor must win on all of
+        // them, and the pod must be indistinguishable from the silent one.
+        let (greedy, tightened) = shape(IsolationSpec {
+            seccomp: Some(Seccomp::Unconfined),
+            read_only_root_fs: Some(false),
+            no_new_privileges: Some(false),
+            drop_all_capabilities: Some(false),
+            run_as_non_root: Some(false),
+            service_account_token: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(
+            greedy, silent,
+            "a workflow that asks for less must get exactly what the floor says"
+        );
+        // …and every override is reported, so the operator sees the attempt.
+        let overridden: Vec<&str> = tightened
+            .iter()
+            .filter(|t| t.requested != "unset")
+            .map(|t| t.field)
+            .collect();
+        for field in [
+            "seccomp",
+            "read_only_root_fs",
+            "no_new_privileges",
+            "drop_all_capabilities",
+            "run_as_non_root",
+            "service_account_token",
+        ] {
+            assert!(overridden.contains(&field), "{field} not reported: {tightened:?}");
+        }
+
+        // 3. paranoid-task — stricter than the floor. Its own non-root uid
+        // survives; a floor that clamped it would be a ceiling.
+        let (paranoid, tightened) = shape(IsolationSpec {
+            read_only_root_fs: Some(true),
+            drop_all_capabilities: Some(true),
+            no_new_privileges: Some(true),
+            run_as_non_root: Some(true),
+            run_as_user: Some(30000),
+            ..Default::default()
+        });
+        assert_eq!(
+            paranoid["spec"]["securityContext"]["runAsUser"], 30000,
+            "the task's own uid must survive the floor"
+        );
+        assert_eq!(paranoid["spec"]["automountServiceAccountToken"], false);
+        assert_eq!(
+            paranoid["spec"]["containers"][0]["securityContext"]["capabilities"]["drop"][0],
+            "ALL"
+        );
+        assert!(
+            tightened.iter().all(|t| t.requested == "unset"),
+            "hardening beyond the floor is not a disagreement: {tightened:?}"
+        );
     }
 
     #[test]
@@ -452,6 +760,7 @@ mod tests {
             // so long: the tests that describe the pod's shape were dead.
             resources: Some(ResourceRequirements { requests, limits, gpu: None }),
             service_account: Some("dagron-etl".to_string()),
+            isolation: None,
             log_sink: None,
         };
         let pod = build_pod("sched-xyz", "etl-task:latest", &ctx.command, &ctx).unwrap();

@@ -99,6 +99,8 @@ All read in `crates/dagron-engine/src/lib.rs` unless noted.
 | `K8S_IMAGE` | image ref | `$DOCKER_IMAGE` → `alpine:latest` | Image for KubeExecutor. |
 | `K8S_NAMESPACE` | string | `default` | KubeExecutor namespace. |
 | `DAGRON_MAX_TASK_TIMEOUT_SECS` | u64 > 0 | unset = **no ceiling** | Upper bound on any single task's wall clock, applied by every executor (local, docker, k8s). A task's own `timeout_secs` is a *request*: it is clamped to this, and so is the 25 s default. Unset changes nothing, which is right for a self-host — it is your hardware. A multi-tenant install wants it set, because plan quotas cap tasks per day and runs per month while nothing capped how long one task may run, leaving worst-case compute per plan unbounded. A value that is not a positive integer (including `0`, which would time out every task instantly) is ignored with a warning rather than silently becoming a ceiling that is not one. |
+| `DAGRON_LOCAL_COMMAND_ALLOWLIST` | comma-separated programs | unset = **any command** | `EXECUTOR=local` only: the programs a task of this pool may run. A pool is an engine process with `RUNNER_CLASSES` set, so a process-wide setting is per-pool. Matching is on the **resolved file**, not the word the task wrote — a bare name is searched on `PATH`, anything with a `/` is a path, and both are canonicalised before comparison, so a planted `dagron-build` on a task-supplied `PATH`, an absolute path to a different file, and a `./` spelling are all refused. The permitted program is then spawned by its canonical path, so the exec does no lookup of its own. An entry that resolves to nothing permits nothing, and an allowlist where nothing resolved refuses every task — the safe direction for a typo, and loud rather than silent. A refusal is a task failure classified as a configuration fault, so it is not retried. **It bounds which program runs, not what that program does.** |
+| `DAGRON_LOCAL_ENV_PASSTHROUGH` | comma-separated variable names | unset = **inherit everything** | `EXECUTOR=local` only: which of the pool's own environment variables reach a task. Set, the subprocess environment is cleared and rebuilt from a fixed baseline (`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `TZ`, `TERM`, `LANG`, `LC_ALL`, `LC_CTYPE`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, and the proxy variables in both cases), plus exactly the names listed here, plus the task's own `env:`. A task whose `env:` names one of the listed variables — or `PATH` — is **refused** rather than quietly overruling the deployment. Unset, a task inherits the engine's whole environment, which is what every local pool did before this existed and why a `build`-class task could read the pool's datastore credential. Note this is a different thing from `DAGRON_REDACT_ENV`, which masks values in stored *output* and cannot stop a task reading one. |
 | `DAGRON_TASK_RUN_AS_USER` | uid | unset | KubeExecutor: stamp `runAsUser` (and `runAsNonRoot` when > 0) onto every task pod. Unset leaves the pod's user to the image, which is what happened before this existed — a task image's final `USER root` ran as root. |
 | `DAGRON_TASK_READ_ONLY_ROOT_FS` | `1`/`true` = on | off | KubeExecutor: `readOnlyRootFilesystem` + `allowPrivilegeEscalation: false` on task containers. |
 | `DAGRON_TASK_DROP_ALL_CAPABILITIES` | `1`/`true` = on | off | KubeExecutor: `capabilities.drop: [ALL]` on task containers. |
@@ -106,6 +108,7 @@ All read in `crates/dagron-engine/src/lib.rs` unless noted.
 | `DAGRON_TASK_ACTIVE_DEADLINE_SECS` | u64 > 0 | unset | KubeExecutor: `activeDeadlineSeconds` on task pods. Without it a hung task holds a node slot until the run-level timeout notices. |
 | `DAGRON_TASK_RUNTIME_CLASS` | string | unset | KubeExecutor: `runtimeClassName` (e.g. `gvisor`) — kernel-surface isolation for untrusted task images. |
 | `DAGRON_TASK_NODE_SELECTOR` | `k=v,k=v` | unset | KubeExecutor: pin task pods to specific nodes, e.g. an untrusted-workload pool. |
+| `DAGRON_TASK_ISOLATION_FLOOR` | `hardened`, or `key=value` comma/newline list | unset = no floor | The trust envelope **no task may go below**, whatever its workflow declares. Every knob above it is process-wide — one envelope for every task this scheduler dispatches — which is the wrong shape when the engine runs other people's code. A task declares its own envelope with `isolation:` (see `docs/HOWTO.md`); this floor is raised over it field by field, taking the stronger value and never the weaker, so an author may harden a task **beyond** the floor and never **under** it. A named `runtime_class` in the floor is *pinned*, not compared: which sandbox runtimes a node has is an operator fact. Parsed at **boot** — an unknown key or a floor this executor cannot enforce is a startup failure, because a floor discovered to be invalid at dispatch was not in force for anything dispatched before it. Keys: `runtime_class`, `seccomp` (`runtime_default`/`unconfined`), `read_only_root_fs`, `no_new_privileges`, `drop_all_capabilities`, `run_as_non_root`, `run_as_user`, `service_account_token`. `hardened` is the preset: seccomp `runtime_default`, read-only root, no new privileges, all capabilities dropped, non-root, no service-account token. |
 | `DAGRON_TASK_AUTOMOUNT_SA_TOKEN` | `1`/`true` = on | **off** | KubeExecutor: mount a ServiceAccount token into task pods that did NOT declare `service_account:`. **This is the one default that changed**: such a task never asked for an identity, and on an IRSA cluster the token it was being handed is an IAM credential given to arbitrary task code. Set it to restore the old behaviour. Tasks that DO declare `service_account:` are unaffected and keep their token. |
 | `RUNNER_CLASSES` | comma list | unset = claim **every** class | Runner segmentation: restrict this scheduler to claiming tasks whose `runner_class` is in the list (e.g. `etl,pulse`). Names validated like the spec field (`[a-z0-9_-]{1,64}`) — a typo is a startup error, not an unclaimable task class. Unset keeps the single-pool behavior. |
 | `POOLS` | `name:slots` comma list | unset = no pools | Named concurrency pools (#21): capacity per pool, e.g. `POOLS=etl:4,db:2`. A task's `pool:` draws a slot; the claim runs at most `slots` tasks of a pool at once, holding the rest in `ready` until one frees (no run dropped). Names validated like `runner_class`; a non-positive/unparseable slot count is a startup error. On Postgres, pooled claims serialize via a global advisory lock (the unpooled fast path stays lock-free); an unpooled or unconfigured-pool task is unlimited. Keep the value identical across HA replicas. |
@@ -256,6 +259,43 @@ Every knob above is registered in `crates/dagron-api/src/config.rs`: startup
 logs each explicitly-set value (secrets redacted) plus a **configuration
 fingerprint** (also in `GET /api/health` as `config_fingerprint`) so a fleet
 can alert when one replica's settings drift from the reviewed deployment.
+
+### Fleet link & offline licence (read by `GET /api/link`)
+
+Read in `crates/dagron-api/src/routes/{link,link_ee}.rs`. **The API reports what
+its own environment says.** In a deployment where the engine and the API get
+different env blocks, an engine that is linked shows here as not linked — the
+page is reading this process, not the machine.
+
+Both routes are registered in every build, and both are admin-only. Built
+without the `enterprise` feature they answer `403` with a signpost naming the
+single-instance path, rather than a `404` — the moment someone asks is the
+moment they have a second instance to manage.
+
+None of these are set by enrolling. Enrolment is **generate, then apply**:
+
+1. `POST /api/link/enrol` makes the one outbound call and returns the unit
+   credential **once**, rendered as an env block, Helm values, and a systemd
+   drop-in. It stores nothing and never hot-reloads the uplink.
+2. Set `DAGRON_FLEET_URL` and `DAGRON_FLEET_TOKEN` where **both** the engine and
+   the API read their environment — per the note above, an env block applied to
+   only one of them leaves a linked engine reporting as unlinked — then restart
+   the engine.
+3. `GET /api/link` reads the result back: the URL, whether the token is set, and
+   whether the outbox is actually draining.
+
+There is no unlink call. Revoke the unit where it was enrolled, unset the two
+variables, restart.
+
+| Variable | Type | Default | What it does |
+| --- | --- | --- | --- |
+| `DAGRON_FLEET_URL` | `http(s)://` origin | unset = not linked | The control plane this instance reports to. Parsed, not prefix-matched — the same rule the enrol call applies, so a URL that enrols is a URL the unit will accept later. |
+| `DAGRON_FLEET_TOKEN` | string | unset | The unit credential minted by `/units/enrol`. `GET /api/link` reports only **whether** it is set; the value is never returned or logged. |
+| `DAGRON_UNIT_SERIAL` | string | unset, then `HOSTNAME`, then empty | Prefills the serial field on the enrol form — a hint only, never a decision. The serial that is actually sent is the one submitted, and it is what gets validated (1–64 of `[A-Za-z0-9-_.:]`, matching the plane) before the join token is spent. |
+| `DAGRON_CLOUD_LICENSE` | `<payload>.<sig>` ed25519 token | unset = absent | The offline licence. Verified signature-first against the public key below, then expiry; the payload is only parsed once the signature holds. Takes precedence over `_FILE`. |
+| `DAGRON_CLOUD_LICENSE_FILE` | path | unset | File form of the above, for a mounted Secret. Read only when `DAGRON_CLOUD_LICENSE` is unset; an empty or unreadable file reports as present-but-invalid with the reason, not as absent. |
+| `DAGRON_CLOUD_LICENSE_PUBLIC_KEY` | ed25519 key, hex or base64 (std or url-safe), 32 bytes | unset = licence cannot be verified | The vendor key. Without it a present licence is reported as unverifiable rather than valid. |
+| `DAGRON_CLOUD_LICENSE_REQUIRED` | `1` \| `true` \| `yes` \| `on` = on | `false` | Mirrors the control plane's own switch, and is only *reported* by this route — reading it here changes nothing on the instance. It is what lets the page say whether an invalid licence is merely noted or is the reason the plane will not start. |
 
 ## Artifact encryption at rest (envelope / BYOK-KMS) & key rotation
 

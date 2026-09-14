@@ -597,6 +597,17 @@ const SIGNATURES: &[Sig] = &[
     Sig("job cancelled", FaultClass::Cancelled, Confidence::High),
     // ── Config. Last of the specific rules: these strings appear inside richer
     //    errors, so anything more precise gets first refusal.
+    //
+    //    The two pool-policy refusals name their own knob, which makes an exact
+    //    needle. They belong here because they *are* a configuration fault —
+    //    the task asked this pool for something the operator did not grant —
+    //    and filing them as one is what stops a doomed task burning its whole
+    //    retry budget: `Config` is an application disposition, budget 1, so the
+    //    attempt already spent is the only one. A refusal is deterministic;
+    //    three more attempts with exponential backoff would produce three more
+    //    identical errors and a slower answer.
+    Sig("dagron_local_command_allowlist", FaultClass::Config, Confidence::High),
+    Sig("dagron_local_env_passthrough", FaultClass::Config, Confidence::High),
     Sig("imagepullbackoff", FaultClass::Config, Confidence::High),
     Sig("errimagepull", FaultClass::Config, Confidence::High),
     Sig("no such file or directory", FaultClass::Config, Confidence::Low),
@@ -661,6 +672,34 @@ fn line_containing<'a>(text: &'a str, lower: &str, needle: &str) -> Option<&'a s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pool-policy refusal is a configuration fault, and the point of saying
+    /// so is the retry budget: `Config` is an application disposition, so the
+    /// attempt already spent is the only one. A refusal is deterministic —
+    /// retrying it three more times with exponential backoff produces three
+    /// more identical errors and a slower answer.
+    ///
+    /// The needles are the knob names, which the executor's refusal messages
+    /// carry verbatim; matching on them rather than on prose means rewording a
+    /// message cannot silently un-classify it.
+    #[test]
+    fn a_pool_policy_refusal_is_a_config_fault_and_is_not_retried() {
+        for text in [
+            "this pool permits only /usr/local/bin/dagron-build; 'sh' resolves to \
+             /bin/sh and is refused (DAGRON_LOCAL_COMMAND_ALLOWLIST)",
+            "this task sets 'DAGRON_BUILD_ATTEST_KEY', which this pool owns and a \
+             task may not replace (DAGRON_LOCAL_ENV_PASSTHROUGH)",
+        ] {
+            let c = classify_text(text).unwrap_or_else(|| panic!("unclassified: {text}"));
+            assert_eq!(c.class, FaultClass::Config, "{text}");
+            assert_eq!(c.class.disposition(), Disposition::Application);
+            assert_eq!(c.class.default_budget(), 1, "one attempt: the one already spent");
+            assert!(
+                !crate::models::should_retry_failed_with_class(1, 5, false, true, Some(c.class), None),
+                "a refusal must not be retried even where the task asked for five attempts"
+            );
+        }
+    }
 
     #[test]
     fn xid_codes_split_device_faults_from_kernel_faults() {

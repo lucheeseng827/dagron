@@ -1,45 +1,26 @@
 // Quickstart for the dagron TypeScript/JavaScript SDK (@dagron/sdk).
 //
-// Builds a DAG in code, logs in to dagron-api, submits a run, and polls it to a
-// terminal state. Zero dependencies — uses Node's global fetch (Node 18+).
+// Builds a DAG in code, authenticates to dagron-api, submits a run, and blocks
+// on it — all through the SDK. Zero dependencies (Node's global fetch, Node 18+).
 //
 //   node 01_quickstart.mjs
 //
 // Config via env (defaults match the local compose stack):
 //   DAGRON_API_URL   default http://localhost:8080
-//   DAGRON_TOKEN     session JWT (skips login if set)
+//   DAGRON_TOKEN     access token or session JWT (skips login if set)
 //   DAGRON_EMAIL     default admin@local
 //   DAGRON_PASSWORD  default dagron-admin
 
-import { Dag } from "../../../sdks/typescript/index.mjs";
+import { Client, Dag } from "../../../sdks/typescript/index.mjs";
 
 const API_URL = process.env.DAGRON_API_URL ?? "http://localhost:8080";
 const EMAIL = process.env.DAGRON_EMAIL ?? "admin@local";
 const PASSWORD = process.env.DAGRON_PASSWORD ?? "dagron-admin";
 
-async function login(apiUrl, email, password) {
-  const res = await fetch(`${apiUrl.replace(/\/$/, "")}/api/login`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ email, password }),
-  });
-  if (!res.ok) throw new Error(`login failed: ${res.status} ${await res.text()}`);
-  return (await res.json()).token;
-}
-
-async function getRun(apiUrl, token, runId) {
-  const res = await fetch(`${apiUrl.replace(/\/$/, "")}/api/runs/${runId}`, {
-    headers: { authorization: `Bearer ${token}` },
-  });
-  if (!res.ok) throw new Error(`get_run failed: ${res.status} ${await res.text()}`);
-  return res.json();
-}
-
-const TERMINAL = new Set(["succeeded", "failed", "cancelled"]);
-
 async function main() {
-  // 1. Author the DAG.
-  const dag = new Dag("sdk-quickstart-ts");
+  // 1. Author the DAG. `resultFrom` names the task whose output becomes the
+  //    run's result, which is what `waitRun` hands back.
+  const dag = new Dag("sdk-quickstart-ts", { resultFrom: "load" });
   const extract = dag.task("extract", { command: ["echo", "extracted"] });
   const transform = dag.task("transform", {
     command: ["echo", "transformed"],
@@ -48,24 +29,32 @@ async function main() {
   dag.task("load", { command: ["echo", "loaded"], dependsOn: [transform] });
   console.log("spec:", dag.toJSON());
 
-  // 2. Auth (token from env, else login).
-  const token = process.env.DAGRON_TOKEN ?? (await login(API_URL, EMAIL, PASSWORD));
+  // 2. Auth: a token from the environment, else a password login. In CI, prefer
+  //    a token — `createToken` mints one and it can be revoked on its own.
+  const api = new Client(API_URL, { token: process.env.DAGRON_TOKEN });
+  if (!api.token) await api.login(EMAIL, PASSWORD);
 
   // 3. Submit — the SDK wraps the spec as {yaml} and returns the run id.
-  const runId = await dag.submit(API_URL, { token });
+  const runId = await api.submitRun(dag);
   console.log("submitted run:", runId);
 
-  // 4. Poll to a terminal state (the TS SDK is build+submit only; poll by hand).
-  let run;
-  for (let i = 0; i < 60; i++) {
-    run = await getRun(API_URL, token, runId);
-    if (TERMINAL.has(run.status)) break;
-    await new Promise((r) => setTimeout(r, 1000));
+  // 4. Block on it server-side: one long-poll on the engine's own event feed,
+  //    rather than a poll loop with an interval to guess at. A wait that times
+  //    out comes back `finished: false`, so we just ask again.
+  let result;
+  for (let i = 0; i < 6; i++) {
+    result = await api.waitRun(runId, { timeoutSecs: 10 });
+    if (result.finished) break;
   }
-  if (!run || !TERMINAL.has(run.status)) {
+  if (!result?.finished) {
     throw new Error(`run ${runId} did not reach a terminal state within 60s`);
   }
-  console.log("run status:", run.status);
+  console.log("run status:", result.status, "result:", result.result);
+  // `failure` explains a failed run without a second round trip.
+  if (result.failure) console.log("failure:", result.failure.message);
+
+  // 5. The per-task rows, for the breakdown.
+  const run = await api.getRun(runId);
   for (const t of run.tasks ?? []) {
     console.log(`  - ${t.name.padEnd(10)} ${t.status}`);
   }

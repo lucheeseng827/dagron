@@ -32,6 +32,15 @@ EMAIL    ?= admin@local
 PASSWORD ?= dagron-admin
 COOKIES  ?= cookies.txt
 
+# Prepended to every target that READS the jar. Two failures it turns into an answer:
+# the jar is not there at all, and `curl -sS` exiting 0 on the 401 that follows — curl
+# treats an HTTP error as a successful transfer, so without `-f` the recipe prints
+# {"error":...} and make reports success. `-f` is on each curl below for the same reason.
+#
+# Recursive `=`, not `:=`, so a command-line COOKIES=… is honoured at use rather than
+# baked at parse time.
+SESSION = @test -r "$(COOKIES)" || { echo "no $(COOKIES) — run 'make login' first"; exit 2; }
+
 DAG      ?= examples/simple_dag.yaml
 CARGO    ?= cargo
 
@@ -154,65 +163,73 @@ endif
 # quickstart deliberately does not publish 8787, so these target `make dev`.
 
 submit: ## POST a DAG to the engine (DAG=…) — prints {"run_id": …}
-	curl -sS -X POST $(ENGINE)/runs --data-binary @$(DAG)
+	curl -fsS -X POST $(ENGINE)/runs --data-binary @$(DAG)
 
 submit-wait: ## Submit and block until the run is terminal (DAG=…, WAIT=30)
-	curl -sS -X POST '$(ENGINE)/runs?wait=true&timeout_secs=$(or $(WAIT),30)' --data-binary @$(DAG)
+	curl -fsS -X POST '$(ENGINE)/runs?wait=true&timeout_secs=$(or $(WAIT),30)' --data-binary @$(DAG)
 
 swagger: ## Print the engine's Swagger UI URL
 	@echo "$(ENGINE)/docs"
 
 ##@ Submit and watch — against the stack on :8080 (docs/HOWTO.md §2, §4)
 
+# `-f`: measured against a 401 stub, the old `curl -sS` exited 0 and still created
+# cookies.txt — so wrong credentials produced a jar with no session in it, and every
+# target below then failed against the API instead of here, where the cause is.
 login: ## Log in and store the session cookie in cookies.txt
-	curl -sS -c $(COOKIES) -X POST $(API)/api/login \
+	curl -fsS -c $(COOKIES) -X POST $(API)/api/login \
 	  -H 'Content-Type: application/json' \
 	  -d '{"email":"$(EMAIL)","password":"$(PASSWORD)"}'
 
 api-submit: login ## Submit a DAG through dagron-api (DAG=…; needs jq)
-	curl -sS -b $(COOKIES) -X POST $(API)/api/runs \
+	curl -fsS -b "$(COOKIES)" -X POST $(API)/api/runs \
 	  -H 'Content-Type: application/json' \
 	  -d "$$(jq -Rn --arg y "$$(cat $(DAG))" '{yaml:$$y}')"
 
 runs: ## List recent runs (STATUS=, NAME=, LIMIT= filter the query)
-	curl -sS -b $(COOKIES) "$(API)/api/runs?limit=$(or $(LIMIT),20)$(if $(STATUS),&status=$(STATUS))$(if $(NAME),&name=$(NAME))"
+	$(SESSION)
+	curl -fsS -b "$(COOKIES)" "$(API)/api/runs?limit=$(or $(LIMIT),20)$(if $(STATUS),&status=$(STATUS))$(if $(NAME),&name=$(NAME))"
 
 run-status: ## One run: status and every task's status, attempt and output (RUN=…)
 	@[ -n "$(RUN)" ] || { echo "usage: make run-status RUN=<run-id>"; exit 2; }
-	curl -sS -b $(COOKIES) $(API)/api/runs/$(RUN)
+	$(SESSION)
+	curl -fsS -b "$(COOKIES)" $(API)/api/runs/$(RUN)
 
 run-graph: ## The DAG as nodes and edges — what the console's graph draws (RUN=…)
 	@[ -n "$(RUN)" ] || { echo "usage: make run-graph RUN=<run-id>"; exit 2; }
-	curl -sS -b $(COOKIES) $(API)/api/runs/$(RUN)/graph
+	$(SESSION)
+	curl -fsS -b "$(COOKIES)" $(API)/api/runs/$(RUN)/graph
 
 run-logs: ## The whole run's logs, merged and attributed (RUN=…, LEVEL=error)
 	@[ -n "$(RUN)" ] || { echo "usage: make run-logs RUN=<run-id> [LEVEL=error]"; exit 2; }
-	curl -sS -b $(COOKIES) "$(API)/api/runs/$(RUN)/logs$(if $(LEVEL),?level=$(LEVEL)&context=1)"
+	$(SESSION)
+	curl -fsS -b "$(COOKIES)" "$(API)/api/runs/$(RUN)/logs$(if $(LEVEL),?level=$(LEVEL)&context=1)"
 
 run-wait: ## Block until a run finishes (RUN=…, WAIT=120; server max 600)
 	@[ -n "$(RUN)" ] || { echo "usage: make run-wait RUN=<run-id>"; exit 2; }
-	curl -sS -b $(COOKIES) "$(API)/api/runs/$(RUN)/wait?timeout_secs=$(or $(WAIT),120)"
+	$(SESSION)
+	curl -fsS -b "$(COOKIES)" "$(API)/api/runs/$(RUN)/wait?timeout_secs=$(or $(WAIT),120)"
 
 watch: ## Stream the change signal for every run (SSE; re-GET on each message)
-	curl -sS -N -b $(COOKIES) $(API)/api/events/stream
+	$(SESSION)
+	curl -fsS -N -b "$(COOKIES)" $(API)/api/events/stream
 
 metrics: ## Run and task counts by status, plus the dead-letter total
-	curl -sS -b $(COOKIES) $(API)/api/metrics
+	$(SESSION)
+	curl -fsS -b "$(COOKIES)" $(API)/api/metrics
 
-# `-f` and the jar check, because `curl -sS` exits 0 on a 401 and `-b` accepts a
-# cookie file that is not there: without both, `make metrics-trend` before
-# `make login` prints {"error":"unauthorized"} and reports success. The nine
-# sibling targets above share the gap — see the PR thread.
 metrics-trend: ## Per-day buckets behind the metrics charts (DAYS=14, max 90; NAME= one workflow)
-	@test -r "$(COOKIES)" || { echo "no $(COOKIES) — run 'make login' first"; exit 2; }
+	$(SESSION)
 	curl -fsS -b "$(COOKIES)" "$(API)/api/metrics/timeseries?days=$(or $(DAYS),14)$(if $(NAME),&name=$(NAME))"
 
 dead-letters: ## Tasks that exhausted their retries (docs/DEAD_LETTERS.md)
-	curl -sS -b $(COOKIES) "$(API)/api/dead-letters?limit=$(or $(LIMIT),50)"
+	$(SESSION)
+	curl -fsS -b "$(COOKIES)" "$(API)/api/dead-letters?limit=$(or $(LIMIT),50)"
 
 redrive: ## Put one dead letter back on the queue (ID=…)
 	@[ -n "$(ID)" ] || { echo "usage: make redrive ID=<dead-letter-id>"; exit 2; }
-	curl -sS -b $(COOKIES) -X POST $(API)/api/dead-letters/$(ID)/redrive
+	$(SESSION)
+	curl -fsS -b "$(COOKIES)" -X POST $(API)/api/dead-letters/$(ID)/redrive
 
 ##@ Build · test · lint (the same commands, in the same order, as CI)
 

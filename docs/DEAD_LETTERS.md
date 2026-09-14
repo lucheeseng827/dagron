@@ -43,9 +43,9 @@ curl -s -X DELETE localhost:8080/api/dead-letters/<id> -b cookies.txt
 **Python SDK**
 
 ```python
-from dagron import Dagron
+from dagron import Client
 
-d = Dagron("http://localhost:8080", token="dgp_…")
+d = Client("http://localhost:8080", token="dgp_…")   # or Client.from_env()
 dead_letters = d.list_dead_letters(limit=50)
 for dl in dead_letters:
     print(dl["source"], dl["failures"], dl["error"])
@@ -59,9 +59,9 @@ if dead_letters:
 **TypeScript SDK**
 
 ```js
-import { Dagron } from "@dagron/sdk";
+import { Client } from "@dagron/sdk";
 
-const d = new Dagron("http://localhost:8080", { token: "dgp_…" });
+const d = new Client("http://localhost:8080", { token: "dgp_…" }); // or Client.fromEnv()
 const parked = await d.listDeadLetters({ limit: 50 });
 if (parked.length > 0) {
   await d.redriveDeadLetter(parked[0].id);   // re-attempt as a fresh submission

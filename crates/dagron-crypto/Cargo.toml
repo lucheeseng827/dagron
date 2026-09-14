@@ -21,6 +21,12 @@ kms-gcp = ["dep:google-cloud-kms", "dep:tokio"]
 # Native Azure Key Vault KEK provider (DAGRON_ENV_KEK_PROVIDER=azurekv).
 kms-azure = ["dep:azure_security_keyvault_keys", "dep:azure_identity", "dep:azure_core", "dep:tokio"]
 
+[dev-dependencies]
+# The `attest_run` example parses a workflow spec to get argv/env out of it.
+# A dev-dependency, so the crate itself stays free of a YAML parser — the same
+# leanness rule that keeps chrono out of `bundle_sign`.
+serde_yaml = "0.9"
+
 [dependencies]
 aes-gcm = "0.10"
 sha2 = "0.10"

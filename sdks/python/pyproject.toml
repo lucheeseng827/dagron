@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dagron-sdk"
 dynamic = ["version"]
-description = "Author dagron DAGs in Python and drive the dagron-api control plane (runs, workflows, schedules)."
+description = "Author dagron DAGs in Python and drive the dagron-api control plane (runs, workflows, schedules, environments, datasets, artifacts)."
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "Apache-2.0" }

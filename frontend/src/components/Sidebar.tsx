@@ -18,11 +18,13 @@ type IconName =
   | "metrics"
   | "approvals"
   | "backfills"
+  | "state"
   | "datasets"
   | "users"
   | "audit"
   | "bell"
   | "key"
+  | "link"
   | "search"
   | "agent"
   | "envs";
@@ -48,6 +50,7 @@ const OPS: NavItem[] = [
   { href: "/datasets", label: "Datasets", icon: "datasets" },
   { href: "/environments", label: "Environments", icon: "envs" },
   { href: "/backfills", label: "Backfills", icon: "backfills" },
+  { href: "/state", label: "State plans", icon: "state" },
   { href: "/dead-letters", label: "Dead letters", icon: "dead", badge: "deadCount" },
   { href: "/metrics", label: "Metrics", icon: "metrics" },
 ];
@@ -65,7 +68,10 @@ const ACCOUNT: NavItem[] = [
   { href: "/settings/tokens", label: "API tokens", icon: "key" },
 ];
 // Screens shown only when health.edition === "enterprise": the audit trail.
-const ADMIN_EE: NavItem[] = [{ href: "/settings/audit", label: "Audit log", icon: "audit" }];
+const ADMIN_EE: NavItem[] = [
+  { href: "/settings/audit", label: "Audit log", icon: "audit" },
+  { href: "/settings/link", label: "Fleet link", icon: "link" },
+];
 
 export default function Sidebar() {
   const pathname = usePathname();
@@ -329,6 +335,13 @@ function NavIcon({ name }: { name: IconName }) {
     strokeLinejoin: "round" as const,
   };
   switch (name) {
+    case "link":
+      return (
+        <svg {...p}>
+          <path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7" />
+          <path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7" />
+        </svg>
+      );
     case "overview":
       return (
         <svg {...p}>
@@ -395,6 +408,18 @@ function NavIcon({ name }: { name: IconName }) {
         <svg {...p}>
           <polyline points="1 4 1 10 7 10" />
           <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
+        </svg>
+      );
+    case "state":
+      // A branch where only part of the tree is selected — the planner's whole
+      // idea in one glyph, and deliberately unlike the backfills replay arrow.
+      return (
+        <svg {...p}>
+          <circle cx="5" cy="6" r="2" />
+          <circle cx="19" cy="6" r="2" />
+          <circle cx="12" cy="18" r="2" />
+          <path d="M5 8v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8" />
+          <path d="M12 13v3" />
         </svg>
       );
     case "datasets":

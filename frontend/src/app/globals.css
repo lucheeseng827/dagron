@@ -62,6 +62,13 @@
   --gap-4: 16px;
   --gap-5: 24px;
   --radius: 7px;
+
+  /* This console is dark, full stop — layout.tsx hardcodes data-theme="dark"
+     and no rule here reads it. Saying so lets the engine paint the widgets it
+     owns to match: checkbox and radio ticks, spinners, the autofill wash, date
+     and select popups, and any scrollbar the rules below do not reach.
+     Without it those render light on a dark page, which is the giveaway. */
+  color-scheme: dark;
 }
 
 * {
@@ -83,6 +90,69 @@ code,
 pre,
 .mono {
   font-family: var(--font-mono);
+}
+
+/* Text fields, once, for the whole console.
+   Tailwind's preflight sets `color: inherit` on form controls but deliberately
+   leaves `background` alone, so a bare <input>/<textarea>/<select> inherited
+   the app's near-white --fg on top of the user agent's white field: a light box
+   in a dark page, its own text barely legible. Two components had already
+   worked around it privately (.dy-cmdk-input, .dy-dock-input); every field
+   outside them — State plans' "Per-model command", Submit, GitOps, the settings
+   forms — was left bare. This is that same intent stated once, on the element,
+   so a plain <input> is right by default and no page has to redress it.
+   `select` is included because it is the same control wearing a list.
+   `:where()` and not `:not()` on purpose: a chain of :not() would score (0,3,1)
+   and quietly outrank the .dy-cmdk-input / .dy-dock-input classes that style
+   the palette and agent dock, repainting a transparent, borderless field. Held
+   at zero specificity, this is a floor any class still overrides. */
+input:where(:not([type="checkbox"], [type="radio"], [type="range"])),
+textarea,
+select {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: var(--gap-2) 9px;
+  font: inherit;
+}
+
+/* Off-palette #9ca3af arrived with preflight. --dim is the palette's own
+   "present but secondary", and is AA on --bg where that grey was not. */
+input::placeholder,
+textarea::placeholder {
+  color: var(--dim);
+  opacity: 1;
+}
+
+/* The same amber focus ring the buttons and rows use — offset so it reads as a
+   ring around the field rather than a second border on it. :focus-visible, so a
+   pointer click does not paint one but a Tab does. */
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-color: transparent;
+}
+
+input:disabled,
+textarea:disabled,
+select:disabled {
+  color: var(--dim);
+  background: var(--panel);
+  cursor: not-allowed;
+}
+
+/* The accent means "act here / you are here" (see the palette note above), and
+   a checked box is exactly that. Sizing it up from the 13px default keeps it a
+   real target next to 14px label text. */
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--accent);
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
 }
 
 /* Minimal pill scrollbars — thin, transparent track, muted rounded thumb (no
@@ -515,6 +585,34 @@ pre,
 .dy-dot-sm {
   width: 7px;
   height: 7px;
+}
+/* key/value board: a definition list that reads as rows on a desk and as a
+   single column on a small, poor screen (an edge unit's terminal, a phone in a
+   plant). Labels are uppercase-tracked like the nav section headings. */
+.dy-kv {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 10px 18px;
+  margin: 0;
+}
+.dy-kv dt {
+  color: var(--muted);
+  font-size: 12.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding-top: 2px;
+}
+.dy-kv dd {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 560px) {
+  .dy-kv { grid-template-columns: 1fr; gap: 2px 0; }
+  .dy-kv dt { margin-top: 10px; }
+  .dy-kv dt:first-child { margin-top: 0; }
 }
 .dy-empty {
   color: var(--muted);

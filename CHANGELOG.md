@@ -6,7 +6,179 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-09-14
+
 ### Added
+- **A local pool can stop trusting its specs.** An `EXECUTOR=local` pool runs
+  its tasks as subprocesses of the engine — that is why it exists, and it is
+  also the problem: `Command` inherits the parent environment, and `command:`
+  comes from the workflow. So on such a pool a spec author could run any program
+  the pool's user can run and read every variable the pool process holds. That
+  was measured against the executor, not reasoned about: `["sh","-c","echo
+  $DATABASE_URL"]` returns the datastore DSN, a task's `env:` entry replaces an
+  engine-set variable, and `["id"]` returns whatever the pool runs as.
+
+  Two settings close it, and **both are opt-in — unset, nothing changes at
+  all**, which matters because every self-host and every `pulse` pool shares
+  this code.
+
+  `DAGRON_LOCAL_COMMAND_ALLOWLIST` names the programs a task may run. A pool is
+  an engine process with `RUNNER_CLASSES` set, so a process-wide setting is
+  per-pool. Matching is on the **resolved file**, not the word the task wrote,
+  because a comparison on `command[0]` is defeated three ways — a planted
+  program on a task-supplied `PATH`, an absolute path to a different file, and a
+  `./` spelling all reached a decoy in testing. The permitted program is then
+  spawned by its canonical path, so the exec does no lookup of its own and there
+  is no window between the check and the exec.
+
+  `DAGRON_LOCAL_ENV_PASSTHROUGH` names which of the pool's variables reach a
+  task; everything else is cleared. A small baseline (`PATH`, `HOME`, TLS trust,
+  proxy settings) always comes through, because `env_clear()` without it
+  produces a task that fails with "No such file or directory" and an operator
+  who turns the feature off. A task whose `env:` names one of the operator's
+  variables is **refused** rather than quietly overruling the deployment.
+
+  A refusal is a task failure classified as a configuration fault, so it costs
+  one attempt rather than the task's whole retry budget — a refusal is
+  deterministic, and three more attempts with backoff would produce three more
+  identical errors and a slower answer.
+
+  What an allowlist does not buy, and should not be sold as: it bounds *which
+  program* runs, not what that program does.
+
+- **`notify.git.description`: say what the run produced, not just that it
+  passed.** A commit status has always read `dagron run succeeded`. That is the
+  right default and it stays the default — every workflow with a `notify.git`
+  block keeps the check it had. But when a run *produces* something the reviewer
+  is looking for, the check is the place to say so, and there was no way to.
+
+  A `notify.git` block can now carry a `description:`, `{{ param }}`-templated
+  like every other field in it. Four `run.*` names also resolve there, because
+  the things an author most wants in a check are the ones only the engine knows:
+  `{{ run.id }}` (so `target_url` can link to a run without the caller passing an
+  id it cannot know), `{{ run.workflow }}`, `{{ run.status }}`, and
+  `{{ run.images }}` — the distinct task images the spec declares, in
+  first-appearance order. The dot keeps them clear of ordinary parameter names,
+  and where one collides the engine's value wins, so a check cannot be made to
+  report whatever a caller put in a parameter.
+
+  `{{ run.images }}` is what makes this worth having for a workflow whose image
+  is built rather than pulled: `description: "built {{ run.images }}"` turns the
+  check on the pull request that changed the image's definition into the answer
+  to *which image came out of it*. Nothing has to be reported back from the run —
+  a content-addressed reference is in the spec before the image exists.
+
+  GitHub rejects a status whose description exceeds 140 characters, and a list of
+  image references reaches that easily, so the text is cut with an ellipsis
+  rather than the whole status being lost to a validation error. A template that
+  resolved to nothing falls back to the state's wording: a blank check reads as a
+  broken integration rather than a passing run.
+
+### Fixed
+- **Two real knobs were being reported as typos at every boot.** The
+  configuration scan warns about a variable that looks like a dagron knob but
+  is not one — and `DAGRON_MAX_TASK_TIMEOUT_SECS`, documented in
+  `docs/CONFIG.md` and read by every executor, was missing from the registry
+  the scan checks against. Anything setting it (the cloud provisioner stamps it
+  onto every workspace engine) logged a warning for a knob that is real. The
+  `DAGRON_BUILD_*` family drew the same warning for a dozen variables a build
+  pool's own chart sets; those belong to a different binary and can never be
+  registered here, so the prefix is now known-foreign. Over-warning is what
+  trains an operator to ignore the scan, which is the failure the scan exists to
+  prevent. A test now pins the registry against the constants other crates
+  export, and the registry's sortedness against its own stated invariant.
+
+### Added
+- **The Python SDK covers the 0.9 API and the whole `TaskSpec` (`dagron-sdk`
+  0.4.0 → 0.9.0).** It had been pinned at the 0.4 gateway while the API grew
+  twenty-odd routes, so anything added since — access tokens, environments and
+  their secrets, the archive, triage, datasets, workflow versions and lifecycle,
+  signed bundles, artifacts, the settings pages, `search`, `readyz` — was
+  reachable from the console and from `curl`, but not from Python. The version
+  number is the API version it covers, the convention set when the SDKs were
+  first lined up with the gateway; every change here is additive.
+
+  The `Dag` builder had drifted the same way, and worse: it emitted 12 of the
+  engine's ~35 task fields, so a DAG authored in Python could not express a
+  fan-out, a sensor, an approval gate, a sub-workflow trigger, a pool, a
+  priority, a cache, a `produces:`, a gang, a hook, a trigger rule or a retry
+  budget — and nothing said so. `task()` now takes all of them, `Dag(...)` takes
+  the spec-level block (`parameters`, `tags`, `environment`, `task_defaults`,
+  `result_from`, `budget`, `deadline`, `notify`, `on_datasets`, …), and
+  `Dag.template()` declares reusable sub-DAGs. `approval()`, `sensor()` and
+  `trigger()` are shorthands for the three command-less kinds.
+
+  Client-side validation grew to match, mirroring `validate_graph` field for
+  field — one kind per task, `type: workflow` names a target, `arguments` have a
+  callee, trigger rules and runner classes are well-formed, a `when:` depends on
+  the task whose output it reads, `result_from` names a real task — and stops
+  where the server stops, so a dependency that only resolves after expansion is
+  still left to the engine rather than 400'd early by the client.
+
+  Two calls are worth naming because they replace a loop: `wait_run` long-polls
+  `GET /api/runs/{id}/wait` (the engine's own event feed, no poll interval to
+  tune, and the failure summary comes back with it), and `stream_events` reads
+  the account-wide SSE feed instead of polling every list. `Client.from_env()`
+  plus `create_token` mean a CI job stores a revocable token rather than the
+  password that mints one. `ROADMAP.md` carries the endpoint-by-endpoint matrix.
+- **The TypeScript SDK catches up with it (`@dagron/sdk` 0.4.0 → 0.9.0).** The two
+  SDKs have always been released together and are documented as covering the same
+  ground, so bringing Python forward alone left that claim false. `Client` now
+  mirrors the Python client **method for method** — 88 of them, camelCased — and
+  a test asserts nothing more: the two surfaces are compared name by name.
+
+  Its `Dag` had drifted furthest of anything here. It emitted **four** task
+  fields — `image`, `command`, `dependsOn`, `runnerClass` — so a DAG authored
+  in TypeScript could not set a retry, a timeout, an env var, an `input` or a
+  `workflow_ref`, never mind a sensor or a gate, and `toSpec()` checked only
+  that dependencies resolved. It now takes the whole `TaskSpec`, declares
+  templates, and runs the same `validate_graph` mirror the Python builder does.
+
+  One deliberate behaviour change: an unknown key in an options bag now throws
+  instead of being dropped. `{ retryDelay: 5 }` for `retryDelaySecs` used to
+  produce a task with no retry delay and no complaint — the same silent-drop the
+  SDK already refuses for log filters, and the reason an options bag is riskier
+  than Python's keyword arguments.
+
+  `index.d.ts` was rewritten alongside it (typed `TaskOptions`, `DagOptions`,
+  `WaitSpec`, `RunResult`, `CreatedToken`, …) and now type-checks under
+  `--strict`, as does a consumer program written against it. The package's
+  `files` list has always named a `README.md` that did not exist; it does now.
+  No `[Symbol.dispose]` to pair with Python's context manager: this package
+  supports Node 18, where that symbol is `undefined` and a computed
+  `[Symbol.dispose]()` defines a method named "undefined" instead of a disposer.
+- **Review round: six SDK findings, and one the reviewer had backwards.** The
+  worst was a race in both `waitRun`/`wait_run`: they long-poll the gateway but
+  used the client's shared transport timeout, whose default (30 s) is exactly
+  the server's default wait budget — so `waitRun(id)` was a coin flip and
+  `waitRun(id, {timeoutSecs: 600})` aborted 570 seconds early, every time. Both
+  now size a per-call transport budget off the server's *clamped* `[1, 600]`
+  range plus a margin, widening only that one request; the shared `timeout` is
+  never mutated, because concurrent calls share it.
+
+  Reproducing that turned up a second defect the review missed: in Python a read
+  that times out after the connection is established comes out of
+  `http.client` as a bare socket timeout, which `URLError` never sees — so it
+  escaped as `TimeoutError` rather than `DagronError`, breaking the client's
+  one-exception-type promise on exactly the calls that wait longest.
+
+  The rest: `iter_runs`/`iterRuns` now refuse the `limit`/`offset` they drive
+  themselves (Python raised an opaque `TypeError` from inside the generator;
+  TypeScript silently overwrote the caller's value); `Template.to_spec`/`toSpec`
+  deep-copy, so reading a template directly no longer hands out the builder's
+  own task list; a `repeat:` block is checked against the engine's key spelling
+  at build time, since TypeScript's validation accepted a camelCased
+  `maxIterations` that would have left the required wire field unset; and both
+  package READMEs stopped implying `create_token` populates the environment
+  `from_env` reads.
+
+  The one turned around: the review asked for `listGitRepos(): Promise<Dict[]>`.
+  `GET /api/git-repos` returns an *object* — `{repos, worker_online,
+  credentials_configured}`, the flags riding along so the console cannot promise
+  "Auto-sync ON" where nothing polls — so the TypeScript declaration was right
+  and **Python's `-> List[Dict[str, Any]]` was the wrong one**. Fixed in Python,
+  and the TypeScript declaration is now a named `GitRepoList` so the shape is
+  answered by the type rather than guessed at.
 - **A `Makefile`: every command the docs tell you to paste, as a target.**
   Getting a first run out of dagron meant transcribing a compose invocation from
   the README, a login-then-submit pair from `docs/HOWTO.md`, and a `curl` with a
@@ -29,6 +201,48 @@ All notable changes to this project are documented here. The format is based on
   environment and those names are common in it: with `?=`, a shell `NAME` leaks
   into `make runs` as a query filter, and a shell `DB` picks the database
   `make restore` overwrites. A command-line `make runs NAME=etl` still wins.
+
+- **Two new SDK examples per language, for the surface the 0.9.0 bump just
+  landed.** The full `TaskSpec` a `Dag` can now build had no example using any
+  of it: `06_advanced_dag.py` / `02_advanced_dag.mjs` chain a fan-out
+  (`with_items`), a sensor, an approval gate resolved programmatically, and a
+  sub-workflow trigger in one run, plus a reference snippet for
+  `pool`/`priority`/`gang`/`cache`/`produces` that isn't submitted (those
+  route to engine resources — replicas, gang groups — that have to already
+  exist on the deployment running it). `07_notify_and_automation.py` /
+  `03_notify_and_automation.mjs` cover the other two: `create_token` /
+  `from_env` for the token a CI job should hold instead of a password, and
+  `notify.git.description` templated with `{{ run.* }}`. Both run to
+  completion against the local compose stack with no extra setup — the
+  commit-status update is best-effort and a documented no-op without
+  `GITHUB_TOKEN`/`GITLAB_TOKEN` configured.
+
+### Fixed
+- **Both of `docs/DEAD_LETTERS.md`'s SDK snippets imported a class that does not
+  exist.** They opened `from dagron import Dagron` / `import { Dagron } from
+  "@dagron/sdk"` and constructed `Dagron(...)`; the client has always been
+  `Client` in both SDKs, so the first line of the example a reader copies raised
+  `ImportError` (or `undefined is not a constructor`). Both use `Client` now,
+  and point at `from_env()` / `fromEnv()`, since the surrounding section is
+  about a token.
+- **`examples/sdk/typescript/01_quickstart.mjs` hand-rolled `fetch` calls the
+  SDK has covered since 0.3.0**, under a comment stating "the TS SDK is
+  build+submit only; poll by hand". It drives `Client` now, and blocks on
+  `waitRun` instead of a 60-iteration poll loop.
+- **`docs/CONFIG.md`'s fleet-link section no longer cites a document this
+  repository does not carry.** It pointed at an install runbook that is not
+  published here, which left a reader of that section with nowhere to go. What
+  the section actually needed is written out in it now: the enrol call returns
+  the credential once and stores nothing, the two variables have to be set where
+  *both* the engine and the API read their environment, and unlinking is a
+  revoke-and-restart rather than a call.
+- **`EnrolResult` (`frontend/src/types/dagron.ts`) drops a field no build here
+  can receive.** `POST /api/link/enrol` answers `403` without the `enterprise`
+  feature, so the field only ever appeared in a response this build does not
+  produce. `enrolUnit` is generic in its result now
+  (`enrolUnit<R extends EnrolResult = EnrolResult>`), which lets a caller that
+  knows a wider response shape ask for it without a cast; the default is
+  unchanged.
 
 ## [0.9.1] - 2026-09-04
 

@@ -12,6 +12,7 @@ pub mod badge;
 pub mod control;
 pub mod datasets;
 pub mod lifecycle;
+pub mod link;
 pub mod gitrepos;
 pub mod gitsync;
 pub mod graph;

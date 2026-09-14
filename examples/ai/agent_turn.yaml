@@ -1,6 +1,7 @@
 # One turn of a durable agent loop — register this, then run `agent_loop.yaml`.
 #
-#   curl -sX POST localhost:8080/api/workflows \
+#   # log in first — docs/HOWTO.md §2 writes the session to cookies.txt
+#   curl -fsS -b cookies.txt -X POST localhost:8080/api/workflows \
 #     -H 'content-type: application/json' \
 #     --data "$(jq -Rn --rawfile s examples/ai/agent_turn.yaml '{name:"agent-turn",spec:$s}')"
 #

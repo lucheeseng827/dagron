@@ -241,6 +241,18 @@ pub struct TaskSpec {
     /// `DAGRON_GANG_RANK` / `DAGRON_GANG_SIZE` for rendezvous.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gang_member: Option<GangMember>,
+    /// **Trust envelope** for this task — the privileges it runs under, declared
+    /// per task rather than per scheduler process. See
+    /// [`crate::isolation::IsolationSpec`].
+    ///
+    /// The engine raises whatever is declared here to the operator's
+    /// `DAGRON_TASK_ISOLATION_FLOOR` before dispatch, so a workflow author may
+    /// harden a task beyond the floor but never below it — which is what makes
+    /// the field safe to expose to authors who are not the operator. The
+    /// *effective* envelope is what the Kubernetes executor applies and what a
+    /// run attestation records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<crate::isolation::IsolationSpec>,
 }
 
 /// `gang:` — all-or-nothing co-scheduling for one task (see [`TaskSpec::gang`]).
@@ -863,6 +875,14 @@ pub struct SlackNotify {
 }
 
 /// A `notify.git` commit-status target. String fields are `{{ param }}`-templated.
+///
+/// Besides the workflow's own parameters, four `run.*` names resolve in these
+/// fields, because the things an author most wants in a check are things only
+/// the engine knows: `{{ run.id }}`, `{{ run.workflow }}`, `{{ run.status }}`
+/// and `{{ run.images }}` (the distinct task images, first-appearance order).
+/// The dot keeps them clear of ordinary parameter names; where one collides,
+/// the engine's value wins, so a check cannot be made to report whatever a
+/// caller put in a parameter.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GitNotify {
     /// `github` or `gitlab`.
@@ -878,6 +898,16 @@ pub struct GitNotify {
     /// Optional link back to the run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_url: Option<String>,
+    /// The one line of text the check shows. Absent (the default) keeps the
+    /// engine's own "dagron run succeeded" wording.
+    ///
+    /// Worth setting when the run *produced* something the reviewer is looking
+    /// for. A workflow whose image is built from a recipe is the case this was
+    /// added for: `description: "built {{ run.images }}"` turns the check on
+    /// the pull request that changed the recipe into the answer to what came
+    /// out of it, instead of a pass/fail that says nothing about which image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 pub struct DagGraph {
@@ -1218,6 +1248,11 @@ impl DagGraph {
                 if c.key.trim().is_empty() {
                     bail!("empty cache.key for task '{}' in DAG '{}'", task.name, spec.name);
                 }
+            }
+            if let Some(iso) = &task.isolation {
+                iso.validate().map_err(|e| {
+                    anyhow::anyhow!("invalid isolation for task '{}' in DAG '{}': {e}", task.name, spec.name)
+                })?;
             }
             // `resources.gpu` accelerator sugar: zero devices is a spec bug,
             // not a request.

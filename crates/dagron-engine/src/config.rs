@@ -96,7 +96,19 @@ pub fn knobs() -> &'static [Knob] {
             KR("DAGRON_ENV_KMS_VAULT_URL_OLD", "—"),
             K("DAGRON_ENV_KMS_WRAP_CMD", "— (command provider only)"),
             K("DAGRON_ENV_KMS_WRAP_CMD_OLD", "—"),
+            // The two local-pool knobs (dagron-executor's `pool` module). A
+            // pool is an engine process with RUNNER_CLASSES set, so these are
+            // per-pool by construction. Both unset = a local pool behaves
+            // exactly as it always has.
+            K("DAGRON_LOCAL_COMMAND_ALLOWLIST", "— (any command)"),
+            K("DAGRON_LOCAL_ENV_PASSTHROUGH", "— (inherit the pool's env)"),
             K("DAGRON_MAX_TASKS_PER_RUN", "100000 (compiled ceiling)"),
+            // Registered late: the executor has read this since the task-clock
+            // ceiling landed and `docs/CONFIG.md` documents it, but it was
+            // never added here — so every deployment that set it (the cloud
+            // provisioner stamps it on every workspace engine) drew a "looks
+            // like a dagron knob but is not one" warning for a knob that is.
+            K("DAGRON_MAX_TASK_TIMEOUT_SECS", "— (no ceiling)"),
             K("DAGRON_MIN_FREE_BYTES", "0 (off)"),
             K("DAGRON_PRESSURE_FILE", "— (no pressure gate)"),
             K("DAGRON_READY_TIMEOUT_MS", "500 (floor 50)"),
@@ -106,6 +118,7 @@ pub fn knobs() -> &'static [Knob] {
             K("DAGRON_TASK_ACTIVE_DEADLINE_SECS", "—"),
             K("DAGRON_TASK_AUTOMOUNT_SA_TOKEN", "— (off)"),
             K("DAGRON_TASK_DROP_ALL_CAPABILITIES", "— (off)"),
+            K("DAGRON_TASK_ISOLATION_FLOOR", "— (no floor)"),
             K("DAGRON_TASK_NODE_SELECTOR", "—"),
             K("DAGRON_TASK_READ_ONLY_ROOT_FS", "— (off)"),
             K("DAGRON_TASK_RUNTIME_CLASS", "—"),
@@ -117,6 +130,7 @@ pub fn knobs() -> &'static [Knob] {
             K("DB_MAX_CONNECTIONS", "8"),
             K("DB_SCHEDULES", "— (off)"),
             K("DEAD_LETTER_MAX_ATTEMPTS", "3"),
+            K("DIR_POLL_MS", "2000 (floor 100)"),
             K("DOCKER_IMAGE", "alpine:latest"),
             K("EXECUTOR", "local"),
             K("GC_ARCHIVE_COMPACT_MIN_AGE_DAYS", "30"),
@@ -178,7 +192,6 @@ pub fn knobs() -> &'static [Knob] {
             K("WAIT_URL_DENY_PRIVATE", "— (off)"),
             K("WORKER_COUNT", "16 (min 1)"),
             K("WORKFLOW_DIR", "/workflows"),
-            K("DIR_POLL_MS", "2000 (floor 100)"),
         ]
     })
 }
@@ -209,6 +222,13 @@ const FOREIGN_PREFIXES: &[&str] = &[
     // The fleet-link worker (an optional sidecar loop, not the engine) reads its
     // own family; registering it here keeps a unit's shell quiet.
     "DAGRON_FLEET_",
+    // The build task binary's deployment configuration. The engine never reads
+    // any of it — it is the environment a `build`-class task's subprocess is
+    // handed — so none of it can be a registered knob, and without this entry a
+    // build pool logged one "looks like a dagron knob but is not one" warning
+    // per variable at every boot, for a dozen variables its own chart sets.
+    // Over-warning is what trains an operator to ignore the scan.
+    "DAGRON_BUILD_",
 ];
 
 /// Prefix families the typo scan claims: an env var starting with one of these
@@ -499,6 +519,43 @@ mod tests {
     /// Env-var mutation is process-global; serialize the tests that do it.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// A knob the engine reads but the registry does not list warns at startup
+    /// as a typo — for a knob that is real. That happened: the task-clock
+    /// ceiling was read by the executor and documented in `docs/CONFIG.md` for
+    /// releases while the cloud provisioner stamped it onto every workspace
+    /// engine, and each of those engines logged it as a probable typo.
+    ///
+    /// Pinning the names against the constants the other crate exports is what
+    /// keeps that from happening again silently: a knob added over there and
+    /// forgotten here turns this red rather than turning up in a support log.
+    #[test]
+    fn every_knob_another_crate_reads_is_registered() {
+        let registered = |name: &str| knobs().iter().any(|k| k.name == name);
+        for name in [
+            dagron_executor::pool::ENV_COMMAND_ALLOWLIST,
+            dagron_executor::pool::ENV_PASSTHROUGH,
+            "DAGRON_MAX_TASK_TIMEOUT_SECS",
+            "DAGRON_SENSITIVE_ENV_PATTERNS",
+            "DAGRON_REDACT_ENV",
+        ] {
+            assert!(
+                registered(name),
+                "{name} is read by the engine but missing from the knob registry, so \
+                 setting it draws a typo warning"
+            );
+        }
+    }
+
+    /// The registry is kept sorted by name so a reader can find a knob and a
+    /// diff adding one is one line.
+    #[test]
+    fn the_registry_is_sorted() {
+        let names: Vec<&str> = knobs().iter().map(|k| k.name).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "keep knobs() sorted by name");
+    }
+
     /// The fingerprint is stable for a fixed environment and moves when any
     /// registered knob moves.
     #[test]
@@ -544,5 +601,59 @@ mod tests {
         assert!(profile_preset("hyperspeed").is_none());
         let ll = profile_preset("low-latency").unwrap();
         assert!(ll.iter().any(|(k, v)| *k == "POLL_INTERVAL_MS" && *v == "25"));
+    }
+}
+
+#[cfg(test)]
+mod build_pool_warning_tests {
+    use super::*;
+
+    /// The build pool's own knobs must not read as typos.
+    ///
+    /// `OUR_PREFIXES` claims the bare `DAGRON_` prefix, and `ee/dagron-build`
+    /// reads its deployment configuration from `DAGRON_BUILD_*` — variables the
+    /// engine binary never reads and so can never register. Before
+    /// `DAGRON_BUILD_` joined `FOREIGN_PREFIXES`, every build pool logged one
+    /// "looks like a dagron knob but is not one" warning per variable at every
+    /// boot, for thirteen variables its own chart sets. That is exactly the
+    /// over-warning the comment on `OUR_PREFIXES` says trains operators to
+    /// ignore the signal.
+    #[test]
+    fn the_build_pools_knobs_are_not_reported_as_typos() {
+        let known = |name: &str| {
+            knobs().iter().any(|k| k.name == name)
+                || FOREIGN_PREFIXES.iter().any(|p| name.starts_with(p))
+        };
+        // Every DAGRON_BUILD_* a build pool's chart renders onto it.
+        for name in [
+            "DAGRON_BUILD_NAMESPACE",
+            "DAGRON_BUILD_SANDBOX",
+            "DAGRON_BUILD_CONTEXT_DELIVERY",
+            "DAGRON_BUILD_CONTEXT_MAX_BYTES",
+            "DAGRON_BUILD_BUILDKIT_IMAGE",
+            "DAGRON_BUILD_BUILDKIT_USERNS_IMAGE",
+            "DAGRON_BUILD_FETCH_IMAGE",
+            "DAGRON_BUILD_PUSH",
+            "DAGRON_BUILD_TIMEOUT_SECS",
+            "DAGRON_BUILD_REGISTRY_INSECURE",
+            "DAGRON_BUILD_PUSH_SECRET",
+            "DAGRON_BUILD_SERVICE_ACCOUNT",
+            "DAGRON_BUILD_NODE_SELECTOR",
+            "DAGRON_BUILD_RESOURCES",
+            "DAGRON_BUILD_RECIPE",
+            "DAGRON_BUILD_BACKEND",
+            "DAGRON_BUILD_ATTEST_KEY",
+            "DAGRON_BUILD_ATTEST_PUBKEYS",
+        ] {
+            assert!(known(name), "{name} would be warned about as a typo at every boot");
+        }
+
+        // The prefix must not swallow a real engine knob that happens to start
+        // the same way — a foreign prefix is a hole in the typo scan, so it has
+        // to be exactly as wide as the family it covers.
+        assert!(
+            !FOREIGN_PREFIXES.iter().any(|p| "DAGRON_BUNDLE_PUBKEYS".starts_with(p)),
+            "DAGRON_BUNDLE_PUBKEYS is the engine's own and must stay in the scan"
+        );
     }
 }

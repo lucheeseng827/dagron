@@ -7,11 +7,15 @@
 //! * `kube_executor` — run each task as a Kubernetes pod (feature `kubernetes`).
 //! * [`worker`] — the ractor worker pool that dispatches claimed tasks to the
 //!   configured executor and reports results back to the reconcile loop.
+//! * [`pool`] — what an `EXECUTOR=local` pool permits: which programs a task may
+//!   run, and which of the pool's own environment variables it may see. Both
+//!   opt-in; unset, a local pool behaves exactly as it always has.
 
 pub mod docker_executor;
 pub mod executor;
 #[cfg(feature = "kubernetes")]
 pub mod kube_executor;
+pub mod pool;
 pub mod redact;
 pub mod secrets;
 pub mod worker;

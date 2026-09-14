@@ -25,11 +25,13 @@ const PAGES: { label: string; href: string; keywords: string }[] = [
   { label: "Submit", href: "/submit", keywords: "submit new run yaml" },
   { label: "GitOps", href: "/gitops", keywords: "gitops repos git sync" },
   { label: "Backfills", href: "/backfills", keywords: "backfills catchup range" },
+  { label: "State plans", href: "/state", keywords: "state plan explain rebuild models sql planner freshet" },
   { label: "Dead letters", href: "/dead-letters", keywords: "dead letters dlq poison" },
   { label: "Metrics", href: "/metrics", keywords: "metrics charts stats observability" },
   { label: "Notifications", href: "/settings/notifications", keywords: "notifications slack webhook alerts settings" },
   { label: "Users", href: "/settings/users", keywords: "users accounts admin settings" },
   { label: "Audit log", href: "/settings/audit", keywords: "audit log history admin" },
+  { label: "Fleet link", href: "/settings/link", keywords: "fleet link enrol unit control plane licence license cloud" },
 ];
 
 interface Item {
