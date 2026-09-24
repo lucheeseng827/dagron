@@ -32,8 +32,11 @@ spec:
     spec:
       securityContext:
         runAsNonRoot: true
-        runAsUser: 65532
-        fsGroup: 65532
+        # Must be the uid the image defines (Dockerfile: `adduser -u 10001 gitops`), not the
+        # distroless 65532: OpenSSH refuses to run for a uid with no passwd entry ("No user
+        # exists for uid"), so an ssh:// repository could never sync.
+        runAsUser: 10001
+        fsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
       {{- with .Values.imagePullSecrets }}

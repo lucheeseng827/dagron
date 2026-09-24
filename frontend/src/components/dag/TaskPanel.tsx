@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import LogFilterBar from "@/components/logview/LogFilterBar";
 import LogLines, { type RenderedLine } from "@/components/logview/LogLines";
+import TaskIterations from "@/components/logview/TaskIterations";
 import { getTaskLogs } from "@/lib/dagron-api";
 import { statusColor, statusLabel, type WaitingOn } from "@/lib/adapter";
 import {
@@ -282,6 +283,12 @@ export default function TaskPanel({
             </div>
           )}
           {actions && <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>{actions(logs)}</div>}
+          {/* The pane below shows ONE attempt — `task_runs.output` is a single
+              column every attempt overwrites. For a `repeat:` loop that is the
+              last pass; for a retried task it is the attempt that passed. This
+              is where the rest of them are, and it stays closed (and unfetched)
+              until asked: the pane below polls, and this must not. */}
+          <TaskIterations runId={runId} taskId={logs.task_id} attempt={logs.attempt} filter={filter} />
           <LogFilterBar
             value={filter}
             onChange={onFilterChange}

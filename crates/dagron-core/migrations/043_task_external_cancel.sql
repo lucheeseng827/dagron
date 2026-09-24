@@ -1,0 +1,27 @@
+-- Cancel teardown for deferred external jobs (mirrors
+-- migrations_pg/055_task_external_cancel.sql).
+--
+-- Cancelling a run is pure SQL: it flips rows terminal and clears leases.
+-- Nothing reaches the system actually running the work, so "we cancelled your
+-- run" has meant "we stopped watching your cluster bill" for every deferred
+-- task. This column is how the teardown sweep bounds its own retrying.
+--
+-- The predicate for "owes teardown" needs no column at all, which is why there
+-- is only one here: `external_handle IS NOT NULL` on a row that is NOT in the
+-- parked shape (`status <> 'running'`). The normal completion paths —
+-- resolve_external and fail_external — NULL the handle because the remote job
+-- is already terminal and nothing is owed. Anything else that flips a row
+-- terminal while a handle is still set leaves the handle behind, and that is
+-- the debt.
+--
+-- Deliberately task-level rather than run-level. Run-level is wrong twice:
+-- reap_completed_runs finalizes on the happy path, so every completed job would
+-- get a redundant vendor cancel; and cancel_gang_siblings leaves the run
+-- `running`, so those rows would never sweep at all.
+ALTER TABLE task_runs ADD COLUMN external_cancel_attempts INTEGER NOT NULL DEFAULT 0;
+
+-- No new index. The teardown sweep filters on `external_handle IS NOT NULL`,
+-- which is exactly the predicate of the partial index migration 042 already
+-- created, and orders by the same `next_poll_at` that index is on. That column
+-- carries "when this row's remote job next needs attention" through both phases
+-- of its life — first when to poll it, then when to retry tearing it down.

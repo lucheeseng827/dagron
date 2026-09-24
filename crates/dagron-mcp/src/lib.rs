@@ -25,9 +25,27 @@ use std::time::Duration;
 
 mod tools;
 
-pub use tools::{call_tool, tool_access, tool_defs, tool_defs_for, Access};
+pub use tools::{call_tool, tool_access, tool_defs, tool_defs_for, Access, Effect};
 
-/// MCP protocol revision this server implements.
+/// MCP protocol revision this server implements, and answers every `initialize`
+/// with.
+///
+/// Still `2024-11-05`, although the tool `annotations` in `tools/list` arrived
+/// in `2025-03-26`. That is deliberate. A `2024-11-05` tool definition does not
+/// forbid extra fields, and a client that acts on annotations reads them from
+/// the tool whatever revision was negotiated. One that honours them only under
+/// a newer revision falls back to asking before every call, which is the
+/// behaviour this server had before it sent any, and the safe direction.
+///
+/// Advertising a newer revision is not a one-line change. This constant is the
+/// answer whatever revision the client asked for, so raising it would hand a
+/// client that speaks only older ones a revision it cannot use. Doing it
+/// properly means negotiating (echo the client's revision when it is one this
+/// server speaks), and each revision claimed carries rules this server does
+/// not meet yet: `2025-03-26` requires accepting a JSON-RPC batch, which the
+/// stdio loop leaves unanswered today, and `2025-06-18` requires an HTTP
+/// transport to refuse an unsupported `MCP-Protocol-Version` header with `400`.
+/// That is its own change, with its own tests.
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 pub const SERVER_NAME: &str = "dagron-mcp";
 
@@ -455,7 +473,16 @@ mod tests {
             assert!(t["name"].is_string());
             assert!(t["description"].is_string());
             assert_eq!(t["inputSchema"]["type"], "object");
+            // What a client decides approval from, on the wire where it reads it.
+            assert!(t["annotations"]["readOnlyHint"].is_boolean(), "{} has no readOnlyHint", t["name"]);
         }
+        // The one a client may run unasked, and the one it must not.
+        let hint = |name: &str| {
+            tools.iter().find(|t| t["name"] == name).expect("tool present")["annotations"].clone()
+        };
+        assert_eq!(hint("dagron_list_runs")["readOnlyHint"], true);
+        assert_eq!(hint("dagron_cancel_run")["readOnlyHint"], false);
+        assert_eq!(hint("dagron_cancel_run")["destructiveHint"], true);
     }
 
     #[tokio::test]
@@ -483,6 +510,11 @@ mod tests {
         // Reads still work, or the mode would be useless.
         for shown in ["dagron_list_runs", "dagron_get_run_logs", "dagron_get_health"] {
             assert!(names.contains(&shown.to_string()), "{shown} must stay available");
+        }
+        // And everything left says so: a read-only server is one whose whole
+        // catalogue a client may run without asking anyone.
+        for t in resp["result"]["tools"].as_array().unwrap() {
+            assert_eq!(t["annotations"]["readOnlyHint"], true, "{} is not read-only", t["name"]);
         }
     }
 

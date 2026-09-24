@@ -376,6 +376,113 @@ pub async fn get_run_spec(
     Ok(Json(RunSpec { yaml, name }))
 }
 
+/// Run ids accepted by one `GET /api/runs/specs` call.
+///
+/// Bounds the `= ANY($1)` and the response together. The console asks for a
+/// page of runs at a time (25), so this is slack rather than a constraint — it
+/// exists so one request cannot ask the server to materialise every spec in the
+/// installation.
+const MAX_RUN_SPEC_IDS: usize = 200;
+
+/// One distinct spec, and the runs that were created from it.
+#[derive(Debug, Serialize, PartialEq)]
+pub struct RunSpecGroup {
+    pub yaml: String,
+    pub name: Option<String>,
+    /// The requested runs that ran this exact spec, in the order asked for.
+    pub run_ids: Vec<String>,
+}
+
+/// `GET /api/runs/specs?ids=a,b,c` — the specs behind many runs in one call,
+/// **grouped by content**.
+///
+/// Every run snapshots its own `workflow_definitions` row at submit, so N runs
+/// of a workflow nobody edited are N identical specs under N different ids.
+/// Returning them per-run would send the same document twenty-five times to
+/// answer "did this change?" — so identical specs collapse into one entry
+/// listing the runs that used it, which is also the shape the caller wants:
+/// one group means nothing changed.
+///
+/// Unknown run ids are simply absent from the response rather than a 404. A
+/// caller asking about a page of runs should get the ones that resolved; which
+/// ids came back is already the answer to which didn't, and failing the whole
+/// batch over one archived run would make the endpoint useless for the case it
+/// exists for. 400 only for a malformed request: no ids, or more than
+/// [`MAX_RUN_SPEC_IDS`].
+pub async fn get_run_specs(
+    _auth: AuthUser,
+    State(state): State<AppState>,
+    Query(params): Query<RunSpecsParams>,
+) -> Result<Json<Vec<RunSpecGroup>>, (StatusCode, String)> {
+    // Deduped, because a caller repeating an id should not make the IN list
+    // longer or the group's `run_ids` contain it twice.
+    let mut ids: Vec<String> = Vec::new();
+    for raw in params.ids.as_deref().unwrap_or_default().split(',') {
+        let id = raw.trim();
+        if !id.is_empty() && !ids.iter().any(|seen| seen == id) {
+            ids.push(id.to_string());
+        }
+    }
+    if ids.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "ids= is required (comma-separated run ids)".into()));
+    }
+    if ids.len() > MAX_RUN_SPEC_IDS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("too many ids: {} (max {MAX_RUN_SPEC_IDS})", ids.len()),
+        ));
+    }
+
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT r.id, d.spec, d.name FROM workflow_runs r
+         JOIN workflow_definitions d ON d.id = r.definition_id
+         WHERE r.id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(&state.read_pool)
+    .await
+    .map_err(|e| (internal(e), "db query failed".to_string()))?;
+
+    Ok(Json(group_run_specs(&ids, rows)))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RunSpecsParams {
+    /// Comma-separated run ids.
+    pub ids: Option<String>,
+}
+
+/// Collapse `(run id, spec, name)` rows into one entry per distinct spec.
+///
+/// Ordering is by `requested` rather than by whatever the database returned:
+/// the caller lines these up against its own list, and `= ANY` gives no order
+/// at all. Split out from the handler so it can be tested without a database —
+/// the grouping is the part with the behaviour in it.
+fn group_run_specs(
+    requested: &[String],
+    rows: Vec<(String, String, Option<String>)>,
+) -> Vec<RunSpecGroup> {
+    let mut groups: Vec<RunSpecGroup> = Vec::new();
+    for id in requested {
+        let Some((_, spec, name)) = rows.iter().find(|(rid, _, _)| rid == id) else {
+            continue; // unknown / archived run — absent, not an error
+        };
+        // Keyed on the pair: `name` is derived from the spec today, so a
+        // mismatch is not expected — but grouping two definitions together on a
+        // spec match while reporting only one of their names would be a quiet
+        // lie if that ever stops holding.
+        match groups.iter_mut().find(|g| g.yaml == *spec && g.name == *name) {
+            Some(g) => g.run_ids.push(id.clone()),
+            None => groups.push(RunSpecGroup {
+                yaml: spec.clone(),
+                name: name.clone(),
+                run_ids: vec![id.clone()],
+            }),
+        }
+    }
+    groups
+}
+
 #[derive(sqlx::FromRow)]
 struct RunSummaryFull {
     id: String,
@@ -497,6 +604,136 @@ pub async fn wait_run(
 fn internal(err: sqlx::Error) -> StatusCode {
     tracing::error!(error = ?err, "db query failed");
     StatusCode::INTERNAL_SERVER_ERROR
+}
+
+#[cfg(test)]
+mod run_spec_group_tests {
+    use super::*;
+
+    fn row(id: &str, spec: &str) -> (String, String, Option<String>) {
+        (id.to_string(), spec.to_string(), Some("wf".to_string()))
+    }
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The case the endpoint exists for: nobody edited the workflow, so N runs
+    /// share one spec under N different definition ids. Sending it once is the
+    /// whole saving, and "one group" is also the caller's answer to "did
+    /// anything change?".
+    #[test]
+    fn identical_specs_collapse_into_one_group() {
+        let g = group_run_specs(
+            &ids(&["r1", "r2", "r3"]),
+            vec![row("r1", "name: w\n"), row("r2", "name: w\n"), row("r3", "name: w\n")],
+        );
+        assert_eq!(g.len(), 1, "three runs of one definition are one group");
+        assert_eq!(g[0].run_ids, ids(&["r1", "r2", "r3"]));
+    }
+
+    /// …and a real edit splits them, in the order the caller asked.
+    #[test]
+    fn distinct_specs_group_separately_in_requested_order() {
+        let g = group_run_specs(
+            &ids(&["r3", "r2", "r1"]),
+            // Deliberately returned in a different order from the request: a
+            // Postgres `= ANY` has no ordering, so the handler must not inherit
+            // one from the database.
+            vec![row("r1", "name: a\n"), row("r3", "name: b\n"), row("r2", "name: b\n")],
+        );
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].yaml, "name: b\n", "the first requested run's spec leads");
+        assert_eq!(g[0].run_ids, ids(&["r3", "r2"]));
+        assert_eq!(g[1].run_ids, ids(&["r1"]));
+    }
+
+    /// A spec that recurs after another one is the *same* group here — the
+    /// endpoint groups by content, and "was this reverted?" is a question about
+    /// adjacency that only the caller's chronology can answer. Grouping by
+    /// content and ordering by request is what lets it: the caller sees r2 and
+    /// r4 share a spec and r3 does not.
+    #[test]
+    fn a_reverted_spec_is_the_same_group_adjacency_is_the_callers_question() {
+        let g = group_run_specs(
+            &ids(&["r2", "r3", "r4"]),
+            vec![row("r2", "name: a\n"), row("r3", "name: b\n"), row("r4", "name: a\n")],
+        );
+        assert_eq!(g.len(), 2, "two distinct specs, whatever order they ran in");
+        assert_eq!(g[0].run_ids, ids(&["r2", "r4"]), "the revert rejoins its content group");
+    }
+
+    /// An id with no row — archived, purged, or simply wrong — is left out
+    /// rather than failing the batch. A page of runs that includes one archived
+    /// row must still answer for the other twenty-four.
+    #[test]
+    fn unknown_ids_are_absent_not_an_error() {
+        let g = group_run_specs(&ids(&["gone", "r1"]), vec![row("r1", "name: w\n")]);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].run_ids, ids(&["r1"]));
+    }
+
+    /// Two definitions whose specs match but whose names don't stay apart. The
+    /// name is derived from the spec today, so this should not arise — the
+    /// point is that if it ever does, one group reporting a single name would
+    /// be a quiet lie rather than a visible bug.
+    #[test]
+    fn specs_that_match_but_names_that_dont_stay_apart() {
+        let g = group_run_specs(
+            &ids(&["r1", "r2"]),
+            vec![
+                ("r1".into(), "name: w\n".into(), Some("old".into())),
+                ("r2".into(), "name: w\n".into(), Some("new".into())),
+            ],
+        );
+        assert_eq!(g.len(), 2, "the name is part of the key");
+    }
+
+    #[test]
+    fn nothing_requested_is_nothing_returned() {
+        assert!(group_run_specs(&[], vec![row("r1", "name: w\n")]).is_empty());
+    }
+
+    /// `/api/runs/specs` is a literal sibling of `/api/runs/{id}`. Axum panics
+    /// at startup on a genuine conflict and otherwise prefers the static
+    /// segment — this pins both halves of that, because the failure mode is a
+    /// server that either won't boot or silently routes the bulk call into the
+    /// single-run handler.
+    #[test]
+    fn specs_route_is_not_shadowed_by_the_run_id_route() {
+        use axum::routing::get;
+        // Built exactly as `main.rs` declares them, in the same order.
+        let app: axum::Router<()> = axum::Router::new()
+            .route("/api/runs/{id}", get(|| async { "one" }))
+            .route("/api/runs/specs", get(|| async { "bulk" }))
+            .route("/api/runs/{id}/spec", get(|| async { "one-spec" }));
+
+        let hit = |path: &str| {
+            let app = app.clone();
+            let req = axum::http::Request::builder().uri(path).body(axum::body::Body::empty()).unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    use tower::ServiceExt;
+                    let res = app.oneshot(req).await.unwrap();
+                    let status = res.status();
+                    let body = axum::body::to_bytes(res.into_body(), 64).await.unwrap();
+                    (status, String::from_utf8(body.to_vec()).unwrap())
+                })
+        };
+
+        assert_eq!(hit("/api/runs/specs"), (StatusCode::OK, "bulk".to_string()));
+        assert_eq!(
+            hit("/api/runs/0191f3c2-1111-7000-8000-000000000001"),
+            (StatusCode::OK, "one".to_string()),
+            "a real run id still reaches the single-run handler"
+        );
+        assert_eq!(
+            hit("/api/runs/0191f3c2-1111-7000-8000-000000000001/spec"),
+            (StatusCode::OK, "one-spec".to_string()),
+        );
+    }
 }
 
 #[cfg(test)]

@@ -582,6 +582,11 @@ export declare class Client {
     spec: SpecLike,
     opts?: { name?: string; description?: string },
   ): Promise<Dict>;
+  /**
+   * Requires the `admin` group; `403` otherwise. Irreversible, and it cascades to the
+   * workflow's schedules — prefer `setWorkflowState(id, "retired")`, which stops the workflow,
+   * keeps its schedules, and is open to any session.
+   */
   deleteWorkflow(workflowId: string): Promise<void>;
   runWorkflow(workflowId: string, opts?: { parameters?: Record<string, string> }): Promise<Dict>;
   listWorkflowRuns(workflowId: string, opts?: { limit?: number; offset?: number }): Promise<Dict[]>;
@@ -677,13 +682,21 @@ export declare class Client {
   redriveDeadLetter(deadLetterId: string): Promise<Dict>;
   discardDeadLetter(deadLetterId: string): Promise<void>;
   listGitRepos(): Promise<GitRepoList>;
+  /**
+   * Requires the `admin` group; `403` otherwise. A connected repository writes the workflows
+   * it finds and, with `prune`, retires the ones whose file is gone.
+   */
   connectGitRepo(
     url: string,
     opts?: { branch?: string; autoSync?: boolean; path?: string; auth?: GitRepoAuth },
   ): Promise<Dict>;
+  /** Requires the `admin` group; `403` otherwise. Write-only — the secret is never returned. */
   setGitRepoAuth(repoId: string, opts?: GitRepoAuth): Promise<Dict>;
+  /** Requires the `admin` group; `403` otherwise. */
   clearGitRepoAuth(repoId: string): Promise<void>;
+  /** Any authenticated session: asks for the poll `auto_sync` already runs on a timer. */
   syncGitRepo(repoId: string): Promise<Dict>;
+  /** Requires the `admin` group; `403` otherwise. */
   disconnectGitRepo(repoId: string): Promise<void>;
 
   // observability

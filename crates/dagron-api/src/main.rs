@@ -297,6 +297,11 @@ async fn main() -> Result<()> {
         )
         .route("/api/runs", get(routes::runs::list_runs))
         .route("/api/runs/{id}", get(routes::runs::get_run))
+        // Static, so it must be declared alongside `/api/runs/{id}` rather than
+        // under it: axum matches a literal segment ahead of a parameter, and
+        // run ids are uuids, so nothing can be shadowed by it. Covered by
+        // `specs_route_is_not_shadowed_by_the_run_id_route` in `routes::runs`.
+        .route("/api/runs/specs", get(routes::runs::get_run_specs))
         .route("/api/runs/{id}/spec", get(routes::runs::get_run_spec))
         .route("/api/runs/{id}/wait", get(routes::runs::wait_run))
         .route("/api/runs/{id}/graph", get(routes::graph::get_graph))
@@ -304,6 +309,7 @@ async fn main() -> Result<()> {
         // task's output (live-tailable) under the same filter grammar.
         .route("/api/runs/{id}/logs", get(routes::logs::get_run_logs))
         .route("/api/runs/{id}/tasks/{tid}/logs", get(routes::logs::get_task_logs))
+        .route("/api/runs/{id}/tasks/{tid}/attempts", get(routes::logs::get_task_attempts))
         .route("/api/runs/{id}/stream", get(routes::stream::stream_run))
         // Account-wide activity stream: feeds the list pages' live-updates mode.
         .route("/api/events/stream", get(routes::stream::stream_events))

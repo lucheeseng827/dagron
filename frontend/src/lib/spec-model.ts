@@ -32,12 +32,43 @@ export interface Task {
   /// Arguments for the called template, filling its declared `parameters`.
   /// Only meaningful with `template`.
   arguments?: Record<string, string>;
+  /// Fan-out over a literal list (engine `with_items`): the expander turns this
+  /// task into one row per item at run-creation time, named `<task>.<index>`.
+  /// Mutually exclusive with `with_param`. See `loop-model.ts` for the loop
+  /// vocabulary the editor presents over this.
+  with_items?: unknown[];
+  /// Fan-out over a parameter holding a JSON array (engine `with_param`), e.g.
+  /// `"{{ shards }}"`. Mutually exclusive with `with_items`.
+  with_param?: string;
+  /// Fan-out over an upstream task's **output** (engine `with_output_of`),
+  /// named by that task. Unlike the two above this is resolved at run time, by
+  /// a sweep that reads the producer's stdout and inserts the instance rows —
+  /// so the count is not knowable when the run is created. The named task must
+  /// also be in `depends_on`.
+  with_output_of?: string;
+  /// Per-instance name template for a fan-out (engine `instance_key`), e.g.
+  /// `"{{ item.region }}"` → `sync.us-east-1`. Only meaningful alongside
+  /// `with_items` / `with_param`.
+  instance_key?: string;
+  /// Loop-in-place operator (engine `repeat`): re-run this task after each
+  /// success until `until` holds. Unlike fan-out this is *sequential* and
+  /// resolved by the engine at run time, not by the expander.
+  repeat?: RepeatSpec;
   /// Spec keys this editor doesn't model (e.g. `env`, `input`, `type: approval`
   /// knobs) preserved verbatim so the visual round-trip is lossless — switching
   /// to the visual tab never silently drops a field. Fields the *visual model*
-  /// cannot honestly represent (fan-out, sensors, …) don't rely on this: they
+  /// cannot honestly represent (sensors, gangs, …) don't rely on this: they
   /// lock the visual tab outright, see `spec-support.ts`.
   _extra?: Record<string, unknown>;
+}
+
+/// `repeat:` — the engine's loop-in-place operator. `until` is evaluated after
+/// each success with `{{ output }}` (the task's stdout) and `{{ attempt }}` (the
+/// 1-based iteration) bound; running out of `max_iterations` **fails** the task.
+export interface RepeatSpec {
+  until: string;
+  max_iterations: number;
+  delay_secs?: number;
 }
 
 /// A `templates:` entry — a reusable sub-DAG a task calls with `template:`.
@@ -85,6 +116,11 @@ export const KNOWN_TASK_KEYS = new Set([
   "workflow_ref",
   "template",
   "arguments",
+  "with_items",
+  "with_param",
+  "with_output_of",
+  "instance_key",
+  "repeat",
 ]);
 
 /// Top-level keys the editor models directly.
@@ -113,6 +149,20 @@ function strMap(v: unknown): Record<string, string> | undefined {
   return out;
 }
 
+/// Parse a `repeat:` block, or undefined when the value isn't one the editor
+/// models. A value that reaches here in the wrong shape is not silently
+/// normalized: `spec-support.ts` value-checks the same key and locks the visual
+/// tab, so the round-trip never gets the chance to drop it.
+function parseRepeat(v: unknown): RepeatSpec | undefined {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+  const r = v as Record<string, unknown>;
+  if (typeof r.until !== "string") return undefined;
+  const max = num(r.max_iterations);
+  if (max == null) return undefined;
+  const delay = num(r.delay_secs);
+  return { until: r.until, max_iterations: max, ...(delay ? { delay_secs: delay } : {}) };
+}
+
 /// Parse one task entry. Returns an error string instead of a task when the
 /// entry is unusable as a graph node.
 function parseTask(rawUnknown: unknown): { task?: Task; error?: string } {
@@ -137,6 +187,11 @@ function parseTask(rawUnknown: unknown): { task?: Task; error?: string } {
       workflow_ref: typeof raw.workflow_ref === "string" ? raw.workflow_ref : undefined,
       template: typeof raw.template === "string" ? raw.template : undefined,
       arguments: strMap(raw.arguments),
+      with_items: Array.isArray(raw.with_items) ? (raw.with_items as unknown[]) : undefined,
+      with_param: typeof raw.with_param === "string" ? raw.with_param : undefined,
+      with_output_of: typeof raw.with_output_of === "string" ? raw.with_output_of : undefined,
+      instance_key: typeof raw.instance_key === "string" ? raw.instance_key : undefined,
+      repeat: parseRepeat(raw.repeat),
       _extra: extraKeys(raw, (k) => KNOWN_TASK_KEYS.has(k)),
     },
   };
@@ -244,6 +299,26 @@ function taskToYaml(t: Task): Record<string, unknown> {
   if (t.arguments && Object.keys(t.arguments).length) o.arguments = t.arguments;
   if (t.command.length > 0 || (!isCall && !isApproval)) o.command = t.command;
   if (t.depends_on.length) o.depends_on = t.depends_on;
+  // Loop operators sit between "what it runs" and "how it retries": a fan-out
+  // decides how many rows exist, `repeat` decides how often one of them runs.
+  if (t.with_items !== undefined) o.with_items = t.with_items;
+  if (t.with_param !== undefined) o.with_param = t.with_param;
+  if (t.with_output_of !== undefined) o.with_output_of = t.with_output_of;
+  // `instance_key` only labels a fan-out; emitting it alone is a spec the
+  // engine rejects ("instance_key without with_items/with_param").
+  if (
+    t.instance_key &&
+    (t.with_items !== undefined || t.with_param !== undefined || t.with_output_of !== undefined)
+  ) {
+    o.instance_key = t.instance_key;
+  }
+  if (t.repeat) {
+    o.repeat = {
+      until: t.repeat.until,
+      max_iterations: t.repeat.max_iterations,
+      ...(t.repeat.delay_secs ? { delay_secs: t.repeat.delay_secs } : {}),
+    };
+  }
   if (t.max_attempts != null) o.max_attempts = t.max_attempts;
   if (t.retry_delay_secs != null) o.retry_delay_secs = t.retry_delay_secs;
   if (t.timeout_secs != null) o.timeout_secs = t.timeout_secs;

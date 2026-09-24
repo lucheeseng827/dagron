@@ -2,6 +2,8 @@
 name = "dagron-plan"
 version = "0.1.0"
 edition = "2021"
+# MSRV — see the root Cargo.toml for how 1.88 was measured.
+rust-version = "1.88"
 description = "dagron-plan — show what a workflow change does before you merge it: diff two DAG specs (resolved through the real parser + expander) into a PR-friendly markdown + Mermaid report with git-diff-style exit codes."
 
 [[bin]]

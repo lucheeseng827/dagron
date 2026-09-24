@@ -574,9 +574,46 @@ export const SNIPPETS: Snippet[] = [
     category: "Control flow",
     kind: "task",
     base: "poll",
+    // `repeat` is a modeled field, not an `_extra` key: `taskToYaml` skips
+    // `_extra` entries whose key the model owns, so putting it there would
+    // insert a block whose loop never reaches the YAML.
     makeTask: () => ({
       command: ["sh", "-c", "check-status"],
-      _extra: { repeat: { until: "{{ output }} == done", max_iterations: 30, delay_secs: 10 } },
+      repeat: { until: "{{ output }} == done", max_iterations: 30, delay_secs: 10 },
+    }),
+  },
+  {
+    id: "repeat-times",
+    label: "Repeat N times",
+    description: "Runs the step 3 times in a row — set the count in the Loop panel.",
+    category: "Control flow",
+    kind: "task",
+    base: "pass",
+    // The engine has no count on `repeat:` — counting `{{ attempt }}` is how a
+    // fixed number of passes is expressed, and `loop-model.ts` reads this exact
+    // shape back as "Repeat N times" in the panel.
+    //
+    // `{{ attempt }}` belongs in `until` and nowhere else. Commands are
+    // substituted once, at expansion, where `attempt` is not bound — it is
+    // runtime state the engine binds only when evaluating `until` after each
+    // success. A command containing it would print the literal `{{ attempt }}`
+    // on every pass. A step that needs its number wants a fan-out, where
+    // `{{ item }}` is substituted per instance.
+    makeTask: () => ({
+      command: ["sh", "-c", "echo pass"],
+      repeat: { until: "{{ attempt }} == 3", max_iterations: 3 },
+    }),
+  },
+  {
+    id: "for-each-item",
+    label: "For each item",
+    description: "Fans out into one parallel task per item — edit the list.",
+    category: "Control flow",
+    kind: "task",
+    base: "shard",
+    makeTask: () => ({
+      command: ["sh", "-c", "echo processing {{ item }}"],
+      with_items: ["a", "b", "c"],
     }),
   },
 ];

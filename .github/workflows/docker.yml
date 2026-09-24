@@ -104,6 +104,29 @@ jobs:
             context: "."
             file: "./crates/dagron-gitops/Dockerfile"
             build_args: ""
+          # The MCP-tool *step* — a task binary, not a service. docs/MCP.md
+          # tells readers to write `command: ["dagron-step-mcp"]`, and until it
+          # was added here that binary shipped in no image and no release asset,
+          # so the one command the docs hand a reader was the one thing nothing
+          # delivered. Normally consumed as a COPY --from into a task's own
+          # image; see crates/dagron-step-mcp/Dockerfile.
+          - name: dagron-step-mcp
+            context: "."
+            file: "./crates/dagron-step-mcp/Dockerfile"
+            build_args: ""
+          # The two `defer:` step binaries. Both images carry every backend
+          # their crate can build, while the crates default to the lean set —
+          # one image that submits anywhere beats three a user must choose
+          # between, and a source build vendoring the binary should not be made
+          # to carry a Kubernetes client or a wire driver it will never use.
+          - name: dagron-step-spark
+            context: "."
+            file: "./crates/dagron-step-spark/Dockerfile"
+            build_args: ""
+          - name: dagron-step-sql
+            context: "."
+            file: "./crates/dagron-step-sql/Dockerfile"
+            build_args: ""
         arch: [amd64, arm64]
         # `arch` is a real matrix axis, so these includes attach the platform +
         # runner to each (image × arch) combination rather than adding new legs.
@@ -189,7 +212,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [dagron-engine, dagron-engine-localdev, dagron-api, dagron-mcp, dagron-gitops]
+        image: [dagron-engine, dagron-engine-localdev, dagron-api, dagron-mcp, dagron-gitops, dagron-step-mcp, dagron-step-spark, dagron-step-sql]
     steps:
       - name: Collect this image's per-arch digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1

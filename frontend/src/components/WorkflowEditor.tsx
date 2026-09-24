@@ -8,6 +8,8 @@ import Editor from "@monaco-editor/react";
 import "@/lib/monaco"; // self-host the Monaco runtime (air-gap; no CDN)
 import ScheduleDrawer from "@/components/ScheduleDrawer";
 import EditableDag from "@/components/dag/EditableDag";
+import WorkflowLoopBar from "@/components/dag/WorkflowLoopBar";
+import { applyLoopBody, loopBodyModel, readWorkflowLoop } from "@/lib/workflow-loop";
 // `@ee/*` resolves to src/ee here and to the src/ee-stub signpost in the public
 // mirror, where src/ee is stripped. That fallback — not an import guard — is why
 // this file can name the enterprise control and still build open.
@@ -18,10 +20,12 @@ import { STARTERS } from "@/lib/starters";
 import {
   createWorkflow,
   deleteWorkflow,
+  getMe,
   getWorkflow,
   runWorkflow,
   syncWorkflowToGit,
   updateWorkflow,
+  type Me,
 } from "@/lib/dagron-api";
 import { errMsg } from "@/lib/err";
 
@@ -51,6 +55,15 @@ export default function WorkflowEditor({ id }: { id?: string }) {
   // assumed: an edit must not silently reactivate a workflow someone paused.
   const [wfState, setWfState] = useState<WorkflowState | undefined>();
   const [wfVersion, setWfVersion] = useState<number | undefined>();
+  // Delete is admin-only in the API (403 otherwise), so the button is hidden rather than left
+  // to fail. Save, Run and Sync to Git are not gated; neither is the lifecycle control above,
+  // which is how a non-admin stops a workflow — `retired` keeps the schedules delete would
+  // cascade away.
+  const [me, setMe] = useState<Me | null>(null);
+  const isAdmin = me?.groups?.includes("admin") ?? false;
+  useEffect(() => {
+    getMe().then(setMe).catch(() => {});
+  }, []);
 
   // Live parse for the visual editor; the model is derived from the YAML spec.
   const parsed = useMemo(() => parseModel(spec), [spec]);
@@ -59,6 +72,9 @@ export default function WorkflowEditor({ id }: { id?: string }) {
   // locks Visual mode rather than letting an edit quietly corrupt it.
   const support = useMemo(() => visualSupport(spec), [spec]);
   const locked = !support.ok;
+  // Is this spec wrapped in a whole-workflow loop? Drives both the loop bar and
+  // what the canvas edits — the body's tasks rather than the wrapper's one call.
+  const wfLoop = useMemo(() => (parsed.model ? readWorkflowLoop(parsed.model) : null), [parsed.model]);
 
   // Loading a workflow that uses those features while sitting on the Visual tab
   // must move the user, not present a graph they can edit into nonsense.
@@ -224,9 +240,11 @@ export default function WorkflowEditor({ id }: { id?: string }) {
             <button onClick={onRun} disabled={busy} className="dy-btn dy-btn-primary">
               ▶ Run
             </button>
-            <button onClick={onDelete} disabled={busy} className="dy-btn dy-btn-danger">
-              Delete
-            </button>
+            {isAdmin && (
+              <button onClick={onDelete} disabled={busy} className="dy-btn dy-btn-danger">
+                Delete
+              </button>
+            )}
           </>
         )}
         <button onClick={onSave} disabled={busy} className="dy-btn dy-btn-primary">
@@ -255,6 +273,13 @@ export default function WorkflowEditor({ id }: { id?: string }) {
         </p>
       )}
 
+      {/* Visual mode only. The bar rewrites the spec wholesale, which in the
+          YAML view would reformat the text under the user's cursor — and "don't
+          make me edit YAML for this" is the point of the control. */}
+      {view === "visual" && parsed.model && (
+        <WorkflowLoopBar model={parsed.model} onChange={(m) => setSpec(modelToYaml(m))} />
+      )}
+
       <div style={{ flex: 1, minHeight: 320, border: "1px solid var(--border)", borderRadius: 10, overflow: "hidden" }}>
         {view === "yaml" ? (
           <Editor
@@ -266,9 +291,15 @@ export default function WorkflowEditor({ id }: { id?: string }) {
             options={{ minimap: { enabled: false }, fontSize: 13, tabSize: 2, scrollBeyondLastLine: false }}
           />
         ) : parsed.model ? (
+          // A looping workflow is drawn as the graph the user wrote, not as the
+          // single `loop-pass` node the spec holds: the canvas edits the loop's
+          // *body*, and `applyLoopBody` folds each edit back into the wrapper.
+          // `key` re-seeds the canvas when the loop is added or removed, since
+          // the task list it's drawing is swapped wholesale at that moment.
           <EditableDag
-            model={parsed.model}
-            onChange={(m) => setSpec(modelToYaml(m))}
+            key={wfLoop ? "loop-body" : "top-level"}
+            model={wfLoop ? loopBodyModel(parsed.model, wfLoop) : parsed.model}
+            onChange={(m) => setSpec(modelToYaml(wfLoop ? applyLoopBody(wfLoop, m) : m))}
             imageField={(ctx) => <RecipeImageField {...ctx} />}
           />
         ) : (

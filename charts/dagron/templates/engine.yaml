@@ -18,6 +18,12 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "pods/log"]
     verbs: ["create", "get", "list", "watch", "delete"]
+  # A task's secret env vars (`value_from`) reach its pod by secretKeyRef from a
+  # per-task Secret rather than as plaintext in the Pod spec (DAGRON_TASK_SECRET_ENV;
+  # `inline` needs none of this). The engine creates it, owns it by the pod, deletes it.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -102,6 +108,21 @@ spec:
                 secretKeyRef:
                   name: {{ include "dagron.dbSecretName" . }}
                   key: {{ .Values.externalDatabaseSecret.listenKey }}
+            {{- end }}
+            {{- if and (not .Values.postgres.enabled) .Values.externalDatabaseSecret.controlKey }}
+            # Hosted installs: the platform's usage database, for the engine's
+            # meter and run-completion hook (see values.yaml workspaceId).
+            - name: CONTROL_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "dagron.dbSecretName" . }}
+                  key: {{ .Values.externalDatabaseSecret.controlKey }}
+            {{- end }}
+            {{- if and .Values.workspaceId .Values.orgId }}
+            - name: DAGRON_WORKSPACE_ID
+              value: {{ .Values.workspaceId | quote }}
+            - name: DAGRON_ORG_ID
+              value: {{ .Values.orgId | quote }}
             {{- end }}
             - name: API_ADDR
               value: "0.0.0.0:{{ .Values.engine.port }}"

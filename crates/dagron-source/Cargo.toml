@@ -2,6 +2,8 @@
 name = "dagron-source"
 version = "0.1.0"
 edition = "2021"
+# MSRV — see the root Cargo.toml for how 1.88 was measured.
+rust-version = "1.88"
 description = "dagron workflow ingestion: the WorkflowSource trait + File/Dir/Stream/Channel built-in sources (SOURCE=dir watches a directory of YAML, re-submitting a spec when its file changes) (SOURCE=stream follows an NDJSON file/pipe with a durable offset checkpoint), a SourceFactory extension seam, and the ractor IngestActor that turns submissions into runs. Managed broker connectors (Redis/SQS/Kafka/NATS) plug in behind the SourceFactory seam."
 
 [lib]

@@ -2,6 +2,8 @@
 name = "dagron-gitops"
 version = "0.1.0"
 edition = "2021"
+# MSRV — see the root Cargo.toml for how 1.88 was measured.
+rust-version = "1.88"
 publish = false
 description = "dagron GitOps worker — polls connected repos, validates their workflow specs, and reconciles them into the workflows table. Ships as its own optional image so the API gateway stays distroless and never shells out."
 

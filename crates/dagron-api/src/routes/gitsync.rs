@@ -10,7 +10,9 @@
 //!   GITHUB_TOKEN        PAT / app token with `repo` (contents + pull_requests)
 //!   GIT_REPO            "owner/name"
 //!   GIT_BASE            base branch (default "main")
-//!   GIT_PATH_PREFIX     path prefix for committed specs (default "dags/")
+//!   GIT_PATH_PREFIX     path prefix for committed specs (default: the `path` of the connected
+//!                       git repo matching GIT_REPO, so a merged PR lands where the pull loop
+//!                       watches; "dags/" when no such repo is connected)
 //!   GIT_API_BASE        API root (default "https://api.github.com"; set for GHE)
 
 use axum::extract::{Path, State};
@@ -49,6 +51,35 @@ impl GitConfig {
     }
 }
 
+/// Whether a connected repo URL (`https://github.com/o/n.git`, `git@github.com:o/n.git`, ...) is the
+/// `owner/name` in `GIT_REPO`.
+fn url_is_repo(url: &str, repo: &str) -> bool {
+    let url = url.trim().trim_end_matches('/').trim_end_matches(".git").to_lowercase();
+    let repo = repo.trim().to_lowercase();
+    url.ends_with(&format!("/{repo}")) || url.ends_with(&format!(":{repo}"))
+}
+
+/// `<path>/` of the connected git repo that is `GIT_REPO`: the directory the pull loop already
+/// watches. `Ok(None)` means the lookup succeeded and no connected repo is that one.
+///
+/// The datastore error is returned, never folded into `None`: the caller reads `None` as "keep the
+/// `dags/` default", so a transient failure here would open a pull request against a directory the
+/// pull loop is not watching and report it as a success — the exact failure this default exists to
+/// prevent. Better a 500 the operator retries.
+async fn connected_repo_prefix(pool: &sqlx::PgPool, repo: &str) -> Result<Option<String>, ApiError> {
+    // Ordered: the https and ssh spellings of one forge repo are distinct `url`s, so the UNIQUE
+    // constraint allows both to be connected, and which of the two answered would otherwise be
+    // whichever row the scan happened to return first. `created_at` is RFC3339, so it sorts as text.
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT url, path FROM git_repos ORDER BY created_at, id")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| internal(format!("reading the connected repositories: {e}")))?;
+    Ok(rows
+        .into_iter()
+        .find(|(url, _)| url_is_repo(url, repo))
+        .map(|(_, path)| format!("{}/", path.trim_matches('/'))))
+}
+
 fn env(key: &str) -> Result<String, ApiError> {
     std::env::var(key).map_err(|_| {
         (
@@ -71,7 +102,12 @@ pub async fn sync_to_git(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SyncResponse>, ApiError> {
-    let cfg = GitConfig::from_env()?;
+    let mut cfg = GitConfig::from_env()?;
+    if std::env::var("GIT_PATH_PREFIX").is_err() {
+        if let Some(prefix) = connected_repo_prefix(&state.read_pool, &cfg.repo).await? {
+            cfg.path_prefix = prefix;
+        }
+    }
 
     // Load the workflow's name + spec.
     let row: Option<(String, String)> =
@@ -251,4 +287,19 @@ fn slugify(name: &str) -> String {
 fn internal(msg: String) -> ApiError {
     tracing::error!(%msg, "git sync failed");
     (StatusCode::INTERNAL_SERVER_ERROR, msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::url_is_repo;
+
+    /// The connected repo is found from the forms a URL is stored in, and only when `owner/name` matches whole.
+    #[test]
+    fn a_connected_url_is_matched_to_git_repo() {
+        assert!(url_is_repo("https://github.com/Acme/Flows.git", "acme/flows"));
+        assert!(url_is_repo("git@github.com:acme/flows.git", "acme/flows"));
+        assert!(url_is_repo("ssh://git@host/acme/flows/", "acme/flows"));
+        assert!(!url_is_repo("https://github.com/acme/flows-extra.git", "acme/flows"));
+        assert!(!url_is_repo("https://github.com/other-acme/flows.git", "acme/flows"));
+    }
 }

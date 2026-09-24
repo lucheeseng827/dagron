@@ -36,50 +36,56 @@ rather than reimplemented.
 
 **W** = changes cluster state (hidden and refused under `DAGRON_MCP_READONLY`).
 
-| Tool | Input | → dagron-api |
-|---|---|---|
-| `dagron_list_runs` | `status?`, `name?`, `trigger?`, `limit?`, `offset?` | `GET /api/runs` |
-| `dagron_get_run` | `run_id` | `GET /api/runs/{id}` |
-| `dagron_wait_run` | `run_id`, `timeout_secs?` (1–600) | `GET /api/runs/{id}/wait` |
-| `dagron_get_run_spec` | `run_id` | `GET /api/runs/{id}/spec` |
-| `dagron_get_run_graph` | `run_id` | `GET /api/runs/{id}/graph` |
-| **W** `dagron_submit_run` | `yaml`, `parameters?`, `idempotency_key?` | `POST /api/runs` — body `{"yaml": …, "parameters"?: {k: v}}` as `application/json`; `idempotency_key` is sent as the **`Idempotency-Key:` header**, not a body field |
-| **W** `dagron_cancel_run` | `run_id` | `POST /api/runs/{id}/cancel` |
-| **W** `dagron_rerun_run` | `run_id`, `from?` | `POST /api/runs/{id}/rerun` |
-| **W** `dagron_resubmit_run` | `run_id` | `POST /api/runs/{id}/resubmit` |
-| **W** `dagron_retry_task` | `run_id`, `task_id` | `POST /api/runs/{id}/tasks/{tid}/retry` |
-| **W** `dagron_clear_task` | `run_id`, `task_id` | `POST /api/runs/{id}/tasks/{tid}/clear` |
-| **W** `dagron_triage_run` | `run_id`, `state`, `note?` | `POST /api/runs/{id}/triage` |
-| **W** `dagron_clear_triage` | `run_id` | `DELETE /api/runs/{id}/triage` |
-| `dagron_list_approvals` | — | `GET /api/approvals` |
-| **W** `dagron_approve_task` | `run_id`, `task_id` | `POST /api/runs/{id}/tasks/{tid}/approve` |
-| **W** `dagron_reject_task` | `run_id`, `task_id` | `POST /api/runs/{id}/tasks/{tid}/reject` |
-| `dagron_list_workflows` | `tag?` | `GET /api/workflows` |
-| `dagron_get_workflow` | `workflow_id` | `GET /api/workflows/{id}` |
-| `dagron_list_workflow_runs` | `workflow_id`, `limit?`, `offset?` | `GET /api/workflows/{id}/runs` |
-| `dagron_list_workflow_versions` | `workflow_id` | `GET /api/workflows/{id}/versions` |
-| **W** `dagron_create_workflow` | `spec`, `name?`, `description?` | `POST /api/workflows` |
-| **W** `dagron_update_workflow` | `workflow_id`, `spec`, `name?`, `description?` | `PUT /api/workflows/{id}` |
-| **W** `dagron_delete_workflow` | `workflow_id` | `DELETE /api/workflows/{id}` |
-| **W** `dagron_set_workflow_state` | `workflow_id`, `state` | `POST /api/workflows/{id}/state` |
-| **W** `dagron_run_workflow` | `workflow_id`, `parameters?` | `POST /api/workflows/{id}/run` |
-| `dagron_get_task_logs` | `run_id`, `task_id`, + log filter | `GET /api/runs/{id}/tasks/{tid}/logs` |
-| `dagron_get_run_logs` | `run_id` + log filter | `GET /api/runs/{id}/logs` |
-| `dagron_get_artifact` | `run_id`, `task`, `name` | `GET /api/runs/{rid}/artifacts/{task}/{name}` |
-| `dagron_artifact_exists` | `run_id`, `task`, `name` | `…/{name}/exists` |
-| **W** `dagron_put_artifact` | `run_id`, `task`, `name`, `content` | `PUT /api/runs/{rid}/artifacts/{task}/{name}` |
-| `dagron_get_metrics` | — | `GET /api/metrics` |
-| `dagron_get_metrics_timeseries` | `days?` (1–90), `name?` | `GET /api/metrics/timeseries` |
-| `dagron_get_health` | — | `GET /api/health` |
-| `dagron_search` | `q`, `limit?` (1–20) | `GET /api/search` |
-| `dagron_list_dead_letters` | `limit?` (1–500) | `GET /api/dead-letters` |
-| **W** `dagron_redrive_dead_letter` | `id` | `POST /api/dead-letters/{id}/redrive` |
-| **W** `dagron_delete_dead_letter` | `id` | `DELETE /api/dead-letters/{id}` |
-| `dagron_list_datasets` | `limit?` | `GET /api/datasets` |
-| `dagron_get_dataset_events` | `uri?`, `limit?` | `GET /api/datasets/events` |
-| `dagron_list_archived_runs` | `name?`, `limit?`, `offset?` | `GET /api/archive/runs` |
-| `dagron_get_archived_run` | `run_id` | `GET /api/archive/runs/{id}` |
-| `dagron_get_run_events` | `run_id`, `wait_ms?` (100–10000) | bounded SSE read of `GET /api/runs/{id}/stream` |
+**Hints** = the MCP `annotations` the tool declares: `read-only` is
+`readOnlyHint: true`; a write states `destructiveHint`, `idempotentHint` and
+`openWorldHint`, and the column lists the true ones. `open-world` here means the
+call can set task code running. What each means, and why each write got its
+hints: [tool annotations](../../docs/MCP.md#tool-annotations).
+
+| Tool | Input | → dagron-api | Hints |
+|---|---|---|---|
+| `dagron_list_runs` | `status?`, `name?`, `trigger?`, `limit?`, `offset?` | `GET /api/runs` | read-only |
+| `dagron_get_run` | `run_id` | `GET /api/runs/{id}` | read-only |
+| `dagron_wait_run` | `run_id`, `timeout_secs?` (1–600) | `GET /api/runs/{id}/wait` | read-only |
+| `dagron_get_run_spec` | `run_id` | `GET /api/runs/{id}/spec` | read-only |
+| `dagron_get_run_graph` | `run_id` | `GET /api/runs/{id}/graph` | read-only |
+| **W** `dagron_submit_run` | `yaml`, `parameters?`, `idempotency_key?` | `POST /api/runs` — body `{"yaml": …, "parameters"?: {k: v}}` as `application/json`; `idempotency_key` is sent as the **`Idempotency-Key:` header**, not a body field | open-world |
+| **W** `dagron_cancel_run` | `run_id` | `POST /api/runs/{id}/cancel` | destructive · idempotent |
+| **W** `dagron_rerun_run` | `run_id`, `from?` | `POST /api/runs/{id}/rerun` | destructive · open-world |
+| **W** `dagron_resubmit_run` | `run_id` | `POST /api/runs/{id}/resubmit` | open-world |
+| **W** `dagron_retry_task` | `run_id`, `task_id` | `POST /api/runs/{id}/tasks/{tid}/retry` | destructive · open-world |
+| **W** `dagron_clear_task` | `run_id`, `task_id` | `POST /api/runs/{id}/tasks/{tid}/clear` | destructive · open-world |
+| **W** `dagron_triage_run` | `run_id`, `state`, `note?` | `POST /api/runs/{id}/triage` | destructive · idempotent |
+| **W** `dagron_clear_triage` | `run_id` | `DELETE /api/runs/{id}/triage` | destructive · idempotent |
+| `dagron_list_approvals` | — | `GET /api/approvals` | read-only |
+| **W** `dagron_approve_task` | `run_id`, `task_id` | `POST /api/runs/{id}/tasks/{tid}/approve` | idempotent · open-world |
+| **W** `dagron_reject_task` | `run_id`, `task_id` | `POST /api/runs/{id}/tasks/{tid}/reject` | destructive · idempotent · open-world |
+| `dagron_list_workflows` | `tag?` | `GET /api/workflows` | read-only |
+| `dagron_get_workflow` | `workflow_id` | `GET /api/workflows/{id}` | read-only |
+| `dagron_list_workflow_runs` | `workflow_id`, `limit?`, `offset?` | `GET /api/workflows/{id}/runs` | read-only |
+| `dagron_list_workflow_versions` | `workflow_id` | `GET /api/workflows/{id}/versions` | read-only |
+| **W** `dagron_create_workflow` | `spec`, `name?`, `description?` | `POST /api/workflows` | idempotent · open-world |
+| **W** `dagron_update_workflow` | `workflow_id`, `spec`, `name?`, `description?` | `PUT /api/workflows/{id}` | destructive · open-world |
+| **W** `dagron_delete_workflow` | `workflow_id` | `DELETE /api/workflows/{id}` | destructive · idempotent |
+| **W** `dagron_set_workflow_state` | `workflow_id`, `state` | `POST /api/workflows/{id}/state` | idempotent · open-world |
+| **W** `dagron_run_workflow` | `workflow_id`, `parameters?` | `POST /api/workflows/{id}/run` | open-world |
+| `dagron_get_task_logs` | `run_id`, `task_id`, + log filter | `GET /api/runs/{id}/tasks/{tid}/logs` | read-only |
+| `dagron_get_run_logs` | `run_id` + log filter | `GET /api/runs/{id}/logs` | read-only |
+| `dagron_get_artifact` | `run_id`, `task`, `name` | `GET /api/runs/{rid}/artifacts/{task}/{name}` | read-only |
+| `dagron_artifact_exists` | `run_id`, `task`, `name` | `…/{name}/exists` | read-only |
+| **W** `dagron_put_artifact` | `run_id`, `task`, `name`, `content` | `PUT /api/runs/{rid}/artifacts/{task}/{name}` | destructive · idempotent |
+| `dagron_get_metrics` | — | `GET /api/metrics` | read-only |
+| `dagron_get_metrics_timeseries` | `days?` (1–90), `name?` | `GET /api/metrics/timeseries` | read-only |
+| `dagron_get_health` | — | `GET /api/health` | read-only |
+| `dagron_search` | `q`, `limit?` (1–20) | `GET /api/search` | read-only |
+| `dagron_list_dead_letters` | `limit?` (1–500) | `GET /api/dead-letters` | read-only |
+| **W** `dagron_redrive_dead_letter` | `id` | `POST /api/dead-letters/{id}/redrive` | destructive · idempotent · open-world |
+| **W** `dagron_delete_dead_letter` | `id` | `DELETE /api/dead-letters/{id}` | destructive · idempotent |
+| `dagron_list_datasets` | `limit?` | `GET /api/datasets` | read-only |
+| `dagron_get_dataset_events` | `uri?`, `limit?` | `GET /api/datasets/events` | read-only |
+| `dagron_list_archived_runs` | `name?`, `limit?`, `offset?` | `GET /api/archive/runs` | read-only |
+| `dagron_get_archived_run` | `run_id` | `GET /api/archive/runs/{id}` | read-only |
+| `dagron_get_run_events` | `run_id`, `wait_ms?` (100–10000) | bounded SSE read of `GET /api/runs/{id}/stream` | read-only |
 
 Both log tools accept the same server-side filter grammar — `q`, `exclude`,
 `regex`, `level`, `case`, `context`, `limit`, `tail` — so an agent that learns one
@@ -171,6 +177,14 @@ sequenceDiagram
 
 - **A tool failure is `isError: true`, not a transport error.** The model sees the
   failure text and can react to it, which is the whole point of returning it.
+- **Every tool declares MCP `annotations`, derived from the read/write split.**
+  `readOnlyHint` is the same split `DAGRON_MCP_READONLY` enforces, so a client
+  that runs `readOnlyHint: true` tools without asking runs exactly the 24 a
+  read-only server keeps. A write states all three other hints, `false` ones
+  included, since the spec reads an absent `destructiveHint` or `openWorldHint`
+  as `true`. They are hints: they decide who a client asks, not what can run.
+  `initialize` still answers `2024-11-05`, and the annotations are sent anyway
+  (the [protocol revision note](../../docs/MCP.md#tool-annotations) says why).
 - **uuid-shaped ids are restricted to `[A-Za-z0-9_-]`** before any request is
   made — `run_id`, `task_id`, `workflow_id`, a dead-letter `id`. They are
   interpolated into request URLs, so an id carrying `/` or `?` could otherwise

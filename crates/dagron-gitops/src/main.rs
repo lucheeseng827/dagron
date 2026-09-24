@@ -91,6 +91,10 @@ async fn main() -> anyhow::Result<()> {
 /// guaranteed in compose or k8s, and creating them here would mean two owners of
 /// one schema — the drift that has bitten this codebase repeatedly.
 ///
+/// The git-management columns (`git_repos.prune`, `workflows.managed_by`/`managed_md5`) are on the
+/// list too: a sync against a schema that lacks them would fail every file for a reason that has
+/// nothing to do with the file.
+///
 /// `workflow_versions` is on the list because a signed bundle writes a
 /// version row per workflow inside the same transaction as the upsert: were
 /// the table still missing, the first bundle sync after a fresh deploy would
@@ -100,16 +104,20 @@ async fn wait_for_schema(pool: &sqlx::PgPool) {
     loop {
         let ready = sqlx::query_scalar::<_, i64>(
             // Scoped to the search path and counted DISTINCT: the same table name
-            // in a second visible schema would otherwise push the count past four
+            // in a second visible schema would otherwise push the count past the expected seven (4 tables + 3 columns)
             // and wedge this loop forever on a schema that is in fact ready.
-            "SELECT count(DISTINCT table_name) FROM information_schema.tables
-             WHERE table_schema = ANY (current_schemas(false))
-               AND table_name IN ('git_repos', 'gitops_workers', 'workflows', 'workflow_versions')",
+            "SELECT (SELECT count(DISTINCT table_name) FROM information_schema.tables
+                      WHERE table_schema = ANY (current_schemas(false))
+                        AND table_name IN ('git_repos', 'gitops_workers', 'workflows', 'workflow_versions'))
+                  + (SELECT count(DISTINCT table_name || '.' || column_name) FROM information_schema.columns
+                      WHERE table_schema = ANY (current_schemas(false))
+                        AND ((table_name = 'git_repos' AND column_name = 'prune')
+                          OR (table_name = 'workflows' AND column_name IN ('managed_by', 'managed_md5'))))",
         )
         .fetch_one(pool)
         .await;
         match ready {
-            Ok(n) if n >= 4 => return,
+            Ok(n) if n >= 7 => return,
             Ok(_) => info!("waiting for dagron-api to create the GitOps schema"),
             Err(e) => warn!(error = %e, "schema probe failed"),
         }
@@ -141,6 +149,8 @@ async fn heartbeat(pool: &sqlx::PgPool, worker_id: &str) -> anyhow::Result<()> {
 #[derive(sqlx::FromRow)]
 struct Due {
     id: String,
+    name: String,
+    prune: bool,
     url: String,
     branch: String,
     path: String,
@@ -255,7 +265,7 @@ fn decrypt(ciphertext: &str) -> Result<String, String> {
 async fn sweep(pool: &sqlx::PgPool, poll_secs: i64) -> anyhow::Result<()> {
     let stale = (chrono::Utc::now() - chrono::Duration::seconds(poll_secs)).to_rfc3339();
     let due: Vec<Due> = sqlx::query_as(
-        "SELECT id, url, branch, path, last_synced_at,
+        "SELECT id, name, prune, url, branch, path, last_synced_at,
                 auth_kind, auth_username, auth_secret, auth_known_hosts,
                 (sync_requested_at IS NOT NULL) AS requested
          FROM git_repos
@@ -304,6 +314,9 @@ async fn run_one(pool: &sqlx::PgPool, repo: &Due) {
         }
     };
     let target = sync::Repo {
+        id: repo.id.clone(),
+        name: repo.name.clone(),
+        prune: repo.prune,
         url: repo.url.clone(),
         branch: repo.branch.clone(),
         path: repo.path.clone(),
@@ -330,6 +343,12 @@ async fn run_one(pool: &sqlx::PgPool, repo: &Due) {
             };
             if report.skipped > 0 {
                 msg.push_str(&format!(" · {} non-workflow file(s) ignored", report.skipped));
+            }
+            if report.retired > 0 {
+                msg.push_str(&format!(" · {} retired (file deleted)", report.retired));
+            }
+            if report.prune_skipped {
+                msg.push_str(" · prune skipped: fix the file error(s) below first");
             }
             if !report.errors.is_empty() {
                 msg.push_str(&format!(
@@ -370,7 +389,6 @@ async fn write_result(
          SET state = $1,
              rev = COALESCE($2, rev),
              workflow_count = $3,
-             drift = 0,
              last_message = $4,
              last_synced_at = $5
          WHERE id = $6",
@@ -404,6 +422,8 @@ mod tests {
     ) -> Due {
         Due {
             id: "r1".into(),
+            name: "o/r".into(),
+            prune: false,
             url: "https://github.com/o/r.git".into(),
             branch: "main".into(),
             path: "dagron".into(),

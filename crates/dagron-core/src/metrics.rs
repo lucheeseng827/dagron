@@ -131,6 +131,24 @@ pub struct Metrics {
     pub deadline_alerts: AtomicU64,
     /// Tasks resolved from the memoization cache without executing (#22).
     pub cache_hits: AtomicU64,
+    /// Remote jobs this engine gave up trying to tear down (`defer:`).
+    ///
+    /// The one number that says "a cancelled run left something running on
+    /// someone's cluster and we stopped trying". It exists because the
+    /// alternative to a visible leak is a silent one: teardown is best-effort
+    /// by nature — a job we cannot reach is a job we cannot stop — and the
+    /// honest response to that is a counter and a log line naming the handle,
+    /// not a pretence that the cluster is idle.
+    pub external_orphans: AtomicU64,
+    /// Workloads (pods, containers) the fleet sweep deleted because the task
+    /// that owned them was no longer live.
+    ///
+    /// Worth alerting on if it is anything but near-zero in steady state. Every
+    /// increment is a workload that outlived its task, which means a scheduler
+    /// died between creating it and finishing it — the failure the per-dispatch
+    /// reap cannot see, because that reap only ever runs when the *same task*
+    /// is dispatched again.
+    pub orphan_workloads_reaped: AtomicU64,
     /// Failed attempts by [`crate::fault::FaultClass`], indexed by the class's
     /// position in `FaultClass::ALL`.
     ///
@@ -160,6 +178,8 @@ pub struct Metrics {
     /// ingest actor's nack, the ops API's 507 — since the datastore that
     /// raises it holds no metrics handle.
     pub admission_refused_disk: AtomicU64,
+    /// Runs refused because DAGRON_ADMISSION_FILE was closed.
+    pub admission_refused_gate: AtomicU64,
     /// `1` while the pressure file (`DAGRON_PRESSURE_FILE`) is holding new
     /// claims at zero, else `0`. A state gauge like the catch-up gauges:
     /// the reconcile loop is the single writer, re-publishing its verdict
@@ -226,12 +246,15 @@ impl Default for Metrics {
             runs_deadline_exceeded: AtomicU64::new(0),
             deadline_alerts: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
+            external_orphans: AtomicU64::new(0),
+            orphan_workloads_reaped: AtomicU64::new(0),
             task_faults: std::array::from_fn(|_| AtomicU64::new(0)),
             schedule_gated: AtomicU64::new(0),
             schedules_stopped: AtomicU64::new(0),
             dataset_updates: AtomicU64::new(0),
             dataset_fires: AtomicU64::new(0),
             admission_refused_disk: AtomicU64::new(0),
+            admission_refused_gate: AtomicU64::new(0),
             claims_paused: AtomicU64::new(0),
             clock_steps: AtomicU64::new(0),
             #[cfg(feature = "enterprise")]
@@ -304,6 +327,14 @@ impl Metrics {
     pub fn inc_cache_hits(&self) {
         Self::bump(&self.cache_hits);
     }
+    /// One remote job abandoned: teardown was owed and could not be delivered.
+    pub fn inc_external_orphans(&self) {
+        Self::bump(&self.external_orphans);
+    }
+    /// One leftover workload deleted by the fleet sweep.
+    pub fn inc_orphan_workloads_reaped(&self) {
+        Self::bump(&self.orphan_workloads_reaped);
+    }
     /// One schedule auto-stopped by a `stopStrategy` expression.
     pub fn inc_schedules_stopped(&self) {
         Self::bump(&self.schedules_stopped);
@@ -315,6 +346,11 @@ impl Metrics {
     /// One run fired by a dataset trigger (`on_datasets:`).
     pub fn inc_dataset_fires(&self) {
         Self::bump(&self.dataset_fires);
+    }
+    /// One run refused because the admission gate (`DAGRON_ADMISSION_FILE`)
+    /// was closed or unreadable.
+    pub fn inc_admission_refused_gate(&self) {
+        Self::bump(&self.admission_refused_gate);
     }
     /// One run refused by the free-disk floor (`DAGRON_MIN_FREE_BYTES`).
     pub fn inc_admission_refused_disk(&self) {
@@ -388,7 +424,7 @@ impl Metrics {
     pub fn render(&self, snap: &MetricsSnapshot, pool: Option<&DbPoolStats>) -> String {
         let mut out = String::with_capacity(2048);
 
-        let counters: [(&str, &str, u64); 15] = [
+        let counters: [(&str, &str, u64); 18] = [
             ("scheduler_runs_created_total", "Runs created by this scheduler since boot.",
              self.runs_created.load(Ordering::Relaxed)),
             ("scheduler_tasks_dispatched_total", "Tasks dispatched to the worker pool.",
@@ -407,6 +443,10 @@ impl Metrics {
              self.deadline_alerts.load(Ordering::Relaxed)),
             ("scheduler_cache_hits_total", "Tasks resolved from the memoization cache without executing.",
              self.cache_hits.load(Ordering::Relaxed)),
+            ("scheduler_external_orphans_total", "Remote jobs (defer:) this engine gave up tearing down — each one may still be running and consuming cluster-hours.",
+             self.external_orphans.load(Ordering::Relaxed)),
+            ("scheduler_orphan_workloads_reaped_total", "Pods/containers deleted by the fleet sweep because the task that owned them was no longer live — each one outlived the scheduler that created it.",
+             self.orphan_workloads_reaped.load(Ordering::Relaxed)),
             ("scheduler_schedule_gated_total", "Schedule fires skipped by a when: gate.",
              self.schedule_gated.load(Ordering::Relaxed)),
             ("scheduler_schedules_stopped_total", "Schedules auto-stopped by a stopStrategy expression.",
@@ -417,6 +457,8 @@ impl Metrics {
              self.dataset_fires.load(Ordering::Relaxed)),
             ("scheduler_admission_refused_disk_total", "Runs refused by the free-disk floor (DAGRON_MIN_FREE_BYTES).",
              self.admission_refused_disk.load(Ordering::Relaxed)),
+            ("scheduler_admission_refused_gate_total", "Runs refused because the admission gate (DAGRON_ADMISSION_FILE) was closed.",
+             self.admission_refused_gate.load(Ordering::Relaxed)),
             ("scheduler_clock_steps_total", "Wall-clock steps caught by the clock detector (wall vs monotonic past DAGRON_CLOCK_STEP_TOLERANCE_MS).",
              self.clock_steps.load(Ordering::Relaxed)),
         ];

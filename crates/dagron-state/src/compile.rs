@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::spec::{DagSpec, TaskSpec};
+use crate::spec::{DagSpec, EnvVar, SecretRef, TaskSpec};
 use crate::wire::{PlanModel, PlanResponse, Reason, Unit};
 
 /// How to derive task dependencies from a plan.
@@ -56,12 +56,16 @@ pub struct CompileOptions {
     #[serde(default = "default_workflow_name")]
     pub workflow_name: String,
     /// The argv to run per model. Supports `{{ model }}`, `{{ unit }}`,
-    /// `{{ partitions }}` (comma-joined; empty for a full-model rebuild), and —
-    /// from contract v3 — `{{ replace }}`, `{{ partition_column }}` and
-    /// `{{ unique_key }}`, which expand to the planner's declaration and are empty
-    /// when the plan carries none.
+    /// `{{ partitions }}` (comma-joined; empty for a full-model rebuild); from
+    /// contract v3 `{{ replace }}`, `{{ partition_column }}` and `{{ unique_key }}`,
+    /// which expand to the planner's declaration and are empty when the plan carries
+    /// none; and from contract v4 `{{ sql }}` and `{{ dialect }}` — the rendered
+    /// statements (see [`crate::wire::Sql::script`]) and their dialect. Each placeholder
+    /// is written `{{ name }}` or `{{name}}`; anything else in braces is left alone for
+    /// the command's own templating.
     ///
-    /// e.g. `["sh", "-c", "dbt run --select {{ model }}"]`
+    /// e.g. `["sh", "-c", "dbt run --select {{ model }}"]`, or `["dagron-step-sql"]`
+    /// with `env: { SQL_STATEMENT: "{{ sql }}", SQL_MODE: script, … }`.
     pub command_template: Vec<String>,
     #[serde(default)]
     pub ordering: Ordering,
@@ -69,9 +73,19 @@ pub struct CompileOptions {
     pub max_attempts: Option<u32>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
-    /// Env applied to every generated task.
+    /// Env applied to every generated task, with the same placeholders expanded per
+    /// task as `command_template` (from contract v4). That is what lets a statement
+    /// travel in an environment variable — `SQL_STATEMENT: "{{ sql }}"` — instead of
+    /// being quoted into a shell command line.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Env resolved from dagron secrets: variable name → secret name, compiled to
+    /// `value_from: { secret: … }` on every task. The credential never travels in
+    /// the plan or this envelope — only the secret's name does — and dagron resolves
+    /// it at dispatch without storing it. How a warehouse password reaches
+    /// `dagron-step-sql` (`{"SQL_PASSWORD": "WAREHOUSE_PASSWORD"}`). Not expanded.
+    #[serde(default)]
+    pub secret_env: BTreeMap<String, String>,
     /// Tags for the generated workflow. Defaults to `["state-plan"]` so these runs
     /// are filterable in the console away from ordinary workflows.
     #[serde(default = "default_tags")]
@@ -95,6 +109,7 @@ impl Default for CompileOptions {
             max_attempts: None,
             timeout_secs: None,
             env: BTreeMap::new(),
+            secret_env: BTreeMap::new(),
             tags: default_tags(),
         }
     }
@@ -128,6 +143,14 @@ pub enum CompileError {
     EmptyPlan,
     /// No `command_template`: nothing would run.
     NoCommand,
+    /// The template references `{{ sql }}` but this model carries no SQL, or only
+    /// blank statements — the plan was produced without a dialect. Expanding it to
+    /// nothing would hand the task an empty statement, so it is refused here rather
+    /// than failing at run time.
+    MissingSql { model: String },
+    /// A variable set both literally (`env`) and from a secret (`secret_env`): which
+    /// one the task gets would be an accident of ordering, so neither is chosen.
+    EnvConflict { name: String },
 }
 
 impl std::fmt::Display for CompileError {
@@ -138,6 +161,15 @@ impl std::fmt::Display for CompileError {
             }
             Self::EmptyPlan => write!(f, "plan is empty: nothing to rebuild"),
             Self::NoCommand => write!(f, "options.command_template is required"),
+            Self::MissingSql { model } => write!(
+                f,
+                "the command or env uses {{{{ sql }}}} but model `{model}` carries no runnable SQL — \
+                 plan with a dialect (e.g. `freshet submit --sql postgres`)"
+            ),
+            Self::EnvConflict { name } => write!(
+                f,
+                "`{name}` is in both options.env and options.secret_env: set it one way"
+            ),
         }
     }
 }
@@ -157,6 +189,23 @@ pub fn compile(env: &PlanEnvelope) -> Result<DagSpec, CompileError> {
     }
     if env.options.command_template.is_empty() {
         return Err(CompileError::NoCommand);
+    }
+    if let Some(name) = env.options.secret_env.keys().find(|k| env.options.env.contains_key(*k)) {
+        return Err(CompileError::EnvConflict { name: name.clone() });
+    }
+    let wants_sql = env
+        .options
+        .command_template
+        .iter()
+        .chain(env.options.env.values())
+        .any(|t| t.contains("{{ sql }}") || t.contains("{{sql}}"));
+    if wants_sql {
+        // Blank counts as missing: a script of only empty statements would compile
+        // here and be refused by the step only after the workflow was submitted.
+        let runnable = |sql: &crate::wire::Sql| sql.statements.iter().any(|s| !s.trim().is_empty());
+        if let Some(m) = env.plan.models.iter().find(|m| !m.sql.as_ref().is_some_and(runnable)) {
+            return Err(CompileError::MissingSql { model: m.name.clone() });
+        }
     }
 
     // Model name -> task name, and the plan position that makes edge filtering
@@ -185,14 +234,25 @@ pub fn compile(env: &PlanEnvelope) -> Result<DagSpec, CompileError> {
             Ordering::Derived => derived_edges(model, i, env, &task_names, &position),
         };
 
+        let values = placeholder_values(model);
         tasks.push(TaskSpec {
             name: task_names[model.name.as_str()].clone(),
-            command: render_command(&env.options.command_template, model),
+            command: env.options.command_template.iter().map(|arg| expand(arg, &values)).collect(),
             depends_on,
             input: Some(task_input(model)),
             max_attempts: env.options.max_attempts,
             timeout_secs: env.options.timeout_secs,
-            env: env.options.env.clone(),
+            env: env
+                .options
+                .env
+                .iter()
+                .map(|(k, v)| EnvVar { name: k.clone(), value: expand(v, &values), value_from: None })
+                .chain(env.options.secret_env.iter().map(|(k, secret)| EnvVar {
+                    name: k.clone(),
+                    value: String::new(),
+                    value_from: Some(SecretRef { secret: secret.clone() }),
+                }))
+                .collect(),
         });
     }
 
@@ -238,46 +298,71 @@ fn derived_edges(
     edges
 }
 
-/// Substitute the per-model placeholders into the operator's argv.
+/// Every placeholder's value for one model.
 ///
 /// The replace placeholders expand to the *declaration*, never to SQL: dagron does
 /// not know which warehouse runs the command, so `{{ replace }}` becomes
-/// `insert_overwrite`, not an `INSERT OVERWRITE` statement. Turning one into the
-/// other is the operator's command's job, or an engine adapter's — not this
-/// crate's, which is the same line the planner draws upstream.
+/// `insert_overwrite`, not an `INSERT OVERWRITE` statement. `{{ sql }}` is the
+/// exception that proves it: the planner rendered those statements for a dialect it
+/// was told, and they reach the task byte for byte.
 ///
-/// A plan with no replace op expands them to the empty string rather than leaving
-/// the braces in place. A literal `{{ replace }}` reaching a shell would be a
-/// confusing failure, and an empty string is what every other unset placeholder
-/// here already produces.
-fn render_command(template: &[String], model: &PlanModel) -> Vec<String> {
+/// An absent value expands to the empty string rather than leaving the braces in
+/// place. A literal `{{ replace }}` reaching a shell would be a confusing failure.
+/// (`{{ sql }}` with no SQL never gets this far — [`compile`] refuses it.)
+fn placeholder_values(model: &PlanModel) -> BTreeMap<&'static str, String> {
     let (unit, partitions) = match &model.unit {
         Unit::FullModel => ("full_model", String::new()),
         Unit::Partitions(ps) => ("partitions", ps.join(",")),
     };
     let replace = model.replace.as_ref();
-    let strategy = replace.map(|r| r.strategy.as_str()).unwrap_or("");
-    let partition_column =
-        replace.and_then(|r| r.partition_column.as_deref()).unwrap_or("");
-    let unique_key = replace.map(|r| r.unique_key.join(",")).unwrap_or_default();
+    BTreeMap::from([
+        ("model", model.name.clone()),
+        ("unit", unit.to_string()),
+        ("partitions", partitions),
+        ("replace", replace.map(|r| r.strategy.as_str().to_string()).unwrap_or_default()),
+        ("partition_column", replace.and_then(|r| r.partition_column.clone()).unwrap_or_default()),
+        ("unique_key", replace.map(|r| r.unique_key.join(",")).unwrap_or_default()),
+        ("sql", model.sql.as_ref().map(|s| s.script()).unwrap_or_default()),
+        ("dialect", model.sql.as_ref().map(|s| s.dialect.clone()).unwrap_or_default()),
+    ])
+}
 
-    template
-        .iter()
-        .map(|arg| {
-            arg.replace("{{ model }}", &model.name)
-                .replace("{{model}}", &model.name)
-                .replace("{{ unit }}", unit)
-                .replace("{{unit}}", unit)
-                .replace("{{ partitions }}", &partitions)
-                .replace("{{partitions}}", &partitions)
-                .replace("{{ replace }}", strategy)
-                .replace("{{replace}}", strategy)
-                .replace("{{ partition_column }}", partition_column)
-                .replace("{{partition_column}}", partition_column)
-                .replace("{{ unique_key }}", &unique_key)
-                .replace("{{unique_key}}", &unique_key)
-        })
-        .collect()
+/// Substitute the placeholders in one template, in a **single pass**.
+///
+/// Single-pass is the correctness property, not a style choice. The previous
+/// implementation chained `str::replace` once per placeholder, so text a substitution
+/// had just inserted was scanned again by every later one: a model whose rendered SQL
+/// contained the literal `{{ model }}` (in a string or a comment) had it rewritten
+/// inside the statement. Here the output of a substitution is never re-read.
+///
+/// Only the two spellings this crate has always accepted — `{{ name }}` and
+/// `{{name}}` — and only known names are substituted; anything else in braces is
+/// the command's own templating and passes through untouched.
+fn expand(template: &str, values: &BTreeMap<&'static str, String>) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(at) = rest.find("{{") {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let hit = values.iter().find_map(|(name, value)| {
+            [format!("{{{{ {name} }}}}"), format!("{{{{{name}}}}}")]
+                .into_iter()
+                .find(|spelling| tail.starts_with(spelling.as_str()))
+                .map(|spelling| (spelling.len(), value))
+        });
+        match hit {
+            Some((len, value)) => {
+                out.push_str(value);
+                rest = &tail[len..];
+            }
+            None => {
+                out.push_str("{{");
+                rest = &tail[2..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The planner's own facts, preserved on the task. The task name is sanitized and
@@ -318,6 +403,14 @@ fn task_input(model: &PlanModel) -> serde_json::Value {
         if let Some(w) = &r.widened {
             obj.insert("replace_widened".into(), w.explain().into());
         }
+    }
+    // Contract v4. The statements themselves, not a digest: a run's history should
+    // say exactly what it asked the warehouse to do, and whether that could be left
+    // half-done.
+    if let Some(sql) = &model.sql {
+        obj.insert("sql_dialect".into(), sql.dialect.clone().into());
+        obj.insert("sql_statements".into(), sql.statements.clone().into());
+        obj.insert("sql_atomic".into(), sql.atomic.into());
     }
     serde_json::Value::Object(obj)
 }

@@ -41,6 +41,19 @@ import {
   type Template,
   type WorkflowModel,
 } from "@/lib/spec-model";
+import {
+  describeLoop,
+  loopError,
+  loopInstances,
+  readLoop,
+  writeLoop,
+  LOOP_SOURCE_SUPPORTED,
+  MAX_FOREACH_COUNT,
+  MAX_REPEAT_ITERATIONS,
+  type LoopKind,
+  type LoopSource,
+  type LoopSpec,
+} from "@/lib/loop-model";
 
 const nodeTypes = { status: StatusNode, sentinel: SentinelNode };
 
@@ -424,7 +437,10 @@ function EditableDagInner({ model, onChange, imageField }: EditableDagProps) {
 
 /// The canvas node payload for one task. A call task (`template:` /
 /// `workflow_ref`) renders as a sub-DAG node — one node standing for several —
-/// so the count of what it expands to comes along for the subtitle.
+/// so the count of what it expands to comes along for the subtitle. A looping
+/// task is the other one-node-many-rows case, and carries its loop line for the
+/// same reason: the badge is what keeps the drawn graph honest about how many
+/// tasks it really is (see `spec-support.ts`).
 function nodeData(t: Task, model: WorkflowModel) {
   return {
     name: t.name,
@@ -434,6 +450,7 @@ function nodeData(t: Task, model: WorkflowModel) {
     templateRef: t.template,
     templateTasks: model.templates.find((tpl) => tpl.name === t.template)?.tasks.length,
     dockerImage: t.docker_image,
+    loop: describeLoop(readLoop(t)),
   };
 }
 
@@ -664,6 +681,11 @@ function TaskPanel({
         </>
       )}
 
+      {/* Keyed on the task: LoopFields holds a draft (the item list is edited as
+          text), and without a remount that draft would follow the selection onto
+          another task and be applied there. */}
+      <LoopFields key={task.name} task={task} allTasks={allTasks} patch={patch} isLeaf={isLeaf} />
+
       <Label>Depends on</Label>
       <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
         {allTasks.filter((t) => t.name !== task.name).length === 0 && (
@@ -700,6 +722,265 @@ function TaskPanel({
           })}
       </div>
     </aside>
+  );
+}
+
+/// Loop controls for the selected task — the panel half of the loop badge on
+/// the node. One picker chooses *how* the task loops, because the engine's two
+/// mechanisms are not interchangeable and the fields differ:
+///
+///   * **For each item** → `with_items:` / `with_param:`. Parallel; the expander
+///     makes N task rows when the run is created, so N is known up front and the
+///     node can say `×N`.
+///   * **Repeat N times** / **Repeat until** → `repeat:`. Sequential; one row
+///     re-run in place after each success.
+///
+/// The draft lives in local state rather than being derived from the task on
+/// every render: the item list is edited as JSON text, and a half-typed `["a`
+/// has to survive the keystroke that makes it briefly unparseable. It is seeded
+/// from the task and re-seeded by the `key` at the call site when the selection
+/// changes — the same remount idiom `ImageFieldSlot` uses, with the same
+/// trade-off (an edit made in the YAML tab lands when the task is next
+/// selected).
+function LoopFields({
+  task,
+  allTasks,
+  patch,
+  isLeaf,
+}: {
+  task: Task;
+  /// Every task in the workflow — used only to say whether the producer a
+  /// runtime fan-out reads is itself a fan-out, which changes what the reader
+  /// should expect: one list per copy, unioned.
+  allTasks: Task[];
+  patch: (p: Partial<Task>) => void;
+  /// False for a template / workflow call. A call is expanded away at run
+  /// creation and its `repeat:` goes with it, so only fan-out is offered.
+  isLeaf: boolean;
+}) {
+  // The steps this one already waits for. A runtime fan-out may only read a
+  // task it depends on, so this is both the option list and the check: offering
+  // anything else would be offering a spec the engine rejects at submit.
+  const deps = task.depends_on ?? [];
+  const [loop, setLoop] = useState<LoopSpec>(() => readLoop(task));
+  const set = (p: Partial<LoopSpec>) => {
+    const next = { ...loop, ...p };
+    setLoop(next);
+    // Only a loop that would survive a save reaches the model. Mid-edit, a
+    // half-typed item list parses to nothing and `writeLoop` would put
+    // `with_items: []` where the user's previous list was — so typing the first
+    // `[` of a replacement would destroy the list being replaced. The draft
+    // stays local until it is valid; the error line below says why.
+    if (!loopError(next, isLeaf, deps)) patch(writeLoop(task, next));
+  };
+  const err = loopError(loop, isLeaf, deps);
+  // Whether the step this one reads is itself fanned out. Read from the
+  // authored graph, which is what the editor edits — the instances it becomes
+  // do not exist until the run is created.
+  // `find` may miss — no producer picked yet, or one that was renamed away.
+  // Falling back to `task` would read THIS task's loop, which is a foreach by
+  // construction here, and the hint would show for an empty producer.
+  const producer = loop.source === "output" ? allTasks.find((t) => t.name === loop.producer) : undefined;
+  const producerFansOut = producer != null && readLoop(producer).kind === "foreach";
+  const n = loopInstances(loop);
+  const described = describeLoop(loop);
+
+  return (
+    <>
+      <Label>Loop</Label>
+      <select
+        style={inputStyle}
+        value={loop.kind}
+        onChange={(e) => set({ kind: e.target.value as LoopKind })}
+        title="How this step repeats. Fan-out makes many tasks in parallel; repeat re-runs one task in sequence."
+      >
+        <option value="none">Runs once (default)</option>
+        <option value="foreach">For each item — parallel copies</option>
+        <option value="repeat" disabled={!isLeaf}>
+          Repeat N times — in place{isLeaf ? "" : " (leaf steps only)"}
+        </option>
+        <option value="until" disabled={!isLeaf}>
+          Repeat until — poll{isLeaf ? "" : " (leaf steps only)"}
+        </option>
+      </select>
+
+      {loop.kind === "foreach" && (
+        <>
+          <Label>Items from</Label>
+          <select
+            style={inputStyle}
+            value={loop.source}
+            onChange={(e) => set({ source: e.target.value as LoopSource })}
+          >
+            <option value="count">A count — N copies</option>
+            <option value="list">A list I type here</option>
+            <option value="param">A workflow parameter</option>
+            {/* Enabled only once this step waits for something: the list is
+                read from a task's output, so there has to be a task whose
+                output is guaranteed to exist by then. */}
+            <option value="output" disabled={!LOOP_SOURCE_SUPPORTED.output || deps.length === 0}>
+              An earlier step&apos;s output{deps.length === 0 ? " (add a Depends on first)" : ""}
+            </option>
+          </select>
+
+          {loop.source === "count" && (
+            <>
+              <Label>Copies</Label>
+              <input
+                style={inputStyle}
+                type="number"
+                min={1}
+                max={MAX_FOREACH_COUNT}
+                value={loop.count}
+                onChange={(e) => set({ count: Number(e.target.value) })}
+                title={`How many parallel copies of this step to create (max ${MAX_FOREACH_COUNT}). Each gets its number as {{ item }}.`}
+              />
+            </>
+          )}
+          {loop.source === "list" && (
+            <>
+              <Label>Items (JSON list)</Label>
+              <input
+                style={inputStyle}
+                value={loop.items}
+                onChange={(e) => set({ items: e.target.value })}
+                placeholder='["a", "b", "c"]'
+                title="One copy per entry. Use {{ item }} in the command, or {{ item.key }} for objects."
+              />
+            </>
+          )}
+          {loop.source === "output" && (
+            <>
+              <Label>Output of</Label>
+              <select
+                style={inputStyle}
+                value={loop.producer}
+                onChange={(e) => set({ producer: e.target.value })}
+                title="The step whose stdout is a JSON array. Read while the run is going, so the number of copies is not known until then."
+              >
+                <option value="">(pick a step)</option>
+                {deps.map((d) => (
+                  <option key={d} value={d}>
+                    {d}
+                  </option>
+                ))}
+              </select>
+              <p style={{ color: "var(--dim)", fontSize: 11, margin: "2px 0 8px" }}>
+                That step must print a JSON array, e.g. <code>[&quot;a&quot;,&quot;b&quot;]</code>. One
+                copy per element, with the element as <code>{"{{ item }}"}</code>. Printing{" "}
+                <code>[]</code> is fine — the step is simply skipped.
+              </p>
+              {/* The producer may itself be a fan-out, in which case every copy
+                  of it prints a list and this step runs once per item across
+                  all of them. Without saying so, the line above reads as "one
+                  list" and the copy count comes out surprising. */}
+              {producerFansOut && (
+                <p style={{ color: "var(--blue)", fontSize: 11, margin: "-4px 0 8px" }}>
+                  ⟳ “{loop.producer}” is itself a loop — you get one copy per item across{" "}
+                  <em>all</em> of its copies, in order.
+                </p>
+              )}
+            </>
+          )}
+          {loop.source === "param" && (
+            <>
+              <Label>Parameter</Label>
+              <input
+                style={inputStyle}
+                value={loop.param}
+                onChange={(e) => set({ param: e.target.value })}
+                placeholder="{{ shards }}"
+                title="A workflow parameter holding a JSON array. Resolved when the run is created."
+              />
+            </>
+          )}
+
+          <Label>Name each copy by</Label>
+          <input
+            style={inputStyle}
+            value={loop.label}
+            onChange={(e) => set({ label: e.target.value })}
+            placeholder="(numbered: .0, .1, .2 …)"
+            title="Optional instance_key — a template rendered per copy, e.g. {{ item.region }} names a task sync.us-east-1 instead of sync.0."
+          />
+        </>
+      )}
+
+      {(loop.kind === "repeat" || loop.kind === "until") && (
+        <>
+          {loop.kind === "until" && (
+            <>
+              <Label>Until</Label>
+              <input
+                style={inputStyle}
+                value={loop.until}
+                onChange={(e) => set({ until: e.target.value })}
+                placeholder="{{ output }} == done"
+                title="Checked after each success against the task's stdout ({{ output }}) and iteration number ({{ attempt }})."
+              />
+            </>
+          )}
+          <div style={{ display: "flex", gap: 8, alignItems: "stretch" }}>
+            <div style={fieldCol}>
+              <Label>{loop.kind === "repeat" ? "Times" : "Give up after"}</Label>
+              <input
+                style={fieldInput}
+                type="number"
+                min={1}
+                max={MAX_REPEAT_ITERATIONS}
+                value={loop.count}
+                onChange={(e) => set({ count: Number(e.target.value) })}
+                title={
+                  loop.kind === "repeat"
+                    ? "How many times this step runs, one after another."
+                    : "Iteration budget. A condition that never comes true fails the task — it is not a quiet success."
+                }
+              />
+            </div>
+            <div style={fieldCol}>
+              <Label>Gap</Label>
+              <input
+                style={fieldInput}
+                type="number"
+                min={0}
+                placeholder="0 s"
+                value={loop.delaySecs || ""}
+                onChange={(e) => set({ delaySecs: Number(e.target.value) || 0 })}
+                title="Seconds to wait between passes. The task holds no worker while it waits."
+              />
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* What the spec will actually do, in one line. The node's badge says the
+          same thing at a glance; this is where the consequence gets spelled out,
+          because "3 tasks in parallel" and "1 task run 3 times" are the whole
+          difference between the two mechanisms. */}
+      {err ? (
+        <p style={{ color: "var(--red)", fontSize: 11, margin: "6px 0 10px" }}>{err}</p>
+      ) : (
+        described && (
+          <p style={{ color: "var(--muted)", fontSize: 11, margin: "6px 0 10px" }}>
+            {described.title}
+            {/* Only for bare indexes: with an `instance_key` the copies are
+                named from the rendered label, which isn't known until the run
+                is created, so showing `.0 … .n-1` would name tasks that never
+                exist. */}
+            {loop.kind === "foreach" && n != null && !loop.label.trim() && (
+              <>
+                {" "}
+                Names: <span className="mono">{task.name}.0</span> …{" "}
+                <span className="mono">
+                  {task.name}.{n - 1}
+                </span>
+                .
+              </>
+            )}
+          </p>
+        )
+      )}
+    </>
   );
 }
 

@@ -1,0 +1,74 @@
+# Pattern 14 — Runtime width (with_output_of: fan out over what a task PRINTED)
+#
+# Patterns 03 and 05 decide their width before the run exists: `with_items` from
+# a literal list, `with_param` from a parameter you override at submit. Both are
+# resolved by the expander, which is what lets `budget:` refuse a blow-up at
+# submit — and also what makes them unable to answer the question you usually
+# have, which is "how many are there *today*".
+#
+# `with_output_of:` names an upstream task. That task prints a JSON array; each
+# element becomes one task row, inserted while the run is going.
+#
+#   discover  ──▶  process (one row, parked)
+#                     │  sweep reads discover's output: ["2026-01","2026-02",…]
+#                     ▼
+#                  process.2026-01   process.2026-02   process.2026-03
+#                     └──────────────────┬──────────────────┘
+#                                        ▼
+#                              process  (the same row, now the join point)
+#                                        ▼
+#                                     report
+#
+# The authored `process` row never executes — it is the barrier. Everything
+# that depended on it still does, so `report` waits for every partition without
+# knowing there were three of them.
+name: runtime-fanout
+
+tasks:
+  # Any command whose stdout is a JSON array. In practice: a query, an `aws s3
+  # ls | jq -R . | jq -s .`, a service call — anything that knows the answer
+  # only at run time.
+  - name: discover
+    command: ["sh", "-c", "echo '[\"2026-01\", \"2026-02\", \"2026-03\"]'"]
+
+  - name: process
+    # argv, NOT `sh -c`. This matters more here than in any other fan-out:
+    # `{{ item }}` is a value some upstream task *printed*, so it is the one
+    # thing in a workflow the author did not write. Interpolated into a shell
+    # string, a partition named `a; rm -rf /` is a command. As separate argv
+    # entries it is an argument, whatever it contains.
+    command: ["echo", "processing partition", "{{ item }}"]
+    # `depends_on` is REQUIRED and must include the producer: the number of
+    # copies is read from its output, so a producer this step did not wait for
+    # would make the count depend on scheduling order. Submit refuses it.
+    depends_on: [discover]
+    with_output_of: discover
+    # Optional, same as any fan-out: names the rows process.2026-01 … instead
+    # of process.0 … Labels are sanitized to [A-Za-z0-9_.-] and must be unique.
+    instance_key: "{{ item }}"
+
+  # Wired to the barrier, not to the instances — which is why this file does
+  # not have to know how many there will be.
+  - name: report
+    command: ["sh", "-c", "echo all partitions done"]
+    depends_on: [process]
+
+# Notes
+#
+# * An empty array (`[]`) is a SUCCESS with zero instances, not an error: at run
+#   time "there were no partitions" is a result. `with_items: []` is the
+#   opposite — at submit an empty list is an authoring mistake and is refused.
+# * Output that is not a JSON array fails `process` with a message naming what
+#   it got, rather than fanning out over nothing and looking like success.
+# * This is the one construct that makes a run bigger after admission, so the
+#   run's task ceiling (DAGRON_MAX_TASKS_PER_RUN) is re-checked before the rows
+#   are inserted. Budget for the expected width.
+# * The producer may itself be fanned out, or live inside a template. Which
+#   rows are read comes from this task's own `depends_on`, which expansion has
+#   already rewired onto the producer's instances — so `with_output_of` over a
+#   fanned-out producer fans out over the UNION of what every instance printed,
+#   in instance order. See pattern 15.
+# * Prefer argv over `sh -c` wherever `{{ item }}` appears. The producer's
+#   output is data, and this is the one fan-out whose items the workflow author
+#   never sees. (The two `sh -c` commands above interpolate nothing, which is
+#   why they are fine as they stand.)

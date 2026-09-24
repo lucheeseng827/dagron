@@ -2,6 +2,8 @@
 name = "dagron-forge"
 version = "0.1.0"
 edition = "2021"
+# MSRV — see the root Cargo.toml for how 1.88 was measured.
+rust-version = "1.88"
 description = "dagron forge feedback — post commit statuses / PR checks to GitHub or GitLab when a run finishes, so a workflow's result shows up as a green/red check on the commit that triggered it."
 
 [lib]

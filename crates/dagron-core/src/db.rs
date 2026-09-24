@@ -104,6 +104,22 @@ pub fn free_bytes(_path: &std::path::Path) -> std::io::Result<u64> {
     ))
 }
 
+/// The dead letter a redrive came to consume was already gone: someone else
+/// redrove or discarded it first. Raised by the claim inside both backends'
+/// `create_run_inner`, so the run's transaction aborts before anything is
+/// written, and turned into `Ok(None)` by `create_run_from_dead_letter`. It
+/// never leaves this module.
+#[derive(Debug)]
+struct DeadLetterGone;
+
+impl std::fmt::Display for DeadLetterGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("dead letter already redriven or discarded")
+    }
+}
+
+impl std::error::Error for DeadLetterGone {}
+
 #[cfg(test)]
 mod free_bytes_tests {
     use super::free_bytes;

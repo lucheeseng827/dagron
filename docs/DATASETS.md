@@ -1,9 +1,10 @@
 # Datasets — data-aware scheduling (produce → track → trigger)
 
-> Airflow Datasets / Dagster asset-sensor parity, for the single-team loop:
-> produce, track, sense, and trigger on one dataset. Where that loop stops is
-> [below](#limits-of-this-build) — stated as an error at the boundary, never as
-> a silent no-op.
+> Airflow Datasets / Dagster asset-sensor parity for the whole authoring loop:
+> produce, track, sense, and trigger — on one dataset or on a fan-in across
+> several. Where that loop stops is
+> [below](#limits-of-this-build--datasets) — stated as an error at the
+> boundary, never as a silent no-op.
 
 Time-based schedules answer "run at 02:00 and hope the data landed."
 Dataset-aware scheduling answers "run **because** the data landed":
@@ -105,40 +106,71 @@ subscribed dataset records a new update. The triggering URI is injected as
   cursor back and retries once a slot frees; nothing is lost.
 - Sweep cadence is ~5 s; `DATASET_TRIGGERS=0` opts a scheduler out.
 
+## Partitioning a dataset URI by the fire's date
+
+A dataset URI templates per instance, and three variables carry the fire's
+**logical** date — the date the run is *for*, not the date it ran:
+
+| Variable | Example |
+|---|---|
+| `{{ scheduled_time }}` | `2026-09-14T22:30:00+00:00` |
+| `{{ ds }}` | `2026-09-14` |
+| `{{ ds_nodash }}` | `20260914` |
+
+```yaml
+produces: ["clickhouse://analytics/marts/daily_rollup/{{ ds }}"]
+```
+
+All three are bound identically on every fire path — cron, schedule, backfill
+and backfill jobs — from one derivation, because a backfill and a cron fire that
+partition by the same expression must produce the same string or they write to
+different partitions of one table. `ds` is the UTC day of `scheduled_time`,
+matching the timestamp beside it rather than any local calendar.
+
+That is what makes a replay correct: backfilling last March writes March's
+partitions, not today's.
+
+A worked example is [`examples/warehouse/`](../examples/warehouse/), which pairs
+this with a deferred Spark job whose `produces:` is recorded when the *remote*
+job finishes.
+
 ## What the loop does and does not cover
 
 | Capability | This build |
 |---|---|
 | `produces:` recording, registry + lineage ledger and their read APIs | full |
 | `wait: { dataset: … }` sensor | full |
-| Dataset-triggered workflows | **one** dataset per workflow |
-| Multi-dataset composition (`on_datasets: [a, b, …]` + `datasets_mode: any\|all`) | validation error, with the reason |
+| Dataset-triggered workflows | full — any number of datasets |
+| Multi-dataset composition (`on_datasets: [a, b, …]` + `datasets_mode: any\|all`) | full (open since 0.10.0) |
 | External dataset events (`POST /datasets/events`) — CDC, S3 notifications, other orchestrators | `403`, with the reason |
 | Freshness SLAs, a lineage graph UI, dataset partitions | not implemented |
 
-The **single-team loop is complete on its own**: one workflow produces, another
-senses or fires on it, the lineage is fully queryable, and HA is included. What
-is missing is composition and integration at org scale — fan-in across many
-teams' datasets, and events from systems outside dagron. Both refuse loudly
-rather than half-working, which is the property that matters when a workflow's
-trigger is the thing you are debugging.
+The **authoring loop is complete on its own**: workflows produce, sense, fire on
+one dataset or fan in across several, the lineage is fully queryable, and HA is
+included. What is missing is integration and reporting at org scale — data
+arriving from systems outside dagron, and the freshness/graph surfaces built on
+top. External events refuse loudly rather than half-working, which is the
+property that matters when a workflow's trigger is the thing you are debugging;
+the rest simply do not exist yet and say so.
 
-## Limits of this build
+## Limits of this build — datasets
 
 Every gate is a **signpost, not a dead end** — it names what was attempted,
 where it ships, and what to do instead in this build (the pattern
-`dagron-source`'s connector errors established):
+`dagron-source`'s connector errors established). The full list across the
+product, and what to do if you want the capability rather than the fallback, is
+[what this build does not do](https://github.com/lucheeseng827/dagron#what-this-build-does-not-do) in the README; this section covers the ones that are dataset-specific.
 
-- **Multi-dataset composition.** `on_datasets: [a, b]` with
-  `datasets_mode: any|all` is rejected at validation, so a *trigger* cannot wait
-  for *both* upstream tables to refresh. Express the join inside the workflow
-  instead: trigger on one dataset and put a `wait: { dataset: … }` sensor (§2 —
-  full in this build) on the other, which parks mid-DAG holding no worker slot
-  until that dataset updates. One semantic difference to know: the sensor
-  resolves on the next update *after* it parks, so a partner dataset that
-  already refreshed before the run started does not satisfy it, where
-  `datasets_mode: all` would have. Where that distinction matters, do the fan-in
-  outside dagron and submit the joined run yourself.
+> **Multi-dataset composition is open.** `on_datasets: [a, b]` with
+> `datasets_mode: any|all` was refused here until 0.10.0, with the advice to
+> "trigger on one dataset and put a `wait: { dataset: … }` sensor on the other".
+> That advice is **wrong** in the case it was written for. A sensor stamps its
+> cursor when it parks, so it resolves only on an update that lands *after* that
+> moment — an upstream that refreshed before the run started never satisfies it,
+> so the run waits for tomorrow's load and hangs to its `run_timeout_secs`.
+> `datasets_mode: all` does not have that race. A gate whose documented
+> alternative loses data is a gate on correctness, so it is gone.
+
 - **External dataset events.** `POST /datasets/events` answers `403`, so data
   landing from outside dagron (CDC, S3 notifications, another orchestrator)
   cannot announce itself directly. Work around it with a small `produces:` task

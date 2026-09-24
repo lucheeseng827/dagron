@@ -27,6 +27,7 @@ fn direct(name: &str) -> PlanModel {
         unit: Unit::FullModel,
         depends_on: None,
         replace: None,
+        sql: None,
     }
 }
 
@@ -57,6 +58,7 @@ fn a_compiled_plan_is_a_valid_dagron_workflow() {
                 unit: Unit::Partitions(vec!["2026-09-01".into()]),
                 depends_on: None,
                 replace: None,
+                sql: None,
             },
         ]),
         graph: None,
@@ -132,6 +134,7 @@ fn a_multi_parent_plan_from_an_explicit_graph_validates() {
                 unit: Unit::FullModel,
                 depends_on: None,
                 replace: None,
+                sql: None,
             },
         ]),
         graph: Some(graph_edges),
@@ -142,4 +145,48 @@ fn a_multi_parent_plan_from_an_explicit_graph_validates() {
     let graph = DagGraph::from_yaml(&yaml)
         .unwrap_or_else(|e| panic!("dagron rejected a fan-in plan: {e}\n---\n{yaml}"));
     assert_eq!(graph.task_spec("mart").unwrap().depends_on, vec!["a", "b"]);
+}
+
+#[test]
+fn multi_line_sql_in_env_survives_dagron_s_own_parser() {
+    // Statements carry newlines, quotes and semicolons; the YAML must carry them
+    // through dagron's real parse -> expand -> validate path intact.
+    use dagron_state::wire::Sql;
+    let script = "BEGIN;\nDROP TABLE IF EXISTS events;\nCREATE TABLE events AS\nselect dt, 'a: b' as \"q\" from raw -- c\n;\nCOMMIT;";
+    let mut m = direct("events");
+    m.sql = Some(Sql {
+        dialect: "postgres".into(),
+        statements: vec![
+            "BEGIN".into(),
+            "DROP TABLE IF EXISTS events".into(),
+            "CREATE TABLE events AS\nselect dt, 'a: b' as \"q\" from raw -- c\n".into(),
+            "COMMIT".into(),
+        ],
+        atomic: true,
+    });
+    let mut opts = options();
+    opts.command_template = vec!["dagron-step-sql".into()];
+    opts.env = BTreeMap::from([("SQL_STATEMENT".to_string(), "{{ sql }}".to_string()), ("SQL_MODE".to_string(), "script".to_string())]);
+    let yaml = compile_yaml(&PlanEnvelope { plan: plan_of(vec![m]), graph: None, options: opts });
+    let graph = DagGraph::from_yaml(&yaml).unwrap_or_else(|e| panic!("dagron rejected it: {e}\n{yaml}"));
+    let task = graph.task_spec("events").expect("task present");
+    let value = task.env.iter().find(|e| e.name == "SQL_STATEMENT").map(|e| e.value.as_str());
+    assert_eq!(value, Some(script));
+}
+
+#[test]
+fn a_secret_env_reaches_dagron_as_value_from_and_never_as_a_value() {
+    // The warehouse password travels as a secret NAME; dagron resolves it at dispatch.
+    let mut opts = options();
+    opts.command_template = vec!["dagron-step-sql".into()];
+    opts.env = BTreeMap::from([("SQL_ENGINE".to_string(), "postgres".to_string())]);
+    opts.secret_env = BTreeMap::from([("SQL_PASSWORD".to_string(), "WAREHOUSE_PASSWORD".to_string())]);
+    let yaml = compile_yaml(&PlanEnvelope { plan: plan_of(vec![direct("events")]), graph: None, options: opts });
+    let graph = DagGraph::from_yaml(&yaml).unwrap_or_else(|e| panic!("dagron rejected it: {e}\n{yaml}"));
+    let task = graph.task_spec("events").expect("task present");
+    let password = task.env.iter().find(|e| e.name == "SQL_PASSWORD").expect("SQL_PASSWORD is set");
+    assert_eq!(password.value_from.as_ref().map(|s| s.secret.as_str()), Some("WAREHOUSE_PASSWORD"));
+    assert!(password.value.is_empty(), "the value is resolved at dispatch, never stored");
+    let engine = task.env.iter().find(|e| e.name == "SQL_ENGINE").unwrap();
+    assert_eq!((engine.value.as_str(), engine.value_from.is_none()), ("postgres", true));
 }

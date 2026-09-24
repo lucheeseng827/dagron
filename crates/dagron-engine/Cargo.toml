@@ -2,6 +2,8 @@
 name = "dagron-engine"
 version = "0.1.0"
 edition = "2021"
+# MSRV — see the root Cargo.toml for how 1.88 was measured.
+rust-version = "1.88"
 description = "dagron engine: the reconcile-loop daemon as a reusable library — config, executor/worker/ingest wiring, the ops surface (API/cron/GC/leadership/schedule), and the run-lifecycle seams (RunSink/Meter) + the SourceFactory hook. The `dagron` bin is a thin shell over `run()`."
 
 [lib]
@@ -102,3 +104,8 @@ arrow-json = { version = "53", optional = true }
 
 [dev-dependencies]
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }
+# `test-util` for `#[tokio::test(start_paused = true)]`: the ExternalPoller
+# timeout is 30 s, and a test that proves a hung poller re-parks rather than
+# failing must not spend 30 s of wall clock to do it. Dev-only — the shipped
+# binary links none of it.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }

@@ -4,7 +4,14 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import LiveToggle from "@/components/LiveToggle";
-import { deleteWorkflow, listWorkflows, runWorkflow, updateSchedule } from "@/lib/dagron-api";
+import {
+  deleteWorkflow,
+  getMe,
+  listWorkflows,
+  runWorkflow,
+  updateSchedule,
+  type Me,
+} from "@/lib/dagron-api";
 import { statusColor } from "@/lib/adapter";
 import { errMsg } from "@/lib/err";
 import { useLiveRefresh, useLiveUpdates } from "@/lib/live";
@@ -17,6 +24,7 @@ const GRID = "2.4fr 1.5fr 1.2fr 1.3fr 0.7fr 92px";
 
 export default function WorkflowsPage() {
   const router = useRouter();
+  const [me, setMe] = useState<Me | null>(null);
   const [rows, setRows] = useState<WorkflowRow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -26,6 +34,14 @@ export default function WorkflowsPage() {
   const [view, setView] = useState<ViewMode>("table");
 
   const [live] = useLiveUpdates();
+
+  // Deleting a workflow is admin-only in the API (403 otherwise), so the button is hidden
+  // rather than left to fail. Retiring one is not gated and stays on the detail page — it is
+  // the reversible way to stop a workflow, and it keeps the schedules delete would cascade away.
+  const isAdmin = me?.groups?.includes("admin") ?? false;
+  useEffect(() => {
+    getMe().then(setMe).catch(() => {});
+  }, []);
 
   const load = useCallback(() => {
     listWorkflows()
@@ -225,9 +241,11 @@ export default function WorkflowsPage() {
                 <Link href={`/workflows/detail/?id=${r.id}`} className="dy-iconbtn" title="Edit" aria-label={`Edit ${r.name}`}>
                   ✎
                 </Link>
-                <IconBtn title="Delete" ariaLabel={`Delete ${r.name}`} disabled={busy === r.id} onClick={() => onDelete(r.id)}>
-                  ✕
-                </IconBtn>
+                {isAdmin && (
+                  <IconBtn title="Delete" ariaLabel={`Delete ${r.name}`} disabled={busy === r.id} onClick={() => onDelete(r.id)}>
+                    ✕
+                  </IconBtn>
+                )}
               </div>
             </div>
           ))}

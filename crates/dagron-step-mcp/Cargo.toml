@@ -2,6 +2,8 @@
 name = "dagron-step-mcp"
 version = "0.1.0"
 edition = "2021"
+# MSRV — see the root Cargo.toml for how 1.88 was measured.
+rust-version = "1.88"
 description = "dagron MCP-tool step — a workflow task that calls a tool on an MCP server over stdio, so a DAG can drive an agent's tools with dagron's retries, artifacts and audit around each call."
 
 [[bin]]
@@ -14,9 +16,11 @@ path = "src/lib.rs"
 
 [dependencies]
 # `process` for spawning the MCP server, `io-util` for its stdio pipes, `time`
-# for the exchange deadline. No HTTP stack: this speaks stdio JSON-RPC, which is
-# the transport every MCP server supports.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "process", "time"] }
+# for the exchange deadline, `net` for the one TCP connection the gateway
+# transport makes. Still no HTTP stack — `src/gateway.rs` writes the request and
+# parses the response itself, because this binary ships in every task image and
+# an HTTP client is a large thing to carry for one POST to a loopback address.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net", "process", "time"] }
 # serde_json only: nothing here derives, so a direct `serde` dependency would
 # be a line in a manifest doing no work.
 serde_json = "1"

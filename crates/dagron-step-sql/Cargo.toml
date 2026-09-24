@@ -1,0 +1,59 @@
+[package]
+name = "dagron-step-sql"
+version = "0.1.0"
+edition = "2021"
+# MSRV — see the root Cargo.toml for how 1.88 was measured.
+rust-version = "1.88"
+description = "dagron SQL step — run one statement against an analytical store (ClickHouse, StarRocks, Postgres…) with a bounded result contract."
+
+[[bin]]
+name = "dagron-step-sql"
+path = "src/main.rs"
+
+[lib]
+name = "dagron_step_sql"
+path = "src/lib.rs"
+
+[features]
+# HTTP only by default: ClickHouse (:8123) needs no
+# driver at all, and they cover the stores this step was asked for. A wire
+# protocol is a large dependency for a task image that may never speak one.
+default = []
+# StarRocks (:9030), Doris, MySQL — the MySQL wire protocol via sqlx.
+# `any` too: one code path serves both wires, so the driver is chosen at runtime
+# from the DSN scheme rather than duplicated per backend.
+mysql = ["dep:sqlx", "sqlx/any", "sqlx/mysql"]
+# Postgres, Redshift, Materialize, CockroachDB, Greenplum — one wire, many stores.
+postgres = ["dep:sqlx", "sqlx/any", "sqlx/postgres"]
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+dagron-logging = { path = "../dagron-logging" }
+# The house feature set, matching the mirrored crates that already use it — a
+# different set churns the lock under `--locked`, so a change here refreshes
+# Cargo.lock in the same commit.
+#
+# `stream` is the one addition: the result contract bounds the read, which means
+# `bytes_stream()` rather than `text()`. It pulls `tokio-util`, which the lock
+# already carries — another workspace crate's reqwest features brought it in —
+# so the manifest change costs the lock nothing beyond the `futures-util` edge
+# below.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "stream"] }
+# For `StreamExt`/`TryStreamExt` over the two streams: reqwest's byte stream and
+# sqlx's row stream. Default features, matching dagron-executor, so the lock's
+# existing futures-util entry is reused rather than re-resolved.
+futures-util = "0.3"
+
+# sqlx DIRECTLY, and never through dagron-core. crates/dagron-gitops is excluded
+# from the workspace build precisely because a `dagron-core/postgres` dependency
+# unifies with the workspace's default sqlite and trips dagron-core's "exactly
+# one DB backend" compile_error!. Activating sqlx's own backend features from a
+# sibling crate is safe; forwarding dagron-core's would exile this crate from
+# `--workspace` and from CI.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

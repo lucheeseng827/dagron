@@ -44,7 +44,16 @@ schedules and backfill fire exactly once across N replicas.
   workers, drain live-log chunks, collect results (with exponential-backoff retry),
   and reap finalized runs.
 - **`Seams` (`hooks`)** — the extension points: a `SourceFactory` hook for extra
-  ingestion sources, and `RunSink` / `Meter` run-lifecycle hooks (no-op by default).
+  ingestion sources, `RunSink` / `Meter` run-lifecycle hooks, and an
+  `ExternalPoller` for `defer:` kinds the built-ins do not own (all no-op or
+  absent by default). **`Meter::on_task_completed` fires once per task that
+  reaches `succeeded` or `failed`, on whichever path got it there** — a worker
+  result, a memoization cache hit, or a reconcile sweep resolving a parked
+  sensor, sub-workflow, approval gate or deferred remote job. That matters for
+  an implementation enforcing a quota: a parked task holds no worker and never
+  traverses the worker-result path, so a hook wired only there would not see it.
+  Cancellation is *not* reported here — a cancelled task neither succeeded nor
+  failed, and the hook takes a `bool`.
 - **Ops surface (feature `ops`)** — the axum management API plus the leadership-gated
   `cron`, `gc`, DB-`schedule` and paced-backfill loops, coordinated by a
   `leadership` lease so time-sources fire on exactly one node.

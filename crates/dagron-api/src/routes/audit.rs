@@ -1,10 +1,13 @@
 //! Audit trail for control-plane mutations, plus viewer read-only enforcement.
 //!
-//! **Feature-gated** (`--features enterprise`): the audit log (a compliance
-//! surface) and the read-only `viewer` role are not in this build. Without
-//! that feature this module is a passthrough middleware — no `audit_log` table,
-//! no `/api/audit` route, no role enforcement — and every mutation behaves
-//! exactly as it did before either existed.
+//! **The audit log is feature-gated** (`--features enterprise`): it is a compliance surface, and
+//! without that feature there is no `audit_log` table and no `/api/audit` route.
+//!
+//! **Viewer read-only is not.** It was, which let a `viewer` write in an open build: the console
+//! only offers the role under enterprise, but `POST /api/users` accepts `groups: ["viewer"]` in
+//! both, and a downgrade from enterprise keeps the viewers it had. A role meaning "read-only"
+//! that silently grants writes is a bug, not a boundary, so the rule lives in `crate::auth` and
+//! this middleware applies it in every build.
 //!
 //! The enterprise implementation lives in `audit_ee.rs`, which is not part of
 //! the open tree. It is `include!`d rather than declared as a module so that a
@@ -24,17 +27,25 @@ use crate::state::AppState;
 #[cfg(feature = "enterprise")]
 include!("audit_ee.rs");
 
-/// Middleware: a pure passthrough in this build — nothing is recorded and no
-/// role is enforced.
+/// Middleware: enforces the read-only `viewer` role. This build records nothing — the audit trail
+/// is the enterprise half — but applies the same rule off the same definition.
 ///
-/// Auth itself stays with each handler's `AuthUser` extractor, so an
-/// unauthenticated mutation still 401s there; this layer adds nothing to it.
+/// An unauthenticated mutation still 401s at the handler's `AuthUser` extractor, not here: this
+/// layer only refuses a caller it can identify. It authenticates inside the `is_control_mutation`
+/// guard so reads pay nothing, and through `authenticate` rather than the JWT decoder, so a
+/// viewer's personal access token cannot do what their session cannot.
 #[cfg(not(feature = "enterprise"))]
 pub async fn audit_mutations(
     State(state): State<AppState>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    let _ = state;
+    if crate::auth::is_control_mutation(req.method(), req.uri().path()) {
+        if let Some(claims) = crate::auth::authenticate(req.headers(), &state).await {
+            if crate::auth::is_viewer(&claims) {
+                return crate::auth::read_only_refusal();
+            }
+        }
+    }
     next.run(req).await
 }

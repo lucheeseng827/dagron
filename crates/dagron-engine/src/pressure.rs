@@ -82,6 +82,86 @@ pub enum Transition {
 /// *transition* — not every tick — is what gets logged. Warning once per
 /// closure (and info once per reopening) is the difference between a log an
 /// operator reads and one they filter out.
+/// Run-**admission** gate (`DAGRON_ADMISSION_FILE`): while the file says closed,
+/// the engine refuses to admit NEW runs.
+///
+/// # How this differs from the pressure file, which is the whole point
+///
+/// They gate opposite ends and must not be confused:
+///
+/// | | `DAGRON_PRESSURE_FILE` | `DAGRON_ADMISSION_FILE` |
+/// |---|---|---|
+/// | Refuses | task **claims** | new **runs** |
+/// | Runs already submitted | stay queued, drain later | unaffected, finish normally |
+/// | Answer to a submitter | none — the run is accepted | `503` + `Retry-After` |
+///
+/// A host that is too hot wants work to *wait*; a host that is not permitted to
+/// take on new work wants the submitter *told*, so it can go elsewhere. Queueing
+/// silently would be the wrong answer to the second question — the backlog would
+/// grow for hours and then all land at once when the gate opened.
+///
+/// # What it never does
+///
+/// It does not touch in-flight work. Runs already admitted keep running to
+/// completion, their tasks keep being claimed and dispatched, sub-workflows they
+/// spawn are still created, and recovery sweeps keep running. This is load-bearing
+/// for the first caller (a metering agent that has lost its marketplace): refusing
+/// new work is a support ticket, while killing an eight-hour training job because
+/// a NAT gateway flapped would break the durability claim the product is sold on.
+///
+/// # Why a file
+///
+/// The same argument as the pressure gate, and it shares [`is_closed`] so the two
+/// cannot drift: a file is *state* rather than an event, so a gate survives the
+/// restart of both the process that set it and the process it gates, and every
+/// daemon that might set it already has `touch` and `rm`. On a Marketplace
+/// appliance the engine is the OSS binary and the metering agent is a separate
+/// unit, so there is no in-process seam for them to share even in principle —
+/// a file on the state volume is the only interface they both have.
+///
+/// Absent file ⇒ open. Present ⇒ closed, unless its body is an [`OPEN_SENTINELS`]
+/// value. Unreadable ⇒ closed, because whoever wrote it meant something.
+#[derive(Debug, Clone, Default)]
+pub struct AdmissionGate {
+    path: Option<PathBuf>,
+}
+
+impl AdmissionGate {
+    /// Watch `path`; `None` = no gate (admission always open).
+    pub fn new(path: Option<PathBuf>) -> Self {
+        Self { path }
+    }
+
+    /// From `DAGRON_ADMISSION_FILE` (trimmed; empty = unset).
+    pub fn from_env() -> Self {
+        let path = std::env::var("DAGRON_ADMISSION_FILE")
+            .ok()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from);
+        Self::new(path)
+    }
+
+    /// The watched file, if any — for the boot log line.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Is admission currently closed?
+    ///
+    /// Deliberately stateless and uncached, unlike [`PressureGate::poll`]. That
+    /// one is read once per reconcile tick from a single loop and logs
+    /// transitions, so it owns state; this is read from three places (the API
+    /// handler, the cron firer, the schedule firer) on a path that is about to
+    /// open a database transaction. One `read_to_string` of a tiny file — or one
+    /// `ENOENT` — is nothing beside `create_run`, and skipping the cache means a
+    /// freshly-written verdict takes effect on the very next submission rather
+    /// than up to a TTL later.
+    pub fn is_closed(&self) -> bool {
+        self.path.as_deref().is_some_and(is_closed)
+    }
+}
+
 pub struct PressureGate {
     path: Option<PathBuf>,
     closed: bool,
@@ -143,6 +223,74 @@ impl PressureGate {
 
 #[cfg(test)]
 mod tests {
+    /// Absent file ⇒ open. This is the state every deployment that has not opted
+    /// in is in, and a fresh state volume before the first write, so it must not
+    /// be a refusal.
+    #[test]
+    fn an_unset_or_absent_gate_admits() {
+        assert!(!AdmissionGate::new(None).is_closed(), "unset gate admits");
+        let dir = std::env::temp_dir().join(format!("m54_adm_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let g = AdmissionGate::new(Some(dir.join("nope")));
+        assert!(!g.is_closed(), "absent file admits");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Present ⇒ closed, and the open sentinels flip it back without an unlink —
+    /// so a writer can toggle the gate by rewriting one byte rather than racing
+    /// its own next write against a delete.
+    #[test]
+    fn presence_closes_and_the_open_sentinels_reopen() {
+        let dir = std::env::temp_dir().join(format!("m54_adm_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("admission");
+        let g = AdmissionGate::new(Some(f.clone()));
+
+        std::fs::write(&f, "metering_degraded").unwrap();
+        assert!(g.is_closed());
+
+        for open in OPEN_SENTINELS {
+            std::fs::write(&f, open).unwrap();
+            assert!(!g.is_closed(), "{open:?} must reopen admission");
+            std::fs::write(&f, format!("  {}\n", open.to_uppercase())).unwrap();
+            assert!(!g.is_closed(), "{open:?} is matched trimmed and case-insensitively");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unreadable verdict counts as CLOSED — the same policy as the pressure
+    /// file, and for the same reason: whoever put it there meant something, and
+    /// a gate that fails open on a verdict it cannot parse is not a gate. Note
+    /// this is safe precisely because ABSENCE is open, so an install that never
+    /// opted in can never trip it.
+    #[test]
+    fn an_unreadable_gate_is_closed() {
+        let dir = std::env::temp_dir().join(format!("m54_adm_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A directory where a file is expected: exists, cannot be read as text.
+        let as_dir = dir.join("admission");
+        std::fs::create_dir_all(&as_dir).unwrap();
+        assert!(AdmissionGate::new(Some(as_dir)).is_closed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The two gates are independent: closing admission must not pause claims,
+    /// and vice versa. They answer different questions (§AdmissionGate), and a
+    /// deployment can arm either without the other.
+    #[test]
+    fn the_admission_gate_and_the_pressure_gate_do_not_share_state() {
+        let dir = std::env::temp_dir().join(format!("m54_adm_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let adm = dir.join("admission");
+        let pres = dir.join("pressure");
+        std::fs::write(&adm, "closed").unwrap();
+
+        assert!(AdmissionGate::new(Some(adm)).is_closed());
+        let mut claims = PressureGate::new(Some(pres));
+        assert!(!claims.poll(), "claims stay open");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     fn temp_path(tag: &str) -> PathBuf {

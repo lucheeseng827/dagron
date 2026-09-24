@@ -2,6 +2,8 @@
 name = "dagron-crypto"
 version = "0.1.0"
 edition = "2021"
+# MSRV — see the root Cargo.toml for how 1.88 was measured.
+rust-version = "1.88"
 description = "Shared secret-value encryption for dagron (AES-256-GCM, env-derived key). Dependency-free of sqlx/features so both dagron-api and dagron-engine can use it."
 
 [features]

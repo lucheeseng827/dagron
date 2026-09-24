@@ -101,11 +101,12 @@ pub fn prepare(dir: &Path, keys: &[VerifyingKey]) -> Result<(String, Vec<(String
 /// stored on the repo row; on any error nothing was written.
 pub async fn reconcile_bundle(
     pool: &sqlx::PgPool,
+    repo_id: &str,
     dir: &Path,
     keys: &[VerifyingKey],
 ) -> Result<Applied, String> {
     let (provenance, specs) = prepare(dir, keys)?;
-    let synced = crate::sync::apply_specs(pool, &specs, &provenance)
+    let synced = crate::sync::apply_specs(pool, repo_id, &specs, &provenance)
         .await
         .map_err(|e| format!("{provenance} verified but applying it failed, nothing applied: {e}"))?;
     info!(bundle = %provenance, workflows = synced.len(), "signed bundle applied");

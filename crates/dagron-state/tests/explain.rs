@@ -13,6 +13,7 @@ fn direct(name: &str) -> PlanModel {
         unit: Unit::FullModel,
         depends_on: None,
         replace: None,
+        sql: None,
     }
 }
 
@@ -26,6 +27,7 @@ fn downstream(name: &str, because_of: &str, cols: &[&str]) -> PlanModel {
         unit: Unit::FullModel,
         depends_on: None,
         replace: None,
+        sql: None,
     }
 }
 
@@ -135,6 +137,7 @@ fn partition_units_are_counted_not_listed() {
         unit: Unit::Partitions(vec!["d1".into(), "d2".into(), "d3".into()]),
         depends_on: None,
         replace: None,
+        sql: None,
     }]);
     env.options.ordering = Ordering::Derived;
     let ex = explained(&env);
@@ -146,6 +149,7 @@ fn partition_units_are_counted_not_listed() {
         unit: Unit::Partitions(vec!["d1".into()]),
         depends_on: None,
         replace: None,
+        sql: None,
     }]));
     assert_eq!(one.rows[0].unit, "1 partition", "singular, not '1 partitions'");
 }
@@ -286,4 +290,19 @@ fn one_partition_is_singular() {
         ex.rows[0].writes.as_deref(),
         Some("`delete_insert` over 1 partition on `dt`")
     );
+}
+
+#[test]
+fn a_non_atomic_write_is_called_out_before_the_table() {
+    use dagron_state::wire::Sql;
+    let mut m = direct("events");
+    m.sql = Some(Sql { dialect: "databricks".into(), statements: vec!["DELETE …".into(), "INSERT …".into()], atomic: false });
+    let mut ok = direct("daily");
+    ok.sql = Some(Sql { dialect: "databricks".into(), statements: vec!["CREATE OR REPLACE TABLE …".into()], atomic: true });
+    let md = explained(&envelope(vec![m, ok])).markdown;
+    let caution = md.find("[!CAUTION]").expect("a caution callout");
+    assert!(caution < md.find("| Model |").unwrap(), "before the table:\n{md}");
+    assert!(md.contains("> - `events` (databricks)"), "{md}");
+    assert!(!md.contains("> - `daily`"), "an atomic write is not called out:\n{md}");
+    assert!(md.contains("Rendered as **databricks** SQL: 3 statement(s) across 2 model(s)."), "{md}");
 }

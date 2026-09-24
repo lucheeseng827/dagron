@@ -17,6 +17,13 @@ global:
 #   - name: ecr-creds
 imagePullSecrets: []
 
+# Tenant identity, set when a hosting platform installs one release of this chart
+# per workspace. When both are set they reach the engine as DAGRON_WORKSPACE_ID /
+# DAGRON_ORG_ID, which the hosting platform's usage meter and run-completion hook
+# read. Empty (the default) for a standalone install: the engine ignores them.
+workspaceId: ""
+orgId: ""
+
 # ── Engine / API ───────────────────────────────────────────────────────────
 # The `dagron` binary running as a long-lived server: schedules fire, workers
 # run tasks, and the HTTP API is served on `port`.
@@ -25,7 +32,7 @@ imagePullSecrets: []
 # `kubernetes` cargo features. The module Dockerfile defaults to a sqlite-only
 # build — see terraform/README.md §"Building the images".
 engine:
-  image: mancube/dagron-engine:0.9.1
+  image: mancube/dagron-engine:0.9.2
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 8080
@@ -112,6 +119,9 @@ externalDatabaseSecret:
   # and then never wakes on new work, which reads as "the scheduler is slow".
   # Empty = single-DSN mode, and `key` must then be a direct endpoint.
   listenKey: ""
+  # Optional key holding the hosting platform's usage-database credential, passed
+  # to the engine as CONTROL_DATABASE_URL (see workspaceId above). Empty = none.
+  controlKey: ""
 
 # ── dagron-api (authenticated UI gateway) ───────────────────────────────────
 # Stateless edge over the same Postgres the engine writes; owns login (its own
@@ -128,7 +138,7 @@ gitops:
   enabled: false
   # First published in 0.5.0. Release packaging rewrites this tag to the release
   # version (docker.yml), so the pin here only matters to a repo checkout.
-  image: mancube/dagron-gitops:0.9.1
+  image: mancube/dagron-gitops:0.9.2
   imagePullPolicy: IfNotPresent
   # Seconds between auto-sync reconciles per repo. A manual Sync is immediate.
   pollSecs: 60
@@ -160,7 +170,7 @@ gitops:
 
 dagronApi:
   enabled: true
-  image: mancube/dagron-api:0.9.1
+  image: mancube/dagron-api:0.9.2
   imagePullPolicy: IfNotPresent
   replicas: 1
   port: 8080
@@ -261,3 +271,23 @@ ingress:
   tls:
     enabled: false
     secretName: dagron-tls
+
+# ── NetworkPolicy ───────────────────────────────────────────────────────────
+# The engine's ops API has no authentication, so the network is its only boundary. On by default:
+# ingress to the engine and the chart-managed Postgres is limited to what needs it. It protects
+# nothing on a CNI that does not enforce NetworkPolicy (kindnet does; check yours), and covers
+# ingress only — no egress policy. See docs/HARDENING.md. `enabled: false` renders nothing.
+networkPolicy:
+  enabled: true
+  engine:
+    # Namespace allowed to scrape the engine's /metrics (a Prometheus / ServiceMonitor). "" = nobody.
+    monitoringNamespace: monitoring
+    # Extra peers allowed to reach the engine API, as raw NetworkPolicy peers, e.g.
+    #   - podSelector: {matchLabels: {app: my-scheduler}}
+    #   - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ops}}
+    # dagron-api does NOT call the engine over HTTP, so it is not listed by default.
+    allowFrom: []
+  postgres:
+    # Extra peers allowed to reach the chart-managed Postgres (engine, dagron-api, gitops and
+    # operator pods of this release are always allowed).
+    allowFrom: []

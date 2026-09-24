@@ -48,17 +48,21 @@ export const NODE_H_TALL = NODE_H + NODE_MID_ROW;
 /// reserves the space the node really occupies. The middle-row count mirrors
 /// StatusNode exactly: the sub-workflow row and the template row are independent
 /// and can both show, while the image row shows only when neither reference does.
+/// The loop row is independent of all three — a fan-out over a sub-DAG call
+/// draws the template row *and* the loop row — so it is counted on its own.
 export function statusNodeHeight(d: {
   templateRef?: string | null;
   workflowRef?: string | null;
   dockerImage?: string | null;
+  loop?: unknown;
 }): number {
   const isWorkflowRef = Boolean(d.workflowRef);
   const isTemplate = Boolean(d.templateRef);
   const midRows =
     Number(isWorkflowRef) +
     Number(isTemplate) +
-    Number(!isWorkflowRef && !isTemplate && Boolean(d.dockerImage));
+    Number(!isWorkflowRef && !isTemplate && Boolean(d.dockerImage)) +
+    Number(Boolean(d.loop));
   return NODE_H + midRows * NODE_MID_ROW;
 }
 

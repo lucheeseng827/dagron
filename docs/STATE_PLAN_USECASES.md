@@ -115,7 +115,7 @@ The cases below reference these by name.
 |---|---|---|---|
 | **S1** | **Cold plan** | No committed state → every model is `directly_changed`. Safe, expensive. | `freshet plan` |
 | **S2** | **Incremental plan** | Fingerprint diff vs. the committed snapshot → only what moved. | `freshet plan` |
-| **S3** | **Column-level pruning** | A downstream model rebuilds only if it consumes a column that *actually changed* — not merely because it sits downstream. This is the product. | `planner-core` |
+| **S3** | **Column-level pruning** | A downstream model rebuilds only if it consumes a column that *actually changed* — not merely because it sits downstream. This is the product. | `freshet-core` |
 | **S4** | **Explain (read-only)** | Summary, per-model rows (why / unit / waits-on), markdown + Mermaid. Touches no DB, no network, no dagron. | `dagron-state explain`, `POST /plans/explain`, console |
 | **S5** | **CI gate** | `--exit-code` returns **2** when the plan is non-empty (`git diff` shape: 0 ok, 1 error, 2 non-empty). | `dagron-state explain --exit-code` |
 | **S6** | **Compile-only** | Plan → dagron workflow YAML. Submits nothing. | `dagron-state plan`, `POST /plans` |

@@ -1397,6 +1397,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "tower 0.5.3",
  "tower-http",
  "tracing",
  "uuid",
@@ -1659,6 +1660,35 @@ dependencies = [
  "anyhow",
  "dagron-logging",
  "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "dagron-step-spark"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dagron-logging",
+ "k8s-openapi",
+ "kube",
+ "reqwest 0.12.28",
+ "rustls 0.23.40",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "dagron-step-sql"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dagron-logging",
+ "futures-util",
+ "reqwest 0.12.28",
+ "serde_json",
+ "sqlx",
  "tokio",
  "tracing",
 ]
@@ -4955,6 +4985,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlx-core",
+ "sqlx-mysql",
  "sqlx-postgres",
  "sqlx-sqlite",
  "syn 2.0.118",
@@ -4993,6 +5024,7 @@ dependencies = [
  "percent-encoding",
  "rand 0.8.6",
  "rsa",
+ "serde",
  "sha1",
  "sha2 0.10.9",
  "smallvec",

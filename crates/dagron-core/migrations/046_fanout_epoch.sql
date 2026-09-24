@@ -1,0 +1,23 @@
+-- Which generation of a fan-out barrier an instance row belongs to
+-- (mirrors migrations_pg/059_fanout_epoch.sql).
+--
+-- Instances are wired as `(dependent_id = barrier, dependency_id = instance)` —
+-- the barrier depends on its children. Every reset path walks the *other*
+-- direction: `clear_task_with_downstream` and the API's mirrored clear SQL
+-- follow `dependency_id -> dependent_id` to find a task's downstream cone, so a
+-- barrier can be reset while its instances are left behind, terminal.
+--
+-- The next sweep then finds instances, takes the join branch, and resolves the
+-- barrier against results from the *previous* attempt without ever re-reading
+-- the producer. Clear a producer, and the re-run processes the old partitions.
+--
+-- The fix is the same shape as `external_epoch` (migration 042/053), and for
+-- the same reason: a generation counter is what tells a re-armed row from the
+-- one that already ran. Every reset path — `clear_task_with_downstream`,
+-- `retry_task_from_ui`, `rerun_from_failed`, and dagron-api's clear — already
+-- does `version = version + 1`, so stamping an instance with the barrier's
+-- version at creation makes staleness a comparison the sweep can make, in one
+-- place, instead of seven SQL statements that have to be kept in step.
+--
+-- `attempt` cannot serve: the barrier is never claimed, so it never increments.
+ALTER TABLE task_runs ADD COLUMN fanout_epoch INTEGER NOT NULL DEFAULT 0;

@@ -2,6 +2,8 @@
 name = "dagron-autopsy"
 version = "0.1.0"
 edition = "2021"
+# MSRV — see the root Cargo.toml for how 1.88 was measured.
+rust-version = "1.88"
 description = "dagron job autopsy — schedules nothing. Sits beside an existing Slurm cluster, joins sacct + DCGM + NCCL logs + InfiniBand counters against a job's node set and time window, and emits a fault-attributed job record: what broke, on which device, when, with the evidence."
 
 [[bin]]

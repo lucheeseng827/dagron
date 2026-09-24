@@ -1,6 +1,6 @@
 openapi: 3.0.3
 info:
-  title: module-54 workflow scheduler — management API
+  title: dagron workflow scheduler — management API
   description: >
     Read/write control surface over the workflow scheduler's datastore: list and
     inspect runs, submit a DAG, cancel a run, and scrape metrics. Every operation
@@ -21,7 +21,8 @@ info:
     exposing it. It is intended for in-process ops and trusted-network sidecar use.
   version: 0.1.0
   license:
-    name: lab crate
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
 servers:
   - url: http://127.0.0.1:8080
     description: Local management API (set API_ADDR to choose host:port)
@@ -507,6 +508,108 @@ paths:
         "500":
           $ref: "#/components/responses/Error"
 
+  /runs/{id}/tasks/{task_id}/attempts:
+    get:
+      tags: [runs]
+      summary: The iterations a task's log cannot show
+      description: >
+        `task_runs.output` is singular, so the task-log view has only ever shown
+        the most recent attempt — one pass of a `repeat:` loop, or the attempt
+        that passed rather than the ones that explain why it needed to. The
+        superseded attempts are retained as a bounded tail and read here.
+
+
+        Separate from `taskLogs` because that endpoint polls: attaching a
+        history to every one-second tail poll would multiply the hot path by the
+        size of the history. Fetch this when a reader asks for the iterations.
+
+
+        An empty `attempts` list is an answer, not an error — a task that ran
+        once has no superseded attempts, and neither does one that looped while
+        retention was off (`DAGRON_ATTEMPT_LOG_BYTES=0`). `evicted` is how a
+        history that lost its beginning says so.
+      operationId: taskAttempts
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+        - $ref: "#/components/parameters/TaskId"
+        - $ref: "#/components/parameters/LogFilterQ"
+        - $ref: "#/components/parameters/LogFilterExclude"
+        - $ref: "#/components/parameters/LogFilterRegex"
+        - $ref: "#/components/parameters/LogFilterLevel"
+        - $ref: "#/components/parameters/LogFilterCase"
+        - $ref: "#/components/parameters/LogFilterContext"
+        - $ref: "#/components/parameters/LogFilterLimit"
+        - $ref: "#/components/parameters/LogFilterTail"
+      responses:
+        "200":
+          description: The retained superseded attempts, oldest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [task_id, name, current_attempt, attempts, evicted, filtered]
+                properties:
+                  task_id: { type: string, format: uuid }
+                  name: { type: string }
+                  current_attempt:
+                    type: integer
+                    format: int64
+                    description: >
+                      The attempt on the task row. Deliberately NOT in
+                      `attempts` — its output is in `task_runs.output`, whole,
+                      where `taskLogs` reads it.
+                  attempts:
+                    type: array
+                    items:
+                      type: object
+                      required: [attempt, reason, output, retention_truncated, finished_at, total, matched, truncated]
+                      properties:
+                        attempt: { type: integer, format: int64 }
+                        reason:
+                          type: string
+                          enum: [iteration, failed]
+                          description: >
+                            `iteration` — a `repeat:` pass whose `until` had not
+                            held yet — or `failed`, an attempt that errored and
+                            was retried.
+                        output: { type: string, description: the retained tail, or the filtered text when a filter is active }
+                        retention_truncated:
+                          type: boolean
+                          description: >
+                            Output was dropped to fit `DAGRON_ATTEMPT_LOG_BYTES`.
+                            Distinct from `truncated`, which is the filter's
+                            line cap.
+                        finished_at: { type: string }
+                        lines:
+                          type: array
+                          description: Present only when a filter was requested.
+                          items: { $ref: "#/components/schemas/LogLine" }
+                        total: { type: integer }
+                        matched: { type: integer }
+                        truncated: { type: boolean }
+                  evicted:
+                    type: boolean
+                    description: >
+                      The history does not start at attempt 1 — earlier
+                      attempts existed and are not here, either because the
+                      retention window dropped them
+                      (`DAGRON_ATTEMPT_LOG_KEEP`) or because this response hit
+                      its read cap of 200. A history that silently starts at
+                      iteration 51 would be a lie either way.
+                  filtered: { type: boolean }
+        "400":
+          description: An invalid filter (uncompilable regex, unknown level, non-numeric bound)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: Run or task not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          $ref: "#/components/responses/Error"
+
   /runs/{id}/cancel:
     post:
       tags: [runs]
@@ -775,8 +878,10 @@ paths:
       tags: [dead-letters]
       summary: Redrive a dead letter
       description: >
-        Re-attempt the parked payload as a fresh run. On success the dead letter
-        is deleted; a still-invalid payload returns `400` and the row is kept.
+        Re-attempt the parked payload as a fresh run, all or nothing: the run is
+        created and the dead letter deleted in one transaction. A redrive that
+        fails leaves the dead letter exactly as it was, so the same id can be
+        redriven once the cause is fixed.
       operationId: redriveDeadLetter
       parameters:
         - $ref: "#/components/parameters/DeadLetterId"
@@ -801,8 +906,51 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: A concurrent redrive, or a discard, took the dead letter first
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "500":
           $ref: "#/components/responses/Error"
+        "503":
+          description: >
+            The workflow is at its `max_active_runs` cap. The dead letter is kept;
+            retry `dead_letter_id`, the id you sent, after `Retry-After`.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              description: Seconds to wait before retrying.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, dead_letter_id]
+                properties:
+                  error: { type: string }
+                  dead_letter_id: { type: string, format: uuid }
+                  workflow: { type: string }
+                  max_active_runs: { type: integer }
+                  active_runs: { type: integer }
+        "507":
+          description: >
+            The datastore is below its free-disk floor (`DAGRON_MIN_FREE_BYTES`).
+            The dead letter is kept; retry `dead_letter_id`, the id you sent,
+            after `Retry-After`.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              description: Seconds to wait before retrying.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, dead_letter_id]
+                properties:
+                  error: { type: string }
+                  dead_letter_id: { type: string, format: uuid }
+                  free_bytes: { type: integer }
+                  min_free_bytes: { type: integer }
 
   /dead-letters/{id}:
     delete:

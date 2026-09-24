@@ -1,13 +1,13 @@
 //! The planner's frozen JSON wire contract, as dagron reads it.
 //!
-//! These types mirror the planner's `planner-embed::PlanResponse` — the single
+//! These types mirror the planner's `freshet-embed::PlanResponse` — the single
 //! JSON funnel every planner binding (C-ABI, WASM, Python, CLI) marshals through.
 //! They are **deliberately duplicated** rather than imported: `crates/` is mirrored
 //! to the public dagron repo, where the planner's source does not exist, and the
 //! whole point of the planner is that it is embeddable by orchestrators that are
 //! not dagron.
 //!
-//! Duplication needs a guard. Upstream has one for free — `planner-embed` converts
+//! Duplication needs a guard. Upstream has one for free — `freshet-embed` converts
 //! via an exhaustive, no-wildcard match, so adding a `BackfillReason` variant fails
 //! to compile until the contract is updated. This side has no compiler link to
 //! upstream, so it is guarded instead by [`WIRE_CONTRACT_VERSION`] and the
@@ -25,12 +25,20 @@
 //! * **v2** — adds [`PlanModel::depends_on`], the planner's own plan-restricted
 //!   edge set. Additive and backward compatible: a v1 payload still parses, and a
 //!   v2 consumer falls back for it.
+//! * **v3** — adds [`PlanModel::replace`], what the rebuild does to the relation.
+//! * **v4** — adds [`PlanModel::sql`], the statements that perform it, present when
+//!   the planner was asked to render a dialect. This crate carries them onto the
+//!   task — as `{{ sql }}` / `{{ dialect }}` and in the task's recorded input — and
+//!   never writes, edits or interprets SQL itself.
+//! * **v5** — adds `cost.unpruned_millicu` to the planner's opt-in effort map. This
+//!   crate does not mirror `cost`, so a v5 plan parses exactly as a v4 one did; the
+//!   version moves so the two ends name the same revision.
 
 use serde::{Deserialize, Serialize};
 
 /// The contract revision this crate reads. Bump when a field or variant changes,
 /// and update the golden fixture in the same commit.
-pub const WIRE_CONTRACT_VERSION: &str = "planner-embed/3";
+pub const WIRE_CONTRACT_VERSION: &str = "planner-embed/5";
 
 /// A planner result: the minimal, topologically-ordered set of models to rebuild.
 ///
@@ -77,6 +85,44 @@ pub struct PlanModel {
     /// difference, so encoding one would be ceremony.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replace: Option<Replace>,
+    /// The SQL that performs this model's rebuild. Added in contract v4.
+    ///
+    /// A plain `Option`, like `replace`: absent means the caller did not ask the
+    /// planner for a dialect, whichever version produced the plan. The planner
+    /// renders all-or-nothing, so a v4 plan that has it has it on every model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql: Option<Sql>,
+}
+
+/// A model's rebuild as SQL: statements to run **in order, on one session**.
+///
+/// Mirrors the planner's `WireSql`. Opaque here in every way that matters: dagron
+/// does not know which warehouse a task's command talks to, so it neither checks the
+/// dialect nor splits, joins or edits a statement beyond the placeholder join in
+/// [`crate::compile`].
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Sql {
+    /// `postgres` | `snowflake` | `bigquery` | `databricks` | `redshift`, as the planner spells it.
+    pub dialect: String,
+    /// No trailing `;` on any of them.
+    pub statements: Vec<String>,
+    /// Whether the statements are all-or-nothing when run as above. `false` means a
+    /// failure part-way can leave the relation half-written — surfaced by `explain`.
+    pub atomic: bool,
+}
+
+impl Sql {
+    /// The statements as one script, `;`-separated — what `{{ sql }}` expands to.
+    ///
+    /// A single statement is returned exactly as the planner rendered it, so a
+    /// one-statement executor (dagron-step-sql's `exec` mode) gets precisely one
+    /// statement. Several are joined for a script runner (its `script` mode).
+    pub fn script(&self) -> String {
+        match self.statements.as_slice() {
+            [one] => one.clone(),
+            many => many.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n"),
+        }
+    }
 }
 
 /// How a rebuild's rows reach the target relation.
@@ -166,7 +212,7 @@ impl Widening {
     }
 }
 
-/// Why a model is in the plan. Mirrors `planner_core::BackfillReason`.
+/// Why a model is in the plan. Mirrors `freshet_core::BackfillReason`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {
@@ -180,7 +226,7 @@ pub enum Reason {
     },
 }
 
-/// How much of a model to rebuild. Mirrors `planner_core::BackfillUnit`.
+/// How much of a model to rebuild. Mirrors `freshet_core::BackfillUnit`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Unit {

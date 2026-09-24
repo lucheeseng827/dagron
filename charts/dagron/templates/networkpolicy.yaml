@@ -1,0 +1,65 @@
+{{- if .Values.networkPolicy.enabled }}
+# The engine's ops API (POST /runs, /runs/{id}/cancel, /rerun, approve …) has NO authentication of its
+# own, and neither has Postgres beyond its password. Without these policies any pod in the cluster —
+# including the task pods, which run workflow-author code — can submit arbitrary runs and reach the
+# datastore. Ingress only; see docs/HARDENING.md for what this does not cover. A CNI that does not
+# enforce NetworkPolicy ignores these objects (harmless, and protects nothing).
+{{- /* An ingress rule with an empty `from` allows EVERY source, so no peers means no rule at all
+       (`ingress: []` = deny all), never `from: []`. */}}
+{{- $engineFrom := list }}
+{{- if .Values.networkPolicy.engine.monitoringNamespace }}
+{{- $engineFrom = append $engineFrom (dict "namespaceSelector" (dict "matchLabels" (dict "kubernetes.io/metadata.name" .Values.networkPolicy.engine.monitoringNamespace))) }}
+{{- end }}
+{{- range .Values.networkPolicy.engine.allowFrom }}{{ $engineFrom = append $engineFrom . }}{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "dagron.fullname" . }}-engine
+  labels:
+    {{- include "dagron.labels" . | nindent 4 }}
+    app.kubernetes.io/component: engine
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: engine
+  policyTypes: [Ingress]
+  {{- if $engineFrom }}
+  ingress:
+    - from:
+        {{- toYaml $engineFrom | nindent 8 }}
+      ports:
+        - {port: {{ .Values.engine.port }}, protocol: TCP}
+  {{- else }}
+  ingress: []
+  {{- end }}
+{{- if .Values.postgres.enabled }}
+---
+# The datastore is reachable only from the components that use it — not from task pods.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "dagron.fullname" . }}-postgres
+  labels:
+    {{- include "dagron.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: postgres
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+            matchExpressions:
+              - {key: app.kubernetes.io/component, operator: In, values: [engine, dagron-api, gitops, operator]}
+        {{- with .Values.networkPolicy.postgres.allowFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      ports:
+        - {port: 5432, protocol: TCP}
+{{- end }}
+{{- end }}

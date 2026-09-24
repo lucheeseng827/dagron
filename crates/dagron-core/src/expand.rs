@@ -49,7 +49,7 @@ const MAX_TASKS: usize = 100_000;
 /// restart without a rebuild. Values above the compiled ceiling are refused
 /// rather than honoured — this knob exists to tighten the bound, and letting it
 /// widen one that exists to prevent an OOM would defeat the point.
-fn max_tasks_per_run() -> usize {
+pub fn max_tasks_per_run() -> usize {
     std::env::var("DAGRON_MAX_TASKS_PER_RUN")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -311,12 +311,91 @@ fn expand_one(
             task.name
         );
     }
+    // `defer:` belongs to the leaf that submits, and [`build_leaf`] reads it off
+    // the template's task — so a `defer:` written on the *call* is dropped on the
+    // floor. Refuse it rather than expand a workflow whose deferral silently is
+    // not there: the author would get a task that runs its command and succeeds
+    // immediately, which reads as a working submit.
+    //
+    // A template that should defer says so on its own leaf, where it survives
+    // expansion and where "which task submits" has an answer.
+    if is_call && task.defer.is_some() {
+        bail!(
+            "task '{}' cannot set `defer:` on a `template:` call — a call expands into the \
+             template's tasks, so the deferral has no leaf to attach to and would be dropped. \
+             Put `defer:` on the template's own submitting task instead",
+            task.name
+        );
+    }
+    // `repeat:` on a call is the same silent drop as `defer:` above, and for the
+    // same reason: `expand_call` replaces the call with the template's tasks and
+    // the call's own fields go with it, so the loop never reaches a row anything
+    // evaluates. Nothing downstream can catch it either — post-expansion
+    // validation runs on leaves, by which point the field is gone — so the
+    // rejection has to be here.
+    //
+    // Left silent this reads as a working workflow that quietly ran its body
+    // once, which is the failure mode `dag.rs` already refuses to allow for
+    // `repeat` on an approval or a sensor.
+    if is_call && task.repeat.is_some() {
+        bail!(
+            "task '{}' cannot set `repeat:` on a `template:` call — a call expands into the \
+             template's tasks, so the loop has no leaf to attach to and would be dropped. \
+             Loop the template's own task, or fan the call out with `with_items:` to run the \
+             sub-DAG more than once",
+            task.name
+        );
+    }
     if task.with_items.is_some() && task.with_param.is_some() {
         bail!("task '{}' sets both with_items and with_param", task.name);
     }
-    if task.instance_key.is_some() && task.with_items.is_none() && task.with_param.is_none() {
+    // The runtime fan-out's shape rules live here rather than in
+    // `dag::from_spec`, which validates the **expanded** graph: a task that set
+    // both `with_items` and `with_output_of` has already been fanned out by the
+    // time that validator runs, and the leaf it inspects no longer carries
+    // `with_items` — so the conflict would be invisible exactly where it
+    // matters. Checked before anything resolves, like every other guard above.
+    if task.with_output_of.is_some() {
+        if task.with_items.is_some() || task.with_param.is_some() {
+            bail!(
+                "task '{}' sets with_output_of together with with_items/with_param — a task \
+                 fans out from one source",
+                task.name
+            );
+        }
+        if is_call {
+            bail!(
+                "task '{}' cannot set `with_output_of` on a `template:` call — a call expands \
+                 into the template's tasks, so there is no row to fan out at run time. Fan out \
+                 a leaf inside the template, or use `with_items:` on the call, which is \
+                 resolved at expansion",
+                task.name
+            );
+        }
+        if task.gang.is_some() {
+            bail!(
+                "task '{}' cannot combine `with_output_of` with `gang` — a gang's size has to \
+                 be known before it is claimed",
+                task.name
+            );
+        }
+        if !matches!(task.task_type.as_deref(), None | Some("task")) {
+            bail!(
+                "task '{}' cannot combine `with_output_of` with `type: {}` — a runtime fan-out \
+                 substitutes {{{{ item }}}} into a command",
+                task.name,
+                task.task_type.as_deref().unwrap_or("task")
+            );
+        }
+    }
+    if task.instance_key.is_some()
+        && task.with_items.is_none()
+        && task.with_param.is_none()
+        && task.with_output_of.is_none()
+    {
         bail!(
-            "task '{}' sets instance_key without with_items/with_param (nothing to label)",
+            "task '{}' sets instance_key without with_items/with_param/with_output_of \
+             (nothing to label)",
             task.name
         );
     }
@@ -419,6 +498,156 @@ fn expand_one(
         acc.tasks.extend(inst.tasks);
     }
     Ok(acc)
+}
+
+/// The rows a `with_output_of: <producer>` reads, chosen from the consumer's
+/// own **expanded** `depends_on`.
+///
+/// The producer may have been fanned out itself, in which case there is no row
+/// called `<producer>` at all — expansion replaced it with `<producer>.0`,
+/// `<producer>.1`, … and rewired this task's `depends_on` onto exactly those
+/// rows. That rewiring is the answer: the consumer's dependency list already
+/// names the producer's rows, precisely, with no pattern to match against the
+/// rest of the run and no chance of picking up an unrelated task that happens
+/// to share a prefix.
+///
+/// Exact match wins over the prefix. A task name may legally contain a dot
+/// (names are only bounded in length), so a workflow *could* have both `a` and
+/// `a.b` as authored tasks; if this task depends on `a` itself, that is the
+/// producer and `a.b` is a different task that merely sorts next to it.
+///
+/// Order is `depends_on` order, which expansion writes in instance order — so
+/// the concatenated items come out `producer.0`'s first, then `producer.1`'s,
+/// rather than in whatever order a string sort would give (`.0, .1, .10, .2`).
+pub fn fanout_producer_rows<'a>(producer: &str, depends_on: &'a [String]) -> Vec<&'a str> {
+    if let Some(exact) = depends_on.iter().find(|d| d.as_str() == producer) {
+        return vec![exact.as_str()];
+    }
+    let prefix = format!("{producer}.");
+    depends_on.iter().filter(|d| d.starts_with(&prefix)).map(|d| d.as_str()).collect()
+}
+
+/// One instance a runtime fan-out (`with_output_of:`) resolves to.
+#[derive(Debug, Clone)]
+pub struct FanoutInstance {
+    /// `<barrier>.<label>` — the same naming `with_items:` produces, so a run
+    /// view cannot tell which kind of fan-out it is looking at, which is the
+    /// point.
+    pub name: String,
+    /// The leaf to insert, with `{{ item }}` already substituted.
+    pub spec: TaskSpec,
+}
+
+/// Resolve a parked fan-out barrier into its instances from the producer's
+/// output.
+///
+/// **Pure, and deliberately so.** This is the whole semantics of a runtime
+/// fan-out — what counts as a list, how instances are named, what `{{ item }}`
+/// binds to — with no database in sight, because the alternative is that
+/// semantics living inside a sweep that can only be exercised against a live
+/// datastore. The engine's sweep does the transaction; this decides the answer.
+///
+/// `producers` is one `(row name, trimmed stdout)` pair per producer row, in
+/// `depends_on` order — usually one, but **N when the producer is itself
+/// fanned out**. Their arrays are concatenated in that order, so chaining a
+/// fan-out off a fan-out gives the union of what every instance found.
+///
+/// Empty output is **not** an error: at expansion an empty `with_items:` is an
+/// authoring mistake and is refused, but at run time "there was nothing to
+/// process" is a result, so an empty producer contributes no items and a run
+/// where every producer is empty leaves the barrier to succeed with none. That
+/// also means one skipped producer instance costs its share and nothing else.
+pub fn fanout_instances(
+    barrier: &TaskSpec,
+    producers: &[(&str, &str)],
+) -> Result<Vec<FanoutInstance>> {
+    let mut items: Vec<Value> = Vec::new();
+    for (row, output) in producers {
+        let raw = output.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let parsed: Value = serde_json::from_str(raw).map_err(|e| {
+            anyhow::anyhow!(
+                "task '{}' fans out over '{}' output, which is not valid JSON: {e}",
+                barrier.name,
+                row,
+            )
+        })?;
+        // Named by ROW, not by the authored producer: with a chained fan-out
+        // the answer to "which one printed the bad thing" is the only useful
+        // part of the message, and `regions` would name three of them.
+        let arr = parsed.as_array().ok_or_else(|| {
+            anyhow::anyhow!(
+                "task '{}' fans out over '{}' output, which is {} rather than a JSON array",
+                barrier.name,
+                row,
+                json_kind(&parsed),
+            )
+        })?;
+        items.extend(arr.iter().cloned());
+    }
+    let items = &items;
+
+    let mut seen_labels: BTreeSet<String> = BTreeSet::new();
+    let mut out = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let mut inst_ctx: BTreeMap<String, String> = BTreeMap::new();
+        bind_item(&mut inst_ctx, item);
+        inst_ctx.insert("index".to_string(), i.to_string());
+
+        // Same labelling rules as the expansion-time fan-out, held to the same
+        // uniqueness: two instances with one name would be two rows a run view
+        // cannot tell apart, and the duplicate is far likelier here — the
+        // labels come from data rather than from a list the author wrote.
+        let label = match &barrier.instance_key {
+            Some(key) => {
+                let label = sanitize_label(&substitute(key, &inst_ctx));
+                if label.is_empty() {
+                    bail!(
+                        "task '{}' instance_key '{}' rendered empty for item {i} \
+                         (after sanitizing to [A-Za-z0-9_.-])",
+                        barrier.name,
+                        key
+                    );
+                }
+                if !seen_labels.insert(label.clone()) {
+                    bail!(
+                        "task '{}' instance_key '{}' rendered duplicate label '{}' — \
+                         labels must be unique within the fan-out",
+                        barrier.name,
+                        key,
+                        label
+                    );
+                }
+                label
+            }
+            None => i.to_string(),
+        };
+
+        let name = format!("{}.{label}", barrier.name);
+        let mut spec = build_leaf(barrier, &name, &inst_ctx, None);
+        // An instance is an ordinary task. Carrying either of these forward
+        // would make it fan out again — an infinite regress whose first
+        // iteration looks like it worked.
+        spec.with_output_of = None;
+        spec.instance_key = None;
+        out.push(FanoutInstance { name, spec });
+    }
+    Ok(out)
+}
+
+/// What a non-array JSON value is, for an error message that says what it got
+/// rather than only what it wanted.
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 /// Expand a `template:` call into its sub-DAG with an isolated parameter scope.
@@ -524,6 +753,46 @@ fn build_leaf(
             r.until = substitute(&r.until, ctx);
             r
         }),
+        // `defer` survives expansion with `kind` and `connection` substituted,
+        // so a template can parameterize which backend a leaf submits to
+        // (`kind: "{{ engine }}"`) the way `runner_class` already can. The two
+        // numbers are not templated: they are budgets the author states, not
+        // things a caller's argument should be able to rewrite.
+        //
+        // `connection` is substituted *before* the enterprise gate reads it, so
+        // a templated connection name is refused by that gate in the open build
+        // rather than slipping past it as an unresolved `{{ … }}` literal.
+        defer: task.defer.as_ref().map(|d| {
+            let mut d = d.clone();
+            d.kind = substitute(&d.kind, ctx);
+            d.connection = d.connection.as_ref().map(|c| substitute(c, ctx));
+            // The http block templates where a task's own fields do: the URL and
+            // header values carry `{{ params.* }}` / `{{ item }}` so a fan-out
+            // can poll per-shard endpoints. `{{ handle }}` is NOT bound here and
+            // survives verbatim — it is runtime state the engine fills at poll
+            // time, exactly as `{{ output }}` reaches `repeat.until`.
+            //
+            // The predicates are substituted too, so a template can parameterize
+            // the state it waits for; they were already parsed at validation, and
+            // validation runs after expansion, so a substitution that breaks one
+            // is still caught at submit.
+            d.http = d.http.as_ref().map(|h| {
+                let mut h = h.clone();
+                h.url = substitute(&h.url, ctx);
+                h.succeed_when = substitute(&h.succeed_when, ctx);
+                h.fail_when = h.fail_when.as_ref().map(|f| substitute(f, ctx));
+                h.error_from = h.error_from.as_ref().map(|e| substitute(e, ctx));
+                for hdr in &mut h.headers {
+                    hdr.value = substitute(&hdr.value, ctx);
+                }
+                if let Some(c) = &mut h.cancel {
+                    c.url = substitute(&c.url, ctx);
+                    c.body = c.body.as_ref().map(|b| substitute(b, ctx));
+                }
+                h
+            });
+            d
+        }),
         // Gang membership survives expansion (a template's leaf may gang);
         // gang_member is engine-stamped at run creation, never authored.
         gang: task.gang.clone(),
@@ -558,8 +827,18 @@ fn build_leaf(
         },
         with_items: None,
         with_param: None,
+        // Unlike the other two, this one **survives onto the leaf**: it is not
+        // resolved here at all. It is the instruction the engine reads when
+        // the row parks, and dropping it would turn a runtime fan-out into an
+        // ordinary task that runs once — exactly the silent-drop failure the
+        // `repeat:`-on-a-call guard exists to prevent.
+        with_output_of: task.with_output_of.clone(),
         when: runtime_when,
-        instance_key: None,
+        // Cleared for the expansion-time fan-outs, whose labelling already
+        // happened above — carrying it would leave a stale template on a leaf
+        // that is already named. A runtime fan-out has not been labelled yet,
+        // so its key has to travel to the sweep that will use it.
+        instance_key: task.with_output_of.as_ref().and(task.instance_key.clone()),
     }
 }
 
@@ -760,7 +1039,10 @@ mod tests {
     /// that exists to prevent an OOM would defeat the bound.
     #[test]
     fn task_ceiling_env_can_lower_but_never_raise() {
-        // Serialised via the env, so keep the mutations local and restore after.
+        // Serialised via the env, so keep the mutations local and restore after
+        // — and hold `env_lock`, because the datastore's runtime fan-out tests
+        // read this same key on their write path.
+        let _g = crate::env_lock();
         let restore = std::env::var("DAGRON_MAX_TASKS_PER_RUN").ok();
 
         std::env::set_var("DAGRON_MAX_TASKS_PER_RUN", "500");
@@ -1043,6 +1325,79 @@ tasks:
         assert!(checked >= 13, "expected the example catalog, found {checked}");
     }
 
+    /// The warehouse catalog is the `defer:` + `{{ ds }}` story in runnable
+    /// form, so it has to keep parsing as the spec grows. An example that no
+    /// longer validates is worse than no example — it is a working shape the
+    /// reader copies and then debugs.
+    #[test]
+    fn every_warehouse_example_expands_and_builds() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/warehouse");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(dir).expect("read examples/warehouse") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|s| s.to_str()) != Some("yaml") {
+                continue;
+            }
+            let yaml = std::fs::read_to_string(&path).unwrap();
+            crate::dag::DagGraph::from_yaml(&yaml)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            checked += 1;
+        }
+        assert!(checked >= 1, "expected the warehouse catalog, found {checked}");
+    }
+
+    /// The doneyet catalog is the `docs/SCOPE.md` §4 producer contract in
+    /// runnable form — the answer to "dagron does not do monitoring, so how
+    /// do I get it?". `watched_pipeline.yaml` additionally exercises a
+    /// template whose `{{ run }}` argument is substituted into a shell body,
+    /// so a regression in argument substitution breaks this before it
+    /// breaks a reader's copy-paste.
+    #[test]
+    fn every_doneyet_example_expands_and_builds() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/doneyet");
+        // Unlike the two catalogs above, this one is held out of the OSS
+        // mirror (`.ossync.yaml` → exclude `/doneyet`), so in the mirror the
+        // directory legitimately does not exist and there is nothing to
+        // check. In the monorepo — where these examples are authored and
+        // edited — it is always present and the assert below is the gate.
+        // NotFound only: any other io error (a typo in the path above, a
+        // permission problem, a later rename) must fail rather than quietly
+        // check zero files and report success.
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => panic!("read {dir}: {e}"),
+        };
+        let mut checked = 0;
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|s| s.to_str()) != Some("yaml") {
+                continue;
+            }
+            let yaml = std::fs::read_to_string(&path).unwrap();
+            let graph = crate::dag::DagGraph::from_yaml(&yaml)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            // Every example registers, heartbeats and finishes a doneyet run;
+            // an example that lost those calls is no longer the contract.
+            let body = graph
+                .spec
+                .tasks
+                .iter()
+                .filter_map(|t| t.command.last())
+                .cloned()
+                .collect::<String>();
+            for call in ["/runs", "/heartbeat", "/finish"] {
+                assert!(
+                    body.contains(call),
+                    "{}: no `{call}` call left in the example",
+                    path.display()
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 2, "expected the doneyet catalog, found {checked}");
+    }
+
     #[test]
     fn instance_key_labels_fan_out_instances() {
         let (names, deps) = run(
@@ -1257,6 +1612,47 @@ tasks:
     }
 
     #[test]
+    fn a_chained_producers_rows_come_from_the_consumers_own_dependencies() {
+        let deps = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Not fanned out: the producer is one row, named exactly.
+        assert_eq!(
+            fanout_producer_rows("list", &deps(&["list", "other"])),
+            vec!["list"]
+        );
+
+        // Fanned out: expansion rewired the consumer onto the instances, and
+        // those are the rows to read.
+        assert_eq!(
+            fanout_producer_rows("regions", &deps(&["regions.0", "regions.1", "seed"])),
+            vec!["regions.0", "regions.1"]
+        );
+
+        // Order is dependency order, NOT a string sort. Past nine instances the
+        // two disagree, and a string sort would pair item lists with the wrong
+        // region without ever looking wrong.
+        let wide: Vec<String> = (0..12).map(|i| format!("r.{i}")).collect();
+        let got = fanout_producer_rows("r", &wide);
+        assert_eq!(got.first(), Some(&"r.0"));
+        assert_eq!(got.get(2), Some(&"r.2"), "r.2 is third, not r.10");
+        assert_eq!(got.last(), Some(&"r.11"));
+
+        // A task this one does not depend on is unreachable, whatever it is
+        // called — the whole point of reading `depends_on` rather than matching
+        // names against the run.
+        assert!(fanout_producer_rows("ghost", &deps(&["regions.0"])).is_empty());
+
+        // Exact match wins over the prefix. Names may contain dots, so `a` and
+        // `a.b` can both be authored tasks; depending on `a` itself means `a`
+        // is the producer and `a.b` is simply a neighbour.
+        assert_eq!(
+            fanout_producer_rows("a", &deps(&["a", "a.b"])),
+            vec!["a"],
+            "the un-fanned producer, not it plus a same-prefixed sibling"
+        );
+    }
+
+    #[test]
     fn when_output_refs_are_extracted() {
         assert_eq!(when_output_refs("{{ tasks.check.output }} == go"), vec!["check"]);
         assert!(when_output_refs("{{ mode }} == slow").is_empty());
@@ -1311,5 +1707,214 @@ tasks:
         .unwrap();
         let poll = ok.spec.tasks.iter().find(|t| t.name == "poll").unwrap();
         assert_eq!(poll.repeat.as_ref().unwrap().until, "100 <= {{ output }}");
+    }
+    /// The loops the **console's visual editor** writes, held against the real
+    /// expander.
+    ///
+    /// The loop controls in the UI are a claim about YAML: tick "repeat 4 times"
+    /// and the editor emits `with_items: [1, 2, 3, 4]`. Nothing on that side can
+    /// check the claim — the console has no engine — so the fixtures below are
+    /// the editor's own output, pasted verbatim from
+    /// `frontend/scripts/check-loops.mjs --print`. That script proves the editor
+    /// writes this; this test proves the engine runs it. Change one and the
+    /// other has to change with it, which is the point: a shape that drifts here
+    /// is a control that silently stops looping.
+    #[test]
+    fn loops_the_console_writes_expand() {
+        // "For each item → a count": N parallel copies, numbered.
+        let (names, _) = run(
+            r#"
+name: my-workflow
+tasks:
+  - { name: prepare, command: ["echo", "prepare"] }
+  - name: process
+    command: ["echo", "process"]
+    depends_on: [prepare]
+    with_items: [1, 2, 3, 4]
+"#,
+        );
+        assert_eq!(
+            names,
+            vec!["prepare", "process.0", "process.1", "process.2", "process.3"],
+            "a count fans out into one task per pass"
+        );
+
+        // "For each item → a list", named by `instance_key`.
+        let (names, deps) = run(
+            r#"
+name: my-workflow
+tasks:
+  - { name: prepare, command: ["echo", "prepare"] }
+  - name: process
+    command: ["echo", "process"]
+    depends_on: [prepare]
+    with_items:
+      - { region: us-east-1 }
+      - { region: eu-west-2 }
+    instance_key: "{{ item.region }}"
+"#,
+        );
+        assert_eq!(names, vec!["prepare", "process.eu-west-2", "process.us-east-1"]);
+        assert_eq!(deps["process.us-east-1"], vec!["prepare"], "copies keep the call's deps");
+
+        // "For each item → an earlier step's output": the one fan-out the
+        // expander must NOT resolve. It has to survive expansion untouched and
+        // land on the leaf as a single row carrying `with_output_of`, because
+        // that row is what parks and what `reconcile_fanouts` reads. Dropping
+        // it here — the natural thing for an expander that owns every other
+        // fan-out to do — would turn it into an ordinary task that runs once
+        // with a literal `{{ item }}` in its command.
+        let spec = expanded(
+            r#"
+name: my-workflow
+tasks:
+  - { name: prepare, command: ["echo", "prepare"] }
+  - name: process
+    command: ["handle", "{{ item }}"]
+    depends_on: [prepare]
+    with_output_of: prepare
+    instance_key: "{{ item.region }}"
+"#,
+        );
+        let leaf = spec.tasks.iter().find(|t| t.name == "process").expect("one row, not N");
+        assert_eq!(
+            spec.tasks.len(),
+            2,
+            "the expander leaves it alone — the rows appear mid-run, not here"
+        );
+        assert_eq!(leaf.with_output_of.as_deref(), Some("prepare"));
+        assert_eq!(
+            leaf.instance_key.as_deref(),
+            Some("{{ item.region }}"),
+            "and the label template travels with it — the sweep is what applies it"
+        );
+        assert_eq!(
+            leaf.command,
+            vec!["handle".to_string(), "{{ item }}".to_string()],
+            "`{{ item }}` is NOT substituted here: there is no item until the producer runs"
+        );
+
+        // "Repeat N times": one row, re-run in place. The console has no count
+        // field to write — `RepeatSpec` has none — so it counts `{{ attempt }}`,
+        // and that expression has to survive expansion for the engine to see it.
+        let spec = expanded(
+            r#"
+name: my-workflow
+tasks:
+  - name: process
+    command: ["echo", "process"]
+    repeat: { until: "{{ attempt }} == 5", max_iterations: 5, delay_secs: 2 }
+"#,
+        );
+        let rep = spec.tasks[0].repeat.as_ref().expect("repeat survives onto the leaf");
+        assert_eq!(rep.until, "{{ attempt }} == 5", "the runtime key is not substituted away");
+        assert_eq!(rep.max_iterations, 5);
+        // …and it really does stop at the Nth pass rather than one either side.
+        for i in 1..5 {
+            assert_eq!(rep.decide("out", i), crate::dag::RepeatDecision::Again { delay_secs: 2 }, "pass {i} is not the last");
+        }
+        assert_eq!(rep.decide("out", 5), crate::dag::RepeatDecision::Done, "the 5th pass ends the loop");
+
+        // "Repeat whole workflow → all at once": the graph moved into a
+        // template, called once per pass.
+        let (names, _) = run(
+            r#"
+name: my-workflow
+templates:
+  - name: loop-body
+    parameters: { pass: "1" }
+    tasks:
+      - { name: prepare, command: ["echo", "prepare"] }
+      - { name: process, command: ["echo", "process"], depends_on: [prepare] }
+tasks:
+  - name: loop-pass
+    template: loop-body
+    arguments: { pass: "{{ item }}" }
+    with_items: [1, 2, 3]
+"#,
+        );
+        assert_eq!(
+            names,
+            vec![
+                "loop-pass.0.prepare",
+                "loop-pass.0.process",
+                "loop-pass.1.prepare",
+                "loop-pass.1.process",
+                "loop-pass.2.prepare",
+                "loop-pass.2.process",
+            ],
+            "three independent copies of the whole graph"
+        );
+
+        // "Repeat whole workflow → one after another": the body recurses with
+        // `pass + 1` under a `when:` base case, so the expander unrolls the
+        // passes into a chain instead of a fan.
+        let (names, deps) = run(
+            r#"
+name: my-workflow
+templates:
+  - name: loop-body
+    parameters: { pass: "1", passes: "1" }
+    tasks:
+      - { name: prepare, command: ["echo", "prepare"] }
+      - { name: process, command: ["echo", "process"], depends_on: [prepare] }
+      - name: loop-next-pass
+        template: loop-body
+        arguments: { pass: "{{ pass + 1 }}", passes: "{{ passes }}" }
+        depends_on: [process]
+        when: "{{ passes }} > {{ pass }}"
+tasks:
+  - name: loop-pass
+    template: loop-body
+    arguments: { pass: "1", passes: "3" }
+"#,
+        );
+        assert_eq!(names.len(), 6, "three passes of two tasks, and no fourth: {names:?}");
+        // The guard stopped the recursion — a 4th pass would add this name.
+        assert!(
+            !names.contains(&"loop-pass.loop-next-pass.loop-next-pass.loop-next-pass.prepare".to_string()),
+            "`when: passes > pass` is the base case: {names:?}"
+        );
+        // …and each pass waits for the one before it. This is the whole
+        // difference from the parallel shape above.
+        assert_eq!(
+            deps["loop-pass.loop-next-pass.prepare"],
+            vec!["loop-pass.process"],
+            "pass 2 starts after pass 1's last task"
+        );
+        assert_eq!(
+            deps["loop-pass.loop-next-pass.loop-next-pass.prepare"],
+            vec!["loop-pass.loop-next-pass.process"],
+            "pass 3 starts after pass 2's last task"
+        );
+    }
+    /// `repeat:` on a template call is refused, not ignored.
+    ///
+    /// Before this guard the field was dropped during expansion and the run
+    /// executed the sub-DAG exactly once — a workflow that looks like it loops,
+    /// submits cleanly, and quietly doesn't. The console's loop control offers
+    /// "repeat in place" only on leaf steps for this reason; the engine refusing
+    /// it is what keeps a hand-written spec (or an older one) from hitting the
+    /// silent path instead.
+    #[test]
+    fn repeat_on_a_template_call_is_refused_not_dropped() {
+        let spec: DagSpec = serde_yaml::from_str(
+            r#"
+name: w
+templates:
+  - name: body
+    tasks:
+      - { name: work, command: ["true"] }
+tasks:
+  - name: go
+    template: body
+    repeat: { until: "{{ attempt }} == 3", max_iterations: 3 }
+"#,
+        )
+        .expect("parse");
+        let err = expand(spec).expect_err("a loop that would be dropped is an error").to_string();
+        assert!(err.contains("cannot set `repeat:` on a `template:` call"), "got: {err}");
+        // The message has to name the way out, or the only signal is a refusal.
+        assert!(err.contains("with_items"), "the error points at the fan-out alternative: {err}");
     }
 }

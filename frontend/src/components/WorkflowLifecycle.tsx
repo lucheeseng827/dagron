@@ -11,8 +11,10 @@
 // The UI's job here is to make "paused is not deleted" obvious enough that
 // nobody reaches for Delete to mean "stop for now".
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import SpecDiff from "@/components/SpecDiff";
 import { listWorkflowVersions, setWorkflowState } from "@/lib/dagron-api";
+import { diffLines, diffStat } from "@/lib/diff";
 import { errMsg } from "@/lib/err";
 import { absTime, timeAgo } from "@/lib/time";
 import type { WorkflowState, WorkflowVersion } from "@/types/dagron";
@@ -50,7 +52,15 @@ export default function WorkflowLifecycle({
   const [showHistory, setShowHistory] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [viewing, setViewing] = useState<WorkflowVersion | null>(null);
+  /// The version being compared *to*. Null until a row is opened.
+  const [head, setHead] = useState<WorkflowVersion | null>(null);
+  /// The version being compared *from*, by number. Null means "the origin" —
+  /// resolved against the list rather than pinned to 1, because the oldest
+  /// recorded version is not necessarily v1 for a workflow that predates
+  /// versioning. Diffing from the origin forward is the default because the
+  /// question history is opened with is "how did this drift from what we
+  /// started with"; "what changed in this one save" is the per-row stat.
+  const [baseVersion, setBaseVersion] = useState<number | null>(null);
   // Separate from `versions === null`, which also means "not fetched yet" —
   // without its own flag, a rejected request has no way to tell "still
   // loading" apart from "failed", and the panel is stuck showing "Loading…"
@@ -79,7 +89,42 @@ export default function WorkflowLifecycle({
   useEffect(() => {
     setVersions(null);
     setHistoryError(null);
+    // The open diff refers to rows that are about to be refetched; keeping it
+    // would leave a comparison pinned to a stale copy of the spec.
+    setHead(null);
   }, [version]);
+
+  // Oldest first. The list arrives newest-first (the table still shows it that
+  // way), but a history is *read* forward, and every derivation below —
+  // per-save change, the origin, the base default — is "against the one
+  // before".
+  const chronological = useMemo(() => (versions ? [...versions].reverse() : []), [versions]);
+  const origin = chronological[0] ?? null;
+  const base = useMemo(
+    () =>
+      baseVersion == null
+        ? origin
+        : (versions?.find((v) => v.version === baseVersion) ?? origin),
+    [baseVersion, versions, origin],
+  );
+
+  /// What each save changed, against the version before it.
+  ///
+  /// This is what turns the table from a list of timestamps into a changelog:
+  /// for most visits `+4 −1` on the row is the whole answer, and nothing has to
+  /// be opened. Computed once for the list — the specs are already in hand, so
+  /// this costs no requests.
+  const perSave = useMemo(() => {
+    const out = new Map<number, string | null>();
+    for (let i = 0; i < chronological.length; i++) {
+      const prev = chronological[i - 1];
+      out.set(
+        chronological[i].version,
+        prev ? diffStat(diffLines(prev.spec, chronological[i].spec)) : null,
+      );
+    }
+    return out;
+  }, [chronological]);
 
   const current = state ?? "active";
 
@@ -185,31 +230,51 @@ export default function WorkflowLifecycle({
                     <th>Version</th>
                     <th>Saved</th>
                     <th>By</th>
+                    <th>Changed</th>
                     <th />
                   </tr>
                 </thead>
                 <tbody>
-                  {versions.map((v) => (
-                    <tr key={v.id}>
-                      <td className="mono">
-                        v{v.version}
-                        {v.version === version && (
-                          <span style={{ color: "var(--dim)" }}> · current</span>
-                        )}
-                      </td>
-                      <td title={absTime(v.created_at)}>{timeAgo(v.created_at)}</td>
-                      <td style={{ color: "var(--muted)" }}>{v.created_by ?? "—"}</td>
-                      <td style={{ textAlign: "right" }}>
-                        <button
-                          onClick={() => setViewing(v)}
-                          className="dy-btn"
-                          style={{ fontSize: 12, padding: "4px 8px" }}
-                        >
-                          View
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
+                  {versions.map((v) => {
+                    const stat = perSave.get(v.version);
+                    const isOrigin = origin != null && v.version === origin.version;
+                    return (
+                      <tr key={v.id}>
+                        <td className="mono">
+                          v{v.version}
+                          {v.version === version && (
+                            <span style={{ color: "var(--dim)" }}> · current</span>
+                          )}
+                          {isOrigin && <span style={{ color: "var(--dim)" }}> · origin</span>}
+                        </td>
+                        <td title={absTime(v.created_at)}>{timeAgo(v.created_at)}</td>
+                        <td style={{ color: "var(--muted)" }}>{v.created_by ?? "—"}</td>
+                        {/* Against the version before it — what this one save
+                            did, which is a different question from the diff
+                            below (drift from the base). */}
+                        <td className="mono" style={{ fontSize: 11.5 }}>
+                          {isOrigin ? (
+                            <span style={{ color: "var(--dim)" }}>—</span>
+                          ) : stat ? (
+                            <Stat stat={stat} />
+                          ) : (
+                            <span style={{ color: "var(--dim)" }}>no change</span>
+                          )}
+                        </td>
+                        <td style={{ textAlign: "right" }}>
+                          <button
+                            onClick={() => setHead(head?.id === v.id ? null : v)}
+                            className="dy-btn"
+                            style={{ fontSize: 12, padding: "4px 8px" }}
+                            aria-expanded={head?.id === v.id}
+                            title={`Compare v${v.version} against the base below`}
+                          >
+                            {head?.id === v.id ? "Hide" : "Diff"}
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             )}
@@ -220,36 +285,97 @@ export default function WorkflowLifecycle({
       {/* Read-only. Restoring a version is a real action with a real question
           behind it — does it become a new version, or rewind? — and shipping a
           button before that is answered would be guessing on the user's
-          behalf. Copying out of here works today. */}
-      {viewing && (
+          behalf. Copying out of the Full YAML toggle works today. */}
+      {head && base && (
         <div style={{ marginTop: 12 }}>
-          <div className="dy-cardhead">
-            <strong>v{viewing.version}</strong>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              flexWrap: "wrap",
+              marginBottom: 8,
+            }}
+          >
+            <label style={{ color: "var(--muted)", fontSize: 12 }} htmlFor="diff-base">
+              Compare from
+            </label>
+            <select
+              id="diff-base"
+              value={base.version}
+              onChange={(e) => setBaseVersion(Number(e.target.value))}
+              style={selectStyle}
+              title="The version this diff is measured against."
+            >
+              {chronological.map((v) => (
+                <option key={v.id} value={v.version} disabled={v.version === head.version}>
+                  v{v.version}
+                  {origin && v.version === origin.version ? " (origin)" : ""}
+                </option>
+              ))}
+            </select>
+            {/* One click back to the common case, since the base is sticky
+                across rows on purpose — walking v1→v2→v3 with a fixed base is
+                the reason the selector is here rather than hardcoded. */}
+            {origin && base.version !== origin.version && (
+              <button
+                onClick={() => setBaseVersion(null)}
+                className="dy-btn"
+                style={{ fontSize: 11.5, padding: "3px 8px" }}
+              >
+                Reset to origin
+              </button>
+            )}
+            <span style={{ flex: 1 }} />
             <button
-              onClick={() => setViewing(null)}
+              onClick={() => setHead(null)}
               className="dy-btn"
               style={{ fontSize: 12, padding: "4px 8px" }}
             >
               Close
             </button>
           </div>
-          <pre
-            className="mono"
-            style={{
-              background: "var(--bg)",
-              border: "1px solid var(--border)",
-              borderRadius: 6,
-              padding: 12,
-              fontSize: 12.5,
-              maxHeight: 320,
-              overflow: "auto",
-              whiteSpace: "pre-wrap",
-            }}
-          >
-            {viewing.spec}
-          </pre>
+          {base.version === head.version ? (
+            <p className="dy-empty" style={{ margin: 0 }}>
+              v{head.version} is the base. Pick another version to compare it with.
+            </p>
+          ) : (
+            <SpecDiff
+              base={base.spec}
+              head={head.spec}
+              baseLabel={`v${base.version}`}
+              headLabel={`v${head.version}`}
+              identical={`v${head.version} is byte-identical to v${base.version}.`}
+            />
+          )}
         </div>
       )}
     </div>
   );
 }
+
+/// `+4 −1`, colored. Shared by the table's per-save column; the diff header
+/// renders its own because it has the raw counts to hand.
+function Stat({ stat }: { stat: string }) {
+  return (
+    <>
+      {stat.split(" ").map((part, i) => (
+        <span
+          key={i}
+          style={{ color: part.startsWith("+") ? "var(--green)" : "var(--red)", marginRight: 5 }}
+        >
+          {part}
+        </span>
+      ))}
+    </>
+  );
+}
+
+const selectStyle: React.CSSProperties = {
+  padding: "3px 6px",
+  background: "var(--bg)",
+  color: "var(--fg)",
+  border: "1px solid var(--border)",
+  borderRadius: 5,
+  fontSize: 12,
+};

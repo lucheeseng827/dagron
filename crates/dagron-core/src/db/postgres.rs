@@ -29,12 +29,33 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
+    attempt_log::{AttemptEnd, Policy as AttemptPolicy},
     dag::DagGraph,
     models::{RunStatus, TaskRun},
 };
+/// Only `list_task_attempts` materializes this, and that is an `ops` read
+/// endpoint — a lean engine build never constructs one.
+#[cfg(feature = "ops")]
+use crate::models::TaskAttempt;
 
 /// NOTIFY channel the reconcile loop listens on for early wakeups.
 const EVENT_CHANNEL: &str = "task_events";
+
+/// One `pending`, deps-satisfied task the slow advance path has to decide
+/// about: `(id, run_id, trigger_rule, is_approval, input, fanout_of)`.
+///
+/// An alias rather than the tuple inline: this grew a sixth element when the
+/// runtime fan-out needed routing here, and six positional fields read at the
+/// call site as a row of unlabelled values.
+type AdvanceCandidate = (String, String, String, i64, Option<String>, Option<String>);
+
+/// A parked runtime fan-out barrier, as `reconcile_fanouts` reads it:
+/// `(id, run_id, input, allow_failure, version, runner_class, priority, pool)`.
+///
+/// The last three are claim inputs the instances inherit — taken from the
+/// **row** rather than re-derived from the spec, because the row's
+/// `runner_class` was already resolved against the DAG default at creation.
+type ParkedFanout = (String, String, Option<String>, i64, i64, String, i64, Option<String>);
 
 /// Backend-agnostic pool alias; `db::Pool` resolves to this when the `postgres`
 /// feature is active.
@@ -91,7 +112,7 @@ pub async fn ping(pool: &Pool) -> Result<()> {
 /// in a single transaction, then NOTIFYs so any idle scheduler wakes to advance
 /// the root tasks. Returns the new run_id.
 pub async fn create_run(pool: &Pool, dag: &DagGraph, yaml_spec: &str) -> Result<String> {
-    create_run_inner(pool, dag, yaml_spec, None).await
+    create_run_inner(pool, dag, yaml_spec, None, None).await
 }
 
 /// [`create_run`] that also commits a streaming source's cursor **in the same
@@ -106,14 +127,43 @@ pub async fn create_run_with_offset(
     source_name: &str,
     position: &str,
 ) -> Result<String> {
-    create_run_inner(pool, dag, yaml_spec, Some((source_name, position))).await
+    create_run_inner(pool, dag, yaml_spec, Some((source_name, position)), None).await
 }
 
+/// [`create_run`] that deletes the dead letter `dead_letter_id` **in the same
+/// transaction**: the redrive primitive. The run and the delete commit together
+/// or not at all, so a refusal after the claim (the run cap, any error) rolls
+/// the delete back as well and leaves the dead letter exactly as it was, with
+/// the same id and history, ready to redrive again. `Ok(None)` when the row is
+/// already gone (redriven or discarded first), and then nothing is created.
+///
+/// The delete is the claim. Concurrent redrives of one id queue on its row
+/// lock, and each loser finds the row gone once the winner commits, so a dead
+/// letter becomes at most one run.
+#[cfg(feature = "ops")]
+pub async fn create_run_from_dead_letter(
+    pool: &Pool,
+    dag: &DagGraph,
+    yaml_spec: &str,
+    dead_letter_id: &str,
+) -> Result<Option<String>> {
+    match create_run_inner(pool, dag, yaml_spec, None, Some(dead_letter_id)).await {
+        Ok(run_id) => Ok(Some(run_id)),
+        Err(e) if e.is::<super::DeadLetterGone>() => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The run writer behind [`create_run`], [`create_run_with_offset`] and
+/// `create_run_from_dead_letter`. Besides the run, `offset` commits a source
+/// cursor and `dead_letter` deletes that dead letter first, as the claim, all in
+/// the one transaction.
 async fn create_run_inner(
     pool: &Pool,
     dag: &DagGraph,
     yaml_spec: &str,
     offset: Option<(&str, &str)>,
+    dead_letter: Option<&str>,
 ) -> Result<String> {
     let def_id = Uuid::new_v4().to_string();
     let run_id = Uuid::new_v4().to_string();
@@ -133,6 +183,23 @@ async fn create_run_inner(
     });
 
     let mut tx = pool.begin().await?;
+
+    // Redrive claim (`create_run_from_dead_letter`), the transaction's first
+    // statement. A concurrent redrive of the same id blocks on this row lock
+    // until the holder commits (the row is gone) or rolls back (the waiter
+    // claims it). Claiming before the admission lock below means no redrive
+    // waits on a dead letter while holding a workflow's admission lock, so two
+    // redrives can never deadlock.
+    if let Some(id) = dead_letter {
+        let claimed = sqlx::query("DELETE FROM dead_letters WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if claimed == 0 {
+            return Err(anyhow::Error::new(super::DeadLetterGone));
+        }
+    }
 
     // Per-workflow concurrency cap (#21): refuse to start a run if this workflow
     // (by name) already has `max_active_runs` runs in flight. The count filters
@@ -238,9 +305,20 @@ async fn create_run_inner(
         gang_size: Option<i64>,
         priority: i64,
         pool_name: Option<String>,
+        /// The producer task's authored name for a runtime fan-out
+        /// (`with_output_of:`), else None. Denormalised onto the row so the
+        /// advance path can route a barrier to its park with a column
+        /// predicate instead of re-parsing every candidate's TaskSpec.
+        ///
+        /// The AUTHORED name, deliberately: the producer may have been fanned
+        /// out into `<name>.0`, `<name>.1`, … and this is the only place the
+        /// name the author wrote survives. The sweep turns it back into rows
+        /// through the barrier's own `depends_on`
+        /// (`expand::fanout_producer_rows`).
+        fanout_of: Option<String>,
     }
-    // Chunk sizes stay well inside both backends' bind limits: 18 columns ×
-    // 1,000 rows = 18,000 binds (Postgres caps at 65,535; bundled SQLite at
+    // Chunk sizes stay well inside both backends' bind limits: 19 columns ×
+    // 1,000 rows = 19,000 binds (Postgres caps at 65,535; bundled SQLite at
     // 32,766), edges are 2 × 5,000 = 10,000.
     const TASK_INSERT_CHUNK: usize = 1_000;
     const EDGE_INSERT_CHUNK: usize = 5_000;
@@ -257,7 +335,7 @@ async fn create_run_inner(
             "INSERT INTO task_runs \
              (id, run_id, name, status, remaining_deps, input, scheduled_at, trigger_rule, \
               allow_failure, is_approval, approval_timeout_secs, approval_on_timeout, \
-              runner_class, gang_id, gang_rank, gang_size, priority, pool) ",
+              runner_class, gang_id, gang_rank, gang_size, priority, pool, fanout_of) ",
         );
         qb.push_values(rows, |mut b, r| {
             b.push_bind(&r.id)
@@ -277,7 +355,8 @@ async fn create_run_inner(
                 .push_bind(r.gang_rank)
                 .push_bind(r.gang_size)
                 .push_bind(r.priority)
-                .push_bind(r.pool_name.as_deref());
+                .push_bind(r.pool_name.as_deref())
+                .push_bind(r.fanout_of.as_deref());
         });
         qb.build().execute(&mut **tx).await?;
         Ok(())
@@ -367,6 +446,10 @@ async fn create_run_inner(
                 // every member of a gang inherits the authored task's values.
                 priority: task_spec.priority,
                 pool_name: task_spec.pool.clone(),
+                // Gang members can't carry this — `with_output_of` and `gang`
+                // are refused together (dag.rs) — but cloning it per member
+                // rather than special-casing keeps one expression.
+                fanout_of: task_spec.with_output_of.clone(),
             });
             ids.push(task_id);
             // Flush a full chunk immediately — the buffer never holds more
@@ -674,9 +757,13 @@ async fn advance_default_shaped(pool: &Pool) -> Result<u64> {
     // Ready half: stamp `scheduled_at` with the readiness instant (the
     // dispatch-latency baseline; see the slow path's twin comment).
     let readied = sqlx::query(
+        // `fanout_of IS NULL` keeps a runtime fan-out barrier out of the fast
+        // path — mirrors the SQLite backend; see there for why a barrier must
+        // never reach `ready` and why excluding it here leaves the claim path
+        // untouched.
         "UPDATE task_runs SET status = 'ready', scheduled_at = $1
          WHERE status = 'pending' AND remaining_deps = 0
-           AND trigger_rule = 'all_success' AND is_approval = 0
+           AND trigger_rule = 'all_success' AND is_approval = 0 AND fanout_of IS NULL
            AND (input IS NULL OR input NOT LIKE '%\"when\"%')
            AND NOT EXISTS (
                SELECT 1 FROM task_dependencies d
@@ -744,8 +831,8 @@ async fn advance_default_shaped(pool: &Pool) -> Result<u64> {
 /// Each transition is guarded by `status = 'pending'`, so concurrent schedulers
 /// are winner-take-all and a skip's dependent-decrement runs exactly once.
 async fn advance_exotic_once(pool: &Pool) -> Result<u64> {
-    let candidates: Vec<(String, String, String, i64, Option<String>)> = sqlx::query_as(
-        "SELECT id, run_id, trigger_rule, is_approval, input FROM task_runs
+    let candidates: Vec<AdvanceCandidate> = sqlx::query_as(
+        "SELECT id, run_id, trigger_rule, is_approval, input, fanout_of FROM task_runs
          WHERE status = 'pending' AND remaining_deps = 0
          ORDER BY id",
     )
@@ -756,7 +843,7 @@ async fn advance_exotic_once(pool: &Pool) -> Result<u64> {
     }
 
     let mut transitioned = 0u64;
-    for (task_id, run_id, rule, is_approval, input) in candidates {
+    for (task_id, run_id, rule, is_approval, input, fanout_of) in candidates {
         let dep_statuses: Vec<String> = sqlx::query_scalar(
             "SELECT dep.status FROM task_dependencies d
              JOIN task_runs dep ON dep.id = d.dependency_id
@@ -827,7 +914,22 @@ async fn advance_exotic_once(pool: &Pool) -> Result<u64> {
         if when_pass && crate::models::trigger_rule_ready(&rule, &dep_statuses) {
             // An approval gate (#19) parks in `awaiting_approval` (never claimed by
             // a worker); `scheduled_at` marks when it began waiting for the sweep.
-            let rows = if is_approval != 0 {
+            let rows = if fanout_of.is_some() {
+                // A runtime fan-out barrier parks instead of going `ready` —
+                // mirrors the SQLite backend. `reconcile_fanouts` resolves it.
+                let now = chrono::Utc::now().to_rfc3339();
+                sqlx::query(
+                    "UPDATE task_runs
+                     SET status = 'running', scheduled_at = $1,
+                         claimed_by = NULL, lease_expires_at = NULL
+                     WHERE id = $2 AND status = 'pending'",
+                )
+                .bind(&now)
+                .bind(&task_id)
+                .execute(pool)
+                .await?
+                .rows_affected()
+            } else if is_approval != 0 {
                 let now = chrono::Utc::now().to_rfc3339();
                 sqlx::query(
                     "UPDATE task_runs SET status = 'awaiting_approval', scheduled_at = $1
@@ -917,10 +1019,17 @@ const RUN_ADMISSION_LOCK: i32 = 0x6461_6772; // ascii "dagr"
 /// twin. Parked tasks (`sub_run_id` / `wake_at` / `wait_url` / `wait_dataset`)
 /// keep `status = 'running'` while holding no worker, so counting them would let
 /// a sleeping sensor squat its pool's budget. Shared by both claim paths.
+/// Pooled tasks currently occupying a slot. See db/sqlite.rs's copy for the
+/// reasoning, including why `defer:` is deliberately NOT excluded: the four
+/// park shapes wait on something free, while a deferred row waits on a job
+/// burning someone's cluster, and counting it is the only thing that lets
+/// `pool:` mean "at most N concurrent remote jobs" rather than "N concurrent
+/// submissions", which take seconds and bound nothing.
 const POOL_RUNNING_COUNT: &str = "SELECT COUNT(*) FROM task_runs
      WHERE status = 'running' AND pool = $1
        AND wake_at IS NULL AND wait_url IS NULL
-       AND wait_dataset IS NULL AND sub_run_id IS NULL";
+       AND wait_dataset IS NULL AND sub_run_id IS NULL
+       AND fanout_of IS NULL";
 
 pub async fn claim_ready(pool: &Pool, worker_id: &str, limit: i64) -> Result<Vec<TaskRun>> {
     claim_ready_classes(pool, worker_id, limit, &[], &std::collections::BTreeMap::new()).await
@@ -1045,7 +1154,7 @@ async fn claim_ready_filtered(
     let cand_rows = sqlx::query(
         "SELECT id, run_id, name, status, attempt, remaining_deps,
                 input, output, claimed_by, lease_expires_at, version,
-                scheduled_at, finished_at, pool
+                scheduled_at, finished_at, pool, external_epoch
          FROM task_runs
          WHERE status = 'ready'
            AND (scheduled_at IS NULL OR scheduled_at <= $1)
@@ -1354,10 +1463,17 @@ async fn mark_task_succeeded_inner(
     // separately-failed dependency is left for the skip half of the next
     // advance sweep. Success-mark only: a failure's dependents skip-cascade
     // through `advance_ready_tasks` on the next tick, off the hot path.
+        // `fanout_of IS NULL` is not cosmetic here. This is the happy-path hop
+        // that promotes a dependent the instant its producer succeeds — which
+        // is *precisely* when a runtime fan-out barrier's dependencies become
+        // satisfied. Without it the barrier would go `ready`, a worker would
+        // claim it, and it would execute the command that is only ever the
+        // template for its instances. It has to be refused in every
+        // pending -> ready transition, not just the sweep's.
     sqlx::query(
         "UPDATE task_runs SET status = 'ready', scheduled_at = $1
          WHERE status = 'pending' AND remaining_deps = 0
-           AND trigger_rule = 'all_success' AND is_approval = 0
+           AND trigger_rule = 'all_success' AND is_approval = 0 AND fanout_of IS NULL
            AND (input IS NULL OR input NOT LIKE '%\"when\"%')
            AND id IN (
                SELECT dependent_id FROM task_dependencies WHERE dependency_id = $2
@@ -1472,6 +1588,358 @@ pub async fn append_task_output(
     }
     tx.commit().await?;
     Ok(())
+}
+
+// ── Runtime fan-out (`with_output_of:`) ──────────────────────────────────────
+
+/// Statuses meaning an instance will not change again.
+const FANOUT_TERMINAL: [&str; 4] = ["succeeded", "failed", "skipped", "cancelled"];
+
+/// Resolve parked runtime fan-out barriers — the sweep that makes
+/// `with_output_of:` work.
+///
+/// A barrier is a task whose instance count could not be known when the run was
+/// created, because it is the *result* of an upstream task. It is created as
+/// one row, parks when its dependencies are satisfied (`status = 'running'`,
+/// claim and lease NULL — the same shape as every other park), and is resolved
+/// here in two phases:
+///
+/// 1. **Expand.** No instances yet: read the producer's output, parse a JSON
+///    array, insert one `ready` row per element with `{{ item }}` substituted,
+///    and wire the barrier to depend on each. The barrier stays parked.
+/// 2. **Join.** Instances exist: once all of them are terminal, the barrier
+///    resolves with them and its dependents advance.
+///
+/// The barrier deliberately survives expansion as the **join point**. The
+/// alternative is re-parenting every dependent onto the new instances, which
+/// means rewriting dependency edges underneath a scheduler that is concurrently
+/// reading them; keeping the barrier means dependents were already wired to the
+/// thing they should wait for, `trigger_rule` and `allow_failure` keep working
+/// unchanged, and the only edges this writes are new ones.
+///
+/// Mirrors the SQLite backend statement for statement; see there for the full
+/// reasoning, including why the barrier survives expansion as the join point
+/// rather than the dependents being re-parented onto the instances.
+///
+/// Idempotent and HA-safe. Phase 1's insert is one transaction gated on a CAS
+/// of the barrier's `version`, so two schedulers sweeping at once cannot both
+/// expand it; phase 2's resolve is guarded on the parked shape, so a
+/// double-resolve is a no-op. A crash mid-expansion commits nothing and the
+/// barrier is simply expanded again next tick.
+pub async fn reconcile_fanouts(pool: &Pool) -> Result<Vec<(String, crate::models::FanoutOutcome)>> {
+    let parked: Vec<ParkedFanout> = sqlx::query_as(
+            "SELECT id, run_id, input, allow_failure, version,
+                    runner_class, priority, pool
+             FROM task_runs
+             WHERE status = 'running' AND fanout_of IS NOT NULL AND claimed_by IS NULL",
+        )
+        .fetch_all(pool)
+        .await?;
+
+    let mut out = Vec::new();
+    for (task_id, run_id, input, allow_failure, version, runner_class, priority, pool_name) in
+        parked
+    {
+        // Instances from a PREVIOUS generation of this barrier, dropped before
+        // anything else looks at them.
+        //
+        // A barrier's instances are its dependencies (`dependent_id = barrier`),
+        // so no reset path's downstream cone reaches them: clearing a barrier —
+        // or its producer — leaves them terminal and attached. Without this the
+        // join branch below would resolve the re-run against the previous
+        // attempt's results and never re-read the producer, so clearing a
+        // producer and re-running would process the old partitions.
+        //
+        // Strictly `<`, never `<>`: a concurrent scheduler that won the CAS
+        // first has already stamped instances with a HIGHER epoch than this
+        // stale read, and `<>` would delete the rows it just created. `version`
+        // only increases, so older is the only kind of stale there is.
+        // Edges first — `task_dependencies` references `task_runs` with no
+        // cascade, so the reverse order is a foreign-key violation.
+        sqlx::query(
+            "DELETE FROM task_dependencies
+             WHERE dependent_id = $1
+               AND dependency_id IN (
+                   SELECT id FROM task_runs
+                   WHERE fanout_parent = $2 AND fanout_epoch < $3
+               )",
+        )
+        .bind(&task_id)
+        .bind(&task_id)
+        .bind(version)
+        .execute(pool)
+        .await?;
+        sqlx::query("DELETE FROM task_runs WHERE fanout_parent = $1 AND fanout_epoch < $2")
+            .bind(&task_id)
+            .bind(version)
+            .execute(pool)
+            .await?;
+
+        let instances_present: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_runs WHERE fanout_parent = $1")
+                .bind(&task_id)
+                .fetch_one(pool)
+                .await?;
+
+        // ── phase 2: join ───────────────────────────────────────────────────
+        if instances_present > 0 {
+            let statuses: Vec<String> =
+                sqlx::query_scalar("SELECT status FROM task_runs WHERE fanout_parent = $1")
+                    .bind(&task_id)
+                    .fetch_all(pool)
+                    .await?;
+            if statuses.iter().any(|s| !FANOUT_TERMINAL.contains(&s.as_str())) {
+                continue; // still running — the common tick
+            }
+            let failed = statuses.iter().filter(|s| *s == "failed" || *s == "cancelled").count();
+            let succeeded = failed == 0 || allow_failure != 0;
+            let summary = fanout_summary(&statuses);
+            if finish_fanout(pool, &task_id, succeeded, &summary).await? {
+                out.push((
+                    task_id,
+                    crate::models::FanoutOutcome::Joined {
+                        succeeded,
+                        instances: statuses.len(),
+                    },
+                ));
+            }
+            continue;
+        }
+
+        // ── phase 1: expand ─────────────────────────────────────────────────
+        let Some(spec) = input
+            .as_deref()
+            .and_then(|j| serde_json::from_str::<crate::dag::TaskSpec>(j).ok())
+        else {
+            let why = "the task's stored spec could not be read".to_string();
+            if finish_fanout(pool, &task_id, false, &why).await? {
+                out.push((task_id, crate::models::FanoutOutcome::Failed { reason: why }));
+            }
+            continue;
+        };
+        let producer = spec.with_output_of.clone().unwrap_or_default();
+
+        // Which rows hold the producer's output. Taken from this task's own
+        // expanded `depends_on`, which is what makes a producer that is ITSELF
+        // fanned out work: expansion replaced `regions` with `regions.0`,
+        // `regions.1`, … and rewired this task onto exactly those rows, so the
+        // dependency list already names them and nothing has to be matched
+        // against the rest of the run. See `expand::fanout_producer_rows`.
+        let want = crate::expand::fanout_producer_rows(&producer, &spec.depends_on);
+        if want.is_empty() {
+            let why = format!(
+                "with_output_of names '{producer}', which is not among this task's \
+                 dependencies — nothing to read"
+            );
+            if finish_fanout(pool, &task_id, false, &why).await? {
+                out.push((task_id, crate::models::FanoutOutcome::Failed { reason: why }));
+            }
+            continue;
+        }
+
+        // Read through the dependency EDGES rather than by name: one query
+        // whatever the producer's width, no bind limit to chunk around, and a
+        // row this task does not depend on cannot be reached even in
+        // principle. Ordering comes from `want` below, not from the query.
+        let dep_rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT t.name, t.output
+             FROM task_runs t
+             JOIN task_dependencies d ON d.dependency_id = t.id
+             WHERE d.dependent_id = $1",
+        )
+        .bind(&task_id)
+        .fetch_all(pool)
+        .await?;
+        let by_name: std::collections::HashMap<&str, &str> = dep_rows
+            .iter()
+            .map(|(n, o)| (n.as_str(), o.as_deref().unwrap_or("")))
+            .collect();
+        // `depends_on` order, which is instance order — so a chained fan-out
+        // concatenates `regions.0`'s items before `regions.1`'s rather than in
+        // whatever order a string sort would give.
+        let producers: Vec<(&str, &str)> =
+            want.iter().map(|n| (*n, *by_name.get(n).unwrap_or(&""))).collect();
+
+        let instances =
+            match crate::expand::fanout_instances(&spec, &producers) {
+                Ok(v) => v,
+                Err(e) => {
+                    let why = e.to_string();
+                    if finish_fanout(pool, &task_id, false, &why).await? {
+                        out.push((task_id, crate::models::FanoutOutcome::Failed { reason: why }));
+                    }
+                    continue;
+                }
+            };
+
+        // The admission decision this feature owes the rest of the system. A
+        // run's task count is otherwise fixed before the run exists, which is
+        // what lets `budget:` refuse a fan-out blow-up at submit; a runtime
+        // fan-out breaks that invariant, so the ceiling is re-checked here —
+        // and exceeding it fails the task with the same typed message
+        // expansion uses, rather than inserting the rows and finding out.
+        let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_runs WHERE run_id = $1")
+            .bind(&run_id)
+            .fetch_one(pool)
+            .await?;
+        let ceiling = crate::expand::max_tasks_per_run() as i64;
+        if existing + instances.len() as i64 > ceiling {
+            let why = format!(
+                "runtime fan-out over '{producer}' would add {} tasks to a run that already has \
+                 {existing}, exceeding {ceiling} (DAGRON_MAX_TASKS_PER_RUN)",
+                instances.len()
+            );
+            if finish_fanout(pool, &task_id, false, &why).await? {
+                out.push((task_id, crate::models::FanoutOutcome::Failed { reason: why }));
+            }
+            continue;
+        }
+
+        // An empty list is a result, not a mistake (see `fanout_instances`):
+        // the barrier succeeds with nothing under it and its dependents
+        // advance, which is what "there were no partitions" should mean.
+        if instances.is_empty() {
+            if finish_fanout(pool, &task_id, true, "[]").await? {
+                out.push((
+                    task_id,
+                    crate::models::FanoutOutcome::Joined { succeeded: true, instances: 0 },
+                ));
+            }
+            continue;
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut tx = pool.begin().await?;
+        // Winner-take-all: the same optimistic CAS the claim path uses. Two
+        // schedulers sweeping the same tick both read zero instances, and
+        // without this both would insert a full set.
+        // `RETURNING version` rather than `version + 1` computed here: the
+        // number the instances are stamped with has to be the one this
+        // statement actually wrote, or a stamp and a barrier could disagree
+        // about which generation the rows belong to.
+        let epoch: Option<(i64,)> = sqlx::query_as(
+            "UPDATE task_runs SET version = version + 1
+             WHERE id = $1 AND version = $2 AND status = 'running' AND claimed_by IS NULL
+             RETURNING version",
+        )
+        .bind(&task_id)
+        .bind(version)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((epoch,)) = epoch else {
+            tx.rollback().await?;
+            continue; // another scheduler is expanding this barrier
+        };
+
+        for inst in &instances {
+            let instance_id = Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO task_runs
+                     (id, run_id, name, status, remaining_deps, input, scheduled_at,
+                      trigger_rule, allow_failure, is_approval, runner_class, priority,
+                      pool, fanout_parent, fanout_epoch)
+                 VALUES ($1, $2, $3, 'ready', 0, $4, $5, 'all_success', $6, 0, $7, $8, $9, $10, $11)",
+            )
+            .bind(&instance_id)
+            .bind(&run_id)
+            .bind(&inst.name)
+            .bind(serde_json::to_string(&inst.spec)?)
+            // `ready` with `scheduled_at` now: the dependencies that gate this
+            // fan-out have already succeeded (that is what un-parked the
+            // barrier), so an instance has nothing left to wait for.
+            .bind(&now)
+            .bind(allow_failure)
+            // Claim inputs come from the barrier's row, not its spec: the row's
+            // `runner_class` was already resolved against the DAG default at
+            // creation, and re-deriving it here is how the two come to differ.
+            .bind(&runner_class)
+            .bind(priority)
+            .bind(pool_name.as_deref())
+            .bind(&task_id)
+            // The generation this instance belongs to. A later reset bumps the
+            // barrier's version past it, which is how the sweep above knows to
+            // throw this row away rather than join against it.
+            .bind(epoch)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO task_dependencies (dependent_id, dependency_id) VALUES ($1, $2)",
+            )
+            .bind(&task_id)
+            .bind(&instance_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        out.push((
+            task_id,
+            crate::models::FanoutOutcome::Expanded { instances: instances.len() },
+        ));
+    }
+    Ok(out)
+}
+
+/// A one-line account of how the instances went, stored as the barrier's
+/// output.
+///
+/// Deliberately a summary rather than the instances' concatenated output. The
+/// barrier is one `task_runs.output` column, that column is uncapped, and
+/// collecting N unbounded outputs into it is the same unbounded multiplication
+/// `attempt_log` exists to avoid — the per-instance output is already readable
+/// on each instance's own row.
+fn fanout_summary(statuses: &[String]) -> String {
+    let count = |want: &str| statuses.iter().filter(|s| s.as_str() == want).count();
+    serde_json::json!({
+        "instances": statuses.len(),
+        "succeeded": count("succeeded"),
+        "failed": count("failed") + count("cancelled"),
+        "skipped": count("skipped"),
+    })
+    .to_string()
+}
+
+/// Resolve a parked barrier and advance its dependents, in one transaction.
+///
+/// Guarded on the parked shape (`running` + `fanout_of` + no claim), so a
+/// second scheduler resolving the same barrier is a no-op and the dependent
+/// decrement runs exactly once — the same winner-take-all contract
+/// `resolve_approval` carries. Returns whether this call won.
+async fn finish_fanout(pool: &Pool, task_id: &str, succeeded: bool, output: &str) -> Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    let rows = sqlx::query(
+        "UPDATE task_runs SET status = $1, finished_at = $2, output = $3
+         WHERE id = $4 AND status = 'running' AND fanout_of IS NOT NULL AND claimed_by IS NULL",
+    )
+    .bind(if succeeded { "succeeded" } else { "failed" })
+    .bind(&now)
+    .bind(output)
+    .bind(task_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if rows == 0 {
+        tx.commit().await?;
+        return Ok(false);
+    }
+    // Decremented on failure as well as success, exactly as `mark_task_failed`
+    // does and for the same reason: `remaining_deps` counts dependencies that
+    // are not yet *terminal*, not ones that succeeded. Gating this on success
+    // leaves every dependent of a failed barrier pending forever — the advance
+    // sweep only looks at `remaining_deps = 0`, so it never gets to apply the
+    // trigger rule that would skip them, and the run hangs rather than failing.
+    // It is also what lets an `all_done` dependent run after a failed fan-out.
+    sqlx::query(
+        "UPDATE task_runs SET remaining_deps = remaining_deps - 1
+         WHERE id IN (SELECT dependent_id FROM task_dependencies WHERE dependency_id = $1)
+           AND status = 'pending'",
+    )
+    .bind(task_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// Resolve a human approval gate (#19): `approve` → the task succeeds and its
@@ -2119,6 +2587,413 @@ pub async fn resolve_url_wait(pool: &Pool, task_id: &str) -> Result<bool> {
     Ok(true)
 }
 
+// ── deferred external jobs (`defer:`; the fifth park shape) ──────────────────
+//
+// Mirrors db/sqlite.rs's quartet — see there for the reasoning on each
+// guard. The only differences here are placeholder syntax and that a resolve
+// rides the same NOTIFY-free path the other parked resolutions do (the
+// reconcile poll picks the advanced dependents up).
+
+/// Park a task on a remote job it just submitted: drop the claim and the lease,
+/// keep `status = 'running'`, and record the handle. Fence-guarded.
+///
+/// The NULL lease is the crash-recovery argument: `recover_expired_leases`
+/// filters `lease_expires_at IS NOT NULL`, so a parked row is provably outside
+/// the set it can reclaim.
+#[allow(clippy::too_many_arguments)]
+pub async fn park_external(
+    pool: &Pool,
+    task_id: &str,
+    fence: i64,
+    kind: &str,
+    handle: &str,
+    endpoint: Option<&str>,
+    next_poll_at: &str,
+    deadline_at: Option<&str>,
+) -> Result<bool> {
+    let rows = sqlx::query(
+        "UPDATE task_runs
+         SET external_kind = $1, external_handle = $2, external_endpoint = $3,
+             next_poll_at = $4, external_deadline_at = $5,
+             claimed_by = NULL, lease_expires_at = NULL
+         WHERE id = $6 AND status = 'running' AND version = $7",
+    )
+    .bind(kind)
+    .bind(handle)
+    .bind(endpoint)
+    .bind(next_poll_at)
+    .bind(deadline_at)
+    .bind(task_id)
+    .bind(fence)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(rows > 0)
+}
+
+/// **Claim** up to `limit` parked external jobs due for a poll and return only
+/// the rows this scheduler won. See db/sqlite.rs's copy for why claiming rather
+/// than listing (N schedulers would otherwise make N vendor calls per due row)
+/// and why the guard is null-safe.
+///
+/// `IS NOT DISTINCT FROM` is Postgres's null-safe equality, the counterpart of
+/// SQLite's `IS`: a row parked with no interval carries `next_poll_at IS NULL`,
+/// and an `=` guard would leave exactly those rows unclaimable forever.
+pub async fn claim_due_external_polls(
+    pool: &Pool,
+    limit: i64,
+    claim_secs: u64,
+) -> Result<Vec<crate::models::ExternalPark>> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let until = crate::dag::delayed_retry_at(claim_secs);
+    let rows = sqlx::query_as::<_, (
+        String, String, String, String, String, Option<String>, i64, Option<String>, Option<String>, Option<String>,
+    )>(
+        "SELECT id, name, run_id, external_kind, external_handle, external_endpoint,
+                external_epoch, external_deadline_at, input, next_poll_at
+         FROM task_runs
+         WHERE status = 'running' AND external_handle IS NOT NULL
+           AND (next_poll_at IS NULL OR next_poll_at <= $1)
+         ORDER BY next_poll_at
+         LIMIT $2",
+    )
+    .bind(&now)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    let mut won = Vec::with_capacity(rows.len());
+    for (id, name, run_id, kind, handle, endpoint, epoch, deadline, input, observed) in rows {
+        let claimed = sqlx::query(
+            "UPDATE task_runs SET next_poll_at = $1
+             WHERE id = $2 AND status = 'running' AND external_handle = $3
+               AND next_poll_at IS NOT DISTINCT FROM $4",
+        )
+        .bind(&until)
+        .bind(&id)
+        .bind(&handle)
+        .bind(&observed)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        if claimed > 0 {
+            won.push(crate::models::ExternalPark {
+                id,
+                name,
+                run_id,
+                external_kind: kind,
+                external_handle: handle,
+                external_endpoint: endpoint,
+                external_epoch: epoch,
+                external_deadline_at: deadline,
+                input,
+            });
+        }
+    }
+    Ok(won)
+}
+
+/// Push a parked external job's next poll out after a "still running" verdict.
+/// Guarded on the **observed** handle so a stale HA sweep cannot delay a row
+/// that has since moved on to a newer job.
+pub async fn repark_external(
+    pool: &Pool,
+    task_id: &str,
+    handle: &str,
+    next_poll_at: &str,
+) -> Result<bool> {
+    let rows = sqlx::query(
+        "UPDATE task_runs SET next_poll_at = $1
+         WHERE id = $2 AND status = 'running' AND external_handle = $3",
+    )
+    .bind(next_poll_at)
+    .bind(task_id)
+    .bind(handle)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(rows > 0)
+}
+
+/// Resolve a parked external job whose remote work succeeded. Clearing the
+/// handle in the same statement is what takes the row out of the parked set, so
+/// only one scheduler ever resolves it.
+pub async fn resolve_external(
+    pool: &Pool,
+    task_id: &str,
+    handle: &str,
+    output: Option<&str>,
+) -> Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    let rows = sqlx::query(
+        "UPDATE task_runs
+         SET status = 'succeeded', finished_at = $1, output = COALESCE($2, output),
+             external_handle = NULL, next_poll_at = NULL, external_deadline_at = NULL
+         WHERE id = $3 AND status = 'running' AND external_handle = $4",
+    )
+    .bind(&now)
+    .bind(output)
+    .bind(task_id)
+    .bind(handle)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if rows == 0 {
+        tx.commit().await?;
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE task_runs SET remaining_deps = remaining_deps - 1
+         WHERE id IN (
+             SELECT dependent_id FROM task_dependencies WHERE dependency_id = $1
+         ) AND status = 'pending'",
+    )
+    .bind(task_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Fail a parked external job and **bump `external_epoch`**, so a retry submits
+/// a new remote job instead of adopting the one that just failed (the remote
+/// name is `dagron-<id>-<epoch>` and `id` is stable across every reset).
+pub async fn fail_external(
+    pool: &Pool,
+    task_id: &str,
+    handle: &str,
+    reason: &str,
+) -> Result<bool> {
+    fail_external_impl(pool, task_id, handle, reason, false).await
+}
+
+/// [`fail_external`] that **keeps the handle**, so the row owes a teardown and
+/// the cancel sweep stops the remote job. For the `max_wait_secs` ceiling, where
+/// the job is by definition still running — unlike a remote failure, which
+/// leaves nothing to stop.
+pub async fn fail_external_keep_handle(
+    pool: &Pool,
+    task_id: &str,
+    handle: &str,
+    reason: &str,
+) -> Result<bool> {
+    fail_external_impl(pool, task_id, handle, reason, true).await
+}
+
+async fn fail_external_impl(
+    pool: &Pool,
+    task_id: &str,
+    handle: &str,
+    reason: &str,
+    keep_handle: bool,
+) -> Result<bool> {
+    let handle_sql = if keep_handle { "external_handle" } else { "NULL" };
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    let rows = sqlx::query(&format!(
+        "UPDATE task_runs
+         SET status = 'failed', finished_at = $1, output = $2,
+             external_handle = {handle_sql}, next_poll_at = NULL, external_deadline_at = NULL,
+             external_epoch = external_epoch + 1
+         WHERE id = $3 AND status = 'running' AND external_handle = $4"
+    ))
+    .bind(&now)
+    .bind(reason)
+    .bind(task_id)
+    .bind(handle)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if rows == 0 {
+        tx.commit().await?;
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE task_runs SET remaining_deps = remaining_deps - 1
+         WHERE id IN (
+             SELECT dependent_id FROM task_dependencies WHERE dependency_id = $1
+         ) AND status = 'pending'",
+    )
+    .bind(task_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+// ── cancel teardown (reaching the remote job a cancelled run left running) ───
+//
+// Mirrors db/sqlite.rs — see there for why the predicate is "holds a handle and
+// is not parked", why it is task-level rather than run-level, and why the sweep
+// is a lease claim every replica runs rather than a leader-gated one.
+
+/// Which of `ids` name a task that is **still live** — not yet terminal.
+///
+/// The fleet sweep's only question. It asks about the ids it actually observed
+/// on workloads rather than listing every live task, so the query is bounded by
+/// what the cluster showed rather than by how busy the datastore is.
+///
+/// An id that is **absent from the answer is absent for two different reasons**,
+/// and both mean the same thing for a workload carrying it: the task reached a
+/// terminal status, or the row is gone entirely because retention collected the
+/// run. A workload for either is leftover. That conflation is safe only because
+/// the caller has already scoped its listing to one installation — without
+/// that, "no such row here" would also describe a *live* task belonging to a
+/// different dagron sharing the namespace, and deleting on absence would delete
+/// someone else's running work.
+pub async fn live_task_ids(
+    pool: &Pool,
+    ids: &[String],
+) -> Result<std::collections::HashSet<String>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    // One bound array rather than N placeholders — Postgres has the type, so
+    // the statement text is constant and the plan is cacheable however many
+    // workloads the sweep saw.
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM task_runs \
+          WHERE id = ANY($1) \
+            AND status NOT IN ('succeeded', 'failed', 'skipped', 'cancelled')",
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Claim up to `limit` rows that owe a remote teardown.
+pub async fn claim_due_external_cancels(
+    pool: &Pool,
+    limit: i64,
+    lease_secs: u64,
+) -> Result<Vec<crate::models::ExternalCancel>> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let lease_until = crate::dag::delayed_retry_at(lease_secs);
+    // Read the candidates, then CAS each one on the `next_poll_at` this sweep
+    // OBSERVED, keeping only the rows whose stamp actually landed — the same
+    // shape as `claim_due_external_polls` above, and for the same reason.
+    //
+    // A transaction is not enough here and the first version of this function
+    // relied on one. Under READ COMMITTED two schedulers read the same due
+    // rows; the second `UPDATE` waits for the first to commit and then
+    // overwrites it, and *both* returned every row they read. Both replicas
+    // then send a cancel for the same remote job and both spend an
+    // `external_cancel_attempts` on it, so the give-up budget burns at 2× the
+    // rate with N replicas. The SQLite twin survives the same code only
+    // because SQLite serialises writers through one connection; Postgres does
+    // not, which is exactly the case this claim exists for.
+    let candidates = sqlx::query_as::<_, (
+        String, String, String, String, Option<String>, i64, i64, Option<String>, Option<String>,
+        Option<String>,
+    )>(
+        "SELECT id, run_id, external_kind, external_handle, external_endpoint,
+                external_epoch, external_cancel_attempts, finished_at, next_poll_at, input
+         FROM task_runs
+         WHERE external_handle IS NOT NULL
+           AND status <> 'running'
+           AND (next_poll_at IS NULL OR next_poll_at <= $1)
+         ORDER BY next_poll_at
+         LIMIT $2",
+    )
+    .bind(&now)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    let mut won = Vec::with_capacity(candidates.len());
+    for (id, run_id, kind, handle, endpoint, epoch, attempts, finished_at, observed, input) in
+        candidates
+    {
+        let claimed = sqlx::query(
+            "UPDATE task_runs SET next_poll_at = $1
+             WHERE id = $2 AND external_handle = $3
+               AND next_poll_at IS NOT DISTINCT FROM $4",
+        )
+        .bind(&lease_until)
+        .bind(&id)
+        .bind(&handle)
+        .bind(&observed)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        if claimed > 0 {
+            won.push(crate::models::ExternalCancel {
+                id,
+                run_id,
+                external_kind: kind,
+                external_handle: handle,
+                external_endpoint: endpoint,
+                external_epoch: epoch,
+                external_cancel_attempts: attempts,
+                input,
+                finished_at,
+            });
+        }
+    }
+    Ok(won)
+}
+
+/// Settle a row's teardown debt — torn down, or given up on. Guarded on the
+/// observed handle so a stale sweep cannot clear a newer submission's debt.
+pub async fn clear_external_handle(pool: &Pool, task_id: &str, handle: &str) -> Result<bool> {
+    let rows = sqlx::query(
+        "UPDATE task_runs
+         SET external_handle = NULL, next_poll_at = NULL, external_deadline_at = NULL
+         WHERE id = $1 AND external_handle = $2",
+    )
+    .bind(task_id)
+    .bind(handle)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(rows > 0)
+}
+
+/// Record a failed teardown attempt and schedule the retry, returning the new
+/// attempt count. Only a genuine failure increments.
+pub async fn record_external_cancel_failure(
+    pool: &Pool,
+    task_id: &str,
+    handle: &str,
+    next_at: &str,
+) -> Result<i64> {
+    let n: Option<i64> = sqlx::query_scalar(
+        "UPDATE task_runs
+         SET external_cancel_attempts = external_cancel_attempts + 1, next_poll_at = $1
+         WHERE id = $2 AND external_handle = $3
+         RETURNING external_cancel_attempts",
+    )
+    .bind(next_at)
+    .bind(task_id)
+    .bind(handle)
+    .fetch_optional(pool)
+    .await?;
+    Ok(n.unwrap_or_default())
+}
+
+/// Hand the row back without consuming an attempt: this engine has no poller
+/// for the kind, so it tried nothing. A `RUNNER_CLASSES` pool runs the same
+/// binary with different seams, so one replica can own a kind another cannot.
+pub async fn release_external_cancel_claim(
+    pool: &Pool,
+    task_id: &str,
+    handle: &str,
+    next_at: &str,
+) -> Result<bool> {
+    let rows = sqlx::query(
+        "UPDATE task_runs SET next_poll_at = $1 WHERE id = $2 AND external_handle = $3",
+    )
+    .bind(next_at)
+    .bind(task_id)
+    .bind(handle)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(rows > 0)
+}
+
 // ── datasets (produce → track → trigger; data-aware scheduling) ──────────────
 
 /// Record dataset updates from a succeeded `produces:` task: upsert each URI in
@@ -2268,8 +3143,10 @@ pub async fn prune_dataset_triggers(pool: &Pool) -> Result<u64> {
 
 /// Claim dataset triggers that are due to fire. For each subscribed workflow:
 /// `any` mode fires when **any** subscribed dataset has an event newer than its
-/// cursor; `all` mode (composition, feature-gated) fires only when **every**
-/// subscribed dataset does. Claiming CAS-advances the fresh cursors to their
+/// cursor; `all` mode fires only when **every** subscribed dataset does — the
+/// fan-in a `wait:` sensor cannot express, since a sensor stamps its cursor at
+/// park time and so misses an upstream that landed before the run started.
+/// Claiming CAS-advances the fresh cursors to their
 /// current high-water marks in one transaction — the scheduler that wins the
 /// CAS owns the fire (HA-safe with no leadership; losers roll back and skip).
 /// Multiple updates to one dataset coalesce into a single fire.
@@ -2500,8 +3377,16 @@ pub async fn retry_task(
     fence: i64,
     error: Option<String>,
     retry_at: String,
+    end: AttemptEnd,
 ) -> Result<bool> {
-    let rows = sqlx::query(
+    let policy = AttemptPolicy::from_env();
+    let mut tx = pool.begin().await?;
+
+    // `RETURNING attempt` rather than a second read: this statement is the one
+    // place that knows the CAS held, and the number it returns is the attempt
+    // whose output the same statement is about to overwrite. Reading it
+    // separately would race the next claim, which increments it.
+    let claimed: Option<(i64,)> = sqlx::query_as(
         // Mirrors the SQLite backend: the fault columns describe why this row
         // is *currently* failed, and a row about to run again is not failed.
         // See there for why leaving them costs the roll-up its meaning.
@@ -2514,22 +3399,101 @@ pub async fn retry_task(
              fault_class = NULL,
              fault_detail = NULL,
              fault_confidence = NULL
-         WHERE id = $3 AND claimed_by = $4 AND version = $5",
+         WHERE id = $3 AND claimed_by = $4 AND version = $5
+         RETURNING attempt",
     )
     .bind(&retry_at)
     .bind(&error)
     .bind(task_id)
     .bind(worker_id)
     .bind(fence)
-    .execute(pool)
-    .await?
-    .rows_affected();
+    .fetch_optional(&mut *tx)
+    .await?;
 
-    if rows == 0 {
+    let Some((attempt,)) = claimed else {
+        tx.commit().await?;
         tracing::warn!(task_id, "stale retry ignored — task already reclaimed");
         return Ok(false);
-    }
+    };
+
+    // In the same transaction as the overwrite, deliberately: this is the exact
+    // instant the attempt's output stops existing anywhere else.
+    record_attempt(&mut tx, task_id, attempt, end, error.as_deref(), policy).await?;
+
+    tx.commit().await?;
     Ok(true)
+}
+
+/// Keep a bounded tail of the attempt `retry_task` is overwriting, and evict
+/// whatever that pushes out of the window. Mirrors the SQLite backend — see
+/// there for why this shares the transition's transaction, and
+/// [`crate::attempt_log`] for why it is a tail rather than the whole thing.
+///
+/// A no-op when retention is off (`DAGRON_ATTEMPT_LOG_BYTES=0`).
+async fn record_attempt(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    task_id: &str,
+    attempt: i64,
+    end: AttemptEnd,
+    output: Option<&str>,
+    policy: AttemptPolicy,
+) -> Result<()> {
+    if !policy.enabled() {
+        return Ok(());
+    }
+    let tail = output.map(|o| policy.tail(o));
+    sqlx::query(
+        "INSERT INTO task_attempts
+             (task_id, attempt, reason, output, truncated, finished_at)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (task_id, attempt) DO UPDATE SET
+             reason = excluded.reason,
+             output = excluded.output,
+             truncated = excluded.truncated,
+             finished_at = excluded.finished_at",
+    )
+    .bind(task_id)
+    .bind(attempt)
+    .bind(end.as_str())
+    .bind(tail.map(|(t, _)| t))
+    .bind(tail.is_some_and(|(_, truncated)| truncated))
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&mut **tx)
+    .await?;
+
+    // A range delete on the primary key, not a "keep the newest N" subquery:
+    // `attempt` only increases for a task, so the evictable rows are exactly a
+    // prefix — one index seek per iteration instead of a scan.
+    if let Some(cutoff) = policy.evict_below(attempt) {
+        sqlx::query("DELETE FROM task_attempts WHERE task_id = $1 AND attempt <= $2")
+            .bind(task_id)
+            .bind(cutoff)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Every superseded attempt still retained for a task, oldest first.
+///
+/// The attempt currently on the row is **not** here — it is in
+/// `task_runs.output`, whole.
+#[cfg(feature = "ops")]
+pub async fn list_task_attempts(pool: &Pool, task_id: &str) -> Result<Vec<TaskAttempt>> {
+    // Newest first with a hard cap, then reversed — the caller wants oldest
+    // first, but the rows worth keeping when there are too many are the recent
+    // ones. Capped because `DAGRON_ATTEMPT_LOG_KEEP=0` disables eviction, and
+    // an unbounded retention policy must not imply an unbounded response.
+    let mut rows = sqlx::query_as::<_, TaskAttempt>(
+        "SELECT task_id, attempt, reason, output, truncated, finished_at
+         FROM task_attempts WHERE task_id = $1 ORDER BY attempt DESC LIMIT $2",
+    )
+    .bind(task_id)
+    .bind(i64::try_from(crate::attempt_log::MAX_READ).unwrap_or(i64::MAX))
+    .fetch_all(pool)
+    .await?;
+    rows.reverse();
+    Ok(rows)
 }
 
 // ── Fault attribution ────────────────────────────────────────────────────────
@@ -2888,6 +3852,15 @@ pub async fn rerun_from_failed(pool: &Pool, run_id: &str) -> Result<Option<u64>>
              fault_class = NULL,
              fault_detail = NULL,
              fault_confidence = NULL,
+             -- A re-armed deferred row must submit a NEW remote job, not adopt
+             -- the one that just failed: the remote name is
+             -- `dagron-<id>-<epoch>` and `id` is stable across every reset.
+             external_kind = NULL,
+             external_handle = NULL,
+             external_endpoint = NULL,
+             external_deadline_at = NULL,
+             next_poll_at = NULL,
+             external_epoch = external_epoch + 1,
              scheduled_at = $1,
              version = version + 1
          WHERE run_id = $2 AND status IN ('failed', 'cancelled', 'skipped')",
@@ -2976,6 +3949,12 @@ pub async fn clear_task_with_downstream(
          SET status = 'pending', attempt = 0, claimed_by = NULL, lease_expires_at = NULL,
              output = NULL, finished_at = NULL, scheduled_at = $3, version = version + 1,
              checkpoint_uri = NULL, checkpoint_marker = NULL,
+             -- …and for the same reason a cleared deferred row drops its remote
+             -- handle and takes a fresh epoch: the next submit must start a new
+             -- job rather than adopt the one this row already ran.
+             external_kind = NULL, external_handle = NULL, external_endpoint = NULL,
+             external_deadline_at = NULL, next_poll_at = NULL,
+             external_epoch = external_epoch + 1,
              -- Same reason as `retry_task` and `rerun_from_failed`: a cleared
              -- row is not a failed row, so it must not carry a failed row's
              -- verdict into whatever happens next.
@@ -4280,6 +5259,11 @@ fn row_to_task(row: &sqlx::postgres::PgRow) -> Result<TaskRun> {
         // Dispatch priority + memo-resolution flag, same tolerance as `pool`.
         priority: row.try_get("priority").unwrap_or(0),
         cache_hit: row.try_get("cache_hit").unwrap_or(false),
+        // Same tolerance again: only the claim projection selects it, and a
+        // reader that does not gets 0 — which is the epoch a row that has never
+        // deferred actually has, so the default is the truth rather than a
+        // placeholder.
+        external_epoch: row.try_get("external_epoch").unwrap_or(0),
         // Park reasons, same tolerance: only the run-detail read selects them.
         wake_at: row.try_get("wake_at").ok().flatten(),
         wait_url: row.try_get("wait_url").ok().flatten(),
@@ -4683,11 +5667,26 @@ pub async fn archive_doc_for_run(pool: &Pool, id: &str) -> Result<Option<serde_j
         .bind(id)
         .fetch_all(pool)
         .await?;
+    // The retained per-attempt history (migration 044/056). Without it the
+    // archive would drop exactly what per-attempt retention added — the purge
+    // cascades these rows away, so the archive document is their last chance to
+    // exist. Bounded by DAGRON_ATTEMPT_LOG_KEEP x _BYTES per task, which is
+    // what makes including them affordable; a run with no loops and no retries
+    // adds an empty array.
+    let attempts = sqlx::query(
+        "SELECT * FROM task_attempts
+         WHERE task_id IN (SELECT id FROM task_runs WHERE run_id = $1)
+         ORDER BY task_id, attempt",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await?;
     Ok(Some(serde_json::json!({
         "format": "dagron.run-archive.v1",
         "run": row_to_json(&run),
         "tasks": tasks.iter().map(row_to_json).collect::<Vec<_>>(),
         "outbox_events": outbox.iter().map(row_to_json).collect::<Vec<_>>(),
+        "task_attempts": attempts.iter().map(row_to_json).collect::<Vec<_>>(),
     })))
 }
 
@@ -4804,38 +5803,56 @@ pub async fn purge_runs_by_id(pool: &Pool, run_ids: &[String]) -> Result<u64> {
 /// scheduler reclaims at a time.
 #[cfg(feature = "ops")]
 pub async fn gc_old_runs(pool: &Pool, cutoff: &str) -> Result<u64> {
+    // A run whose tasks still owe a remote teardown is NOT collectable: deleting
+    // it drops the only record of a job still running on someone's cluster, and
+    // turns the visible leak the orphan counter advertises into a silent one.
+    // The debt settles itself once the teardown sweep gives up, so this defers
+    // collection by that window and no longer.
+    const OWES_TEARDOWN: &str = "EXISTS (
+             SELECT 1 FROM task_runs owing
+             WHERE owing.run_id = wr.id AND owing.external_handle IS NOT NULL
+         )";
     let mut tx = pool.begin().await?;
 
     sqlx::query(
+        &format!(
         "DELETE FROM task_dependencies
          WHERE dependent_id IN (
              SELECT tr.id FROM task_runs tr
              JOIN workflow_runs wr ON wr.id = tr.run_id
              WHERE wr.status IN ('succeeded','failed','cancelled')
                AND wr.finished_at IS NOT NULL AND wr.finished_at < $1
-         )",
-    )
+               AND NOT {OWES_TEARDOWN}
+         )"
+    ))
     .bind(cutoff)
     .execute(&mut *tx)
     .await?;
 
     sqlx::query(
+        &format!(
         "DELETE FROM task_runs
          WHERE run_id IN (
-             SELECT id FROM workflow_runs
-             WHERE status IN ('succeeded','failed','cancelled')
-               AND finished_at IS NOT NULL AND finished_at < $1
-         )",
-    )
+             SELECT wr.id FROM workflow_runs wr
+             WHERE wr.status IN ('succeeded','failed','cancelled')
+               AND wr.finished_at IS NOT NULL AND wr.finished_at < $1
+               AND NOT {OWES_TEARDOWN}
+         )"
+    ))
     .bind(cutoff)
     .execute(&mut *tx)
     .await?;
 
     let deleted = sqlx::query(
+        &format!(
         "DELETE FROM workflow_runs
-         WHERE status IN ('succeeded','failed','cancelled')
-           AND finished_at IS NOT NULL AND finished_at < $1",
-    )
+         WHERE id IN (
+             SELECT wr.id FROM workflow_runs wr
+             WHERE wr.status IN ('succeeded','failed','cancelled')
+               AND wr.finished_at IS NOT NULL AND wr.finished_at < $1
+               AND NOT {OWES_TEARDOWN}
+         )"
+    ))
     .bind(cutoff)
     .execute(&mut *tx)
     .await?

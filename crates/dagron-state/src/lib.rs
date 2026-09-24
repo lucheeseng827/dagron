@@ -74,6 +74,9 @@
 //!                     target: ReplaceTarget::Partitions(vec!["2026-06-20".into()]),
 //!                     widened: None,
 //!                 }),
+//!                 // The SQL that performs it (contract v4), when the planner was
+//!                 // asked for a dialect. Carried, never written, by this crate.
+//!                 sql: None,
 //!             },
 //!             PlanModel {
 //!                 name: "mart_revenue".into(),
@@ -88,6 +91,7 @@
 //!                 // Undeclared, and that stays undeclared: no default is
 //!                 // invented for it here or upstream.
 //!                 replace: None,
+//!                 sql: None,
 //!             },
 //!         ],
 //!         ..Default::default()

@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -306,13 +307,101 @@ pub async fn create_workflow(
     ))
 }
 
-/// `PUT /api/workflows/:id` — update spec (+ optional rename). Re-validates.
+/// Error type for the handlers that can also refuse with a JSON body (`409` on a git-managed
+/// workflow). The existing `(StatusCode, String)` / `StatusCode` errors convert, so their `?`s are untouched.
+pub struct ApiErr(Response);
+
+impl IntoResponse for ApiErr {
+    fn into_response(self) -> Response {
+        self.0
+    }
+}
+
+impl From<(StatusCode, String)> for ApiErr {
+    fn from(e: (StatusCode, String)) -> Self {
+        ApiErr(e.into_response())
+    }
+}
+
+impl From<StatusCode> for ApiErr {
+    fn from(e: StatusCode) -> Self {
+        ApiErr(e.into_response())
+    }
+}
+
+/// Deleting a workflow is admin-only. It is the one irreversible control action here: the row
+/// goes, and the delete cascades to the workflow's schedules, so an operator who wanted to stop
+/// a workflow and reached for this loses the schedules too. The reversible path they actually
+/// want, `POST /api/workflows/{id}/state {"state":"retired"}`, stays open to any session — it
+/// stops the workflow running and *keeps* the schedules, which is what `docs/API.md` has
+/// recommended over delete all along.
+///
+/// Creating and updating stay open as well: those are an operator's job, and a bad edit is
+/// recoverable from `/versions`. This gates the one action that is not.
+fn require_admin(claims: &crate::auth::SessionClaims) -> Result<(), ApiErr> {
+    if crate::auth::is_admin(claims) {
+        return Ok(());
+    }
+    // JSON, not `(StatusCode, String)`: that renders a plain-text body, and `docs/API.md` states
+    // the error envelope is `{"error": "<message>"}` — which the `409` this handler can also
+    // return already honours. One route answering two refusals in two shapes is a client bug
+    // waiting to happen.
+    let body = serde_json::json!({
+        "error": "admin group required to delete a workflow; \
+                  POST /api/workflows/{id}/state {\"state\":\"retired\"} stops it without losing its schedules",
+    });
+    Err(ApiErr((StatusCode::FORBIDDEN, Json(body)).into_response()))
+}
+
+/// `?force=true` on `PUT` / `DELETE /api/workflows/:id`.
+#[derive(Deserialize, Default)]
+pub struct ForceQuery {
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// A workflow synced from a git repo is edited in git: refuse with `409` (the body names the repo and
+/// the `sync-to-git` route that turns a UI edit into a PR). An admin may override with `?force=true`;
+/// the forced edit shows up as `drift` until the next sync puts git's definition back.
+async fn refuse_if_managed(
+    pool: &sqlx::PgPool,
+    id: &str,
+    claims: &crate::auth::SessionClaims,
+    force: bool,
+) -> Result<(), ApiErr> {
+    let repo: Option<String> = sqlx::query_scalar(
+        "SELECT r.url FROM workflows w JOIN git_repos r ON r.id = w.managed_by WHERE w.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(internal)?;
+    let Some(url) = repo else { return Ok(()) };
+    if force && claims.groups.iter().any(|g| g == "admin") {
+        return Ok(());
+    }
+    let body = serde_json::json!({
+        "error": format!(
+            "this workflow is managed by the git repository {url}: change it there. \
+             POST /api/workflows/{id}/sync-to-git opens a pull request from the console; \
+             an admin can override with ?force=true (git wins again at the next sync)"
+        ),
+        "repo": url,
+        "sync_to_git": format!("/api/workflows/{id}/sync-to-git"),
+    });
+    Err(ApiErr((StatusCode::CONFLICT, Json(body)).into_response()))
+}
+
+/// `PUT /api/workflows/:id` - update spec (+ optional rename). Re-validates. `409` on a git-managed
+/// workflow (see [`refuse_if_managed`]).
 pub async fn update_workflow(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<ForceQuery>,
     Json(body): Json<UpsertBody>,
-) -> Result<Json<Workflow>, (StatusCode, String)> {
+) -> Result<Json<Workflow>, ApiErr> {
+    refuse_if_managed(&state.write_pool, &id, &auth.0, q.force).await?;
     let spec = control::parse_and_validate(&body.spec)?;
     let name = body.name.unwrap_or(spec.name);
     let description = body.description.filter(|d| !d.trim().is_empty());
@@ -337,7 +426,7 @@ pub async fn update_workflow(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
     if locked.is_none() {
-        return Err((StatusCode::NOT_FOUND, format!("workflow '{id}' not found")));
+        return Err((StatusCode::NOT_FOUND, format!("workflow '{id}' not found")).into());
     }
 
     sqlx::query(
@@ -363,7 +452,7 @@ pub async fn update_workflow(
     let mut sp = sqlx::Acquire::begin(&mut tx)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-    match crate::routes::lifecycle::record_version(&mut sp, &id, &name, &body.spec, Some(&_auth.0.email)).await {
+    match crate::routes::lifecycle::record_version(&mut sp, &id, &name, &body.spec, Some(&auth.0.email)).await {
         Ok(_) => {
             sp.commit()
                 .await
@@ -404,12 +493,16 @@ pub async fn update_workflow(
     }))
 }
 
-/// `DELETE /api/workflows/:id`. 404 if absent.
+/// `DELETE /api/workflows/:id`. 404 if absent; `409` on a git-managed workflow (see
+/// [`refuse_if_managed`]).
 pub async fn delete_workflow(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<StatusCode, StatusCode> {
+    Query(q): Query<ForceQuery>,
+) -> Result<StatusCode, ApiErr> {
+    require_admin(&auth.0)?;
+    refuse_if_managed(&state.write_pool, &id, &auth.0, q.force).await?;
     let n = sqlx::query("DELETE FROM workflows WHERE id = $1")
         .bind(&id)
         .execute(&state.write_pool)
@@ -417,7 +510,7 @@ pub async fn delete_workflow(
         .map_err(internal)?
         .rows_affected();
     if n == 0 {
-        Err(StatusCode::NOT_FOUND)
+        Err(StatusCode::NOT_FOUND.into())
     } else {
         Ok(StatusCode::NO_CONTENT)
     }
@@ -429,6 +522,46 @@ pub struct RunWorkflowBody {
     /// Arguments for the stored spec's declared `parameters:`.
     #[serde(default)]
     pub parameters: BTreeMap<String, String>,
+}
+
+#[cfg(test)]
+mod delete_authz_tests {
+    use super::*;
+
+    fn claims(groups: &[&str]) -> crate::auth::SessionClaims {
+        crate::auth::SessionClaims {
+            sub: "u1".to_string(),
+            email: "u1@example.com".to_string(),
+            name: "U1".to_string(),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            exp: 0,
+        }
+    }
+
+    /// `delete_workflow` gates on this. The console's "operator" is a user with *no* groups, so
+    /// the empty case is the one that matters: it is what used to delete a workflow, schedules
+    /// and all. The body names `state: retired` because refusing without pointing at the
+    /// reversible path would just read as the API being broken.
+    #[tokio::test]
+    async fn deleting_a_workflow_requires_the_admin_group() {
+        for denied in [&[][..], &["viewer"][..], &["operator"][..], &["admins"][..]] {
+            let err = require_admin(&claims(denied)).expect_err("must be refused");
+            let res = err.into_response();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "groups {denied:?}");
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            // The documented envelope, not a plain-text body: `{"error": "<message>"}`.
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("a JSON envelope");
+            let msg = body["error"].as_str().expect("an `error` string");
+            assert!(msg.contains("retired"), "the refusal must name the reversible path: {msg}");
+            assert!(!msg.contains("  "), "no run of spaces from a continued literal: {msg}");
+        }
+        // `ApiErr` wraps a `Response` and has no `Debug`, so the ok side is asserted not unwrapped.
+        assert!(require_admin(&claims(&["admin"])).is_ok(), "the admin group must pass");
+        assert!(
+            require_admin(&claims(&["viewer", "admin"])).is_ok(),
+            "admin among other groups must pass"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -574,4 +707,46 @@ fn dup_or_internal(err: sqlx::Error, name: &str) -> (StatusCode, String) {
     }
     tracing::error!(error = ?err, "db query failed");
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+}
+
+#[cfg(test)]
+mod managed_tests {
+    use super::*;
+    use crate::routes::gitrepos::managed_tests::{add_repo, add_workflow, test_pool};
+
+    fn who(groups: &[&str]) -> crate::auth::SessionClaims {
+        crate::auth::SessionClaims {
+            sub: "u".into(),
+            email: "u@example.com".into(),
+            name: "U".into(),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            exp: usize::MAX,
+        }
+    }
+
+    /// A git-managed workflow refuses `PUT`/`DELETE` with a 409 naming the repo and `sync-to-git`;
+    /// only an admin passing `force` gets through. Unmanaged workflows, and ones whose repo was
+    /// disconnected, are untouched by the guard.
+    #[tokio::test]
+    async fn a_managed_workflow_refuses_edits_unless_an_admin_forces_it() {
+        let Some(pool) = test_pool().await else { return };
+        let tag = Uuid::new_v4().simple().to_string();
+        let repo = add_repo(&pool, &tag).await;
+        let managed = add_workflow(&pool, &format!("m-{tag}"), "s", Some(&repo), "s").await;
+        let loose = add_workflow(&pool, &format!("l-{tag}"), "s", None, "s").await;
+        let orphan = add_workflow(&pool, &format!("o-{tag}"), "s", Some("no-such-repo"), "s").await;
+
+        let refused = refuse_if_managed(&pool, &managed, &who(&["viewer"]), false).await.expect_err("409");
+        assert_eq!(refused.0.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(refused.0.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["repo"], format!("https://example.com/{tag}.git"));
+        assert_eq!(body["sync_to_git"], format!("/api/workflows/{managed}/sync-to-git"));
+
+        assert!(refuse_if_managed(&pool, &managed, &who(&["viewer"]), true).await.is_err(), "force needs admin");
+        assert!(refuse_if_managed(&pool, &managed, &who(&["admin"]), false).await.is_err(), "admin needs force");
+        assert!(refuse_if_managed(&pool, &managed, &who(&["admin"]), true).await.is_ok());
+        assert!(refuse_if_managed(&pool, &loose, &who(&[]), false).await.is_ok());
+        assert!(refuse_if_managed(&pool, &orphan, &who(&[]), false).await.is_ok());
+    }
 }

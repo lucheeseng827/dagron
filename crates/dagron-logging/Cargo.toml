@@ -2,6 +2,8 @@
 name = "dagron-logging"
 version = "0.1.0"
 edition = "2021"
+# MSRV — see the root Cargo.toml for how 1.88 was measured.
+rust-version = "1.88"
 description = "Shared, environment-tunable tracing/observability bootstrap for the dagron stack (controller, worker, management API, operator)."
 
 [lib]

@@ -61,6 +61,41 @@ pub fn next_fire_after(
     Ok(next_fire_in_tz(&schedule, tz, after))
 }
 
+/// Bind a fire's logical date into the parameters every task substitution sees:
+/// `scheduled_time`, `ds` and `ds_nodash`.
+///
+/// One helper rather than three inserts at each of the four call sites (cron,
+/// schedule, backfill, backfill jobs), because the derivation has to agree
+/// across all of them: a backfill that partitions by `{{ ds }}` and a cron fire
+/// that partitions by the same expression must produce the same string, or the
+/// two write to different partitions of the same table.
+///
+/// **Why `ds` has to exist at all.** `produces:` templates at expansion, and
+/// `expand::substitute` leaves an unknown placeholder *verbatim* — so a URI
+/// written `clickhouse://db/t/{{ ds }}` against an engine that does not bind it
+/// survives expansion with the braces intact, and then fails
+/// `validate_dataset_uri`'s whitespace check. The workflow is refused at
+/// registration with an error about its URI, which is a long way from "that
+/// variable does not exist". Every partitioned-warehouse example in the
+/// ecosystem is written with `ds`; not having it is the difference between a
+/// story that renders and one that does not.
+///
+/// `scheduled_time` is always inserted. `ds`/`ds_nodash` are inserted only when
+/// the timestamp parses — a fire is never failed over a date format, and a
+/// missing `ds` surfaces as the same refusal it always did rather than as a
+/// silently wrong partition.
+pub fn insert_logical_date(params: &mut BTreeMap<String, String>, rfc3339: &str) {
+    params.insert("scheduled_time".to_string(), rfc3339.to_string());
+    if let Ok(dt) = DateTime::parse_from_rfc3339(rfc3339) {
+        // UTC, matching `scheduled_time`, which is the logical instant rather
+        // than anyone's local calendar. A `ds` in a different zone from the
+        // `scheduled_time` beside it would be a trap.
+        let utc = dt.with_timezone(&Utc);
+        params.insert("ds".to_string(), utc.format("%Y-%m-%d").to_string());
+        params.insert("ds_nodash".to_string(), utc.format("%Y%m%d").to_string());
+    }
+}
+
 // ── Schedule gates: `when:` (per-fire conditional) + `stopStrategy` ─────────────
 
 /// Build the calendar context a `when:` gate is evaluated against, computed in
@@ -231,5 +266,33 @@ mod tests {
         assert_eq!(days_in_month(2024, 2), 29); // leap Feb
         assert_eq!(days_in_month(2025, 12), 31); // December (year rollover path)
         assert_eq!(days_in_month(2025, 4), 30);
+    }
+
+    /// `ds` / `ds_nodash` are what every partitioned-warehouse example is
+    /// written with, and they must agree across every fire path — a backfill and
+    /// a cron fire that partition by the same expression have to produce the
+    /// same string, or they write to different partitions of one table.
+    #[test]
+    fn the_logical_date_binds_ds_and_ds_nodash_from_one_derivation() {
+        let mut p = BTreeMap::new();
+        insert_logical_date(&mut p, "2026-09-14T22:30:00+00:00");
+        assert_eq!(p.get("scheduled_time").unwrap(), "2026-09-14T22:30:00+00:00");
+        assert_eq!(p.get("ds").unwrap(), "2026-09-14");
+        assert_eq!(p.get("ds_nodash").unwrap(), "20260914");
+
+        // Normalised to UTC, matching `scheduled_time` beside it. An offset
+        // timestamp late in the day is the case where a local-calendar `ds`
+        // would silently name the wrong partition.
+        let mut p = BTreeMap::new();
+        insert_logical_date(&mut p, "2026-09-14T23:30:00-05:00");
+        assert_eq!(p.get("ds").unwrap(), "2026-09-15", "the UTC day, not the offset's");
+
+        // An unparseable timestamp never fails a fire: scheduled_time is bound
+        // as before and ds is simply absent, which surfaces as the refusal it
+        // always was rather than as a wrong partition.
+        let mut p = BTreeMap::new();
+        insert_logical_date(&mut p, "not-a-time");
+        assert_eq!(p.get("scheduled_time").unwrap(), "not-a-time");
+        assert!(p.get("ds").is_none());
     }
 }

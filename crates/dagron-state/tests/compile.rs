@@ -20,6 +20,7 @@ fn direct(name: &str) -> PlanModel {
         unit: Unit::FullModel,
         depends_on: None,
         replace: None,
+        sql: None,
     }
 }
 
@@ -33,6 +34,7 @@ fn downstream(name: &str, because_of: &str) -> PlanModel {
         unit: Unit::FullModel,
         depends_on: None,
         replace: None,
+        sql: None,
     }
 }
 
@@ -123,6 +125,7 @@ fn partitions_render_into_the_command_and_the_input() {
         unit: Unit::Partitions(vec!["2026-09-01".into(), "2026-09-02".into()]),
         depends_on: None,
         replace: None,
+        sql: None,
     }]);
     env.options.command_template =
         vec!["sh".into(), "-c".into(), "build {{ model }} --parts {{ partitions }}".into()];
@@ -186,6 +189,7 @@ fn with_deps(name: &str, deps: &[&str]) -> PlanModel {
         unit: Unit::FullModel,
         depends_on: Some(deps.iter().map(|d| d.to_string()).collect()),
         replace: None,
+        sql: None,
     }
 }
 
@@ -227,6 +231,7 @@ fn an_empty_edge_list_means_waits_for_nothing_not_fall_back() {
         unit: Unit::FullModel,
         depends_on: Some(vec![]),
         replace: None,
+        sql: None,
     };
     let spec = compile(&envelope(vec![with_deps("a", &[]), downstream_with_no_deps])).unwrap();
 
@@ -443,4 +448,114 @@ fn a_v2_plan_compiles_exactly_as_before() {
         assert!(input.get("replace").is_none(), "no replace key at all, not a null");
         assert!(input.get("replace_widened").is_none());
     }
+}
+
+// ---------------------------------------------------------------- contract v4 --
+
+use dagron_state::wire::Sql;
+
+fn rendered(name: &str, statements: &[&str], atomic: bool) -> PlanModel {
+    PlanModel {
+        sql: Some(Sql {
+            dialect: "postgres".into(),
+            statements: statements.iter().map(|s| s.to_string()).collect(),
+            atomic,
+        }),
+        ..direct(name)
+    }
+}
+
+fn with_env(models: Vec<PlanModel>, command: &[&str], env: &[(&str, &str)]) -> PlanEnvelope {
+    let mut e = envelope(models);
+    e.options.command_template = command.iter().map(|s| s.to_string()).collect();
+    e.options.env = env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    e
+}
+
+#[test]
+fn env_values_expand_per_task_so_a_statement_never_touches_a_shell() {
+    let env = with_env(
+        vec![rendered("a", &["select 1"], true), rendered("b", &["select 2"], true)],
+        &["dagron-step-sql"],
+        &[("SQL_STATEMENT", "{{ sql }}"), ("SQL_ENGINE", "postgres"), ("MODEL", "{{model}}")],
+    );
+    let spec = compile(&env).unwrap();
+    assert_eq!(spec.tasks[0].env_value("SQL_STATEMENT").unwrap(), "select 1");
+    assert_eq!(spec.tasks[1].env_value("SQL_STATEMENT").unwrap(), "select 2");
+    assert_eq!(spec.tasks[1].env_value("MODEL").unwrap(), "b", "the unspaced spelling works in env too");
+    assert_eq!(spec.tasks[0].env_value("SQL_ENGINE").unwrap(), "postgres");
+}
+
+#[test]
+fn expansion_is_single_pass_so_substituted_text_is_never_re_expanded() {
+    // The old chained `replace` rewrote a `{{ model }}` that a statement *contained*.
+    let env = with_env(
+        vec![rendered("orders", &["select '{{ model }}' as literal_braces"], true)],
+        &["sh", "-c", "echo {{ model }}: {{ sql }}"],
+        &[],
+    );
+    let spec = compile(&env).unwrap();
+    assert_eq!(spec.tasks[0].command[2], "echo orders: select '{{ model }}' as literal_braces");
+}
+
+#[test]
+fn braces_that_are_not_a_known_placeholder_pass_through() {
+    let env = with_env(vec![direct("m")], &["sh", "-c", "run {{ ds }} {{  model  }} {{model}}"], &[]);
+    let spec = compile(&env).unwrap();
+    assert_eq!(
+        spec.tasks[0].command[2], "run {{ ds }} {{  model  }} m",
+        "the command's own templating, and near-miss spellings, are not this crate's"
+    );
+}
+
+#[test]
+fn the_dialect_placeholder_names_what_the_planner_rendered_for() {
+    let env = with_env(vec![rendered("m", &["select 1"], true)], &["run", "--dialect={{ dialect }}"], &[]);
+    assert_eq!(compile(&env).unwrap().tasks[0].command[1], "--dialect=postgres");
+}
+
+#[test]
+fn a_template_that_needs_sql_refuses_a_plan_that_has_none() {
+    let env = with_env(vec![rendered("a", &["select 1"], true), direct("b")], &["dagron-step-sql"], &[("SQL_STATEMENT", "{{ sql }}")]);
+    assert_eq!(compile(&env).unwrap_err(), CompileError::MissingSql { model: "b".into() });
+    // Present but blank is missing too: it would otherwise fail only after submission.
+    for blank in [&[][..], &["", "  \n\t"][..]] {
+        let env = with_env(vec![rendered("a", blank, true)], &["dagron-step-sql"], &[("SQL_STATEMENT", "{{ sql }}")]);
+        assert_eq!(compile(&env).unwrap_err(), CompileError::MissingSql { model: "a".into() }, "{blank:?}");
+    }
+    let env = with_env(vec![rendered("a", &["", "select 1"], true)], &["dagron-step-sql"], &[("SQL_STATEMENT", "{{ sql }}")]);
+    assert!(compile(&env).is_ok(), "one real statement is enough");
+    // …while a template that never mentions it compiles the same plan fine.
+    let env = with_env(vec![rendered("a", &["select 1"], true), direct("b")], &["run", "{{ model }}"], &[]);
+    assert!(compile(&env).is_ok());
+}
+
+#[test]
+fn the_task_records_the_statements_and_whether_they_are_atomic() {
+    let env = with_env(vec![rendered("m", &["DELETE FROM m WHERE dt = 1", "INSERT INTO m SELECT 1"], false)], &["run"], &[]);
+    let input = compile(&env).unwrap().tasks[0].input.clone().unwrap();
+    assert_eq!(input["sql_dialect"], "postgres");
+    assert_eq!(input["sql_statements"].as_array().unwrap().len(), 2);
+    assert_eq!(input["sql_atomic"], false);
+}
+
+#[test]
+fn a_variable_set_both_literally_and_from_a_secret_is_refused() {
+    let mut env = envelope(vec![direct("a")]);
+    env.options.env = BTreeMap::from([("SQL_PASSWORD".to_string(), "hunter2".to_string())]);
+    env.options.secret_env = BTreeMap::from([("SQL_PASSWORD".to_string(), "WAREHOUSE_PASSWORD".to_string())]);
+    assert_eq!(
+        compile(&env).unwrap_err(),
+        CompileError::EnvConflict { name: "SQL_PASSWORD".into() }
+    );
+}
+
+#[test]
+fn a_secret_env_names_the_secret_and_carries_no_value() {
+    let mut env = envelope(vec![direct("a")]);
+    env.options.secret_env = BTreeMap::from([("SQL_PASSWORD".to_string(), "WAREHOUSE_PASSWORD".to_string())]);
+    let spec = compile(&env).unwrap();
+    let task = &spec.tasks[0];
+    assert_eq!(task.env_secret("SQL_PASSWORD"), Some("WAREHOUSE_PASSWORD"));
+    assert_eq!(task.env_value("SQL_PASSWORD"), None, "a secret is not a literal value");
 }

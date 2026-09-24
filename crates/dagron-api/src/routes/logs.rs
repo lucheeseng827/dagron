@@ -9,6 +9,17 @@
 //!   is the workflow-log problem, not a missing feature on any single task.
 //! - `GET /api/runs/{id}/tasks/{tid}/logs` — the **task** view, with live
 //!   tailing (`?offset=`). Unchanged when no filter is asked for.
+//! - `GET /api/runs/{id}/tasks/{tid}/attempts` — the **iteration history**: the
+//!   attempts this task's output used to be overwritten by. A `repeat:` loop
+//!   shows one iteration in the two views above because `task_runs.output` is
+//!   singular; the superseded ones are retained as a bounded tail
+//!   (`dagron_core::attempt_log`) and read here.
+//!
+//! The history is a **separate** endpoint on purpose. The task view polls, once
+//! a second, for as long as someone is watching a running task; attaching a
+//! capped-but-real history to every one of those polls would multiply the cost
+//! of the hot path by the size of the history. This is fetched when a reader
+//! asks for it, which is the same bargain the run-history diff card makes.
 //!
 //! Both accept the same filter grammar
 //! ([`dagron_logging::logfilter`]) — `q` / `exclude` / `regex` / `level` /
@@ -244,6 +255,58 @@ struct TaskLogRow {
     output: Option<String>,
 }
 
+/// One superseded attempt, as the history endpoint returns it.
+#[derive(Debug, Serialize)]
+pub struct TaskAttemptLog {
+    /// 1-based, the same counter the task view reports as `attempt`.
+    pub attempt: i64,
+    /// `iteration` — a `repeat:` pass whose `until` had not held yet — or
+    /// `failed`, an attempt that errored and was retried. The distinction is
+    /// the difference between "this loop is working" and "this keeps crashing".
+    pub reason: String,
+    pub output: String,
+    /// Whether output was dropped to fit `DAGRON_ATTEMPT_LOG_BYTES`. Stored on
+    /// the row, not inferred here: the cap may have changed since.
+    pub retention_truncated: bool,
+    pub finished_at: String,
+    /// Lines the filter selected, when one was asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lines: Option<Vec<LogLine>>,
+    pub total: usize,
+    pub matched: usize,
+    pub truncated: bool,
+}
+
+/// `GET /api/runs/{id}/tasks/{tid}/attempts` response.
+#[derive(Debug, Serialize)]
+pub struct TaskAttempts {
+    pub task_id: String,
+    pub name: String,
+    /// The attempt currently on the task row. It is **not** in `attempts` —
+    /// its output lives in `task_runs.output`, whole, and the task view reads
+    /// it there. A client showing "iteration N of M" gets M from here.
+    pub current_attempt: i64,
+    /// Oldest first.
+    pub attempts: Vec<TaskAttemptLog>,
+    /// True when the history does not start at attempt 1 — earlier attempts
+    /// existed and are not here. Two causes, and the field deliberately does
+    /// not distinguish them because the reader's question is the same: the
+    /// retention window dropped them (`DAGRON_ATTEMPT_LOG_KEEP`), or this
+    /// response hit its own read cap. A history that silently starts at
+    /// iteration 51 is a lie either way.
+    pub evicted: bool,
+    pub filtered: bool,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct TaskAttemptRow {
+    attempt: i64,
+    reason: String,
+    output: Option<String>,
+    truncated: bool,
+    finished_at: String,
+}
+
 /// Task rows for one run, in execution order. `scheduled_at` is NULL for a task
 /// that never started, which must sort *after* the ones that did — otherwise a
 /// run's log view opens on the tasks that produced no output.
@@ -448,6 +511,106 @@ pub async fn get_task_logs(
         total: res.total,
         matched: res.matched,
         truncated: res.truncated,
+        filtered,
+    }))
+}
+
+/// `GET /api/runs/{id}/tasks/{tid}/attempts[?<filter>]` — the iterations the
+/// task view cannot show.
+///
+/// Scoped to the run like the task view, so a task id cannot be probed against
+/// the wrong run. Takes the same filter grammar, so a filter typed on the log
+/// view means the same thing here.
+///
+/// An empty `attempts` list is a real answer, not an error: a task that ran
+/// once has no superseded attempts, and so does one that looped while retention
+/// was off. `evicted` distinguishes "there were none" from "there were more
+/// than we kept".
+pub async fn get_task_attempts(
+    _auth: AuthUser,
+    State(state): State<AppState>,
+    Path((id, tid)): Path<(String, String)>,
+    RawQuery(raw): RawQuery,
+) -> Result<Json<TaskAttempts>, (StatusCode, String)> {
+    let (filter, _scope, filtered) = parse_request(raw)?;
+
+    let (name, current_attempt) =
+        sqlx::query_as::<_, (String, i64)>(
+            "SELECT name, attempt FROM task_runs WHERE id = $1 AND run_id = $2",
+        )
+        .bind(&tid)
+        .bind(&id)
+        .fetch_optional(&state.read_pool)
+        .await
+        .map_err(internal)?
+        .ok_or((StatusCode::NOT_FOUND, "task not found in this run".to_string()))?;
+
+    // Newest first with a hard cap, then reversed. `DAGRON_ATTEMPT_LOG_KEEP=0`
+    // disables eviction, and an unbounded retention policy must not imply an
+    // unbounded response — this endpoint loads, filters and serializes every
+    // row it reads. The rows stay on disk; `evicted` below reports that the
+    // history shown does not start at the beginning, whether the cause was the
+    // retention window or this cap.
+    let mut rows = sqlx::query_as::<_, TaskAttemptRow>(
+        "SELECT attempt, reason, output, truncated, finished_at
+         FROM task_attempts WHERE task_id = $1 ORDER BY attempt DESC LIMIT $2",
+    )
+    .bind(&tid)
+    .bind(i64::try_from(dagron_core::attempt_log::MAX_READ).unwrap_or(i64::MAX))
+    .fetch_all(&state.read_pool)
+    .await
+    .map_err(internal)?;
+    rows.reverse();
+
+    // The window keeps the newest; anything before the oldest retained row is
+    // gone. Attempt numbering starts at 1, so a history that starts above it
+    // has lost its beginning and must say so.
+    let evicted = rows.first().is_some_and(|r| r.attempt > 1);
+
+    let attempts = rows
+        .into_iter()
+        .map(|r| {
+            let text = r.output.unwrap_or_default();
+            let (output, lines, res) = if filtered {
+                let res = filter.apply(&text);
+                let lines = res
+                    .lines
+                    .iter()
+                    .map(|l| LogLine {
+                        n: l.n,
+                        level: l.level.as_str(),
+                        ts: l.ts.clone(),
+                        text: l.text.clone(),
+                        matched: l.matched,
+                    })
+                    .collect();
+                (res.to_text(), Some(lines), res)
+            } else {
+                let total = text.lines().count();
+                let res =
+                    FilterResult { lines: Vec::new(), total, matched: total, truncated: false };
+                (text, None, res)
+            };
+            TaskAttemptLog {
+                attempt: r.attempt,
+                reason: r.reason,
+                output,
+                retention_truncated: r.truncated,
+                finished_at: r.finished_at,
+                lines,
+                total: res.total,
+                matched: res.matched,
+                truncated: res.truncated,
+            }
+        })
+        .collect();
+
+    Ok(Json(TaskAttempts {
+        task_id: tid,
+        name,
+        current_attempt,
+        attempts,
+        evicted,
         filtered,
     }))
 }

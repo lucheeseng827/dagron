@@ -23,7 +23,9 @@ Scans the configured repos for YAML files carrying a `tasks:` key, validates eac
 one with the **engine's own parser** (so a file that syncs is a file the engine
 can actually run), and upserts it as a workflow definition. Files that aren't
 specs are skipped rather than reported as errors. The reconcile is idempotent —
-the same commit synced twice is a no-op beyond `updated_at`.
+the same commit synced twice writes nothing. A changed spec records a version
+(`created_by = git:<repo>@<rev>`), the workflow becomes git-managed (edits via the API
+answer `409`), and with `prune: true` on the repo a deleted file retires its workflow.
 
 ## Configuration
 

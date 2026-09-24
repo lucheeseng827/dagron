@@ -635,8 +635,43 @@ stateDiagram-v2
 - **Termination guarantee.** Every terminal transition decrements its dependents, and a task whose
   `trigger_rule` cannot be satisfied is `skipped` (itself terminal, cascading further). So the
   dependency frontier always drains to a terminal state and `is_run_complete` terminates.
-- **At-least-once execution.** The lease bounds *concurrent* execution to one holder, but a worker
-  that completes side effects then crashes before recording may have its task re-run after lease
-  expiry — task commands should be idempotent. The bundled tasks (`echo`) are.
+- **At-least-once execution.** A worker that completes side effects then crashes before recording
+  may have its task re-run after lease expiry — task commands should be idempotent. The bundled
+  tasks (`echo`) are.
+
+  **What the lease actually bounds is the row, not the work.** It decides which scheduler may
+  mutate `task_runs`; it says nothing on its own about a process, pod or container already
+  running the command. For `EXECUTOR=local` the two coincide, because the subprocess dies with
+  its parent. For `kubernetes` and `docker` they did not: a pod or container outlives the
+  scheduler that created it, and until 0.10.0 it was named after a random UUID held only on that
+  scheduler's stack — so an expired lease produced a *second* workload running the same command
+  beside the first, and a scheduler crash left the first unreachable to any cleanup.
+
+  Both backends now label every workload with the task row that owns it
+  (`dagron.dev/task-id`, `dagron.dev/run-id`, `dagron.dev/attempt`, `dagron.dev/managed-by`), and
+  **a dispatch deletes any workload for the same task from an earlier attempt before creating its
+  own**. So a reclaim no longer doubles the work.
+
+  That reap only ever runs when the *same task* is dispatched again, so it cannot see a workload
+  whose task never runs again — the run was cancelled while a scheduler was dying, the task
+  failed terminally, retention collected the row. A **fleet sweep** covers those: every
+  `DAGRON_ORPHAN_SWEEP_SECS`, list the workloads carrying this installation's labels, ask the
+  datastore which of their task ids are still non-terminal, and delete the rest
+  (`scheduler_orphan_workloads_reaped_total`).
+
+  It is **opt-in**, and the reason is the fifth label. `managed-by=dagron` says some dagron made
+  this workload; it does not say *which*. Two installations sharing one namespace both stamp it,
+  so a sweep scoped on that alone reads the other install's pods, fails to find their task ids in
+  its own database, and deletes running work belonging to someone else — absence and foreignness
+  are the same observation. `dagron.dev/installation` distinguishes them, dagron cannot infer it
+  (a namespace can hold two installs, one install can span namespaces, and a pod carries no
+  pointer back to the database that made it), so the operator sets `DAGRON_INSTALLATION` or the
+  sweep does not run.
+
+  Two residues remain, and both are deliberate. Deletion is requested, not instantaneous — a pod
+  inside its termination grace period overlaps the new one briefly. And a workload younger than
+  `DAGRON_ORPHAN_MIN_AGE_SECS` is never judged, because the datastore and the apiserver share no
+  transaction: listing before querying means a listed workload predates the liveness answer, and
+  the age floor covers the clock skew and replication lag that ordering alone does not.
 - **Horizontal scale is free of coordination.** N identical schedulers share one Postgres DB; no
   leader election, no heartbeat table — `SKIP LOCKED` partitions work and lease expiry handles death.

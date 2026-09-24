@@ -66,6 +66,17 @@ pub struct ExplainRow {
     /// from `writes` so a client can style it as the warning it is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub widened: Option<String>,
+    /// The dialect the planner rendered this model's SQL for, when it did (v4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sql_dialect: Option<String>,
+    /// How many statements that SQL is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sql_statements: Option<usize>,
+    /// `true` when the planner said the statements are **not** all-or-nothing: a
+    /// failure part-way can leave the relation half-written. Kept as its own field,
+    /// like `widened`, so a client can style it as the warning it is.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub non_atomic: bool,
 }
 
 /// Render an explanation for a plan and the spec it compiled to.
@@ -96,6 +107,9 @@ pub fn explain(envelope: &PlanEnvelope, spec: &DagSpec) -> Explanation {
             depends_on: task.depends_on.clone(),
             writes: model.replace.as_ref().map(writes_words),
             widened: model.replace.as_ref().and_then(|r| r.widened.as_ref()).map(Widening::explain),
+            sql_dialect: model.sql.as_ref().map(|s| s.dialect.clone()),
+            sql_statements: model.sql.as_ref().map(|s| s.statements.len()),
+            non_atomic: model.sql.as_ref().is_some_and(|s| !s.atomic),
         })
         .collect();
 
@@ -260,6 +274,26 @@ fn markdown(summary: &str, rows: &[ExplainRow], mermaid: &str) -> String {
             ));
         }
         out.push('\n');
+    }
+
+    // Same reasoning, for a write the warehouse cannot do atomically: if its run
+    // fails part-way, the relation is left half-written until a rerun finishes it.
+    let non_atomic: Vec<&ExplainRow> = rows.iter().filter(|r| r.non_atomic).collect();
+    if !non_atomic.is_empty() {
+        let plural = if non_atomic.len() == 1 { "model is" } else { "models are" };
+        out.push_str(&format!(
+            "> [!CAUTION]\n> **{} {plural} written by statements that are not atomic** — a run \
+             that fails part-way leaves the relation half-written until it is rerun.\n",
+            non_atomic.len()
+        ));
+        for row in &non_atomic {
+            out.push_str(&format!("> - `{}` ({})\n", row.model, row.sql_dialect.as_deref().unwrap_or_default()));
+        }
+        out.push('\n');
+    }
+    if let Some(dialect) = rows.iter().find_map(|r| r.sql_dialect.as_deref()) {
+        let statements: usize = rows.iter().filter_map(|r| r.sql_statements).sum();
+        out.push_str(&format!("Rendered as **{dialect}** SQL: {statements} statement(s) across {} model(s).\n\n", rows.len()));
     }
 
     let show_writes = rows.iter().any(|r| r.writes.is_some());

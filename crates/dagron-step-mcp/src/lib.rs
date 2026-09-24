@@ -7,8 +7,16 @@
 //! output, artifacts between steps, an approval gate in front of it, and a place
 //! in the run's history — none of which an in-process tool call has.
 //!
-//! **Transport is stdio**, which is the one transport every MCP server
-//! supports: the server is spawned as a child process and spoken to in
+//! **Two targets.** By default the server is spawned as a child and spoken to
+//! over stdio — the one transport every MCP server supports. Set
+//! `DAGRON_MCP_STEP_GATEWAY` and the step instead POSTs the same JSON-RPC to a
+//! gateway over Streamable HTTP, which is how a DAG's tool calls inherit a
+//! governance layer: the allow-list, the argument policy, the tool-definition
+//! pin and the audit ledger all apply, for one environment variable and no
+//! change to the workflow. The two are mutually exclusive by construction (see
+//! [`Target`]) because a step either spawns a server or calls one, never both.
+//!
+//! The stdio path, unchanged: the server is spawned as a child process and spoken to in
 //! newline-delimited JSON-RPC over its stdin/stdout, exactly as
 //! `crates/dagron-mcp/src/main.rs` reads it. A task's `command` already spawns a
 //! process, so a child is native here in a way an HTTP connection is not.
@@ -17,7 +25,9 @@
 //!
 //! | Variable | Meaning |
 //! |---|---|
-//! | `DAGRON_MCP_STEP_SERVER` | server program to spawn (required) |
+//! | `DAGRON_MCP_STEP_SERVER` | server program to spawn (required, unless a gateway is set) |
+//! | `DAGRON_MCP_STEP_GATEWAY` | an MCP gateway to call instead of spawning a server |
+//! | `DAGRON_MCP_STEP_GATEWAY_TOKEN` | bearer token, if the gateway requires auth |
 //! | `DAGRON_MCP_STEP_SERVER_ARGS` | JSON array of its arguments |
 //! | `DAGRON_MCP_STEP_TOOL` | tool name to call (required) |
 //! | `DAGRON_MCP_STEP_ARGS` | JSON object of tool arguments (default `{}`) |
@@ -25,12 +35,16 @@
 //! | `DAGRON_MCP_STEP_OUTPUT` | write the result here instead of stdout |
 //! | `DAGRON_MCP_STEP_TIMEOUT_SECS` | whole-exchange deadline (default 300) |
 
+pub mod gateway;
+
 use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+
+use crate::gateway::{Gateway, GatewaySession};
 
 /// MCP protocol revision this client announces.
 ///
@@ -46,13 +60,30 @@ pub const CLIENT_NAME: &str = "dagron-step-mcp";
 /// that fails — the engine can retry a failure.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
+/// Where a step's tool call goes.
+///
+/// An enum rather than an optional gateway beside an optional program, so the
+/// invalid state — both set, or neither — cannot be constructed. `from_vars`
+/// resolves exactly one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// Spawn the server as a child and speak stdio JSON-RPC to it.
+    Stdio {
+        /// The MCP server program to spawn.
+        program: String,
+        /// Its arguments, already split — see [`StepConfig::from_vars`].
+        args: Vec<String>,
+    },
+    /// POST JSON-RPC to a gateway, which routes to the real server and governs
+    /// the call on the way through.
+    Gateway(Gateway),
+}
+
 /// One resolved MCP-tool step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepConfig {
-    /// The MCP server program to spawn.
-    pub program: String,
-    /// Its arguments, already split — see [`StepConfig::from_vars`].
-    pub args: Vec<String>,
+    /// Where the call goes: a spawned server, or a gateway.
+    pub target: Target,
     /// The tool to call on it.
     pub tool: String,
     /// The tool's arguments. Always a JSON object; MCP defines it that way.
@@ -79,8 +110,33 @@ impl StepConfig {
                 .with_context(|| format!("{k} must be set"))
         };
 
-        let program = req("DAGRON_MCP_STEP_SERVER")?;
         let tool = req("DAGRON_MCP_STEP_TOOL")?;
+
+        // A gateway wins over a server program, and is not an error alongside
+        // one: a workflow that already names its server should be able to gain
+        // governance by setting one variable on the task, without editing the
+        // step it has been running. The program is then unused, and saying so
+        // once is friendlier than refusing to start.
+        let gateway = get("DAGRON_MCP_STEP_GATEWAY").filter(|v| !v.trim().is_empty());
+        if let Some(raw) = gateway {
+            if get("DAGRON_MCP_STEP_SERVER").is_some_and(|p| !p.trim().is_empty()) {
+                tracing::info!(
+                    "DAGRON_MCP_STEP_GATEWAY is set, so DAGRON_MCP_STEP_SERVER is ignored;                      the gateway routes to the server"
+                );
+            }
+            return Ok(Self {
+                target: Target::Gateway(Gateway::parse(
+                    &raw,
+                    get("DAGRON_MCP_STEP_GATEWAY_TOKEN"),
+                )?),
+                tool,
+                arguments: parse_tool_arguments(arguments)?,
+                output: get("DAGRON_MCP_STEP_OUTPUT").filter(|v| !v.trim().is_empty()),
+                timeout_secs: parse_timeout_secs(get("DAGRON_MCP_STEP_TIMEOUT_SECS"))?,
+            });
+        }
+
+        let program = req("DAGRON_MCP_STEP_SERVER")?;
 
         // A JSON array rather than a whitespace-split string, deliberately. A
         // split breaks silently on any argument containing a space — a path, a
@@ -110,8 +166,7 @@ impl StepConfig {
         let timeout_secs = parse_timeout_secs(get("DAGRON_MCP_STEP_TIMEOUT_SECS"))?;
 
         Ok(Self {
-            program,
-            args,
+            target: Target::Stdio { program, args },
             tool,
             arguments,
             output: get("DAGRON_MCP_STEP_OUTPUT").filter(|v| !v.trim().is_empty()),
@@ -216,50 +271,111 @@ pub fn render_result(result: &Value) -> ToolResult {
     ToolResult { text, is_error }
 }
 
-/// A live stdio JSON-RPC session with an MCP server.
-pub struct Session {
+/// A spawned MCP server and the pipe halves used to talk to it.
+struct ChildIo {
     child: Child,
     stdin: ChildStdin,
     stdout: Lines<BufReader<ChildStdout>>,
+}
+
+/// How a [`Session`] carries JSON-RPC.
+///
+/// The stdio side is boxed: a `Child` plus two pipe halves is ~336 bytes against
+/// the gateway session's ~128, and an unboxed enum would make every session —
+/// gateway ones included — carry the larger. One allocation per session, once.
+enum Transport {
+    /// A spawned child, spoken to over its stdio pipes.
+    Stdio(Box<ChildIo>),
+    /// A gateway, one POST per message, holding whatever session state the
+    /// gateway asked the client to carry between them.
+    Gateway(GatewaySession),
+}
+
+/// A live JSON-RPC session with an MCP server, direct or via a gateway.
+pub struct Session {
+    transport: Transport,
     next_id: i64,
 }
 
 impl Session {
-    /// Spawn the server and take its stdio pipes.
+    /// Open the session against whichever target the config resolved.
     ///
-    /// **stderr is inherited, not piped.** It is where a well-behaved MCP server
-    /// puts its diagnostics (dagron's own does), and inheriting it lands them in
-    /// the task's captured output — so when a tool call fails, the reason is in
-    /// the run's logs rather than discarded with the child.
-    pub async fn spawn(cfg: &StepConfig) -> Result<Self> {
-        let mut child = Command::new(&cfg.program)
-            .args(&cfg.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("could not start the MCP server {:?}", cfg.program))?;
+    /// For stdio this spawns the server and takes its pipes. **stderr is
+    /// inherited, not piped** — it is where a well-behaved MCP server puts its
+    /// diagnostics (dagron's own does), and inheriting it lands them in the
+    /// task's captured output, so when a tool call fails the reason is in the
+    /// run's logs rather than discarded with the child.
+    ///
+    /// For a gateway there is nothing to open: Streamable HTTP is one
+    /// request-response per POST, so the connection is made per message.
+    pub async fn connect(cfg: &StepConfig) -> Result<Self> {
+        let transport = match &cfg.target {
+            Target::Gateway(gw) => Transport::Gateway(GatewaySession::new(gw.clone())),
+            Target::Stdio { program, args } => {
+                let mut child = Command::new(program)
+                    .args(args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .with_context(|| format!("could not start the MCP server {program:?}"))?;
 
-        let stdin = child.stdin.take().context("the MCP server has no stdin")?;
-        let stdout = child.stdout.take().context("the MCP server has no stdout")?;
-        Ok(Self { child, stdin, stdout: BufReader::new(stdout).lines(), next_id: 1 })
+                let stdin = child.stdin.take().context("the MCP server has no stdin")?;
+                let stdout = child.stdout.take().context("the MCP server has no stdout")?;
+                Transport::Stdio(Box::new(ChildIo {
+                    child,
+                    stdin,
+                    stdout: BufReader::new(stdout).lines(),
+                }))
+            }
+        };
+        Ok(Self { transport, next_id: 1 })
     }
 
-    /// Send a request and read until its answer arrives.
+    /// Send a request and return its result.
     ///
-    /// Lines that are not this request's response are skipped: a server may emit
-    /// notifications (progress, log messages) between a request and its reply,
-    /// and they carry no `id` to match. Matching on `id` rather than taking the
-    /// next line is what makes that safe.
+    /// Over stdio, lines that are not this request's response are skipped: a
+    /// server may emit notifications (progress, log messages) between a request
+    /// and its reply, and they carry no `id` to match. Matching on `id` rather
+    /// than taking the next line is what makes that safe. Over HTTP the answer
+    /// to a POST is the answer to that request — but a gateway may deliver it as
+    /// an event stream carrying notifications first, so the same skipping
+    /// happens one level down, in `gateway::sse_message`.
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
-        self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
-            .await?;
+        let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
 
+        // Borrowed, not cloned: the session id a stateful gateway hands back at
+        // `initialize` has to survive into the next request, and a clone per
+        // message could never carry it.
+        if let Transport::Gateway(gw) = &mut self.transport {
+            let body = serde_json::to_string(&msg)?;
+            let reply = gw
+                .post(&body)
+                .await?
+                .with_context(|| format!("the MCP gateway accepted {method:?} without answering"))?;
+            // One POST carries one request, so the answer is this request's by
+            // construction — but a gateway that returns someone else's response
+            // would otherwise surface as a baffling result downstream rather
+            // than as the broken gateway it is.
+            match reply.get("id").and_then(Value::as_i64) {
+                Some(got) if got != id => bail!(
+                    "the MCP gateway answered {method:?} (id {id}) with a response for id {got}"
+                ),
+                _ => {}
+            }
+            return interpret(&reply, method, "gateway");
+        }
+
+        self.send(&msg).await?;
+
+        let Transport::Stdio(io) = &mut self.transport else {
+            unreachable!("the gateway path returned above")
+        };
         loop {
-            let line = self
+            let line = io
                 .stdout
                 .next_line()
                 .await
@@ -284,37 +400,30 @@ impl Session {
             if msg.get("id").and_then(Value::as_i64) != Some(id) {
                 continue;
             }
-            if let Some(err) = msg.get("error") {
-                let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
-                let message =
-                    err.get("message").and_then(Value::as_str).unwrap_or("unknown error");
-                bail!("the MCP server rejected {method:?}: {message} (code {code})");
-            }
-            // JSON-RPC 2.0 (and MCP) require a response to carry exactly one of
-            // `result` or `error`. A matched id with neither is malformed — fail
-            // rather than return `Null`, which would read downstream as a tool
-            // that succeeded and produced nothing.
-            return match msg.get("result") {
-                Some(result) => Ok(result.clone()),
-                None => bail!(
-                    "the MCP server's response to {method:?} carried neither a result nor an error"
-                ),
-            };
+            return interpret(&msg, method, "server");
         }
     }
 
     async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
-        self.send(&json!({ "jsonrpc": "2.0", "method": method, "params": params })).await
+        let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
+        // A notification has no id and no response; `202 Accepted` (or any 2xx)
+        // means delivered. Anything the gateway does answer with is discarded,
+        // because there is no request for it to belong to — but the response's
+        // headers are still read, so a session id offered here is not lost.
+        if let Transport::Gateway(gw) = &mut self.transport {
+            return gw.post(&serde_json::to_string(&msg)?).await.map(|_| ());
+        }
+        self.send(&msg).await
     }
 
     async fn send(&mut self, msg: &Value) -> Result<()> {
+        let Transport::Stdio(io) = &mut self.transport else {
+            unreachable!("send is the stdio write path; the gateway posts instead")
+        };
         let mut line = serde_json::to_string(msg)?;
         line.push('\n');
-        self.stdin
-            .write_all(line.as_bytes())
-            .await
-            .context("writing to the MCP server failed")?;
-        self.stdin.flush().await.context("flushing to the MCP server failed")
+        io.stdin.write_all(line.as_bytes()).await.context("writing to the MCP server failed")?;
+        io.stdin.flush().await.context("flushing to the MCP server failed")
     }
 
     /// The MCP handshake: `initialize`, then the `initialized` notification.
@@ -332,6 +441,14 @@ impl Session {
                 }),
             )
             .await?;
+        // From MCP 2025-06-18 every later HTTP request carries the version the
+        // handshake settled on — which is the server's answer, not what this
+        // client asked for. Over stdio there is no header and nothing to carry.
+        if let Transport::Gateway(gw) = &mut self.transport {
+            if let Some(v) = result.get("protocolVersion").and_then(Value::as_str) {
+                gw.negotiated(v);
+            }
+        }
         self.notify("notifications/initialized", json!({})).await?;
         Ok(result)
     }
@@ -344,20 +461,51 @@ impl Session {
         Ok(render_result(&result))
     }
 
-    /// Close stdin and reap the child.
+    /// Close stdin and reap the child; a no-op for a gateway.
     ///
     /// Dropping stdin is what tells a stdio server to exit: its read loop sees
     /// EOF. `kill_on_drop` is the backstop for a server that ignores that, so a
-    /// finished task cannot leave a process behind in the runner.
-    pub async fn shutdown(mut self) {
-        drop(self.stdin);
-        if let Err(e) = self.child.kill().await {
-            tracing::debug!(error = %e, "the MCP server had already exited");
+    /// finished task cannot leave a process behind in the runner. A gateway owns
+    /// its own upstream's lifetime and outlives this step, so there is nothing
+    /// here to tear down.
+    pub async fn shutdown(self) {
+        match self.transport {
+            Transport::Gateway(_) => {}
+            Transport::Stdio(io) => {
+                let ChildIo { mut child, stdin, .. } = *io;
+                drop(stdin);
+                if let Err(e) = child.kill().await {
+                    tracing::debug!(error = %e, "the MCP server had already exited");
+                }
+            }
         }
     }
 }
 
-/// Run one step end to end: spawn, handshake, call, shut down — the handshake
+/// Turn a JSON-RPC response into its result.
+///
+/// JSON-RPC 2.0 (and MCP) require a response to carry exactly one of `result` or
+/// `error`. One with neither is malformed — fail rather than return `Null`,
+/// which would read downstream as a tool that succeeded and produced nothing.
+///
+/// `peer` is what to call the other end in the message: the gateway's denials
+/// are its own, not the server's, and a task log that confuses the two sends
+/// the reader to the wrong place.
+fn interpret(msg: &Value, method: &str, peer: &str) -> Result<Value> {
+    if let Some(err) = msg.get("error") {
+        let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
+        let message = err.get("message").and_then(Value::as_str).unwrap_or("unknown error");
+        bail!("the MCP {peer} rejected {method:?}: {message} (code {code})");
+    }
+    match msg.get("result") {
+        Some(result) => Ok(result.clone()),
+        None => bail!(
+            "the MCP {peer}'s response to {method:?} carried neither a result nor an error"
+        ),
+    }
+}
+
+/// Run one step end to end: connect, handshake, call, shut down — the handshake
 /// and call bounded by `deadline`.
 ///
 /// The timeout lives here, not in the caller, so the child is **always** shut
@@ -366,7 +514,7 @@ impl Session {
 /// tokio's best-effort reaping. Here the deadline expiring still falls through
 /// to `session.shutdown()`.
 pub async fn run_step(cfg: &StepConfig, deadline: tokio::time::Instant) -> Result<ToolResult> {
-    let mut session = Session::spawn(cfg).await?;
+    let mut session = Session::connect(cfg).await?;
     let outcome = tokio::time::timeout_at(deadline, async {
         let info = session.initialize().await?;
         let server = info
@@ -394,6 +542,15 @@ mod tests {
         move |k| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
     }
 
+    /// The spawned program and its arguments, or a panic naming what was there
+    /// instead — the tests below are about the stdio target specifically.
+    fn stdio(cfg: &StepConfig) -> (&str, &[String]) {
+        match &cfg.target {
+            Target::Stdio { program, args } => (program.as_str(), args.as_slice()),
+            Target::Gateway(gw) => panic!("expected a stdio target, got the gateway {gw:?}"),
+        }
+    }
+
     #[test]
     fn a_minimal_config_needs_only_a_server_and_a_tool() {
         let cfg = StepConfig::from_vars(
@@ -401,12 +558,82 @@ mod tests {
             "",
         )
         .unwrap();
-        assert_eq!(cfg.program, "dagron-mcp");
+        let (program, args) = stdio(&cfg);
+        assert_eq!(program, "dagron-mcp");
         assert_eq!(cfg.tool, "ping");
-        assert!(cfg.args.is_empty());
+        assert!(args.is_empty());
         assert_eq!(cfg.arguments, json!({}), "no arguments is an empty object, not an error");
         assert_eq!(cfg.timeout_secs, DEFAULT_TIMEOUT_SECS);
         assert_eq!(cfg.output, None);
+    }
+
+    /// The whole point of the seam: one variable moves a step from calling a
+    /// server directly to calling it through a governed gateway, with nothing
+    /// else in the workflow changing.
+    #[test]
+    fn a_gateway_variable_redirects_the_step_without_touching_anything_else() {
+        let cfg = StepConfig::from_vars(
+            vars(&[
+                ("DAGRON_MCP_STEP_GATEWAY", "127.0.0.1:7878"),
+                ("DAGRON_MCP_STEP_TOOL", "list_issues"),
+            ]),
+            r#"{"repo":"x"}"#,
+        )
+        .unwrap();
+        match &cfg.target {
+            Target::Gateway(gw) => {
+                assert_eq!(gw.host, "127.0.0.1");
+                assert_eq!(gw.port, 7878);
+                assert_eq!(gw.path, "/mcp");
+            }
+            other => panic!("expected a gateway target, got {other:?}"),
+        }
+        assert_eq!(cfg.tool, "list_issues", "the tool and arguments are untouched");
+        assert_eq!(cfg.arguments, json!({"repo": "x"}));
+    }
+
+    /// A workflow that already names its server must be able to gain governance
+    /// by setting one variable on the task, without editing the step. So the
+    /// gateway wins and the program is ignored rather than rejected.
+    #[test]
+    fn a_gateway_wins_over_a_server_program_rather_than_conflicting_with_it() {
+        let cfg = StepConfig::from_vars(
+            vars(&[
+                ("DAGRON_MCP_STEP_SERVER", "mcp-server-github"),
+                ("DAGRON_MCP_STEP_GATEWAY", "http://mcpdef.internal:7878/mcp"),
+                ("DAGRON_MCP_STEP_TOOL", "t"),
+            ]),
+            "",
+        )
+        .unwrap();
+        assert!(matches!(cfg.target, Target::Gateway(_)), "the gateway must win");
+    }
+
+    /// Without a gateway the server is still required — the seam is additive,
+    /// so it must not have loosened the stdio path's contract.
+    #[test]
+    fn a_blank_gateway_falls_back_to_requiring_a_server() {
+        let e = StepConfig::from_vars(
+            vars(&[("DAGRON_MCP_STEP_GATEWAY", "   "), ("DAGRON_MCP_STEP_TOOL", "t")]),
+            "",
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("DAGRON_MCP_STEP_SERVER"), "got: {e}");
+    }
+
+    /// A bad gateway address fails at config time, before a task image has done
+    /// any work — the error names the variable, not a socket.
+    #[test]
+    fn a_malformed_gateway_is_rejected_by_name_at_config_time() {
+        let e = StepConfig::from_vars(
+            vars(&[
+                ("DAGRON_MCP_STEP_GATEWAY", "https://gw.internal/mcp"),
+                ("DAGRON_MCP_STEP_TOOL", "t"),
+            ]),
+            "",
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("DAGRON_MCP_STEP_GATEWAY"), "got: {e}");
     }
 
     #[test]
@@ -431,7 +658,7 @@ mod tests {
             "",
         )
         .unwrap();
-        assert_eq!(cfg.args, vec!["-y", "@mcp/fs", "/data/my files"]);
+        assert_eq!(stdio(&cfg).1, ["-y", "@mcp/fs", "/data/my files"]);
     }
 
     #[test]

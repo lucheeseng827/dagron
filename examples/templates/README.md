@@ -85,6 +85,8 @@ in the **caller's** scope first, then passed in.
 | 11 | `11_diamond_of_subdags.yaml` | Diamond where each branch is a sub-DAG |
 | 12 | `12_retry_wrapper.yaml` | Reusable retry/timeout resilience wrapper |
 | 13 | `13_fanout_then_subdag.yaml` | Fan-out where each item runs a multi-step sub-DAG |
+| 14 | `14_runtime_fanout_from_output.yaml` | Fan-out whose width is read from an upstream task's output, mid-run |
+| 15 | `15_chained_fanout.yaml` | Chained fan-out: a runtime fan-out over what a *fanned-out* producer printed |
 
 Every file in this directory is checked by a unit test
 (`expand::tests::every_example_template_expands_and_builds`) — they all expand,

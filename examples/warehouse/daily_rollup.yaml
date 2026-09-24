@@ -1,0 +1,84 @@
+# A partitioned warehouse rollup: wait for upstream data, transform it on a
+# cluster dagron does not own, and announce the partition it produced.
+#
+# The three things worth reading for:
+#   1. `{{ ds }}` — the fire's logical date, so a backfill of last March writes
+#      March's partitions rather than today's.
+#   2. `defer:` — the Spark job runs for as long as it runs, holding no worker.
+#   3. `produces:` on that deferred task — the partition is announced when the
+#      REMOTE job finishes, not when the submit returns.
+name: daily_rollup
+environment: prod              # named env: variables + AES-256-GCM secrets
+run_timeout_secs: 28800        # 8h, outside the job's own 6h ceiling below
+max_active_runs: 1             # one partition at a time; a backfill paces itself
+
+parameters:
+  ds: "2026-09-14"             # overridden per fire; the default makes a manual run work
+
+task_defaults:
+  max_attempts: 3
+  retry_delay_secs: 30
+  retry_max_delay_secs: 300
+
+tasks:
+  # Wait for today's raw partition to land. Parks holding no worker — a wait
+  # sensor is one of the four free park shapes.
+  - name: wait_raw
+    type: wait
+    wait: { dataset: "clickhouse://analytics/raw/events/{{ ds }}" }
+
+  # Submit the rollup to Spark and park on it. `timeout_secs` bounds the
+  # SUBMIT (300s); `defer.max_wait_secs` bounds the JOB (6h). Conflating those
+  # two is the mistake the split exists to prevent — the executor's default
+  # timeout is 25 seconds.
+  - name: rollup
+    depends_on: [wait_raw]
+    command: ["dagron-step-spark", "submit", "--app", "s3://jobs/daily_rollup.py"]
+    timeout_secs: 300
+    pool: spark                # for a DEFERRED task this caps concurrent REMOTE JOBS
+    env:
+      - { name: SPARK_BACKEND,   value: k8s }
+      - { name: SPARK_NAMESPACE, value: "{{ env.SPARK_NS }}" }
+      # The driver must run as an account that can create executor pods; the
+      # namespace's `default` usually cannot.
+      - { name: SPARK_DRIVER_SERVICE_ACCOUNT, value: spark }
+      - { name: SPARK_CONF_SPARK_EXECUTOR_INSTANCES, value: "8" }
+      - { name: SPARK_CONF_SPARK_APP_ARG_DS,         value: "{{ ds }}" }
+    defer:
+      kind: spark-k8s
+      poll_secs: 30
+      max_wait_secs: 21600
+      http:
+        url: "https://{{ env.K8S_API }}/apis/sparkoperator.k8s.io/v1beta2/namespaces/{{ env.SPARK_NS }}/sparkapplications/{{ handle }}"
+        headers:
+          - { name: Authorization, value_from: { secret: K8S_TOKEN } }
+        succeed_when: "status.applicationState.state == COMPLETED"
+        fail_when:    "status.applicationState.state in [FAILED, SUBMISSION_FAILED]"
+        error_from:   "status.applicationState.errorMessage"
+        # Without this, cancelling the run (or hitting max_wait_secs) leaves the
+        # SparkApplication running. K8S_TOKEN's account then needs `delete` on
+        # sparkapplications as well as `get`.
+        cancel:
+          url: "https://{{ env.K8S_API }}/apis/sparkoperator.k8s.io/v1beta2/namespaces/{{ env.SPARK_NS }}/sparkapplications/{{ handle }}"
+    # Recorded when the remote job finishes, in the reconcile sweep — not when
+    # the submit exits. Downstream consumers of this URI unblock at the right
+    # moment rather than six hours early.
+    produces: ["clickhouse://analytics/marts/daily_rollup/{{ ds }}"]
+
+  # Sanity-check the partition before anything downstream trusts it. A scalar
+  # to stdout is the one thing `when:` can read.
+  - name: verify
+    depends_on: [rollup]
+    max_attempts: 1
+    command: ["dagron-step-sql"]
+    env:
+      - { name: SQL_ENGINE,    value: clickhouse }
+      - { name: SQL_DSN,       value: "http://reader@{{ env.CH_HOST }}:8123/" }
+      - { name: SQL_PASSWORD,  value_from: { secret: CLICKHOUSE_PASSWORD } }
+      - { name: SQL_MODE,      value: scalar }
+      - { name: SQL_STATEMENT, value: "SELECT count() > 0 FROM analytics.marts_daily_rollup WHERE ds = '{{ ds }}'" }
+
+  - name: publish
+    depends_on: [verify]
+    when: "{{ tasks.verify.output }} == 1"
+    command: ["sh", "-c", "echo notifying downstream for {{ ds }}"]

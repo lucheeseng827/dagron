@@ -156,7 +156,7 @@ async fn pace_one(
         // processes *its* interval. Re-validate per fire so a bad snapshot can't
         // panic the loop; on a parse error release the slot and complete the job.
         let mut params = std::collections::BTreeMap::new();
-        params.insert("scheduled_time".to_string(), logical.clone());
+        crate::schedule_time::insert_logical_date(&mut params, &logical);
         // Environment resolution errors split two ways: a *deleted* environment
         // is permanent (complete the job, like a spec that no longer parses),
         // but a transient DB failure must NOT complete it — release the slot,

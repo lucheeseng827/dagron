@@ -166,11 +166,14 @@ that survives a mid-run kill via checkpoint resume, spot/on-demand pool
 routing, sharded batch inference with a gather step, an LLM content pipeline
 with a human approval gate, and a train→eval→deploy quality gate.
 
-## What this build does not do
+## Limits of this build — AI workloads
+
+The canonical list of what is not in this build, and what to do about it, is
+[what this build does not do](https://github.com/lucheeseng827/dagron#what-this-build-does-not-do) in the README. This section covers only the two capabilities this page
+names in passing, because a spec that relies on one should not be written by
+accident.
 
 The primitives above are the programming model and are complete on their own.
-Two capabilities named in passing on this page are **not** here, and are worth
-stating plainly so a spec that relies on one is not written by accident:
 
 - **The all-or-nothing gang claimer** (`RUNNER_GANGS=1`). The gang spec, its
   expansion and the rendezvous env are open and documented above; the claimer

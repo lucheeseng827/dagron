@@ -15,7 +15,7 @@ binary, zero infrastructure to get started.
 [![Engine image size](https://img.shields.io/docker/image-size/mancube/dagron-engine?sort=semver&label=engine%20image)](https://hub.docker.com/r/mancube/dagron-engine)
 [![Platforms](https://img.shields.io/badge/platform-linux%2Famd64%20%7C%20arm64-informational)](https://hub.docker.com/r/mancube/dagron-engine)
 
-**Status: released.** The current release is **0.9.1** — multi-arch images
+**Status: released.** The current release is **0.9.2** — multi-arch images
 (`mancube/dagron-engine`, `-engine-localdev`, `-api`, `-gitops`, `-mcp`) and an
 OCI Helm chart (`oci://registry-1.docker.io/mancube/dagron`, listed on
 [Artifact Hub](https://artifacthub.io/packages/search?repo=dagron-workflow))
@@ -44,6 +44,12 @@ the single-binary case (see [below](#the-console-without-the-stack)).
 | Workflows — saved definitions, schedules, recent-run history | Runs — every execution across all workflows | Metrics — live run/task counts by status |
 |---|---|---|
 | [![Workflows list](docs/images/workflows.png)](docs/images/workflows.png) | [![Runs list](docs/images/runs.png)](docs/images/runs.png) | [![Metrics](docs/images/metrics.png)](docs/images/metrics.png) |
+
+History is shown as **what changed**, not as one YAML document per entry. A
+workflow's definition history diffs each version against a base (the original
+by default), and a run list groups its runs by the definition each one actually
+ran — so "these four failures started with Tuesday's edit" is one screen rather
+than a manual comparison of two YAML dumps.
 
 ## Why dagron
 
@@ -91,7 +97,7 @@ podman compose   -f compose.quickstart.yaml up -d   # podman ≥ 4.7, provider i
 podman-compose   -f compose.quickstart.yaml up -d   # standalone provider, older podman too
 ```
 
-The images are pinned (`DAGRON_VERSION`, default **0.9.1** — the current
+The images are pinned (`DAGRON_VERSION`, default **0.9.2** — the current
 release). Floating `:latest` is deliberately not the default: a quickstart that
 silently changes under you is worse than one you have to bump.
 
@@ -247,9 +253,14 @@ tasks:
 > [`docs/HOWTO.md` §8](docs/HOWTO.md#8-tasks-that-run-longer-than-25-seconds)
 > covers the three budgets and the unrelated 600 s cap on `?wait=true`.
 
-Fan-out tasks (`with_items` / `with_param`) may set
+Fan-out tasks (`with_items` / `with_param` / `with_output_of`) may set
 `instance_key: "{{ item.region }}"` to name each expanded instance
-`<task>.<label>` instead of `<task>.<index>`. Runs fired by a schedule (cron,
+`<task>.<label>` instead of `<task>.<index>`. `with_output_of: <task>` is the
+one resolved **while the run is going** — the named task prints a JSON array
+and one row is inserted per element, so the width comes from data rather than
+from the spec. The named task may itself be fanned out, in which case the
+consumer fans out over the union of what every instance printed
+([`docs/LOOPS.md`](docs/LOOPS.md#iterating-over-a-tasks-output)). Runs fired by a schedule (cron,
 DB schedules, backfill catch-up) receive their nominal fire time as the
 `{{ scheduled_time }}` parameter (RFC-3339), so a backfilled task can process
 *its* interval rather than "now".
@@ -381,6 +392,15 @@ poll-until-done pattern, bounded so it can never wedge a run:
 
 Exhausting `max_iterations` **fails** the task (a condition that never came
 true is an error, not a success).
+
+All three loop shapes — `repeat:` in place, `with_items:` in parallel, and
+`with_output_of:` over an upstream task's output — plus repeating the **whole**
+graph N times are authored from the console's visual editor without touching
+YAML. See [`docs/LOOPS.md`](docs/LOOPS.md), which also says where each
+mechanism stops. The first two resolve at run creation, so their row count is
+fixed before anything executes and `budget:` can refuse a blow-up at submit;
+the third resolves mid-run, so its count comes from data and the task ceiling
+is re-checked as the rows are inserted.
 
 ### Call it as a durable function
 
@@ -633,19 +653,36 @@ at peak, Postgres the bottleneck rather than the engine.
 
 ## What this build does not do
 
-Everything on this page is Apache-2.0 and complete on its own. A few knobs name
-capabilities that are **not** in this build, and they say so rather than failing
-quietly: selecting a managed connector kind (`SOURCE=kafka`, `nats`, `sqs`,
-`redis`) is a startup error, not a silent downgrade to something else. The open
-path — `SOURCE=stream` and the `SourceFactory` seam — always works, and a
-pipeline proven on it moves to another source by changing environment
-variables rather than workflows.
+Everything on this page is Apache-2.0 and complete on its own. A single team
+running a single cluster is not missing anything here.
 
-The same holds for the other seams: `Executor`, `WorkflowSource` and the
-artifact store are traits, and a build without a given backend says which
-feature is missing instead of pretending. The seams exist so an implementation
-you write — or one someone else ships — drops in without forking a file here.
-Nothing on this page depends on that happening.
+A few capabilities are **not** in this build, and dagron says so at the moment
+you reach for one rather than failing quietly or silently downgrading. Selecting
+a managed connector (`SOURCE=kafka`) is a startup error, not a quiet fallback to
+something else.
+
+| Not in this build | What this build does instead |
+|---|---|
+| Managed ingestion connectors — Kafka, NATS, SQS, Redis, and the CloudEvents webhook gateway | `SOURCE=stream` follows an NDJSON file or named pipe, at-least-once with a durable offset checkpoint ([STREAMING.md](docs/STREAMING.md)) |
+| The fleet plane — unit registry, enrolment, cohorts, staged bundle rollout | one unit, driven by `SOURCE=dir` / `stream` / `mqtt` and GitOps sync ([OPERATIONS.md](docs/OPERATIONS.md)) |
+| External dataset events — data landing from CDC, S3 notifications or another orchestrator announcing itself | a small `produces:` task records the dataset once the external load finishes ([DATASETS.md](docs/DATASETS.md)) |
+| Named connections for external compute (`defer.connection:`) | the endpoint rides with the run — `environment:` variables plus `value_from: { secret: … }` ([EXTERNAL_JOBS.md](docs/EXTERNAL_JOBS.md)) |
+| Cost attribution — a vendor's actual invoice reconciled back to the run, workflow and team that caused it | `budget: { external_cost: N }` plus `defer.cost` per task — a ceiling on numbers **you** declared, summed exactly and refused at run creation before anything submits ([EXTERNAL_JOBS.md](docs/EXTERNAL_JOBS.md)) |
+| Envelope encryption with KMS-wrapped data keys, and the rotation sweep | AES-256-GCM environment secrets under `DAGRON_ENV_SECRET_KEY` ([CONFIG.md](docs/CONFIG.md)) |
+| Managed artifact transfer with resumable chunks and central dedup | one local tier, one remote tier, a byte budget, dedup within the unit |
+
+Every one of those errors names three things: what you reached for, what this
+build does instead, and the seam to plug your own implementation into.
+`Executor`, `WorkflowSource`, `SourceFactory`, `ExternalPoller` and the artifact
+store are traits, so an implementation you write — or one someone else ships —
+drops in without forking a file here.
+
+**If you want the row rather than the fallback**, these ship in dagron
+Enterprise. The most useful thing you can do is
+[open an issue](https://github.com/lucheeseng827/dagron/issues/new) saying which
+error you hit and what you were trying to run — that is a more specific
+conversation than any feature list, and it is how the fallbacks above get better
+too.
 
 ## Contributing
 

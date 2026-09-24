@@ -14,8 +14,6 @@
 //! Every field is `skip_serializing_if`-empty, so the emitted YAML carries only
 //! what was set and stays readable as a PR artifact.
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
 /// A dagron workflow: a name and a set of tasks.
@@ -45,8 +43,50 @@ pub struct TaskSpec {
     pub max_attempts: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub env: BTreeMap<String, String>,
+    /// Environment for the task, in dagron's own shape: a **list** of
+    /// `{ name, value }`, which is what `dagron_core::dag::TaskSpec::env` parses.
+    ///
+    /// It was a map here, and dagron's parser rejects a map — so every plan compiled
+    /// with `options.env` produced YAML dagron refused, unnoticed only because no
+    /// compatibility test set an env. `tests/dagron_compat.rs` now does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<EnvVar>,
+}
+
+/// One task environment variable, as dagron spells it: a literal `value`, or a
+/// `value_from` secret that dagron resolves at dispatch and never stores.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EnvVar {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_from: Option<SecretRef>,
+}
+
+/// `value_from: { secret: NAME }` — dagron-core's `SecretRef`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SecretRef {
+    pub secret: String,
+}
+
+impl TaskSpec {
+    /// The literal value of the environment variable `name`, if the task sets one.
+    pub fn env_value(&self, name: &str) -> Option<&str> {
+        self.env
+            .iter()
+            .find(|e| e.name == name && e.value_from.is_none())
+            .map(|e| e.value.as_str())
+    }
+
+    /// The secret the environment variable `name` is resolved from, if it is one.
+    pub fn env_secret(&self, name: &str) -> Option<&str> {
+        self.env
+            .iter()
+            .find(|e| e.name == name)
+            .and_then(|e| e.value_from.as_ref())
+            .map(|s| s.secret.as_str())
+    }
 }
 
 impl DagSpec {

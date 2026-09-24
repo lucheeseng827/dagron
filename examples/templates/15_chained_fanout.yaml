@@ -1,0 +1,67 @@
+# Pattern 15 — Chained runtime fan-out (a fan-out over a fan-out's output)
+#
+# Pattern 14 fans out over what ONE task printed. This fans out over what
+# several tasks printed, because the producer is itself a fan-out:
+#
+#   regions (with_items: us, eu)
+#     ├── regions.0 ──▶ prints ["us-jan", "us-feb"]
+#     └── regions.1 ──▶ prints ["eu-jan", "eu-feb"]
+#            │
+#            ▼  process depends on BOTH, so it reads both
+#   process (one row, parked)
+#     ├── process.us-jan
+#     ├── process.us-feb    ← everything regions.0 found, THEN everything
+#     ├── process.eu-jan       regions.1 found. Interleaved by index it would
+#     └── process.eu-feb       read us-jan, eu-jan, us-feb, eu-feb.
+#            │
+#            ▼
+#   report  ── depends on `process` alone, and never learns there were four
+#
+# The scatter-gather-scatter shape: discover per region, then act on every
+# partition found across all of them, without the workflow knowing in advance
+# how many regions have how much work.
+name: chained-fanout
+
+tasks:
+  # The producer, fanned out at run creation over an authored list.
+  #
+  # The region is passed as an ARGUMENT (`$1`) rather than spliced into the
+  # script text. `{{ item }}` here is authored in this file, so it is not the
+  # injection risk pattern 14 warns about — but the argument form is the habit
+  # worth having, and it is the only correct form one step down.
+  - name: regions
+    command: ["sh", "-c", 'printf "[\"%s-jan\", \"%s-feb\"]\n" "$1" "$1"', "_", "{{ item }}"]
+    with_items: ["us", "eu"]
+
+  # The consumer. `depends_on: [regions]` is rewired by expansion onto
+  # `regions.0` and `regions.1`, and THAT is what decides which rows are read —
+  # not a name match against the run. So this needs no idea how wide `regions`
+  # turned out to be.
+  #
+  # argv, not `sh -c`: `{{ item }}` here is a value an upstream task printed.
+  - name: process
+    command: ["echo", "processing partition", "{{ item }}"]
+    depends_on: [regions]
+    with_output_of: regions
+    instance_key: "{{ item }}"      # names them process.us-jan, process.us-feb, …
+
+  - name: report
+    command: ["sh", "-c", "echo all partitions done"]
+    depends_on: [process]
+
+# Notes
+#
+# * Order is dependency order, which is instance order: everything `regions.0`
+#   found comes before everything `regions.1` found — which is why the four
+#   above read us, us, eu, eu rather than us, eu, us, eu. A string sort over
+#   the producer rows would put `regions.10` before `regions.2` and pair lists
+#   with the wrong region while looking perfectly fine.
+# * A region that finds nothing contributes nothing — its share of the fan-out
+#   is zero, and the others still run. Every region finding nothing leaves
+#   `process` succeeding with no instances, and `report` still runs.
+# * A region printing something that is not a JSON array fails `process`, and
+#   the message names THAT instance (`regions.1`), not `regions`.
+# * This multiplies the task count: N regions × M partitions each is N×M rows
+#   from two authored tasks — four here, from two authored steps. The run's ceiling (DAGRON_MAX_TASKS_PER_RUN) is
+#   re-checked before the rows are inserted, so an over-wide chain fails the
+#   task rather than the datastore.

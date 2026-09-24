@@ -27,18 +27,89 @@ use std::time::Duration;
 
 use crate::{ApiResponse, DagronClient, Method};
 
-/// Whether a tool only reads dagron state or changes it.
+/// Whether a tool only reads dagron state or changes it — and, for a write,
+/// what kind of change.
 ///
 /// The distinction is load-bearing rather than documentary: `DAGRON_MCP_READONLY`
 /// hides every [`Access::Write`] tool from `tools/list` *and* refuses it in
 /// [`call_tool`], which is what keeps the pre-P0 safe-by-default posture
 /// available now that this server can create, delete and approve.
+///
+/// It is also what a client is told. Every tool's MCP `annotations` come from
+/// [`Access::annotations`], so `readOnlyHint` is this split verbatim, and a
+/// write cannot be declared at all without the [`Effect`] its other hints
+/// describe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
     /// Reads only. Safe to expose to an agent whose prompt you do not control.
     Read,
     /// Changes cluster state (creates runs, edits workflows, resolves gates).
-    Write,
+    Write(Effect),
+}
+
+impl Access {
+    /// Whether this is the half `DAGRON_MCP_READONLY` hides and refuses.
+    pub fn is_write(self) -> bool {
+        matches!(self, Access::Write(_))
+    }
+
+    /// The MCP tool `annotations` for a tool with this access.
+    ///
+    /// A read states what is true of every read here: it changes nothing, and
+    /// dagron-api is all it talks to. It carries no `destructiveHint` or
+    /// `idempotentHint`, which the spec gives no meaning on a read-only tool.
+    pub fn annotations(self) -> Value {
+        match self {
+            Access::Read => json!({ "readOnlyHint": true, "openWorldHint": false }),
+            Access::Write(e) => json!({
+                "readOnlyHint": false,
+                "destructiveHint": e.destructive,
+                "idempotentHint": e.idempotent,
+                "openWorldHint": e.open_world,
+            }),
+        }
+    }
+}
+
+/// What a write does, as the rest of the MCP tool annotations say it.
+///
+/// A client reads these to decide whether a call needs a person's approval;
+/// some run a tool unasked only when it declares `readOnlyHint: true`. They
+/// are hints: the spec tells a client not to trust them from a server it does
+/// not trust, so they can decide who is asked but never what may run, which is
+/// `DAGRON_MCP_READONLY`'s job.
+///
+/// A write states all three, false ones included, because the spec reads an
+/// *absent* `destructiveHint` or `openWorldHint` as `true`. Leaving one out is
+/// still a claim, just not a deliberate one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Effect {
+    /// `destructiveHint`: the call can end, discard, delete or overwrite
+    /// something that already exists: a run or task in flight, a task's
+    /// captured output, a record, a stored value or definition. `false` means
+    /// it only adds (a run, a record, a step forward) or flips a lifecycle
+    /// state that the same call flips back.
+    pub destructive: bool,
+    /// `idempotentHint`: a repeat with the same arguments leaves things as the
+    /// first call did. It is refused (`404`/`409`), finds nothing left to do,
+    /// or writes the same values again, timestamps aside. A call that adds a
+    /// record every time, whether a run or a version, is not idempotent.
+    pub idempotent: bool,
+    /// `openWorldHint`: the call can set task code running with no further
+    /// call. It starts or re-runs tasks, releases the tasks behind a gate
+    /// (either way: a rejected gate still releases its failure handlers), or
+    /// arms or changes what a schedule or dataset trigger runs. A task runs
+    /// whatever commands its spec names, so what such a call reaches is not
+    /// bounded by dagron, and whether *that* code destroys anything is the
+    /// workflow's business, not this call's. Read it as "runs code": a client
+    /// that relaxes approval for `destructiveHint: false` should not do so here.
+    pub open_world: bool,
+}
+
+impl Effect {
+    /// Starts a new run and touches nothing that already exists: every call is
+    /// one more run.
+    pub const STARTS_RUN: Effect = Effect { destructive: false, idempotent: false, open_world: true };
 }
 
 // ── Argument access ───────────────────────────────────────────────────────────
@@ -301,8 +372,16 @@ fn params_prop(what: &str) -> Value {
     })
 }
 
+/// One catalogue entry: the definition a client sees, with its annotations
+/// derived from `access`, paired with that same access for the read-only gate.
 fn tool(access: Access, name: &str, description: &str, input: Value) -> (Access, Value) {
-    (access, json!({ "name": name, "description": description, "inputSchema": input }))
+    let def = json!({
+        "name": name,
+        "description": description,
+        "inputSchema": input,
+        "annotations": access.annotations(),
+    });
+    (access, def)
 }
 
 // ── The catalogue ─────────────────────────────────────────────────────────────
@@ -344,7 +423,9 @@ a failure summary.",
         obj(json!({ "run_id": sstr("the run id") }), &["run_id"]),
     ));
     t.push(tool(
-        Access::Write,
+        // A keyed repeat returns the same run, but the hint is the tool's: an
+        // unkeyed repeat is a second run.
+        Access::Write(Effect::STARTS_RUN),
         "dagron_submit_run",
         "Submit a new workflow run from an ad-hoc DAG YAML spec. Pass `parameters` to bind the \
 spec's declared `parameters:`. Pass `idempotency_key` when retrying a submit you are not sure \
@@ -361,7 +442,8 @@ landed: a repeat with the same key returns the SAME run_id instead of creating a
         ),
     ));
     t.push(tool(
-        Access::Write,
+        // Ends the run's unfinished tasks; a repeat finds nothing left to cancel.
+        Access::Write(Effect { destructive: true, idempotent: true, open_world: false }),
         "dagron_cancel_run",
         "Cancel a running workflow by id.",
         obj(json!({ "run_id": sstr("the run id") }), &["run_id"]),
@@ -383,7 +465,9 @@ replaces N round trips. A timed-out wait returns `finished: false` — call agai
 
     // ── Runs: recover ────────────────────────────────────────────────────────
     t.push(tool(
-        Access::Write,
+        // Resets the failed tasks in place, clearing their captured output, and
+        // runs them again: a second call is a second round.
+        Access::Write(Effect { destructive: true, idempotent: false, open_world: true }),
         "dagron_rerun_run",
         "Cascade-rerun a failed or cancelled run from its failure frontier: failed tasks reset \
 and re-run, succeeded ones stay intact. 409 when the run is not in a rerunnable state.",
@@ -396,14 +480,15 @@ and re-run, succeeded ones stay intact. 409 when the run is not in a rerunnable 
         ),
     ));
     t.push(tool(
-        Access::Write,
+        Access::Write(Effect::STARTS_RUN),
         "dagron_resubmit_run",
         "Submit a fresh run from the same spec this run was created from. Unlike rerun, nothing \
 of the original run is reused — you get a new run_id starting from the top.",
         obj(json!({ "run_id": sstr("the run id") }), &["run_id"]),
     ));
     t.push(tool(
-        Access::Write,
+        // Clears the failed attempt's output and runs the task again.
+        Access::Write(Effect { destructive: true, idempotent: false, open_world: true }),
         "dagron_retry_task",
         "Retry one failed or cancelled task in place. 409 when the task is not in a retryable \
 state.",
@@ -413,7 +498,9 @@ state.",
         ),
     ));
     t.push(tool(
-        Access::Write,
+        // Discards the results of the task and everything downstream of it, then
+        // runs them again.
+        Access::Write(Effect { destructive: true, idempotent: false, open_world: true }),
         "dagron_clear_task",
         "Clear a completed task and every task downstream of it, so that sub-DAG re-runs. Use \
 this (not retry) to re-run a task that succeeded. 409 when the task is not completed.",
@@ -432,7 +519,8 @@ first. A run sitting here is waiting on a decision, not on the engine.",
         no_args(),
     ));
     t.push(tool(
-        Access::Write,
+        // Lets the tasks behind the gate run; a repeat is a 409.
+        Access::Write(Effect { destructive: false, idempotent: true, open_world: true }),
         "dagron_approve_task",
         "Approve a parked `type: approval` gate: the task succeeds and its dependents advance. \
 409 when the task is not awaiting approval.",
@@ -442,7 +530,9 @@ first. A run sitting here is waiting on a decision, not on the engine.",
         ),
     ));
     t.push(tool(
-        Access::Write,
+        // Fails the gate, and the failure releases any `one_failed`/`all_done`
+        // task behind it; a repeat is a 409.
+        Access::Write(Effect { destructive: true, idempotent: true, open_world: true }),
         "dagron_reject_task",
         "Reject a parked `type: approval` gate: the task fails and its `all_success` dependents \
 skip. 409 when the task is not awaiting approval.",
@@ -454,7 +544,8 @@ skip. 409 when the task is not awaiting approval.",
 
     // ── Triage ───────────────────────────────────────────────────────────────
     t.push(tool(
-        Access::Write,
+        // Overwrites any earlier triage state and note; nothing keeps the old one.
+        Access::Write(Effect { destructive: true, idempotent: true, open_world: false }),
         "dagron_triage_run",
         "Write down what you concluded about a failed run. `state` is acknowledged (seen, being \
 worked on), resolved (dealt with) or ignored (a real failure we accept); `note` is the part \
@@ -473,7 +564,7 @@ worth reading in three months, so write one.",
         ),
     ));
     t.push(tool(
-        Access::Write,
+        Access::Write(Effect { destructive: true, idempotent: true, open_world: false }),
         "dagron_clear_triage",
         "Undo a triage decision, putting the run back in the attention queue.",
         obj(json!({ "run_id": sstr("the run id") }), &["run_id"]),
@@ -556,7 +647,9 @@ paging on this route.",
         obj(json!({ "workflow_id": sstr("the workflow id") }), &["workflow_id"]),
     ));
     t.push(tool(
-        Access::Write,
+        // Adds a workflow, and a repeat is a 409 duplicate. Open world because a
+        // spec with `on_datasets:` starts runs on its own from then on.
+        Access::Write(Effect { destructive: false, idempotent: true, open_world: true }),
         "dagron_create_workflow",
         "Register a named workflow from a DAG YAML spec. Registration is what makes a \
 `type: workflow` task able to invoke it by name — a parent/child DAG is unreachable without \
@@ -571,7 +664,10 @@ this. The name defaults to the spec's own; 409 on a duplicate.",
         ),
     ));
     t.push(tool(
-        Access::Write,
+        // Replaces the live definition the next scheduled or triggered run
+        // executes. Earlier versions are kept, but recording one is best-effort,
+        // and a repeat records one more.
+        Access::Write(Effect { destructive: true, idempotent: false, open_world: true }),
         "dagron_update_workflow",
         "Replace a registered workflow's spec (and optionally rename it). The prior definition \
 is kept as a version, readable with dagron_list_workflow_versions.",
@@ -586,14 +682,17 @@ is kept as a version, readable with dagron_list_workflow_versions.",
         ),
     ));
     t.push(tool(
-        Access::Write,
+        Access::Write(Effect { destructive: true, idempotent: true, open_world: false }),
         "dagron_delete_workflow",
         "Delete a registered workflow. This cascades its schedules away — prefer \
 dagron_set_workflow_state with 'paused' or 'retired' to stop it reversibly.",
         obj(json!({ "workflow_id": sstr("the workflow id") }), &["workflow_id"]),
     ));
     t.push(tool(
-        Access::Write,
+        // Every state can be set back, so nothing is lost. Open world because
+        // `active` lets the workflow's schedules fire again, an overdue slot on
+        // the next tick.
+        Access::Write(Effect { destructive: false, idempotent: true, open_world: true }),
         "dagron_set_workflow_state",
         "Pause, retire or reactivate a workflow. 'paused' stops it firing while leaving its \
 schedules intact; 'retired' is a soft delete that keeps the history; 'active' resumes.",
@@ -610,7 +709,7 @@ schedules intact; 'retired' is a soft delete that keeps the history; 'active' re
         ),
     ));
     t.push(tool(
-        Access::Write,
+        Access::Write(Effect::STARTS_RUN),
         "dagron_run_workflow",
         "Run a registered workflow by id, with optional arguments for its declared \
 `parameters:`. This is how a stored workflow is called as a function — no need to fetch its \
@@ -673,7 +772,8 @@ rather than inflating your context with base64.",
         ),
     ));
     t.push(tool(
-        Access::Write,
+        // Overwrites an artifact of the same name; nothing keeps the old bytes.
+        Access::Write(Effect { destructive: true, idempotent: true, open_world: false }),
         "dagron_put_artifact",
         "Write a text artifact into the store — the way to seed an input file a DAG will read.",
         obj(
@@ -736,13 +836,15 @@ human name (\"the nightly ETL\") and need an id — every other tool takes ids."
         obj(json!({ "limit": sint("page size (default 100)", 1, 500) }), &[]),
     ));
     t.push(tool(
-        Access::Write,
+        // Deletes the dead letter, its error and failure history with it, and
+        // submits its payload as a run; a repeat is a 404.
+        Access::Write(Effect { destructive: true, idempotent: true, open_world: true }),
         "dagron_redrive_dead_letter",
         "Re-submit a parked payload as a fresh run and drop it from the queue.",
         obj(json!({ "id": sstr("the dead-letter id") }), &["id"]),
     ));
     t.push(tool(
-        Access::Write,
+        Access::Write(Effect { destructive: true, idempotent: true, open_world: false }),
         "dagron_delete_dead_letter",
         "Discard a parked payload permanently.",
         obj(json!({ "id": sstr("the dead-letter id") }), &["id"]),
@@ -794,7 +896,7 @@ once the run has been compacted to the Parquet dataset.",
     t
 }
 
-/// The full MCP tool catalogue (name, description, JSON-Schema input).
+/// The full MCP tool catalogue (name, description, JSON-Schema input, annotations).
 ///
 /// Unfiltered on purpose: this is the catalogue as a *definition*. What a given
 /// server advertises is [`tool_defs_for`].
@@ -891,7 +993,7 @@ fn body(v: Value) -> Option<(String, &'static str)> {
 pub async fn call_tool(client: &DagronClient, name: &str, args: &Value) -> Result<String> {
     // Fail closed: a write tool stays refused in read-only mode even if some
     // composing server advertised it anyway.
-    if client.readonly() && tool_access(name) == Some(Access::Write) {
+    if client.readonly() && tool_access(name).is_some_and(Access::is_write) {
         anyhow::bail!(
             "`{name}` changes cluster state and this server is running read-only \
              (DAGRON_MCP_READONLY); unset it to enable the write tools"
@@ -1340,6 +1442,91 @@ mod tests {
             assert!(tool_access(&name).is_some(), "{name} has no access classification");
         }
         assert!(tool_access("dagron_nonexistent").is_none());
+    }
+
+    /// A client decides from `annotations` whether a call needs a person's
+    /// approval, and some run a tool unasked when it declares
+    /// `readOnlyHint: true`. So every advertised tool carries them, and
+    /// `readOnlyHint` says exactly what the read-only gate ([`tool_access`])
+    /// decides for that name — checked on the definitions a client receives,
+    /// not on the catalogue's own bookkeeping.
+    #[test]
+    fn every_tool_declares_annotations_matching_its_access() {
+        for t in tool_defs() {
+            let name = t["name"].as_str().unwrap();
+            let hints = t["annotations"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{name} declares no annotations"));
+            let access = tool_access(name).expect("advertised tools are classified");
+            assert_eq!(
+                hints.get("readOnlyHint"),
+                Some(&json!(access == Access::Read)),
+                "{name}: readOnlyHint disagrees with the read-only gate"
+            );
+            match access {
+                Access::Read => {
+                    // An absent openWorldHint reads as true, so a read says it.
+                    assert_eq!(hints.get("openWorldHint"), Some(&json!(false)), "{name}");
+                    // Meaningless on a read-only tool per the spec, so absent.
+                    assert!(!hints.contains_key("destructiveHint"), "{name}");
+                    assert!(!hints.contains_key("idempotentHint"), "{name}");
+                }
+                Access::Write(_) => {
+                    // An absent destructiveHint or openWorldHint reads as true:
+                    // a write that omits one has claimed it without deciding.
+                    for hint in ["destructiveHint", "idempotentHint", "openWorldHint"] {
+                        assert!(
+                            hints.get(hint).is_some_and(Value::is_boolean),
+                            "{name} must state {hint}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The hints a client acts on, written out per write, so reclassifying a
+    /// tool is an edit here as well as in the catalogue rather than one word in
+    /// a long list nobody rereads. The reasoning for each row is in
+    /// `docs/MCP.md`, "Tool annotations".
+    #[test]
+    fn the_write_hints_are_the_reviewed_ones() {
+        // (tool, destructive, idempotent, open_world)
+        let reviewed = [
+            ("dagron_submit_run", false, false, true),
+            ("dagron_cancel_run", true, true, false),
+            ("dagron_rerun_run", true, false, true),
+            ("dagron_resubmit_run", false, false, true),
+            ("dagron_retry_task", true, false, true),
+            ("dagron_clear_task", true, false, true),
+            ("dagron_approve_task", false, true, true),
+            ("dagron_reject_task", true, true, true),
+            ("dagron_triage_run", true, true, false),
+            ("dagron_clear_triage", true, true, false),
+            ("dagron_create_workflow", false, true, true),
+            ("dagron_update_workflow", true, false, true),
+            ("dagron_delete_workflow", true, true, false),
+            ("dagron_set_workflow_state", false, true, true),
+            ("dagron_run_workflow", false, false, true),
+            ("dagron_put_artifact", true, true, false),
+            ("dagron_redrive_dead_letter", true, true, true),
+            ("dagron_delete_dead_letter", true, true, false),
+        ];
+        let writes: Vec<(String, Effect)> = catalogue()
+            .into_iter()
+            .filter_map(|(access, def)| match access {
+                Access::Write(e) => Some((def["name"].as_str().unwrap().to_string(), e)),
+                Access::Read => None,
+            })
+            .collect();
+        assert_eq!(writes.len(), reviewed.len(), "a write was added or removed: review its hints here");
+        for (name, destructive, idempotent, open_world) in reviewed {
+            let effect = writes
+                .iter()
+                .find_map(|(n, e)| (n == name).then_some(*e))
+                .unwrap_or_else(|| panic!("{name} is not a write tool"));
+            assert_eq!(effect, Effect { destructive, idempotent, open_world }, "{name}");
+        }
     }
 
     /// The roadmap in `docs/MCP.md`: P0 (author + wait + artifacts), P1 (recover

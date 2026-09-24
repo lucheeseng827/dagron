@@ -44,6 +44,11 @@ export interface StatusNodeData {
   templateTasks?: number;
   /// Container image the task runs in (editor view); shown as a badge line.
   dockerImage?: string;
+  /// Editor view: the loop this task carries, already phrased by `describeLoop`.
+  /// This row is what makes a one-node-many-rows task honest on the canvas — a
+  /// `with_items:` step draws as a single node, and this is where it says so.
+  /// Null / absent for an ordinary task, which then draws no loop row.
+  loop?: { badge: string; title: string } | null;
   /// Run view: dispatch/finish instants, for the duration line on the node.
   scheduledAt?: string | null;
   finishedAt?: string | null;
@@ -144,6 +149,14 @@ export default function StatusNode({ data, sourcePosition, targetPosition }: Nod
       {!isRef && d.dockerImage && (
         <div style={SUBTITLE} title={`Runs in container image: ${d.dockerImage}`}>
           ◳ {d.dockerImage}
+        </div>
+      )}
+      {/* Tinted rather than muted: on a dense canvas the loop row is the one
+          subtitle that changes how many times the node runs, so it should be
+          findable without reading every node. */}
+      {d.loop && (
+        <div style={{ ...SUBTITLE, color: "var(--blue)" }} title={d.loop.title}>
+          {d.loop.badge}
         </div>
       )}
       <div

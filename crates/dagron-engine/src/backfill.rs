@@ -253,7 +253,7 @@ async fn sweep_catchup(
             // fire's logical date is injected as `{{ scheduled_time }}` so a
             // backfilled run processes *its* interval, not "now".
             let mut params = std::collections::BTreeMap::new();
-            params.insert("scheduled_time".to_string(), logical.clone());
+            crate::schedule_time::insert_logical_date(&mut params, &logical);
             let parsed = match crate::environments::template_params(pool, &s.spec).await {
                 Ok(extra) => {
                     params.extend(extra);

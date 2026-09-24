@@ -111,6 +111,7 @@ pub async fn run(
     mut entries: Vec<CronEntry>,
     is_leader: Arc<AtomicBool>,
     metrics: Arc<Metrics>,
+    admission: crate::pressure::AdmissionGate,
 ) {
     info!(schedules = entries.len(), "cron loop running");
     loop {
@@ -141,7 +142,7 @@ pub async fn run(
                         metrics.inc_schedule_gated();
                         info!(schedule = %entry.name, when = entry.when.as_deref().unwrap_or(""), scheduled_time = %nominal, "cron fire gated (when: false) — skipping");
                     } else {
-                        fire(&pool, entry, nominal, &metrics).await;
+                        fire(&pool, entry, nominal, &metrics, &admission).await;
                     }
                 }
                 // Advance regardless of leadership to avoid a backlog of misses.
@@ -160,9 +161,26 @@ pub async fn run(
 /// fire is independent. The fire's nominal time is injected as the
 /// `{{ scheduled_time }}` parameter (RFC-3339) so tasks can reference their
 /// logical date — the data-interval idiom.
-async fn fire(pool: &db::Pool, entry: &CronEntry, nominal: DateTime<Utc>, metrics: &Metrics) {
+async fn fire(
+    pool: &db::Pool,
+    entry: &CronEntry,
+    nominal: DateTime<Utc>,
+    metrics: &Metrics,
+    admission: &crate::pressure::AdmissionGate,
+) {
+    // A schedule is the path that matters most here: the API can be told `503`
+    // and back off, but an unattended cron would keep minting runs for as long
+    // as the gate stayed closed. The fire is SKIPPED, not deferred — a cron fire
+    // is "run the thing that was due at this nominal time", and queueing six
+    // hours of them to land at once when the gate opens is a thundering herd
+    // nobody asked for. The missed fire is logged and gone.
+    if admission.is_closed() {
+        metrics.inc_admission_refused_gate();
+        warn!(schedule = %entry.name, scheduled_time = %nominal, "cron fire skipped — admission gate closed");
+        return;
+    }
     let mut params = std::collections::BTreeMap::new();
-    params.insert("scheduled_time".to_string(), nominal.to_rfc3339());
+    crate::schedule_time::insert_logical_date(&mut params, &nominal.to_rfc3339());
     match DagGraph::from_yaml_with_params(&entry.dag_yaml, &params) {
         Ok(dag) => match db::create_run(pool, &dag, &entry.dag_yaml).await {
             Ok(run_id) => {

@@ -258,6 +258,15 @@ scoping yet. Demoting a user to `viewer` takes effect on their existing tokens
 at once rather than whenever the token is next replaced, but a token belonging
 to an admin *is* an admin. Give automation its own user.
 
+**Roles.** There are two, in every build. A user in the **`viewer`** group is read-only:
+every mutating request (`POST`/`PUT`/`PATCH`/`DELETE`, by session or by token) is refused
+with `403 viewer role is read-only`, except logging in and out. **Git repository
+configuration is admin-only**: connecting a repo, deleting one, and setting or removing its
+credential need the `admin` group (`403` otherwise); listing repos and *sync now* stay open
+to any non-viewer. Everyone else is an ordinary user with the rights they have always had,
+including over workflows. Per-team ownership, custom roles and SSO group mapping are
+Enterprise.
+
 ## 6. Secrets & environment variables
 
 Two layers: plain **variables** (substituted into the spec) and encrypted
@@ -319,6 +328,28 @@ At dispatch the engine resolves `value_from` from the environment's secret store
 first, then falls back to a `DAGRON_SECRET_<NAME>` env var / the secrets directory
 on the engine host. For knobs the chart doesn't model, `engine.extraEnv` /
 `dagronApi.extraEnv` pass raw env vars straight to the containers.
+
+### Where a secret's plaintext can be seen
+
+Encrypted at rest, decrypted only in the engine's memory at dispatch, and never in
+the API, run JSON or the engine log. After that it depends on the executor:
+
+- **Kubernetes** (default `DAGRON_TASK_SECRET_ENV=secret`): the value is placed in a
+  per-task Kubernetes Secret and the pod references it with `secretKeyRef`, so it is
+  **not** in the Pod spec: `kubectl get pod -o yaml`, `describe` and API-server audit
+  logs show a reference. The Secret is owned by the pod and deleted with it. Anyone who
+  can `get secrets` in the task namespace can still read it while the task runs, and
+  encrypting Secrets in etcd is the cluster's job (an `EncryptionConfiguration`, or a
+  KMS provider), not dagron's. If the engine cannot create Secrets the task fails naming
+  the missing permission; `DAGRON_TASK_SECRET_ENV=inline` restores the old behaviour
+  (plaintext `env[].value` in the Pod spec, readable by anyone who can `get pods`).
+- **Docker executor**: the value is passed as a container environment variable, so
+  `docker inspect` shows it to anyone with access to the Docker socket.
+- **Local executor**: it is in the subprocess environment, readable by the same OS user
+  (`/proc/<pid>/environ`).
+
+In every case the task itself sees the plaintext (it has to), and the output redactor
+masks it in stored output.
 
 ---
 

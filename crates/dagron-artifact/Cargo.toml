@@ -2,6 +2,8 @@
 name = "dagron-artifact"
 version = "0.1.0"
 edition = "2021"
+# MSRV — see the root Cargo.toml for how 1.88 was measured.
+rust-version = "1.88"
 description = "dagron artifact store seam: the ArtifactStore trait + a local-filesystem default and S3/GCS/Azure object-store backends (features s3/gcs/azure) behind the same trait. Passes data files between tasks in a run and holds checkpoint artifacts for cross-machine resume."
 
 [lib]

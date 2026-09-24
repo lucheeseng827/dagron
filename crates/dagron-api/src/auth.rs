@@ -41,6 +41,48 @@ pub struct SessionClaims {
     pub exp: usize,
 }
 
+/// Whether a session carries the `admin` group — the one privilege level this API
+/// distinguishes. The console calls the three roles admin / operator / viewer, but only
+/// `admin` is a group: an operator is a user with no groups at all, so "not a viewer" is
+/// not a thing a handler can ask. Route modules wrap this in their own `require_admin` to
+/// build whatever error body they return (plain text, JSON); the predicate is shared so the
+/// group name is written once.
+pub fn is_admin(claims: &SessionClaims) -> bool {
+    claims.groups.iter().any(|g| g == "admin")
+}
+
+/// Whether a session is read-only — the `viewer` group. A viewer may read anything they are
+/// authenticated for and change nothing; the refusal is [`read_only_refusal`], applied by the
+/// middleware in `routes::audit` before a request reaches any handler.
+pub fn is_viewer(claims: &SessionClaims) -> bool {
+    claims.groups.iter().any(|g| g == "viewer")
+}
+
+/// Whether a request is a *control* mutation: the ones a read-only session may not make, and the
+/// ones the enterprise build records in its audit trail. Anything but `GET`/`HEAD`/`OPTIONS`,
+/// except logging in and out — those are auth plumbing rather than control actions, and a viewer
+/// who cannot sign in cannot read either.
+///
+/// Shared by both builds so the two cannot answer "is this a mutation?" differently: the open
+/// build enforces the role, the enterprise build enforces it *and* audits, off one definition.
+pub fn is_control_mutation(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+        && !matches!(path, "/api/login" | "/api/logout")
+}
+
+/// The refusal a read-only session gets for a control mutation. JSON, per the error envelope
+/// `docs/API.md` documents — a middleware refusal is no less a client-facing error than a
+/// handler's.
+pub fn read_only_refusal() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        axum::Json(serde_json::json!({ "error": "viewer role is read-only" })),
+    )
+        .into_response()
+}
+
 /// Extractor that authenticates a request and yields the validated claims.
 /// Returns 401 on any missing/invalid/expired token.
 pub struct AuthUser(pub SessionClaims);
@@ -269,5 +311,67 @@ fn extract_bearer(value: &str) -> Option<&str> {
             }
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::*;
+    use axum::http::Method;
+
+    fn claims(groups: &[&str]) -> SessionClaims {
+        SessionClaims {
+            sub: "u1".to_string(),
+            email: "u1@example.com".to_string(),
+            name: "U1".to_string(),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            exp: 0,
+        }
+    }
+
+    /// The console's three roles as the API sees them: `admin` and `viewer` are groups, and an
+    /// operator is a user with none. Only the viewer is read-only — an operator authoring
+    /// workflows is the role's whole purpose, so "no groups" must *not* be caught here.
+    #[test]
+    fn only_the_viewer_group_is_read_only() {
+        assert!(is_viewer(&claims(&["viewer"])));
+        assert!(is_viewer(&claims(&["viewer", "admin"])), "a group list is not an ordered role");
+        assert!(!is_viewer(&claims(&[])), "an operator has no groups and may write");
+        assert!(!is_viewer(&claims(&["admin"])));
+        assert!(!is_viewer(&claims(&["viewers"])), "a near-miss group name is not the role");
+    }
+
+    /// Reads are never refused, and logging in and out are not control actions — a viewer who
+    /// cannot POST /api/login cannot read either, which would make the role useless rather than
+    /// read-only.
+    #[test]
+    fn control_mutations_exclude_reads_and_auth_plumbing() {
+        for (m, p) in [(Method::GET, "/api/workflows"), (Method::HEAD, "/api/workflows"), (Method::OPTIONS, "/api/workflows")] {
+            assert!(!is_control_mutation(&m, p), "{m} {p} is a read");
+        }
+        assert!(!is_control_mutation(&Method::POST, "/api/login"));
+        assert!(!is_control_mutation(&Method::POST, "/api/logout"));
+
+        for (m, p) in [
+            (Method::POST, "/api/workflows"),
+            (Method::PUT, "/api/workflows/w1"),
+            (Method::DELETE, "/api/workflows/w1"),
+            (Method::POST, "/api/workflows/w1/state"),
+            (Method::POST, "/api/git-repos"),
+            // Not a prefix match: only the two exact auth paths are exempt.
+            (Method::POST, "/api/login/extra"),
+        ] {
+            assert!(is_control_mutation(&m, p), "{m} {p} must be judged");
+        }
+    }
+
+    /// The refusal carries the documented JSON envelope, not a plain-text body.
+    #[tokio::test]
+    async fn the_refusal_is_a_json_envelope() {
+        let res = read_only_refusal();
+        assert_eq!(res.status(), axum::http::StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("a JSON envelope");
+        assert_eq!(body["error"], "viewer role is read-only");
     }
 }

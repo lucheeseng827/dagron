@@ -2,6 +2,8 @@
 name = "dagron-core"
 version = "0.1.0"
 edition = "2021"
+# MSRV — see the root Cargo.toml for how 1.88 was measured.
+rust-version = "1.88"
 description = "dagron core: DAG model + validation, matrix/call expansion, the datastore facade (SQLite/Postgres) and the process metrics registry. The foundation the engine, API and operator share."
 
 [lib]

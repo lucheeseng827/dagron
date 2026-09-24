@@ -1,0 +1,49 @@
+[package]
+name = "dagron-step-spark"
+version = "0.1.0"
+edition = "2021"
+# MSRV — see the root Cargo.toml for how 1.88 was measured.
+rust-version = "1.88"
+description = "dagron Spark step — submit a Spark job and hand its id back to the engine, so the task parks on the job instead of holding a worker for its duration."
+
+[[bin]]
+name = "dagron-step-spark"
+path = "src/main.rs"
+
+[lib]
+name = "dagron_step_spark"
+path = "src/lib.rs"
+
+[features]
+default = []
+# The SparkApplication CR backend. NON-DEFAULT because kube + k8s-openapi are a
+# large dependency tree that a task image submitting over REST or spark-submit
+# should not carry. CI compiles and tests this leg explicitly — the precedent is
+# ci.yml's bespoke `-p dagron-source --features mqtt,sqlite`, added because a
+# feature no default build compiles is a feature nobody notices breaking.
+k8s = ["dep:kube", "dep:k8s-openapi", "dep:rustls"]
+
+[dependencies]
+# `process` to spawn spark-submit, `time` for the submit deadline.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+# The shared, env-tunable logging bootstrap every other dagron binary uses, so a
+# step's diagnostics filter like everything else in the run.
+dagron-logging = { path = "../dagron-logging" }
+# The house feature set, matching the five mirrored crates that already use it.
+# The lock carries two reqwest trees; a different set here churns it under
+# `--locked`.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+
+# Deliberately NOT a dependency: dagron-core. Its `default = ["sqlite"]` would
+# link a bundled SQLite into every task image that runs this step, to reuse a
+# dozen lines of dotted-path lookup. The same reasoning keeps dagron-step-sql
+# off it, where the cost would be worse (a second, conflicting DB backend).
+kube = { version = "3", default-features = false, features = ["client", "rustls-tls"], optional = true }
+k8s-openapi = { version = "0.27", features = ["v1_31"], optional = true }
+rustls = { version = "0.23", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

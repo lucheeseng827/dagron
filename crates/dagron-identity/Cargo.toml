@@ -2,6 +2,8 @@
 name = "dagron-identity"
 version = "0.1.0"
 edition = "2021"
+# MSRV — see the root Cargo.toml for how 1.88 was measured.
+rust-version = "1.88"
 description = "dagron-api identity seam: the IdentityProvider trait + VerifiedUser. Ships a local (argon2) provider; an alternate provider can plug SSO in behind the same trait."
 
 [lib]

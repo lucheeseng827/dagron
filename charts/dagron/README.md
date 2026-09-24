@@ -30,6 +30,8 @@ helm show values oci://registry-1.docker.io/mancube/dagron --version 0.5.0
 | `dagron.dagronApi.image` | UI gateway image | `mancube/dagron-api:<chart version>` |
 | `dagron.frontend.image` | Frontend image — off by default; the console ships in `dagron-api` | `mancube/dagron-frontend:0.8.1` (pinned; discontinued after 0.8.1) |
 | `global.imageRegistry` | Relocate every image to a private mirror | `""` |
+| `networkPolicy.enabled` | Limit ingress to the engine's unauthenticated ops API and the bundled Postgres (needs a CNI that enforces NetworkPolicy; ingress only, no egress policy) — see [docs/HARDENING.md](../../../docs/HARDENING.md) | `true` |
+| `networkPolicy.engine.monitoringNamespace` / `.allowFrom` | Who may reach the engine: the Prometheus namespace, plus extra peers | `monitoring` / `[]` |
 
 The bundled Postgres is for testing only — point the engine at a managed
 Postgres for anything real. See [`values.yaml`](./values.yaml) for the full set.

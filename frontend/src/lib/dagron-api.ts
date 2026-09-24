@@ -28,12 +28,14 @@ import type {
   RunDetail,
   RunLogs,
   SearchResponse,
+  RunSpecGroup,
   RunSummary,
   Schedule,
   ScheduleOptions,
   StateCompiled,
   StateExplanation,
   StateSubmitted,
+  TaskAttempts,
   TaskLogs,
   TaskResolution,
   UserView,
@@ -42,6 +44,7 @@ import type {
   Workflow,
   WorkflowRow,
 } from "@/types/dagron";
+import { errorBody } from "@/lib/err";
 import { toParams, type LogFilterState } from "@/lib/log-filter";
 
 const BASE = "/api";
@@ -62,7 +65,7 @@ export async function login(email: string, password: string): Promise<void> {
   });
   if (!res.ok) {
     if (res.status === 401) throw new Error("Invalid email or password.");
-    throw new Error(`${res.status}: ${(await res.text().catch(() => "")) || res.statusText}`);
+    throw new Error(`${res.status}: ${await errorBody(res)}`);
   }
 }
 
@@ -117,8 +120,7 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
     headers: { ...defaultHeaders(options?.body != null), ...(options?.headers as Record<string, string>) },
   });
   if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`${res.status}: ${body || res.statusText}`);
+    throw new Error(`${res.status}: ${await errorBody(res)}`);
   }
   if (res.status === 204) return undefined as T;
   return res.json() as Promise<T>;
@@ -155,6 +157,17 @@ export const getRunGraph = (id: string): Promise<GraphResponse> =>
 export const getRunSpec = (id: string): Promise<{ yaml: string; name: string | null }> =>
   apiFetch(`/runs/${encodeURIComponent(id)}/spec`);
 
+/// The specs behind many runs in one call, **grouped by content**: each entry is
+/// one distinct spec and the runs created from it. Every run snapshots its own
+/// definition row, so a page of runs nobody edited between is one group — which
+/// is both the saving and the answer to "did this change?".
+///
+/// The server caps the batch (400 past its limit) and leaves unknown run ids out
+/// of the response rather than failing the call, so a page containing an
+/// archived run still answers for the rest.
+export const getRunSpecs = (ids: string[]): Promise<RunSpecGroup[]> =>
+  apiFetch(`/runs/specs?ids=${ids.map(encodeURIComponent).join(",")}`);
+
 /// Task logs. Pass `offset` (a prior response's `next_offset`) to tail: only
 /// output past that char offset comes back, until `eof`.
 ///
@@ -173,6 +186,23 @@ export const getTaskLogs = (
   const q = p.toString();
   return apiFetch(
     `/runs/${encodeURIComponent(id)}/tasks/${encodeURIComponent(tid)}/logs${q ? `?${q}` : ""}`,
+  );
+};
+
+/// The iterations the task log can't show: a task's superseded attempts.
+///
+/// A separate request from `getTaskLogs` on purpose — that one *polls*, once
+/// every couple of seconds for as long as a task is running, and attaching a
+/// history to every poll would multiply the tail's cost by the size of the
+/// history. Fetch this when a reader asks for the iterations.
+export const getTaskAttempts = (
+  id: string,
+  tid: string,
+  filter?: LogFilterState,
+): Promise<TaskAttempts> => {
+  const q = filter ? toParams(filter).toString() : "";
+  return apiFetch(
+    `/runs/${encodeURIComponent(id)}/tasks/${encodeURIComponent(tid)}/attempts${q ? `?${q}` : ""}`,
   );
 };
 

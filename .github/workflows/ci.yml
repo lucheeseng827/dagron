@@ -85,6 +85,20 @@ jobs:
             --all-targets -- -D warnings
           cargo clippy --locked -p dagron-api -p dagron-gitops --all-targets -- -D warnings
           cargo clippy --locked -p dagron-source --features mqtt,sqlite --all-targets -- -D warnings
+          # BOTH worlds for each step crate. The feature legs alone are not
+          # enough: an import used only by a feature-gated function is dead in
+          # the default build and invisible to a lint that only ever runs with
+          # the feature on — which is exactly how one reached main.
+          cargo clippy --locked -p dagron-step-spark --all-targets -- -D warnings
+          cargo clippy --locked -p dagron-step-spark --features k8s --all-targets -- -D warnings
+          cargo clippy --locked -p dagron-step-sql --all-targets -- -D warnings
+          cargo clippy --locked -p dagron-step-sql --features mysql,postgres --all-targets -- -D warnings
+          # The Kubernetes pod executor. Non-default, and until 0.10.0 it was
+          # covered by NO leg at all — not clippy, not test, not MSRV — while
+          # being one of the three ways a task actually runs. `dagron-core/sqlite`
+          # rides along because dagron-core needs exactly one DB backend and this
+          # crate does not pick one itself.
+          cargo clippy --locked -p dagron-executor --features kubernetes,dagron-core/sqlite --all-targets -- -D warnings
 
       # --locked, so a PR that edits a Cargo.toml without refreshing Cargo.lock fails
       # here with a clear message rather than drifting the published lockfile.
@@ -102,3 +116,63 @@ jobs:
           # The mqtt feature world (see the clippy note): feature-gated code that
           # no default build compiles, together with its tests.
           cargo test --locked -p dagron-source --features mqtt,sqlite
+          # The step binaries' non-default backends, for exactly the reason the
+          # mqtt leg above exists: a feature no default build compiles is a
+          # feature whose breakage is invisible until someone builds the image.
+          # step-spark's `k8s` is the Kubernetes client; step-sql's two wire
+          # features are what its published image is built with.
+          cargo test --locked -p dagron-step-spark --features k8s
+          cargo test --locked -p dagron-step-sql --features mysql,postgres
+          # The Kubernetes pod executor — see the clippy note. It compiles
+          # without a cluster, so the manifest-shaping and label tests run here
+          # even though nothing connects to an apiserver.
+          cargo test --locked -p dagron-executor --features kubernetes,dagron-core/sqlite
+
+  msrv:
+    name: MSRV (required) — the declared rust-version actually builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Pinned to the `rust-version` every manifest declares. A declared MSRV
+      # nothing compiles against is a claim, not a guarantee: it rots the first
+      # time anyone uses a newer language feature or bumps a dependency whose own
+      # floor moved, and the person who finds out is a packager on a distro
+      # toolchain. docs/RELEASE.md §2 asks for exactly this pairing — "declare
+      # `rust-version` in each `Cargo.toml`; test it in CI".
+      #
+      # 1.88 is measured, not chosen: the tree builds at 1.88 and fails at 1.86,
+      # where serde_with 3.21 stops building. Keep this in lockstep with the
+      # manifests — if you bump one, this job is what tells you about the other.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.88"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: msrv
+
+      # `check`, not `build`: this job answers "does it compile on the oldest
+      # toolchain we promise", and codegen adds minutes without changing that
+      # answer. The same three legs the required build covers, for the same
+      # reasons — the two Postgres-only crates resolve a different backend, and
+      # the mqtt feature world is compiled by no default build.
+      # No working-directory: this file is mirrored to the public repo, where
+      # the module's contents ARE the repo root. That is why no other step here
+      # sets one either.
+      - name: cargo check on the declared MSRV
+        run: |
+          set -euo pipefail
+          cargo check --locked --workspace --exclude dagron-api --exclude dagron-gitops
+          cargo check --locked -p dagron-api -p dagron-gitops
+          cargo check --locked -p dagron-source --features mqtt,sqlite
+          # The step crates' published feature worlds. `--workspace` above
+          # includes both crates but resolver 2 does not activate a feature
+          # across packages, and both declare `default = []` — so without these
+          # two lines the MSRV job compiles neither the Kubernetes client nor
+          # the sqlx wire drivers, which is exactly what the images are built
+          # from. A dependency could raise the effective MSRV for a published
+          # image without any required job going red.
+          cargo check --locked -p dagron-step-spark --features k8s
+          cargo check --locked -p dagron-step-sql --features mysql,postgres
+          cargo check --locked -p dagron-executor --features kubernetes,dagron-core/sqlite

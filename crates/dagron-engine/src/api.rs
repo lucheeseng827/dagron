@@ -87,6 +87,10 @@ pub struct ApiState {
     /// does not bound the work admitted. Counted against the task ROWS the
     /// submission will create, including gang expansion. `0` disables it.
     pub max_inflight_tasks: i64,
+    /// External run-admission gate (`DAGRON_ADMISSION_FILE`). While it reads
+    /// closed, `POST /runs` answers `503` and creates nothing. Unset = always
+    /// open, which is every deployment that has not opted in.
+    pub admission: crate::pressure::AdmissionGate,
 }
 
 /// Bind `addr` and serve the management API until the process exits.
@@ -152,6 +156,7 @@ pub fn router(state: ApiState) -> Router {
         // task's output (live-tailable) under the same filter grammar.
         .route("/runs/{id}/logs", get(run_logs))
         .route("/runs/{id}/tasks/{task_id}/logs", get(task_logs))
+        .route("/runs/{id}/tasks/{task_id}/attempts", get(task_attempts))
         .route("/runs/{id}/cancel", post(cancel_run))
         .route("/runs/{id}/rerun", post(rerun_run))
         .route("/runs/{id}/tasks/{task_id}/clear", post(clear_task))
@@ -256,7 +261,7 @@ async fn docs() -> Html<&'static str> {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>module-54 scheduler — API docs</title>
+  <title>dagron scheduler — API docs</title>
   <link rel="stylesheet" href="/docs/swagger-ui.css" />
 </head>
 <body>
@@ -435,6 +440,31 @@ async fn submit_run(
     Query(q): Query<SubmitQuery>,
     body: String,
 ) -> Result<Response, ApiError> {
+    // Checked before the body is even parsed: a closed gate is a property of the
+    // installation, not of this submission, so there is nothing about the request
+    // worth validating first.
+    //
+    // `503`, not the `429` the capacity valves below use. The existing codes are
+    // chosen to tell a client WHAT to wait for — 429 for a rate condition, 507
+    // for storage — and this is neither. Nothing the submitter does differently,
+    // and no amount of slowing down, will get this run admitted; the installation
+    // itself is not currently taking new work. `Retry-After: 60` rather than the
+    // valves' `1` for the same reason: whatever closed the gate is not resolving
+    // inside a second.
+    if st.admission.is_closed() {
+        st.metrics.inc_admission_refused_gate();
+        info!("run rejected — admission gate closed");
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "60")],
+            Json(json!({
+                "error": "admission closed",
+                "detail": "this installation is not currently accepting new runs;                            in-flight runs are unaffected",
+            })),
+        )
+            .into_response());
+    }
+
     // `{{ env.* }}` variables from the spec's declared environment; an unknown
     // environment is a 400, not a run without its variables.
     let env_params = crate::environments::template_params(&st.pool, &body)
@@ -664,6 +694,83 @@ async fn task_logs(
         obj.insert("truncated".into(), json!(false));
     }
     Ok(Json(body))
+}
+
+/// `GET /runs/{id}/tasks/{task_id}/attempts[?<filter>]` — the iterations
+/// `task_logs` cannot show.
+///
+/// `task_runs.output` is singular, so a `repeat:` loop's log has only ever held
+/// its most recent pass and a retried task only the attempt that passed. The
+/// superseded ones are retained as a bounded tail
+/// ([`dagron_core::attempt_log`]) and read here.
+///
+/// Separate from `task_logs` because that one polls: a reader tailing a running
+/// task asks for it once a second, and a history — capped, but real — attached
+/// to every poll would multiply the hot path by the size of the history.
+///
+/// An empty list is an answer, not a 404: a task that ran once has no
+/// superseded attempts. `evicted` says whether earlier ones existed and fell
+/// out of the retention window, so a history that starts at iteration 51 never
+/// passes itself off as starting at 1.
+async fn task_attempts(
+    State(st): State<ApiState>,
+    Path((id, task_id)): Path<(String, String)>,
+    RawQuery(raw): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (filter, filtering, _pairs) = parse_log_filter(raw.as_deref())?;
+
+    if db::get_run(&st.pool, &id).await?.is_none() {
+        return Err(ApiError(StatusCode::NOT_FOUND, format!("run '{id}' not found")));
+    }
+    let tasks = db::list_tasks(&st.pool, &id).await?;
+    let Some(task) = tasks.into_iter().find(|t| t.id == task_id) else {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("task '{task_id}' not found in run '{id}'"),
+        ));
+    };
+
+    let history = db::list_task_attempts(&st.pool, &task_id).await?;
+    let evicted = history.first().is_some_and(|a| a.attempt > 1);
+    let attempts = history
+        .into_iter()
+        .map(|a| {
+            let text = a.output.unwrap_or_default();
+            let mut obj = json!({
+                "attempt": a.attempt,
+                "reason": a.reason,
+                "retention_truncated": a.truncated,
+                "finished_at": a.finished_at,
+            });
+            let o = obj.as_object_mut().expect("json! built an object");
+            if filtering {
+                let res = filter.apply(&text);
+                o.insert("output".into(), json!(res.to_text()));
+                o.insert("lines".into(), filter_lines_json(&res));
+                o.insert("total".into(), json!(res.total));
+                o.insert("matched".into(), json!(res.matched));
+                o.insert("truncated".into(), json!(res.truncated));
+            } else {
+                let lines = text.lines().count();
+                o.insert("total".into(), json!(lines));
+                o.insert("matched".into(), json!(lines));
+                o.insert("truncated".into(), json!(false));
+                o.insert("output".into(), json!(text));
+            }
+            obj
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Json(json!({
+        "task_id": task.id,
+        "name": task.name,
+        // The attempt on the row. Deliberately not in `attempts`: its output is
+        // in `task_runs.output`, whole, where `task_logs` reads it.
+        "current_attempt": task.attempt,
+        "attempts": attempts,
+        "evicted": evicted,
+        "filtered": filtering,
+    })))
 }
 
 /// `GET /runs/{id}/logs[?<filter>][&task=&status=]` — the **whole run's** output
@@ -1055,8 +1162,12 @@ async fn post_dataset_event(
     Ok(Json(json!({ "recorded": body.uri })))
 }
 
-/// Re-attempt a dead letter as a fresh run. On success the dead letter is
-/// removed; a still-invalid payload returns `400` and the row is kept.
+/// Re-attempt a dead letter as a fresh run, all or nothing: the run is created
+/// and the dead letter deleted in one transaction
+/// (`db::create_run_from_dead_letter`), so a redrive that fails leaves the row
+/// exactly as it was, with the same id and history, to redrive again. A
+/// still-invalid payload is a `400`, a capacity refusal a `503`/`507` with
+/// `Retry-After`, and anything else a `500`; none of them loses the row.
 async fn redrive_dead_letter(
     State(st): State<ApiState>,
     Path(id): Path<String>,
@@ -1068,91 +1179,70 @@ async fn redrive_dead_letter(
     let dag = DagGraph::from_yaml(&dl.payload).map_err(|e| {
         ApiError(StatusCode::BAD_REQUEST, format!("dead letter still invalid: {e}"))
     })?;
-    // Atomic claim gate: the row delete serializes concurrent redrives, so only
-    // the caller that wins the delete creates a run; a loser sees `false` and
-    // gets 409 instead of a duplicate run.
-    if !db::delete_dead_letter(&st.pool, &id).await? {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            format!("dead letter '{id}' was already redriven or discarded"),
-        ));
-    }
-    let run_id = match db::create_run(&st.pool, &dag, &dl.payload).await {
-        Ok(run_id) => run_id,
+    // The claim and the run commit together. Rows are never updated in place,
+    // so the payload read above is the one being claimed.
+    let run_id = match db::create_run_from_dead_letter(&st.pool, &dag, &dl.payload, &id).await {
+        Ok(Some(run_id)) => run_id,
+        // Another redrive, or a discard, took the row first. No run here.
+        Ok(None) => {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                format!("dead letter '{id}' was already redriven or discarded"),
+            ));
+        }
         Err(e) => {
-            // The free-disk floor is a capacity condition, and the row is
-            // already claimed (deleted): re-park the payload as a fresh
-            // dead-letter row — same payload, source and failure count, the
-            // floor as its error — rather than lose it, and answer 507 so the
-            // caller retries once the disk has headroom. If even the re-park
-            // fails, fall through to the loud path below.
+            // The two capacity refusals keep their codes: 507 for the free-disk
+            // floor, 503 for the workflow's run cap (concurrency, not storage).
+            // Both roll the claim back, so the dead letter is still there under
+            // the id that was sent. `dead_letter_id` stays in the body, and a
+            // client that retries "the returned id" retries the right one.
             if let Some(low) = e.downcast_ref::<dagron_core::models::DatastoreLowOnDisk>() {
                 st.metrics.inc_admission_refused_disk();
-                match db::record_dead_letter(&st.pool, &dl.payload, &low.to_string(), &dl.source, dl.failures)
-                    .await
-                {
-                    Ok(new_id) => {
-                        tracing::warn!(
-                            dead_letter_id = %id, reparked_as = %new_id, free = low.free, floor = low.floor,
-                            "redrive refused — datastore low on disk; dead letter re-parked"
-                        );
-                        return Ok((
-                            StatusCode::INSUFFICIENT_STORAGE,
-                            [(header::RETRY_AFTER, "1")],
-                            Json(json!({
-                                "error": "datastore low on disk — dead letter re-parked",
-                                "dead_letter_id": new_id,
-                                "free_bytes": low.free,
-                                "min_free_bytes": low.floor,
-                            })),
-                        )
-                            .into_response());
-                    }
-                    Err(park_err) => {
-                        error!(dead_letter_id = %id, error = ?park_err, "could not re-park the dead letter after a disk-floor refusal");
-                    }
-                }
-            } else if let Some(cap) = e.downcast_ref::<dagron_core::models::MaxActiveRunsReached>() {
-                // The run cap is the other capacity refusal, and it lands here
-                // with the row already claimed. Losing the payload to a
-                // condition that clears on its own would be the worse outcome,
-                // so it re-parks exactly like the disk floor does — 503 rather
-                // than 507, because it is concurrency and not storage.
-                match db::record_dead_letter(&st.pool, &dl.payload, &cap.to_string(), &dl.source, dl.failures)
-                    .await
-                {
-                    Ok(new_id) => {
-                        tracing::warn!(
-                            dead_letter_id = %id, reparked_as = %new_id,
-                            workflow = %cap.name, max = cap.max, active = cap.active,
-                            "redrive refused — workflow at its active-run cap; dead letter re-parked"
-                        );
-                        return Ok((
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            [(header::RETRY_AFTER, "1")],
-                            Json(json!({
-                                "error": "workflow at its active-run cap — dead letter re-parked",
-                                "dead_letter_id": new_id,
-                                "workflow": cap.name,
-                                "max_active_runs": cap.max,
-                                "active_runs": cap.active,
-                            })),
-                        )
-                            .into_response());
-                    }
-                    Err(park_err) => {
-                        error!(dead_letter_id = %id, error = ?park_err, "could not re-park the dead letter after a run-cap refusal");
-                    }
-                }
+                tracing::warn!(
+                    dead_letter_id = %id, free = low.free, floor = low.floor,
+                    "redrive refused — datastore low on disk; dead letter kept"
+                );
+                return Ok((
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    [(header::RETRY_AFTER, "1")],
+                    Json(json!({
+                        "error": "datastore low on disk — dead letter kept",
+                        "dead_letter_id": id,
+                        "free_bytes": low.free,
+                        "min_free_bytes": low.floor,
+                    })),
+                )
+                    .into_response());
             }
-            // The row is already claimed (deleted); surface the payload so the
-            // operator can recover it rather than losing it silently.
-            error!(dead_letter_id = %id, payload = %dl.payload, error = ?e, "redrive create_run failed after claim");
+            if let Some(cap) = e.downcast_ref::<dagron_core::models::MaxActiveRunsReached>() {
+                tracing::warn!(
+                    dead_letter_id = %id, workflow = %cap.name, max = cap.max, active = cap.active,
+                    "redrive refused — workflow at its active-run cap; dead letter kept"
+                );
+                return Ok((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::RETRY_AFTER, "1")],
+                    Json(json!({
+                        "error": "workflow at its active-run cap — dead letter kept",
+                        "dead_letter_id": id,
+                        "workflow": cap.name,
+                        "max_active_runs": cap.max,
+                        "active_runs": cap.active,
+                    })),
+                )
+                    .into_response());
+            }
             return Err(e.into());
         }
     };
     st.metrics.inc_runs_created();
-    info!(dead_letter_id = %id, %run_id, "dead letter redriven into a run");
+    // The row and its failure history are gone with the claim; the run keeps
+    // only the payload, so the history is logged here.
+    info!(
+        dead_letter_id = %id, %run_id, source = %dl.source, failures = dl.failures,
+        first_seen_at = %dl.first_seen_at, last_error_at = %dl.last_error_at, error = %dl.error,
+        "dead letter redriven into a run"
+    );
     Ok(Json(json!({ "run_id": run_id, "redriven_from": id })).into_response())
 }
 
@@ -1215,6 +1305,7 @@ mod tests {
             "/runs/{id}/wait",
             "/runs/{id}/logs",
             "/runs/{id}/tasks/{task_id}/logs",
+            "/runs/{id}/tasks/{task_id}/attempts",
             "/runs/{id}/cancel",
             "/runs/{id}/rerun",
             "/runs/{id}/tasks/{task_id}/clear",
@@ -1270,6 +1361,7 @@ mod tests {
             metrics: Arc::new(Metrics::new()),
             max_inflight_runs,
             max_inflight_tasks,
+            admission: crate::pressure::AdmissionGate::default(),
         };
         (state, path)
     }
@@ -1284,6 +1376,53 @@ mod tests {
 
     /// The admission cap sheds load with 429 once the datastore is at the
     /// in-flight ceiling, and accepts again once it drops below.
+    /// A closed admission gate refuses the run with `503` and creates nothing,
+    /// while an open one is invisible. The two assertions that matter are the
+    /// status (a submitter must be told, not silently queued) and the run count
+    /// (a refusal must not leave a half-created run behind).
+    #[tokio::test]
+    async fn submit_run_refuses_when_the_admission_gate_is_closed() {
+        let dir = std::env::temp_dir().join(format!("module54_gate_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gate_file = dir.join("admission");
+
+        let (mut state, path) = temp_state(0).await;
+        state.admission = crate::pressure::AdmissionGate::new(Some(gate_file.clone()));
+
+        // No file yet → open, and the gate is invisible.
+        let open = submit_run(State(state.clone()), no_wait(), ONE_TASK_DAG.to_string())
+            .await
+            .unwrap()
+            .into_response();
+        assert_eq!(open.status(), StatusCode::CREATED);
+
+        // Close it.
+        std::fs::write(&gate_file, "metering_degraded").unwrap();
+        let closed = submit_run(State(state.clone()), no_wait(), ONE_TASK_DAG.to_string())
+            .await
+            .unwrap()
+            .into_response();
+        assert_eq!(closed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(closed.headers().get(header::RETRY_AFTER).unwrap(), "60");
+        assert_eq!(
+            db::count_active_runs(&state.pool).await.unwrap(),
+            1,
+            "a refused submission must not create a run"
+        );
+
+        // Re-opening takes effect on the very next submission — no TTL to wait out.
+        std::fs::write(&gate_file, "0").unwrap();
+        let reopened = submit_run(State(state.clone()), no_wait(), ONE_TASK_DAG.to_string())
+            .await
+            .unwrap()
+            .into_response();
+        assert_eq!(reopened.status(), StatusCode::CREATED);
+
+        state.pool.close().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn submit_run_sheds_load_at_inflight_cap() {
         let (state, path) = temp_state(1).await;
@@ -1553,6 +1692,107 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The iteration history: three passes of a loop, all three readable,
+    /// numbered, and labelled as loop passes rather than failures.
+    ///
+    /// The end-to-end version of what `db::sqlite`'s retention tests prove in
+    /// the datastore — this one proves the route actually serves them, and that
+    /// the pass still running is reported as `current_attempt` rather than
+    /// being duplicated into the list.
+    #[tokio::test]
+    async fn task_attempts_serves_every_iteration_not_just_the_last() {
+        let (state, path) = temp_state(0).await;
+        let yaml = "name: t\ntasks:\n  - name: poll\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let run_id = db::create_run(&state.pool, &dag, yaml).await.unwrap();
+
+        db::advance_ready_tasks(&state.pool).await.unwrap();
+        let task_id = db::claim_ready(&state.pool, "w", 10).await.unwrap()[0].id.clone();
+
+        // Three loop passes, each superseding the last — the shape the engine
+        // drives when `repeat.until` has not held yet.
+        for i in 1..=3 {
+            let fence: i64 =
+                sqlx::query_scalar("SELECT version FROM task_runs WHERE id = ?")
+                    .bind(&task_id)
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap();
+            assert!(db::retry_task(
+                &state.pool,
+                &task_id,
+                "w",
+                fence,
+                Some(format!("pass {i}\n")),
+                chrono::Utc::now().to_rfc3339(),
+                dagron_core::attempt_log::AttemptEnd::Iteration,
+            )
+            .await
+            .unwrap());
+            sqlx::query("UPDATE task_runs SET scheduled_at = NULL WHERE id = ?")
+                .bind(&task_id)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            db::advance_ready_tasks(&state.pool).await.unwrap();
+            db::claim_ready(&state.pool, "w", 10).await.unwrap();
+        }
+
+        // Unknown run / unknown task still 404 rather than an empty history.
+        assert_eq!(
+            task_attempts(State(state.clone()), Path(("nope".into(), task_id.clone())), RawQuery(None))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            task_attempts(State(state.clone()), Path((run_id.clone(), "nope".into())), RawQuery(None))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::NOT_FOUND
+        );
+
+        let body = task_attempts(
+            State(state.clone()),
+            Path((run_id.clone(), task_id.clone())),
+            RawQuery(None),
+        )
+        .await
+        .unwrap();
+        let attempts = body.0["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), 3, "every superseded pass, not just the last");
+        for (i, a) in attempts.iter().enumerate() {
+            assert_eq!(a["attempt"], (i + 1) as i64);
+            assert_eq!(a["output"], format!("pass {}\n", i + 1));
+            assert_eq!(a["reason"], "iteration", "a loop pass, not a failure");
+        }
+        assert_eq!(body.0["current_attempt"], 4, "the pass now running is not in the list");
+        assert_eq!(body.0["evicted"], false, "nothing fell out of the window");
+        assert_eq!(body.0["filtered"], false);
+
+        // The filter grammar means the same thing here as on the log views.
+        let filtered = task_attempts(
+            State(state.clone()),
+            Path((run_id.clone(), task_id.clone())),
+            RawQuery(Some("q=pass 2".into())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(filtered.0["filtered"], true);
+        let matched: i64 = filtered.0["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["matched"].as_i64().unwrap())
+            .sum();
+        assert_eq!(matched, 1, "one pass matched, and the others still report zero");
+
+        state.pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The **workflow** log view: `GET /runs/{id}/logs` merges every task's
     /// output into one attributed stream, and the shared filter grammar narrows
     /// it. This is the end-to-end check that the filter, the per-task rollup and
@@ -1751,6 +1991,108 @@ mod tests {
                 .0,
             StatusCode::CONFLICT
         );
+
+        state.pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Every run in the test's datastore.
+    async fn run_count(state: &ApiState) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM workflow_runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    /// A redrive refused inside the claiming transaction (the workflow's run
+    /// cap) leaves the dead letter exactly as it was and answers with the same
+    /// id to retry. The old handler deleted the row first and re-parked the
+    /// payload under a new id, with the refusal as its error and fresh
+    /// timestamps. Once the slot frees, the same id redrives, and a repeat is
+    /// a `404` with no second run.
+    #[tokio::test]
+    async fn a_refused_redrive_keeps_the_dead_letter() {
+        let (state, path) = temp_state(0).await;
+        let yaml =
+            "name: capped\nmax_active_runs: 1\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let blocker = db::create_run(&state.pool, &dag, yaml).await.unwrap();
+        let id = db::record_dead_letter(&state.pool, yaml, "transient", "redis", 3).await.unwrap();
+        let parked =
+            serde_json::to_value(db::get_dead_letter(&state.pool, &id).await.unwrap()).unwrap();
+
+        let Ok(refused) = redrive_dead_letter(State(state.clone()), Path(id.clone())).await else {
+            panic!("a run-cap refusal is an answer, not an error");
+        };
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused.headers().get(header::RETRY_AFTER).unwrap(), "1");
+        let body = axum::body::to_bytes(refused.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["dead_letter_id"], id, "the id to retry is the one that was sent");
+        assert_eq!(
+            serde_json::to_value(db::get_dead_letter(&state.pool, &id).await.unwrap()).unwrap(),
+            parked,
+            "the claim rolled back: same row, same history"
+        );
+        assert_eq!(run_count(&state).await, 1, "only the blocker");
+
+        sqlx::query("UPDATE workflow_runs SET status = 'succeeded' WHERE id = ?")
+            .bind(&blocker)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let Ok(done) = redrive_dead_letter(State(state.clone()), Path(id.clone())).await else {
+            panic!("the slot is free, so the same id must redrive");
+        };
+        assert_eq!(done.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(done.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["redriven_from"], id);
+        assert!(db::get_dead_letter(&state.pool, &id).await.unwrap().is_none());
+
+        let Err(ApiError(status, _)) =
+            redrive_dead_letter(State(state.clone()), Path(id.clone())).await
+        else {
+            panic!("a consumed dead letter must not redrive twice");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(run_count(&state).await, 2);
+
+        state.pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Redrives racing on one id make one run. SQLite serializes them on its
+    /// single connection, so each loser either loses the claim (`409`) or finds
+    /// the row already gone (`404`); exactly one wins either way.
+    #[tokio::test]
+    async fn concurrent_redrives_make_one_run() {
+        let (state, path) = temp_state(0).await;
+        let id = db::record_dead_letter(&state.pool, ONE_TASK_DAG, "transient", "redis", 1)
+            .await
+            .unwrap();
+        let racers: Vec<_> = (0..8)
+            .map(|_| {
+                let (state, id) = (state.clone(), id.clone());
+                tokio::spawn(async move { redrive_dead_letter(State(state), Path(id)).await })
+            })
+            .collect();
+        let mut won = 0;
+        for racer in racers {
+            match racer.await.unwrap() {
+                Ok(resp) => {
+                    assert_eq!(resp.status(), StatusCode::OK);
+                    won += 1;
+                }
+                Err(ApiError(status, msg)) => assert!(
+                    matches!(status, StatusCode::CONFLICT | StatusCode::NOT_FOUND),
+                    "{status}: {msg}"
+                ),
+            }
+        }
+        assert_eq!(won, 1, "exactly one redrive wins the claim");
+        assert_eq!(run_count(&state).await, 1);
+        assert!(db::get_dead_letter(&state.pool, &id).await.unwrap().is_none());
 
         state.pool.close().await;
         let _ = std::fs::remove_file(&path);

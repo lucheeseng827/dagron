@@ -1239,14 +1239,16 @@ tasks:
         assert!(err.1.contains("duplicate template name 't'"), "got: {}", err.1);
     }
 
-    /// The console and the engine must agree on where the feature line is.
+    /// The console and the engine must agree about multi-dataset composition.
     ///
-    /// `parse_and_validate` hands specs to `dagron_core`'s parser, so whether a
-    /// multi-dataset spec is accepted depends on the features dagron-api forwards
-    /// to dagron-core — not on dagron-api's own `enterprise` flag. They were not
-    /// wired together, so a feature-on console refused specs the feature-on
-    /// engine beside it accepted, and pointed the operator at a capability
-    /// they already had.
+    /// `parse_and_validate` is dagron-api's own mirror of the spec rules and
+    /// does not know about datasets at all; the authority is `dagron_core`'s
+    /// parser, which `submit_yaml` routes through. When composition was gated,
+    /// acceptance turned on which features dagron-api forwarded to dagron-core
+    /// rather than on dagron-api's own `enterprise` flag, and a feature-on
+    /// console refused specs the feature-on engine beside it accepted. The gate
+    /// is gone, so both halves must now accept it in every build — no `cfg`
+    /// split here, deliberately: that is the property under test.
     #[test]
     fn the_dataset_composition_line_matches_the_engine() {
         let multi = "
@@ -1256,19 +1258,12 @@ datasets_mode: all
 tasks:
   - { name: t, command: [\"true\"] }
 ";
-        // parse_and_validate is dagron-api's own mirror and does not gate this;
-        // the authority is dagron_core's parser, which submit_yaml routes through.
-        let core = dagron_core::dag::DagGraph::from_yaml(multi);
-        #[cfg(feature = "enterprise")]
-        {
-            let dag = core.expect("an enterprise build must accept multi-dataset composition");
-            assert_eq!(dag.spec.on_datasets.len(), 2);
-        }
-        #[cfg(not(feature = "enterprise"))]
-        {
-            let err = core.err().expect("an open build refuses multi-dataset composition").to_string();
-            assert!(err.contains("not in this build"), "signpost names the gap: {err}");
-        }
+        let dag = dagron_core::dag::DagGraph::from_yaml(multi)
+            .expect("the engine accepts multi-dataset composition in every build");
+        assert_eq!(dag.spec.on_datasets.len(), 2);
+        assert_eq!(dag.spec.datasets_mode.as_deref(), Some("all"));
+        // The mirror carries no dataset fields, so it must simply not object.
+        assert!(parse_and_validate(multi).is_ok(), "and so does the console's mirror");
     }
 
     #[test]
@@ -1777,6 +1772,22 @@ pub(crate) async fn submit_yaml_with_params(
     authored_yaml: &str,
     caller_params: &BTreeMap<String, String>,
 ) -> Result<String, (StatusCode, String)> {
+    let dag = build_dag(state, yaml, caller_params).await?;
+    dagron_core::db::create_run(&state.write_pool, &dag, authored_yaml)
+        .await
+        .map_err(create_run_refusal)
+}
+
+/// Everything [`submit_yaml_with_params`] does before it writes: parse, fold in
+/// the caller's parameters and the declared environment, inline `workflow_ref`
+/// chains, and run the engine's parser. Reads only, so a caller that writes the
+/// run some other way (dead-letter redrive) builds it with the same rules and
+/// before opening its own transaction.
+pub(crate) async fn build_dag(
+    state: &AppState,
+    yaml: &str,
+    caller_params: &BTreeMap<String, String>,
+) -> Result<dagron_core::dag::DagGraph, (StatusCode, String)> {
     // One Value parse serves both the environment-key read and the
     // `workflow_ref` check (LOW_LATENCY R-3) — previously each step re-parsed
     // the full document. Reading `environment` from the PRE-expansion document
@@ -1789,33 +1800,40 @@ pub(crate) async fn submit_yaml_with_params(
     let expanded = crate::expand::expand_workflow_refs(state, root, yaml).await?;
     // The engine's own parse → expand (task_defaults, parameters, templates,
     // fan-out, submit-time `when:`) → validate pipeline.
-    let dag = dagron_core::dag::DagGraph::from_yaml_with_params(&expanded, &params).map_err(|e| {
+    dagron_core::dag::DagGraph::from_yaml_with_params(&expanded, &params).map_err(|e| {
         // A budget refusal is not a malformed spec, and must not read as one.
         // "invalid DAG: workflow 'x' would create 900 tasks…" tells an author to
         // go looking for a syntax error that isn't there.
         if let Some(b) = e.downcast_ref::<dagron_core::models::TaskBudgetExceeded>() {
             return (StatusCode::BAD_REQUEST, b.to_string());
         }
-        (StatusCode::BAD_REQUEST, format!("invalid DAG: {e}"))
-    })?;
-    dagron_core::db::create_run(&state.write_pool, &dag, authored_yaml).await.map_err(|e| {
-        // A per-workflow concurrency cap is a capacity condition, not a failure:
-        // answer 429 like the engine's ops API, never 500. (No Retry-After here —
-        // every handler on this path shares the plain (StatusCode, String) error
-        // type, which doesn't carry headers; the engine's equivalent is a single
-        // handler free to return a header-bearing tuple directly.)
-        if let Some(m) = e.downcast_ref::<dagron_core::models::MaxActiveRunsReached>() {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                format!(
-                    "max_active_runs reached for workflow '{}' ({} active, cap {})",
-                    m.name, m.active, m.max
-                ),
-            );
+        // Same reasoning for the external ceiling: a declared budget the spec
+        // exceeds is a deliberate, informative refusal, not a parse failure.
+        if let Some(b) = e.downcast_ref::<dagron_core::models::ExternalBudgetExceeded>() {
+            return (StatusCode::BAD_REQUEST, b.to_string());
         }
-        tracing::error!(error = ?e, "create_run failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())
+        (StatusCode::BAD_REQUEST, format!("invalid DAG: {e}"))
     })
+}
+
+/// The answer for a failed `dagron_core::db::create_run*` write.
+pub(crate) fn create_run_refusal(e: anyhow::Error) -> (StatusCode, String) {
+    // A per-workflow concurrency cap is a capacity condition, not a failure:
+    // answer 429 like the engine's ops API, never 500. (No Retry-After here —
+    // every handler on this path shares the plain (StatusCode, String) error
+    // type, which doesn't carry headers; the engine's equivalent is a single
+    // handler free to return a header-bearing tuple directly.)
+    if let Some(m) = e.downcast_ref::<dagron_core::models::MaxActiveRunsReached>() {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "max_active_runs reached for workflow '{}' ({} active, cap {})",
+                m.name, m.active, m.max
+            ),
+        );
+    }
+    tracing::error!(error = ?e, "create_run failed");
+    (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())
 }
 
 /// The declared environment's variables as `env.NAME` substitution keys.

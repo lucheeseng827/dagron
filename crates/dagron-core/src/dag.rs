@@ -48,6 +48,30 @@ pub struct TaskSpec {
     /// pattern) — e.g. `with_param: "{{ shards }}"`. Resolved like `with_items`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub with_param: Option<String>,
+    /// Fan-out over an **upstream task's output**, resolved at run time rather
+    /// than at expansion — `with_output_of: list-partitions`.
+    ///
+    /// The other two fan-outs are decided by the expander before anything runs,
+    /// which is what lets `budget:` refuse a blow-up at submit. This one cannot
+    /// be: at expansion time the producer has not run, so there is no list. The
+    /// task is created as **one** row that never executes; when its
+    /// dependencies are satisfied it parks (`status = 'running'`, no lease —
+    /// the same shape as every other park), and a reconcile sweep reads the
+    /// producer's trimmed stdout, parses a JSON array, and inserts one
+    /// instance row per element. The parked row then stands as the join point
+    /// its dependents were already wired to, so nothing is re-parented
+    /// mid-run.
+    ///
+    /// The named task must be in `depends_on` — the same rule a runtime
+    /// `when:` output reference carries, and for the same reason: an output
+    /// you are not guaranteed to have is not an input.
+    ///
+    /// An empty array is **not** an error here, unlike `with_items: []`. At
+    /// expansion an empty list is an authoring mistake; at run time "there was
+    /// nothing to process" is a result, so the barrier simply succeeds with
+    /// zero instances.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub with_output_of: Option<String>,
     /// Conditional guard, e.g. `"{{ depth }} > 0"`. When it evaluates false the
     /// task (and any sub-DAG it would expand to) is skipped. This is what lets a
     /// recursive template terminate.
@@ -55,7 +79,7 @@ pub struct TaskSpec {
     pub when: Option<String>,
     /// Human-readable label template for fan-out instances, e.g.
     /// `instance_key: "{{ item.region }}"`. When set on a `with_items` /
-    /// `with_param` task, each expanded instance is named
+    /// `with_param` / `with_output_of` task, each expanded instance is named
     /// `<task>.<rendered-label>` instead of `<task>.<index>` — a readable
     /// display name for fan-out instances. Consumed at
     /// expansion; never persists on a leaf. Labels are sanitized to
@@ -217,6 +241,12 @@ pub struct TaskSpec {
     /// retry/failure path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat: Option<RepeatSpec>,
+    /// Hand this task's work to a system dagron does not own (Spark, a
+    /// warehouse, any submit-then-poll API) and park the row rather than hold a
+    /// worker while it runs. The `command` becomes the submit and prints the
+    /// remote handle; a reconcile sweep polls it. See [`DeferSpec`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defer: Option<DeferSpec>,
     /// **Datasets** this task updates when it succeeds (Airflow `outlets` /
     /// Dagster asset materializations). Each URI is upserted into the `datasets`
     /// registry and appended to the `dataset_events` lineage ledger with the
@@ -340,6 +370,208 @@ impl RepeatSpec {
             },
         }
     }
+}
+
+/// `defer:` — hand this task's work to a system dagron does not own, then park
+/// the row instead of holding a worker while that work runs.
+///
+/// The task's `command` is the **submit**, and nothing else. It runs exactly as
+/// any command task does — lease, `max_attempts`, `timeout_secs`, fault
+/// classification — and on success prints the remote job's identity as
+/// [`HANDLE_PREFIX`]`<handle>` on its last matching stdout line. The engine
+/// then parks the row: claim dropped, lease NULLed, `status` still `running`,
+/// handle on the row. A reconcile sweep polls it to a verdict.
+///
+/// **`timeout_secs` therefore bounds the submit, not the job.** The job's own
+/// ceiling is [`DeferSpec::max_wait_secs`]. Conflating them is the mistake this
+/// split exists to prevent: a 25-second default deadline (the executor's
+/// `DEFAULT_TASK_TIMEOUT_SECS`) is right for a submit and absurd for a
+/// six-hour Spark run.
+///
+/// Why the park is safe across a crash: `recover_expired_leases` filters
+/// `lease_expires_at IS NOT NULL`, so a parked row is provably outside the set
+/// it can reclaim. Every scheduler can die and the row is untouched; any
+/// replica's next sweep resumes the poll. Nothing resubmits, because nothing
+/// re-ran.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DeferSpec {
+    /// Which poller resolves this task — a built-in kind, or one a registered
+    /// `ExternalPoller` claims. Routed on, never parsed for meaning.
+    pub kind: String,
+    /// Seconds between polls (default [`DEFAULT_DEFER_POLL_SECS`]). The floor
+    /// is 1: a zero would hot-loop the sweep against someone's API.
+    #[serde(default = "default_defer_poll_secs")]
+    pub poll_secs: u64,
+    /// What one submission of this task costs, **in whatever unit the author
+    /// chose**. Default 1, so a run that declares no unit costs bounds a plain
+    /// count of submissions.
+    ///
+    /// The engine never learns what this means. It is not dollars, not
+    /// GPU-hours, not anything the engine can verify — it is a number the
+    /// author wrote down so that [`RunBudget::external_cost`] can add it up.
+    /// A 200-node Spark job and a one-row query both cost 1 until someone says
+    /// otherwise, which is exactly the judgement the engine has no way to make.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<u64>,
+    /// Ceiling on how long the *remote job* may take before the task is failed,
+    /// independent of `timeout_secs` (which bounds the submit) and of
+    /// `run_timeout_secs` (which bounds the whole run).
+    ///
+    /// `None` means the run's own deadline is the only bound. That is a
+    /// deliberate default rather than a number, because the right ceiling for a
+    /// remote job is a property of the job and guessing one would fail exactly
+    /// the long workloads the feature exists for. The
+    /// `scheduler_external_parked` gauge is how an operator notices a row that
+    /// has no ceiling and is not moving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_wait_secs: Option<u64>,
+    /// Poll this job over HTTP: the built-in transport, and the one that
+    /// reaches a Databricks run, an EMR Serverless job, a Dataproc batch, a
+    /// Livy or Kyuubi session, a YARN application or a SparkApplication CR
+    /// without a line of vendor code in dagron. See [`DeferHttpSpec`].
+    ///
+    /// Consulted only when no registered `ExternalPoller` claims the row's
+    /// `kind` — a poller installed for a kind is the more specific thing, and
+    /// gets first refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<DeferHttpSpec>,
+    /// Named connection this task defers through — an org-owned,
+    /// access-controlled registry of compute and warehouse endpoints. Not in
+    /// the open build; validation refuses it with a signpost naming the open
+    /// path (`environment:` variables plus `value_from: { secret: … }`).
+    ///
+    /// Declared here rather than left unknown on purpose: `DagSpec` carries no
+    /// `deny_unknown_fields`, so an unrecognised key is *silently dropped* by
+    /// serde. A workflow written against the closed build would otherwise
+    /// validate clean here, run, and submit with whatever the task's own env
+    /// happened to carry, with no diagnostic anywhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<String>,
+}
+
+/// `defer.http` — poll a remote job by GETting a status endpoint and reading a
+/// verdict out of the JSON it returns.
+///
+/// This is the whole vendor story, and deliberately so: one adapter reaches
+/// Databricks (`runs/get`), EMR Serverless (`GetJobRun`), Dataproc
+/// (`batches.get`), Livy, Kyuubi, YARN and a SparkApplication CR, because every
+/// one of them answers "is it done?" with a JSON document containing a state
+/// field. Vendor API drift then becomes a YAML edit by the person it affects,
+/// on their schedule, rather than a dagron release on ours.
+///
+/// The URL may contain `{{ handle }}`, which the poller replaces with the
+/// remote job's identity — the thing the submit printed and the engine parked
+/// on. It survives expansion untouched because `expand::substitute` leaves
+/// unknown placeholders verbatim, the same mechanism that carries
+/// `{{ output }}` into `repeat.until`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DeferHttpSpec {
+    /// Status endpoint. `http`/`https` only, and `{{ handle }}` expands to the
+    /// remote job id.
+    pub url: String,
+    /// Headers to send. The same shape as a task's `env:`, so a credential
+    /// rides as `value_from: { secret: NAME }` and is resolved at poll time
+    /// rather than stored in the spec — and is masked in anything the poller
+    /// writes back to the task.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<EnvVar>,
+    /// The job finished successfully when this holds, e.g.
+    /// `status.applicationState.state == COMPLETED`. See
+    /// [`crate::jsonpred`] for the grammar.
+    pub succeed_when: String,
+    /// …and failed when this does. Optional, because some APIs report failure
+    /// as "reached a terminal state that is not success" and the author would
+    /// rather write one predicate than two. Without it a job that fails is
+    /// bounded by `max_wait_secs` rather than noticed, which is worth saying
+    /// out loud: prefer writing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail_when: Option<String>,
+    /// Dotted path to the vendor's own error text, lifted into the task's
+    /// failure reason so `retry_budgets:` and fault classification see what the
+    /// remote system actually said. Truncated before it reaches the task's
+    /// output — a stack trace in a status document is still a status document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_from: Option<String>,
+    /// How to stop the remote job when the run is cancelled or `max_wait_secs`
+    /// elapses. Without it the built-in transport cannot tear anything down —
+    /// it only ever GETs — and the job keeps running, and costing money, after
+    /// dagron has stopped watching. Sent with this block's `headers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel: Option<DeferHttpCancel>,
+}
+
+/// `defer.http.cancel` — the one request that stops the remote job: a `DELETE`
+/// on a SparkApplication, a `POST /runs/cancel` on Databricks. Same story as
+/// [`DeferHttpSpec`]: dagron carries the transport, the author carries the vendor.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DeferHttpCancel {
+    /// `http`/`https` only; `{{ handle }}` expands to the remote job id.
+    pub url: String,
+    /// `DELETE` when omitted. `POST`, `PUT` and `PATCH` are the other verbs a
+    /// vendor's cancel is ever spelled with; nothing else is accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// Sent as `application/json`; `{{ handle }}` expands here too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+}
+
+impl DeferHttpCancel {
+    /// The verb to send, upper-cased. Validation has already refused anything
+    /// outside [`CANCEL_METHODS`], so callers can pass it straight to reqwest.
+    pub fn method(&self) -> String {
+        self.method.as_deref().map_or("DELETE".into(), |m| m.trim().to_ascii_uppercase())
+    }
+}
+
+/// The verbs `defer.http.cancel.method` may name.
+pub const CANCEL_METHODS: [&str; 4] = ["DELETE", "POST", "PUT", "PATCH"];
+
+/// The `{{ handle }}` placeholder a `defer.http` URL may carry.
+pub const HANDLE_PLACEHOLDER: &str = "{{ handle }}";
+
+/// How much of `error_from`'s extraction reaches the task's output.
+///
+/// A status document's error field is sometimes a sentence and sometimes a
+/// paged stack trace, and the task's `output` column is appended to with no cap
+/// anywhere on the write path — so the bound has to be applied here, before the
+/// text is handed over, rather than checked afterwards.
+pub const MAX_EXTERNAL_ERROR_BYTES: usize = 2048;
+
+/// Default seconds between polls of a deferred task's remote job.
+///
+/// Thirty, matching `wait: { url: … }`'s `WAIT_POLL_SECS` default rather than
+/// inventing a second cadence. Fast enough that a short job does not sit
+/// resolved-but-unnoticed for minutes; slow enough that a few hundred parked
+/// rows do not become a rate-limit incident against one vendor endpoint.
+pub const DEFAULT_DEFER_POLL_SECS: u64 = 30;
+
+fn default_defer_poll_secs() -> u64 {
+    DEFAULT_DEFER_POLL_SECS
+}
+
+/// What a deferred task's submit prints to hand the engine its remote handle.
+///
+/// The **last** matching line wins, so a step may log freely before it: a step
+/// that emits progress and then the handle is the normal shape, and a first-
+/// match rule would make any earlier mention of the prefix in a log line — a
+/// retried submit echoing its previous output, say — silently become the
+/// handle.
+pub const HANDLE_PREFIX: &str = "dagron::handle=";
+
+/// The remote handle a deferred submit declared, if it declared one.
+///
+/// Trimmed, and empty is `None`: a step that printed the prefix with nothing
+/// after it has not named a job, and parking on an empty handle would produce
+/// a row no sweep can ever resolve.
+pub fn parse_handle(output: &str) -> Option<String> {
+    output
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix(HANDLE_PREFIX))
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
 }
 
 /// The largest `repeat.delay_secs` accepted (one year). Validation rejects a
@@ -661,19 +893,55 @@ pub struct TemplateSpec {
 
 /// A run's declared resource ceiling (`budget:` on the spec).
 ///
-/// **Only `tasks` is enforceable today, and that is a statement about the data
-/// rather than about ambition.** `AGENT_SCHEDULER_PLAN.md` §G-S3 asks for a
-/// "spend/token/task budget per run". A task count is exact and knowable at
-/// creation — dagron expands `with_items` fan-out and templates at submit, so
-/// the number of rows a run will insert is already decided before anything
-/// runs. Spend and token counts are not: nothing in the engine meters currency
-/// or model tokens against a run, so a `spend:` field would be a promise with
-/// no measurement behind it, which is worse than no field.
+/// **Every field here is arithmetic on numbers already known at run creation,
+/// and that is a statement about the data rather than about ambition.**
+/// `AGENT_SCHEDULER_PLAN.md` §G-S3 asks for a "spend/token/task budget per
+/// run". A task count is exact and knowable at creation — dagron expands
+/// `with_items` fan-out and templates at submit, so the number of rows a run
+/// will insert is already decided before anything runs.
+///
+/// Spend is not, and this struct still refuses to pretend otherwise. Nothing in
+/// the engine meters currency or model tokens against a run, so a `spend:`
+/// field — a cap on what a run *actually costs* — would be a promise with no
+/// measurement behind it, which is worse than no field. That decision stands.
+///
+/// [`RunBudget::external_cost`] is **not** that field, and the distinction is
+/// the whole reason it can exist. It caps a sum of costs the **author
+/// declared** on their own tasks ([`DeferSpec::cost`], default 1), so the
+/// engine's arithmetic is exact and the only estimate in the system is one a
+/// human wrote down deliberately. Declared, never measured. Reconciling a
+/// vendor's real invoice back to the run that caused it is a different
+/// capability — see `external_cost_attribution`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RunBudget {
     /// Maximum tasks this run may create. `None` = no cap. Must be >= 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tasks: Option<u32>,
+    /// Ceiling on the **declared** cost of this run's external work: the sum of
+    /// [`DeferSpec::cost`] over every deferred task the expanded graph will
+    /// create. `None` = no cap. Must be >= 1.
+    ///
+    /// Checked at run creation, like `tasks` and for the same reason — after
+    /// expansion the sum is exact, so a run that would break its ceiling is
+    /// refused before a single remote job is submitted rather than killed
+    /// halfway through with cluster-hours already spent.
+    ///
+    /// This is the bound that `tasks` cannot express. A run of 1000 `echo`
+    /// tasks and a run of 1000 Spark submits are the same number to `tasks:`
+    /// and wildly different to whoever pays for the cluster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_cost: Option<u64>,
+    /// Reconcile each external job's **actual** vendor cost back to the run,
+    /// workflow and team that launched it. Not in this build — validation
+    /// refuses it with a signpost naming the open path.
+    ///
+    /// Declared in the open struct on purpose. `DagSpec` carries no
+    /// `deny_unknown_fields`, so serde would silently drop an unrecognised key:
+    /// a workflow written against a build that has attribution would validate
+    /// clean here, run, and quietly account nothing. A refusal is louder than a
+    /// drop.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub external_cost_attribution: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -770,18 +1038,25 @@ pub struct DagSpec {
     /// sensors): fire a run of this *registered* workflow when one of these
     /// datasets records a new update (a task with a matching `produces:`
     /// succeeded, or — where the feature is on — an external event was
-    /// posted). This build supports exactly **one** dataset here; subscribing to
-    /// several (fan-in composition, with [`DagSpec::datasets_mode`]) is not in
-    /// this build. Fires coalesce: updates that arrive while a fire is being
-    /// processed produce one run, not one per event. Empty = not
+    /// posted). Subscribe to one dataset, or to several and compose them with
+    /// [`DagSpec::datasets_mode`]. Fires coalesce: updates that arrive while a
+    /// fire is being processed produce one run, not one per event. Empty = not
     /// dataset-triggered.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub on_datasets: Vec<String>,
-    /// How multiple [`DagSpec::on_datasets`] entries combine (**feature-gated**):
+    /// How multiple [`DagSpec::on_datasets`] entries combine:
     /// `"any"` — fire when any subscribed dataset updates (default); `"all"` —
     /// fire only once *every* subscribed dataset has updated since the last
     /// fire (the Airflow AND-of-datasets semantics, e.g. "refresh the join
     /// once both upstream tables landed"). Meaningless with a single dataset.
+    ///
+    /// `all` is the only construct with correct fan-in semantics. The
+    /// alternative — trigger on one upstream and `wait: { dataset: … }` on the
+    /// other — stamps the sensor's cursor when the task *parks*, so an upstream
+    /// that refreshed before this run started does not satisfy it and the run
+    /// hangs to its `run_timeout_secs` waiting for that dataset's next update.
+    /// Reach for `all` whenever the arrival order of the upstreams is not
+    /// guaranteed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub datasets_mode: Option<String>,
     pub tasks: Vec<TaskSpec>,
@@ -988,6 +1263,69 @@ impl DagGraph {
                 }
                 None => {}
             }
+
+            // The external ceiling, checked here for the same reason and in the
+            // same place as the task count: after expansion the sum is exact,
+            // so a run that would break it is refused before one remote job is
+            // submitted rather than killed halfway with cluster-hours spent.
+            match budget.external_cost {
+                Some(0) => bail!(
+                    "invalid budget.external_cost=0 in DAG '{}'; expected >= 1 (or omit). \
+                     A run that may spend nothing externally is a run with no `defer:` \
+                     tasks — just omit them.",
+                    spec.name
+                ),
+                Some(max) => {
+                    // Gang-aware for the same reason the task count is: one
+                    // `gang:` spec becomes `size` rows, and each of them submits.
+                    // Counting the spec once would admit N gangs against a
+                    // ceiling of N while launching N × size remote jobs, which
+                    // is precisely the amplification this exists to cap.
+                    let (planned, deferred_tasks) = spec
+                        .tasks
+                        .iter()
+                        .filter(|t| t.defer.is_some())
+                        .fold((0u64, 0u64), |(cost, n), t| {
+                            let rows = t.gang.as_ref().map(|g| g.size as u64).unwrap_or(1);
+                            let unit = t.defer.as_ref().and_then(|d| d.cost).unwrap_or(1);
+                            (cost.saturating_add(unit.saturating_mul(rows)), n + rows)
+                        });
+                    if planned > max {
+                        return Err(anyhow::Error::new(crate::models::ExternalBudgetExceeded {
+                            name: spec.name.clone(),
+                            max,
+                            planned,
+                            deferred_tasks,
+                        }));
+                    }
+                }
+                None => {}
+            }
+
+            // Cost attribution — reconciling a vendor's ACTUAL invoice back to
+            // the run that caused it — is the gated capability. The ceiling
+            // above is not, and will not become one: a guardrail an author sets
+            // for themselves, over compute they already pay for, rations
+            // nothing that belongs to anyone else. Refuse the attribution flag
+            // with a signpost rather than letting serde drop it silently, which
+            // is what would otherwise happen: `DagSpec` has no
+            // `deny_unknown_fields`.
+            if !cfg!(feature = "enterprise") && budget.external_cost_attribution {
+                bail!(
+                    "DAG '{}' requests external cost attribution: the ledger that reconciles \
+                     each external job's actual vendor cost back to the run, workflow and team \
+                     that launched it is not in this build — \
+                     https://github.com/lucheeseng827/dagron#what-this-build-does-not-do. \
+                     This build enforces the ceiling you declare yourself: set \
+                     `budget: {{ external_cost: N }}` with `defer.cost` per task, and a run \
+                     whose declared total exceeds N is refused before it submits anything. \
+                     `pool:` caps concurrent remote jobs, `run_timeout_secs` bounds the run, \
+                     and a cancelled run tears its remote jobs down \
+                     (docs/EXTERNAL_JOBS.md). Reconciled cost reporting plugs in through the \
+                     seams on dagron_engine::Seams.",
+                    spec.name,
+                );
+            }
         }
         if let Some(d) = &spec.deadline {
             parse_duration_secs(&d.within)
@@ -1002,11 +1340,24 @@ impl DagGraph {
                 .map_err(|e| anyhow::anyhow!("invalid tag in DAG '{}': {e}", spec.name))?;
         }
 
-        // Dataset triggers (`on_datasets:`): valid, deduplicated URIs. The open
-        // build fires on a single dataset; multi-dataset composition (and its
-        // `datasets_mode`) is the feature-gated data-aware scheduler — reject with
-        // a signpost, not a silent partial subscription (the SOURCE-connector
-        // funnel pattern).
+        // Dataset triggers (`on_datasets:`): valid, deduplicated URIs, and a
+        // well-formed `datasets_mode` when one is given.
+        //
+        // Multi-dataset composition used to be refused here with a signpost. It
+        // is open now, and the reason is the fallback that signpost named: "keep
+        // exactly one `on_datasets` entry … or split consumers into one workflow
+        // per upstream dataset". In the canonical two-upstream mart that advice
+        // is not merely lesser, it is WRONG — `park_wait_dataset` stamps its
+        // cursor at park time, so a sensor only resolves on an update that lands
+        // *after* it parks. An upstream that refreshed before the run started
+        // never satisfies it, so the run waits for tomorrow's load and hangs to
+        // its `run_timeout_secs`. `datasets_mode: all` does not have that race.
+        //
+        // A gate whose documented alternative loses data is a gate on
+        // correctness, and correctness is the one thing this project does not
+        // paywall. The composition itself was already implemented and tested in
+        // the open tree on both backends (`claim_due_dataset_triggers` handles
+        // `mode="all"`), so this was a refusal with nothing behind it.
         {
             let mut seen = std::collections::HashSet::new();
             for uri in &spec.on_datasets {
@@ -1030,21 +1381,6 @@ impl DagGraph {
                         spec.name
                     );
                 }
-            }
-            if !cfg!(feature = "enterprise")
-                && (spec.on_datasets.len() > 1 || spec.datasets_mode.is_some())
-            {
-                bail!(
-                    "DAG '{}' subscribes to {} datasets{}: multi-dataset triggers and \
-                     `datasets_mode` composition (any-of / all-of fan-in) are not in \
-                     this build — https://github.com/lucheeseng827/dagron#what-this-build-does-not-do. \
-                     This build fires on a single dataset: keep exactly one `on_datasets` \
-                     entry (and omit `datasets_mode`), or split consumers into one \
-                     workflow per upstream dataset.",
-                    spec.name,
-                    spec.on_datasets.len(),
-                    if spec.datasets_mode.is_some() { " with datasets_mode" } else { "" },
-                );
             }
         }
 
@@ -1206,11 +1542,17 @@ impl DagGraph {
             } else if task.wait.is_some() {
                 bail!("task '{}' sets `wait:` but is not `type: wait` in DAG '{}'", task.name, spec.name);
             }
-            // `produces:` — dataset updates are recorded on the worker-result
-            // success path, which approval gates, sub-workflow triggers, and
-            // wait sensors never take (they resolve via reconcile sweeps). Only
-            // command tasks may declare them, so a `produces:` is never
-            // silently dropped.
+            // `produces:` — dataset updates are recorded wherever a producer task
+            // can succeed, which is now three places: the worker result, a
+            // memoization cache hit, and the external-job sweep that resolves a
+            // `defer:` task. Approval gates, sub-workflow triggers and wait
+            // sensors take none of those, so only command tasks may declare a
+            // `produces:` and it is never silently dropped.
+            //
+            // A deferred task IS a command task, so it passes this guard — and
+            // that is correct now rather than by accident: `resolve_external`
+            // records through the same `record_produces` the other two paths
+            // use. It was refused outright until that wiring existed.
             if !task.produces.is_empty() {
                 if task.is_approval() || task.is_workflow() || task.is_wait() {
                     bail!(
@@ -1366,6 +1708,189 @@ impl DagGraph {
                     );
                 }
             }
+            // `defer:` — the external-job park shape.
+            if let Some(def) = &task.defer {
+                if def.kind.trim().is_empty() {
+                    bail!("task '{}' defer.kind is empty in DAG '{}'", task.name, spec.name);
+                }
+                if def.poll_secs == 0 {
+                    bail!(
+                        "invalid defer.poll_secs=0 for task '{}' in DAG '{}'; expected >= 1 \
+                         (a zero interval hot-loops the sweep against the remote API)",
+                        task.name,
+                        spec.name
+                    );
+                }
+                if def.poll_secs > MAX_REPEAT_DELAY_SECS {
+                    bail!(
+                        "invalid defer.poll_secs={} for task '{}' in DAG '{}'; expected <= {} (one year)",
+                        def.poll_secs,
+                        task.name,
+                        spec.name,
+                        MAX_REPEAT_DELAY_SECS
+                    );
+                }
+                // A ceiling below one poll interval can only ever be breached
+                // before the first poll — the task would fail without the
+                // remote job ever being looked at once.
+                if let Some(max) = def.max_wait_secs {
+                    if max < def.poll_secs {
+                        bail!(
+                            "invalid defer.max_wait_secs={} for task '{}' in DAG '{}'; must be >= \
+                             defer.poll_secs ({}) — a shorter ceiling fails the task before its \
+                             remote job is polled even once",
+                            max,
+                            task.name,
+                            spec.name,
+                            def.poll_secs
+                        );
+                    }
+                }
+                // Both are loop operators over one row, and they disagree about
+                // what ends the loop: `repeat` re-runs the command on success,
+                // `defer` parks on success and waits for a remote verdict. A row
+                // carrying both would re-submit the job every time the poll said
+                // "still running".
+                if task.repeat.is_some() {
+                    bail!(
+                        "task '{}' cannot combine `defer` with `repeat` in DAG '{}' — both are \
+                         loop operators: `repeat` re-runs the command after each success, `defer` \
+                         parks on success until the remote job finishes. Poll with `defer` alone \
+                         (defer.poll_secs), or drop `defer` and poll by re-running the command",
+                        task.name,
+                        spec.name
+                    );
+                }
+                // The submit *is* the command, so the command-less kinds have
+                // nothing to defer, and a sub-workflow trigger already parks on
+                // its own child run.
+                if !matches!(task.task_type.as_deref(), None | Some("task")) {
+                    bail!(
+                        "task '{}' cannot combine `defer` with `type: {}` in DAG '{}' — `defer` \
+                         applies to command tasks: the command is the submit that names the \
+                         remote job",
+                        task.name,
+                        task.task_type.as_deref().unwrap_or("task"),
+                        spec.name
+                    );
+                }
+                // A gang expands into N member rows running one command
+                // all-or-nothing; a deferred member would park N rows on N
+                // remote jobs with no all-or-nothing left anywhere. `gang`
+                // already refuses `repeat` for the same reason.
+                if task.gang.is_some() {
+                    bail!(
+                        "task '{}' cannot combine `defer` with `gang` in DAG '{}': a gang is N \
+                         co-scheduled members of one command, and deferring makes each member \
+                         park on its own remote job — the all-or-nothing the gang exists for is \
+                         gone. Defer a single task that submits the parallel job instead",
+                        task.name,
+                        spec.name
+                    );
+                }
+                // `defer.http:` — the built-in transport. Everything here is
+                // checked at SUBMIT, which is the whole point: a typo in
+                // `succeed_when` is otherwise a workflow that validates, starts
+                // a six-hour job, and only then discovers it cannot read the
+                // answer. That is the most expensive possible moment to find a
+                // typo, and the cheapest possible check to run.
+                if let Some(h) = &def.http {
+                    let url = h.url.trim();
+                    if url.is_empty() {
+                        bail!("task '{}' defer.http.url is empty in DAG '{}'", task.name, spec.name);
+                    }
+                    // Scheme, not reachability. `{{ handle }}` and any
+                    // `{{ param }}` that survived expansion are still in the
+                    // string here, so anything stricter would reject URLs that
+                    // are fine by the time they are fetched.
+                    if !(url.starts_with("http://") || url.starts_with("https://")) {
+                        bail!(
+                            "task '{}' defer.http.url must be http(s) in DAG '{}' — got '{}'",
+                            task.name,
+                            spec.name,
+                            url
+                        );
+                    }
+                    for hdr in &h.headers {
+                        if hdr.name.trim().is_empty() {
+                            bail!(
+                                "task '{}' has a defer.http header with no name in DAG '{}'",
+                                task.name,
+                                spec.name
+                            );
+                        }
+                    }
+                    let parse_pred = |field: &str, raw: &str| -> Result<()> {
+                        crate::jsonpred::Predicate::parse(raw).map(|_| ()).map_err(|e| {
+                            anyhow::anyhow!(
+                                "task '{}' defer.http.{} in DAG '{}': {}",
+                                task.name,
+                                field,
+                                spec.name,
+                                e
+                            )
+                        })
+                    };
+                    if let Some(c) = &h.cancel {
+                        let curl = c.url.trim();
+                        if !(curl.starts_with("http://") || curl.starts_with("https://")) {
+                            bail!(
+                                "task '{}' defer.http.cancel.url must be http(s) in DAG '{}' — got '{}'",
+                                task.name,
+                                spec.name,
+                                curl
+                            );
+                        }
+                        let m = c.method();
+                        if !CANCEL_METHODS.contains(&m.as_str()) {
+                            bail!(
+                                "task '{}' defer.http.cancel.method in DAG '{}' must be one of {} — got '{}'",
+                                task.name,
+                                spec.name,
+                                CANCEL_METHODS.join(", "),
+                                m
+                            );
+                        }
+                    }
+                    parse_pred("succeed_when", &h.succeed_when)?;
+                    if let Some(f) = &h.fail_when {
+                        parse_pred("fail_when", f)?;
+                    }
+                    if let Some(e) = &h.error_from {
+                        crate::jsonpred::Path::parse(e).map_err(|err| {
+                            anyhow::anyhow!(
+                                "task '{}' defer.http.error_from in DAG '{}': {}",
+                                task.name,
+                                spec.name,
+                                err
+                            )
+                        })?;
+                    }
+                }
+                // `defer.connection:` — the governed endpoint registry.
+                if !cfg!(feature = "enterprise") {
+                    if let Some(conn) = def.connection.as_deref() {
+                        bail!(
+                            "task '{}' in DAG '{}' defers on connection '{}': named connections — \
+                             one access-controlled, audited registry of compute and warehouse \
+                             endpoints, with credentials the workflow never names and a record of \
+                             which run used which endpoint — are not in this build — \
+                             https://github.com/lucheeseng827/dagron#what-this-build-does-not-do. \
+                             This build carries the endpoint with the run: put the host in the \
+                             run's `environment:` variables and the credential in the task's env, \
+                             resolved at dispatch and masked in task output (docs/CONFIG.md) — \
+                             `env: [{{ name: SPARK_API, value: \"{{{{ env.SPARK_API }}}}\" }}, \
+                             {{ name: SPARK_TOKEN, value_from: {{ secret: SPARK_TOKEN }} }}]`. \
+                             One team with one cluster needs nothing else \
+                             (docs/EXTERNAL_JOBS.md). Endpoint resolution plugs in via the \
+                             ExternalPoller seam (dagron_engine::Seams).",
+                            task.name,
+                            spec.name,
+                            conn
+                        );
+                    }
+                }
+            }
             // `arguments` has exactly two callees, and after expansion only one
             // of them can still be here: a template's are consumed inline, so
             // anything left belongs to a `type: workflow` trigger. Arguments
@@ -1439,6 +1964,65 @@ impl DagGraph {
                         );
                     }
                 }
+            }
+        }
+
+        // A runtime fan-out reads an upstream task's output, so it carries the
+        // same rule as a runtime `when:` — and needs it more: `when:` only
+        // gates a task, while this decides how many of it there are. Reading
+        // the output of a task that has not necessarily run would make the
+        // instance count depend on scheduling order.
+        //
+        // Only the *reference* rules live here. The shape rules (one fan-out
+        // source, not on a call, not on a gang, command tasks only) are in
+        // `expand.rs`, because this validator runs on the **expanded** graph:
+        // by the time it sees a task that set both `with_items` and
+        // `with_output_of`, the first has already fanned it out and is gone
+        // from the leaf, so the conflict is invisible here.
+        for task in &spec.tasks {
+            let Some(producer) = &task.with_output_of else { continue };
+            // Both checks are instance-aware, because this validator runs on
+            // the EXPANDED graph: a producer that was itself fanned out no
+            // longer exists under its authored name — expansion replaced
+            // `regions` with `regions.0`, `regions.1`, … and rewired this
+            // task's `depends_on` onto them. Comparing the authored name
+            // against node names and dependency names directly is what used to
+            // refuse a chained fan-out at submit.
+            // The cheap check first, and the order is load-bearing rather than
+            // stylistic. Dependencies were already proven to be real nodes
+            // above ("unknown dependency"), so a non-empty result here proves
+            // the producer exists — the scan below is only ever needed to
+            // explain a failure. Reversed, every `with_output_of` task pays an
+            // O(nodes) scan on the happy path, and the expanded graph runs to
+            // `DAGRON_MAX_TASKS_PER_RUN` (100k), on the synchronous submit
+            // path.
+            if crate::expand::fanout_producer_rows(producer, &task.depends_on).is_empty() {
+                // Nothing matched. Distinguish a typo from a real task this
+                // one simply does not depend on, so the message names the
+                // actual mistake — this is the error path, so the scan is free.
+                let prefix = format!("{producer}.");
+                let known = node_index.contains_key(producer)
+                    || node_index.keys().any(|k| k.starts_with(&prefix));
+                if !known {
+                    bail!(
+                        "task '{}' with_output_of names unknown task '{producer}' in DAG '{}'",
+                        task.name,
+                        spec.name
+                    );
+                }
+                bail!(
+                    "task '{}' fans out over '{producer}' output but does not depend on \
+                     '{producer}' in DAG '{}' — add it to depends_on",
+                    task.name,
+                    spec.name
+                );
+            }
+            if producer == &task.name {
+                bail!(
+                    "task '{}' cannot fan out over its own output in DAG '{}'",
+                    task.name,
+                    spec.name
+                );
             }
         }
 
@@ -1738,22 +2322,23 @@ tasks:
         )
         .is_err());
 
-        // Composition (multi-dataset / datasets_mode) is the feature line:
-        // the open build rejects it with a signpost naming the edition; an
-        // enterprise build accepts it.
+        // Composition (multi-dataset + datasets_mode) used to be refused here
+        // in the open build. It is accepted in EVERY build now, and this
+        // assertion is deliberately not `cfg`-split: the gate is gone, not
+        // moved, so an open build and an enterprise build must agree.
+        //
+        // Restoring the gate would put a race on the paid line. The fallback it
+        // used to recommend — one upstream on the trigger, the other on a
+        // `wait: { dataset: … }` sensor — stamps the sensor's cursor at park
+        // time, so an upstream that landed before the run started never
+        // satisfies it. `all` is the only construct that gets that case right.
         let multi = "name: p\non_datasets: [\"a://b\", \"a://c\"]\ndatasets_mode: all\ntasks:\n  - { name: t, command: [\"true\"] }\n";
-        #[cfg(not(feature = "enterprise"))]
-        {
-            let err =
-                DagGraph::from_yaml(multi).err().expect("multi-dataset is feature-gated").to_string();
-            assert!(err.contains("not in this build"), "signpost names the gap: {err}");
-        }
-        #[cfg(feature = "enterprise")]
-        {
-            let dag = DagGraph::from_yaml(multi).unwrap();
-            assert_eq!(dag.spec.on_datasets.len(), 2);
-            assert_eq!(dag.spec.datasets_mode.as_deref(), Some("all"));
-        }
+        let dag = DagGraph::from_yaml(multi).expect("multi-dataset composition is open");
+        assert_eq!(dag.spec.on_datasets.len(), 2);
+        assert_eq!(dag.spec.datasets_mode.as_deref(), Some("all"));
+        // `any` over several datasets is open too — the gate covered both.
+        let any = "name: p\non_datasets: [\"a://b\", \"a://c\"]\ntasks:\n  - { name: t, command: [\"true\"] }\n";
+        assert!(DagGraph::from_yaml(any).is_ok(), "multi-dataset any-of is open");
     }
 
     /// The sweep-side subscription extraction reads raw specs without expansion.
@@ -1783,6 +2368,85 @@ tasks:
         .expect("run_timeout_secs=0 must be rejected")
         .to_string();
         assert!(err.contains("run_timeout_secs=0"), "got: {err}");
+    }
+
+    /// A runtime fan-out reads an upstream task's output, so the producer has
+    /// to be a dependency — not as a nicety, but because otherwise the number
+    /// of instances depends on scheduling order. Same rule a runtime `when:`
+    /// output reference already carries; this one needs it more, because
+    /// `when:` only decides whether a task runs and this decides how many of
+    /// it there are.
+    #[test]
+    fn a_runtime_fan_out_must_depend_on_the_task_it_reads() {
+        let ok = DagGraph::from_yaml(
+            "name: w\ntasks:\n\
+             \x20 - { name: list, command: [\"ls\"] }\n\
+             \x20 - { name: use, command: [\"x\"], depends_on: [list], with_output_of: list }\n",
+        );
+        assert!(ok.is_ok(), "a dependency is a valid producer: {:?}", ok.err());
+
+        let err = DagGraph::from_yaml(
+            "name: w\ntasks:\n\
+             \x20 - { name: list, command: [\"ls\"] }\n\
+             \x20 - { name: use, command: [\"x\"], with_output_of: list }\n",
+        )
+        .err()
+        .expect("a producer that is not a dependency must be refused")
+        .to_string();
+        assert!(err.contains("depends_on"), "the error says how to fix it: {err}");
+
+        let err = DagGraph::from_yaml(
+            "name: w\ntasks:\n\
+             \x20 - { name: use, command: [\"x\"], with_output_of: ghost }\n",
+        )
+        .err()
+        .expect("an unknown producer must be refused")
+        .to_string();
+        assert!(err.contains("unknown task 'ghost'"), "got: {err}");
+    }
+
+    /// The shapes a runtime fan-out cannot take. Each of these would otherwise
+    /// be a spec that submits cleanly and then does something other than what
+    /// it says — the failure mode every guard in this file exists for.
+    #[test]
+    fn a_runtime_fan_out_is_refused_where_it_could_not_work() {
+        let cases: [(&str, &str, &str); 4] = [
+            // Two fan-out sources: one resolved at submit, one mid-run.
+            (
+                "one source",
+                "  - { name: list, command: [\"ls\"] }\n  - { name: use, command: [\"x\"], depends_on: [list], with_output_of: list, with_items: [1, 2] }",
+                "one source",
+            ),
+            // A call is replaced by the template's tasks; its own fields go
+            // with it, so there would be no row to fan out.
+            (
+                "template call",
+                "  - { name: list, command: [\"ls\"] }\n  - { name: use, template: t, depends_on: [list], with_output_of: list }",
+                "template",
+            ),
+            // A gang's size has to be known before it is claimed.
+            (
+                "gang",
+                "  - { name: list, command: [\"ls\"] }\n  - { name: use, command: [\"x\"], depends_on: [list], with_output_of: list, gang: { size: 2 } }",
+                "gang",
+            ),
+            // Nothing to substitute `{{ item }}` into.
+            (
+                "wait sensor",
+                "  - { name: list, command: [\"ls\"] }\n  - { name: use, type: wait, wait: { for: 5m }, depends_on: [list], with_output_of: list }",
+                "with_output_of",
+            ),
+        ];
+        for (what, tasks, needle) in cases {
+            let yaml = format!(
+                "name: w\ntemplates:\n  - name: t\n    tasks:\n      - {{ name: inner, command: [\"true\"] }}\ntasks:\n{tasks}\n"
+            );
+            let err = DagGraph::from_yaml(&yaml)
+                .err()
+                .unwrap_or_else(|| panic!("with_output_of on a {what} must be rejected"))
+                .to_string();
+            assert!(err.contains(needle), "{what}: the error should name it, got: {err}");
+        }
     }
 
     /// `repeat:` is evaluated only where an executor's result comes back. Every
@@ -1896,6 +2560,128 @@ tasks:
             g.spec.tasks.iter().all(|t| t.arguments.is_empty()),
             "a template's arguments are consumed, not carried"
         );
+    }
+
+    // ── budget.external_cost ────────────────────────────────────────────────
+
+    const DEFER: &str = "defer: { kind: spark-k8s }";
+
+    /// The ceiling bounds a plain count of submissions when nobody declares a
+    /// unit cost — `defer.cost` defaults to 1.
+    #[test]
+    fn the_external_ceiling_counts_submissions_by_default() {
+        let yaml = format!(
+            "name: p\nbudget: {{ external_cost: 2 }}\ntasks:\n  \
+             - {{ name: a, command: [x], {DEFER} }}\n  \
+             - {{ name: b, command: [x], {DEFER} }}\n"
+        );
+        DagGraph::from_yaml(&yaml).expect("two submits against a ceiling of two is admitted");
+
+        let over = format!(
+            "name: p\nbudget: {{ external_cost: 2 }}\ntasks:\n  \
+             - {{ name: a, command: [x], {DEFER} }}\n  \
+             - {{ name: b, command: [x], {DEFER} }}\n  \
+             - {{ name: c, command: [x], {DEFER} }}\n"
+        );
+        let err = DagGraph::from_yaml(&over).err().expect("three is over");
+        let b = err
+            .downcast_ref::<crate::models::ExternalBudgetExceeded>()
+            .expect("typed, so the API can answer 400 rather than calling it a parse error");
+        assert_eq!(b.planned, 3);
+        assert_eq!(b.deferred_tasks, 3);
+        assert_eq!(b.max, 2);
+    }
+
+    /// A declared unit cost is what makes the field a *cost* rather than a
+    /// count: two expensive jobs can exceed a ceiling fifty cheap ones fit under.
+    #[test]
+    fn a_declared_unit_cost_is_summed_not_counted() {
+        let yaml = "name: p\nbudget: { external_cost: 100 }\ntasks:\n  \
+             - { name: big,      command: [x], defer: { kind: spark-k8s, cost: 60 } }\n  \
+             - { name: also_big, command: [x], defer: { kind: spark-k8s, cost: 60 } }\n";
+        let err = DagGraph::from_yaml(yaml).err().expect("120 > 100");
+        let b = err.downcast_ref::<crate::models::ExternalBudgetExceeded>().expect("typed");
+        assert_eq!(b.planned, 120, "summed, not counted");
+        assert_eq!(b.deferred_tasks, 2, "and it says how many jobs made up that sum");
+    }
+
+    /// Only deferred tasks count. A run of a thousand `echo`s spends nothing
+    /// externally and must not be refused by a ceiling on external work.
+    #[test]
+    fn ordinary_tasks_do_not_consume_the_external_ceiling() {
+        let yaml = "name: p\nbudget: { external_cost: 1 }\ntasks:\n  \
+             - { name: a, command: [x] }\n  \
+             - { name: b, command: [x] }\n  \
+             - { name: c, command: [x], defer: { kind: spark-k8s } }\n";
+        DagGraph::from_yaml(yaml).expect("local work is free of this ceiling");
+    }
+
+    /// The amplification the ceiling exists to stop.
+    ///
+    /// One `gang:` spec becomes `size` rows and each one submits. Counting the
+    /// spec once would admit a run against a ceiling of 2 while launching 20
+    /// remote jobs — which is the whole failure mode, not an edge case. The
+    /// task-count budget is gang-aware for exactly this reason and this must
+    /// match it.
+    #[test]
+    fn a_gang_costs_its_size_not_one() {
+        let yaml = "name: p\nbudget: { external_cost: 2 }\ntasks:\n  \
+             - { name: fan, command: [x], gang: { size: 10 }, defer: { kind: spark-k8s } }\n";
+        let err = DagGraph::from_yaml(yaml).err().expect("ten submits is over a ceiling of two");
+        let b = err.downcast_ref::<crate::models::ExternalBudgetExceeded>().expect("typed");
+        assert_eq!(b.planned, 10, "size rows, not one spec");
+        assert_eq!(b.deferred_tasks, 10);
+    }
+
+    /// And the unit cost multiplies across the gang, rather than applying once.
+    #[test]
+    fn a_gangs_unit_cost_multiplies_across_its_rows() {
+        let yaml = "name: p\nbudget: { external_cost: 100 }\ntasks:\n  \
+             - { name: fan, command: [x], gang: { size: 4 }, defer: { kind: spark-k8s, cost: 30 } }\n";
+        let err = DagGraph::from_yaml(yaml).err().expect("4 x 30 = 120 > 100");
+        let b = err.downcast_ref::<crate::models::ExternalBudgetExceeded>().expect("typed");
+        assert_eq!(b.planned, 120);
+    }
+
+    #[test]
+    fn an_external_ceiling_of_zero_is_refused_as_meaningless() {
+        let err = DagGraph::from_yaml("name: p\nbudget: { external_cost: 0 }\ntasks:\n  - { name: a, command: [x] }\n")
+            .err()
+            .expect("zero is not a ceiling, it is a contradiction")
+            .to_string();
+        assert!(err.contains("external_cost=0"), "{err}");
+    }
+
+    /// Cost *attribution* — reconciling a real vendor invoice — is the gated
+    /// capability. The declared ceiling above is not, and the signpost has to
+    /// say so: otherwise the refusal reads as "budgets are Enterprise", which is
+    /// the opposite of the rule that a guardrail you set for yourself is never
+    /// the thing sold.
+    #[cfg(not(feature = "enterprise"))]
+    #[test]
+    fn attribution_is_gated_and_the_signpost_names_the_open_ceiling() {
+        let err = DagGraph::from_yaml(
+            "name: p\nbudget: { external_cost_attribution: true }\ntasks:\n  - { name: a, command: [x] }\n",
+        )
+        .err()
+        .expect("attribution is not in this build")
+        .to_string();
+        assert!(err.contains("not in this build"), "names the gap: {err}");
+        assert!(err.contains("#what-this-build-does-not-do"), "links the anchor: {err}");
+        assert!(err.contains("external_cost"), "names the OPEN ceiling, so the refusal is not read as 'budgets are paid': {err}");
+        assert!(err.contains("`pool:`"), "names the other open bound: {err}");
+        assert!(err.contains("docs/EXTERNAL_JOBS.md"), "names the open doc: {err}");
+        assert!(err.contains("dagron_engine::Seams"), "names the seam: {err}");
+    }
+
+    /// An enterprise build accepts it — the gate is a gate, not a removal.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn attribution_is_accepted_where_it_ships() {
+        DagGraph::from_yaml(
+            "name: p\nbudget: { external_cost_attribution: true }\ntasks:\n  - { name: a, command: [x] }\n",
+        )
+        .expect("an enterprise build accepts attribution");
     }
 
     /// `arguments` with nothing to pass them to is a mistake, and a silent one
@@ -2233,5 +3019,371 @@ tasks:
         let b = g.task_spec("b").unwrap();
         assert_eq!(b.retry_budgets.get("gpu-ecc"), Some(&8));
         assert_eq!(b.retry_budgets.get("fabric-ib"), Some(&6));
+    }
+
+    /// `defer:` accepts the shapes it should and refuses the ones that would
+    /// park a row nothing can resolve.
+    #[test]
+    fn defer_validation() {
+        // Minimal valid: a command task with a kind. poll_secs defaults.
+        let g = DagGraph::from_yaml(
+            "name: p\ntasks:\n  - { name: s, command: [submit], defer: { kind: spark-k8s } }\n",
+        )
+        .unwrap();
+        let d = g.task_spec("s").unwrap().defer.clone().unwrap();
+        assert_eq!(d.kind, "spark-k8s");
+        assert_eq!(d.poll_secs, DEFAULT_DEFER_POLL_SECS, "poll_secs defaults");
+        assert!(d.max_wait_secs.is_none(), "no ceiling by default — the run's deadline bounds it");
+
+        let err = |y: &str| {
+            DagGraph::from_yaml(y).err().expect("must be refused").to_string()
+        };
+
+        // An empty kind routes to no poller.
+        assert!(err("name: p\ntasks:\n  - { name: s, command: [x], defer: { kind: \"  \" } }\n")
+            .contains("defer.kind is empty"));
+
+        // A zero interval would hot-loop the sweep against someone's API.
+        let zero = err("name: p\ntasks:\n  - { name: s, command: [x], defer: { kind: k, poll_secs: 0 } }\n");
+        assert!(zero.contains("defer.poll_secs=0"), "{zero}");
+        assert!(zero.contains("hot-loops"), "says why, not just that: {zero}");
+
+        // A ceiling under one interval fails the task before the first poll.
+        let tight = err(
+            "name: p\ntasks:\n  - { name: s, command: [x], defer: { kind: k, poll_secs: 60, max_wait_secs: 30 } }\n",
+        );
+        assert!(tight.contains("max_wait_secs=30"), "{tight}");
+        assert!(tight.contains("polled even once"), "{tight}");
+        // Equal is fine: exactly one poll is a legitimate budget.
+        DagGraph::from_yaml(
+            "name: p\ntasks:\n  - { name: s, command: [x], defer: { kind: k, poll_secs: 60, max_wait_secs: 60 } }\n",
+        )
+        .unwrap();
+
+        // Two loop operators on one row would re-submit on every "still running".
+        let both = err(
+            "name: p\ntasks:\n  - { name: s, command: [x], defer: { kind: k }, repeat: { until: \"{{ output }} == done\", max_iterations: 3 } }\n",
+        );
+        assert!(both.contains("cannot combine `defer` with `repeat`"), "{both}");
+        assert!(both.contains("both are loop operators"), "names the conflict: {both}");
+
+        // The command-less kinds have no submit to defer.
+        for (kind, extra) in [
+            ("approval", ""),
+            ("wait", ", wait: { for: 5s }"),
+            ("workflow", ", workflow: other"),
+        ] {
+            let msg = err(&format!(
+                "name: p\ntasks:\n  - {{ name: s, type: {kind}{extra}, defer: {{ kind: k }} }}\n"
+            ));
+            assert!(
+                msg.contains("cannot combine `defer` with `type:"),
+                "type: {kind} must be refused: {msg}"
+            );
+        }
+
+        // A command-less leaf never reaches this check — expansion's
+        // "exactly one of `command` (leaf) or `template` (call)" rule refuses it
+        // first — so the reachable command-less shapes are the typed kinds above
+        // and the template call, which `expand` refuses by name.
+        let call = err(
+            "name: p\ntemplates:\n  - { name: t, tasks: [{ name: inner, command: [x] }] }\n\
+             tasks:\n  - { name: s, template: t, defer: { kind: k } }\n",
+        );
+        assert!(call.contains("cannot set `defer:` on a `template:` call"), "{call}");
+        assert!(call.contains("would be dropped"), "names the silent failure: {call}");
+
+        // A deferred gang member parks N rows on N jobs — the all-or-nothing is gone.
+        let gang = err(
+            "name: p\ntasks:\n  - { name: s, command: [x], gang: { size: 4 }, defer: { kind: k } }\n",
+        );
+        assert!(gang.contains("cannot combine `defer` with `gang`"), "{gang}");
+
+        // `defer:` + `produces:` is accepted: a deferred task succeeds in the
+        // sweep, and the sweep records dataset updates through the same path
+        // the worker result does.
+        DagGraph::from_yaml(
+            "name: p\ntasks:\n  - { name: s, command: [x], defer: { kind: k }, produces: [\"s3://b/o\"] }\n",
+        )
+        .expect("a deferred task may declare produces:");
+    }
+
+    /// `defer.connection:` is a signpost in the open build: it names what was
+    /// attempted, links the gap list, names a WORKING open path, and names the
+    /// seam. The enterprise build accepts the same spec.
+    #[test]
+    fn defer_connection_is_gated_with_a_signpost() {
+        let spec = "name: p\ntasks:\n  - { name: s, command: [x], defer: { kind: k, connection: prod-spark } }\n";
+        let parsed = DagGraph::from_yaml(spec);
+
+        if cfg!(feature = "enterprise") {
+            let g = parsed.expect("the enterprise build accepts a named connection");
+            assert_eq!(
+                g.task_spec("s").unwrap().defer.as_ref().unwrap().connection.as_deref(),
+                Some("prod-spark")
+            );
+            return;
+        }
+
+        let msg = parsed.err().expect("the open build refuses a named connection").to_string();
+        assert!(msg.contains("prod-spark"), "names what was attempted: {msg}");
+        assert!(msg.contains("not in this build"), "names the gap: {msg}");
+        assert!(
+            msg.contains("#what-this-build-does-not-do"),
+            "links the anchor: {msg}"
+        );
+        assert!(msg.contains("environment:"), "names the open endpoint path: {msg}");
+        assert!(msg.contains("value_from"), "names the open credential path: {msg}");
+        assert!(msg.contains("dagron_engine::Seams"), "names the seam: {msg}");
+    }
+
+    /// The handle is read from the LAST matching line, so a step may log before
+    /// it — and an empty handle is no handle, because parking on one produces a
+    /// row no sweep can ever resolve.
+    #[test]
+    fn parse_handle_takes_the_last_line_and_rejects_empty() {
+        assert_eq!(parse_handle("dagron::handle=abc").as_deref(), Some("abc"));
+        assert_eq!(
+            parse_handle("submitting...\ndagron::handle=run-1\n").as_deref(),
+            Some("run-1"),
+            "a step may log before the handle"
+        );
+        assert_eq!(
+            parse_handle("dagron::handle=stale\nretrying\ndagron::handle=fresh").as_deref(),
+            Some("fresh"),
+            "last wins — an echoed earlier attempt must not become the handle"
+        );
+        assert_eq!(parse_handle("  dagron::handle=  spaced  ").as_deref(), Some("spaced"));
+        assert_eq!(parse_handle("dagron::handle=").as_deref(), None, "empty is no handle");
+        assert_eq!(parse_handle("dagron::handle=   ").as_deref(), None);
+        assert_eq!(parse_handle("no handle here").as_deref(), None);
+    }
+
+    /// `defer.http` is checked at SUBMIT — the point being that a typo in a
+    /// predicate must not survive until four hours into a poll.
+    #[test]
+    fn defer_http_validation() {
+        let ok = DagGraph::from_yaml(
+            "name: p\ntasks:\n  - name: s\n    command: [submit]\n    defer:\n      kind: spark-k8s\n      http:\n        url: \"https://api.example/jobs/{{ handle }}\"\n        headers: [{ name: Authorization, value_from: { secret: TOK } }]\n        succeed_when: \"status.applicationState.state == COMPLETED\"\n        fail_when: \"status.applicationState.state in [FAILED, SUBMISSION_FAILED]\"\n        error_from: \"status.applicationState.errorMessage\"\n",
+        )
+        .unwrap();
+        let h = ok.task_spec("s").unwrap().defer.as_ref().unwrap().http.clone().unwrap();
+        assert!(h.url.contains(HANDLE_PLACEHOLDER), "{{{{ handle }}}} survives expansion");
+        assert_eq!(h.headers[0].value_from.as_ref().unwrap().secret, "TOK");
+
+        let err = |y: &str| DagGraph::from_yaml(y).err().expect("must be refused").to_string();
+        let spec = |http: &str| {
+            format!("name: p\ntasks:\n  - name: s\n    command: [x]\n    defer:\n      kind: k\n      http:\n{http}")
+        };
+
+        // Scheme, not reachability — the URL still holds unexpanded templates.
+        let scheme = err(&spec("        url: \"ftp://h/j\"\n        succeed_when: \"a == b\"\n"));
+        assert!(scheme.contains("must be http(s)"), "{scheme}");
+        assert!(err(&spec("        url: \"  \"\n        succeed_when: \"a == b\"\n")).contains("url is empty"));
+
+        // Every predicate field is parsed, and the diagnostic names which one.
+        let bad_succeed = err(&spec("        url: \"https://h/j\"\n        succeed_when: \"status.phase\"\n"));
+        assert!(bad_succeed.contains("defer.http.succeed_when"), "{bad_succeed}");
+        assert!(bad_succeed.contains("expected `path == VALUE`"), "{bad_succeed}");
+
+        let bad_fail = err(&spec(
+            "        url: \"https://h/j\"\n        succeed_when: \"a == b\"\n        fail_when: \"a in b\"\n",
+        ));
+        assert!(bad_fail.contains("defer.http.fail_when"), "{bad_fail}");
+        assert!(bad_fail.contains("bracketed list"), "{bad_fail}");
+
+        let bad_path = err(&spec(
+            "        url: \"https://h/j\"\n        succeed_when: \"a == b\"\n        error_from: \"a..b\"\n",
+        ));
+        assert!(bad_path.contains("defer.http.error_from"), "{bad_path}");
+        assert!(bad_path.contains("empty segment"), "{bad_path}");
+
+        let no_name = err(&spec(
+            "        url: \"https://h/j\"\n        succeed_when: \"a == b\"\n        headers: [{ name: \"\", value: v }]\n",
+        ));
+        assert!(no_name.contains("header with no name"), "{no_name}");
+    }
+
+    /// `defer.http.cancel` is checked at SUBMIT like the rest of the block, and
+    /// its verb defaults to DELETE.
+    #[test]
+    fn defer_http_cancel_validation() {
+        let spec = |cancel: &str| {
+            format!(
+                "name: p\ntasks:\n  - name: s\n    command: [x]\n    defer:\n      kind: k\n      http:\n        url: \"https://h/j/{{{{ handle }}}}\"\n        succeed_when: \"a == b\"\n        cancel:\n{cancel}"
+            )
+        };
+        let ok = DagGraph::from_yaml(&spec("          url: \"https://h/j/{{ handle }}\"\n")).unwrap();
+        let c = ok.task_spec("s").unwrap().defer.as_ref().unwrap().http.clone().unwrap().cancel.unwrap();
+        assert_eq!(c.method(), "DELETE", "DELETE is the default");
+        assert!(c.url.contains(HANDLE_PLACEHOLDER), "{{{{ handle }}}} survives expansion");
+        assert!(c.body.is_none());
+
+        let post = DagGraph::from_yaml(&spec(
+            "          url: \"https://h/cancel\"\n          method: post\n          body: '{\"run_id\": \"{{ handle }}\"}'\n",
+        ))
+        .unwrap();
+        let c = post.task_spec("s").unwrap().defer.as_ref().unwrap().http.clone().unwrap().cancel.unwrap();
+        assert_eq!(c.method(), "POST", "case-insensitive");
+        assert!(c.body.unwrap().contains("{{ handle }}"));
+
+        let err = |y: &str| DagGraph::from_yaml(y).err().expect("must be refused").to_string();
+        let scheme = err(&spec("          url: \"ftp://h/j\"\n"));
+        assert!(scheme.contains("defer.http.cancel.url must be http(s)"), "{scheme}");
+        let verb = err(&spec("          url: \"https://h/j\"\n          method: GET\n"));
+        assert!(verb.contains("defer.http.cancel.method"), "{verb}");
+        assert!(verb.contains("DELETE, POST, PUT, PATCH"), "{verb}");
+    }
+
+    /// The http block templates per fan-out instance, but `{{ handle }}` is
+    /// runtime state and must reach the poller unsubstituted.
+    #[test]
+    fn defer_http_templates_per_instance_but_leaves_the_handle_alone() {
+        let g = DagGraph::from_yaml(
+            "name: p\nparameters: { host: api.example }\ntasks:\n  - name: s\n    command: [x]\n    defer:\n      kind: k\n      http:\n        url: \"https://{{ host }}/jobs/{{ handle }}\"\n        succeed_when: \"state == DONE\"\n",
+        )
+        .unwrap();
+        let h = g.task_spec("s").unwrap().defer.as_ref().unwrap().http.clone().unwrap();
+        assert_eq!(h.url, "https://api.example/jobs/{{ handle }}");
+    }
+
+    /// Every signpost in the product asserts the same four properties.
+    ///
+    /// A source scan rather than a shared helper crates call, because no such
+    /// helper can reach them all: `dagron-crypto` has zero dagron dependencies,
+    /// `dagron-core` and `dagron-source` are *upstream* of `dagron-engine`, and
+    /// `dagron-api` never builds a `Seams`. One test that reads the tree covers
+    /// every crate regardless of which way the dependency arrows point.
+    ///
+    /// The bar: a gate is a **signpost, not a dead end** — it names what was
+    /// attempted, and it names what to do instead in this build.
+    /// Before this test the eight signposts asserted
+    /// mutually different subsets of that — `source.rs` checked the fallback and
+    /// the seam but not the anchor, `fleet.rs` and `link.rs` checked the anchor
+    /// and the fallback but not the seam, `crypto` checked only that the gap was
+    /// named, and the engine's 403 was asserted by nothing at all. A funnel
+    /// whose steps each enforce a different rule is a funnel that leaks.
+    #[test]
+    fn every_signpost_names_the_gap_and_a_way_forward() {
+        // Split so this test does not match its own source.
+        let anchor = concat!("#what-this-build", "-does-not-do");
+        // The message, not its neighbourhood. A fixed character window around
+        // the anchor reaches into whatever code happens to sit nearby, and in a
+        // large file that almost always contains one of the markers below — so
+        // the test passes for a signpost that says nothing. Measured: a
+        // deliberately dead-end signpost injected into dagron-artifact passed a
+        // 1400-character window and fails this one.
+        //
+        // A signpost is a run of consecutive non-blank lines: a `bail!(…);`, a
+        // `const` with its doc comment, or a paragraph of `//!`. Bounding the
+        // window at the blank lines either side is exactly that run.
+        fn message_block(src: &str, at: usize) -> String {
+            let strip = |l: &str| {
+                l.trim()
+                    .trim_start_matches("//!")
+                    .trim_start_matches("///")
+                    .trim_start_matches("//")
+                    .trim()
+                    .trim_end_matches('\\')
+                    .trim()
+                    .to_string()
+            };
+            let lines: Vec<&str> = src.lines().collect();
+            let idx = src[..at].matches('\n').count();
+            let mut lo = idx;
+            while lo > 0 && !strip(lines[lo - 1]).is_empty() {
+                lo -= 1;
+            }
+            let mut hi = idx;
+            while hi + 1 < lines.len() && !strip(lines[hi + 1]).is_empty() {
+                hi += 1;
+            }
+            lines[lo..=hi].iter().map(|l| strip(l)).collect::<Vec<_>>().join(" ")
+        }
+
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+        let mut checked = 0;
+        let mut offenders: Vec<String> = Vec::new();
+
+        let mut stack = vec![std::path::PathBuf::from(root).join("crates")];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read crates/") {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    // `target/` holds build output, not source we author.
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+                    continue;
+                }
+                let src = std::fs::read_to_string(&path).unwrap();
+                let mut from = 0;
+                while let Some(rel) = src[from..].find(anchor) {
+                    let at = from + rel;
+                    from = at + anchor.len();
+                    // Skip the assertions in this test file and in each
+                    // signpost's own unit test: they quote the anchor to check
+                    // for it, and are not themselves signposts.
+                    let line_start = src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                    let line_end = src[at..].find('\n').map(|i| at + i).unwrap_or(src.len());
+                    if src[line_start..line_end].trim_start().starts_with("assert") {
+                        continue;
+                    }
+                    checked += 1;
+                    let w = message_block(&src, at);
+                    let w = w.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let w = w.as_str();
+
+                    // 1. Names the gap.
+                    let lower = w.to_ascii_lowercase();
+                    let names_gap = lower.contains("not in this build")
+                        || lower.contains("not bundled in this build");
+                    // 2. Names what to do INSTEAD — a working open path, a seam
+                    //    to plug into, or the page that documents one. This is
+                    //    the property that separates a signpost from a refusal.
+                    //
+                    //    The gap phrase is removed FIRST, and that is not a
+                    //    detail: "this build" is the strongest marker of an
+                    //    alternative ("This build streams with SOURCE=stream"),
+                    //    but it is also inside the gap phrase itself, so
+                    //    matching it against the whole message makes the check
+                    //    vacuous — every signpost passes by saying only that it
+                    //    is not in this build. Measured: a deliberately
+                    //    dead-end signpost injected into dagron-artifact passed
+                    //    until this line existed.
+                    // Lowercased: a signpost's alternative is a new sentence
+                    // ("This build runs one unit", dagron-source), so a
+                    // case-sensitive match misses the capital that starts it.
+                    let rest = w
+                        .to_ascii_lowercase()
+                        .replace("not in this build", "")
+                        .replace("not bundled in this build", "");
+                    let names_way_forward =
+                        ["this build", "docs/", "seams", "sourcefactory", "externalpoller",
+                         "unset ", "instead", "the open build"]
+                            .iter()
+                            .any(|m| rest.contains(m));
+                    if !(names_gap && names_way_forward) {
+                        let line = src[..at].matches('\n').count() + 1;
+                        offenders.push(format!(
+                            "{}:{line}: gap={names_gap} way_forward={names_way_forward}",
+                            path.strip_prefix(root).unwrap_or(&path).display()
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(checked >= 8, "expected the product's signposts, found {checked}");
+        assert!(
+            offenders.is_empty(),
+            "a gate must be a signpost, not a dead end — each of these names the gap without \
+             naming a way forward:\n  {}",
+            offenders.join("\n  ")
+        );
     }
 }

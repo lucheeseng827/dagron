@@ -82,8 +82,11 @@ All read in `crates/dagron-engine/src/lib.rs` unless noted.
 | `STREAM_DLQ_PATH` | path | `<STREAM_PATH>.dlq` | Poison-line mirror (NDJSON), alongside the durable `dead_letters` rows. |
 | `TASK_LEASE_HEARTBEAT` | bool | `true` | Workers renew a running task's lease every ⌊`LEASE_SECS`/3⌋ s (+`LEASE_SECS`, so 10 s +30 s at defaults) while it executes, so long tasks (training, consumers) are never reclaimed mid-run. `false` restores the old finish-inside-one-lease behaviour. |
 | `RUNNER_GANGS` | `1`/`true` | off | Gang co-scheduling ([docs/AI_WORKLOADS.md](AI_WORKLOADS.md)): claim `gang:` tasks all-or-nothing and cancel a failed member's siblings. Requires a scheduler built with the `enterprise` feature; inert otherwise. Composes with `POOLS` and `priority`: gang members inherit the task's `pool`, and a pooled gang is claimed only when its pool can seat **every** member at once (never partially, never over the cap); ordinary claims on this path keep the same priority ordering. |
+| `DAGRON_ADMISSION_FILE` | path | — (admission open) | **Run-admission** gate, the mirror image of `DAGRON_PRESSURE_FILE` below: while this file exists the engine refuses to admit **new runs** — `POST /runs` answers `503` with `Retry-After: 60`, and cron/schedule fires are skipped (not queued). Work already admitted is untouched: in-flight runs finish, their tasks are still claimed and dispatched, and sub-workflows they spawn are still created. Same file grammar as the pressure gate (a body of `0`, `false`, `off` or `resume` counts as absent, so a writer can flip it without deleting it); an unreadable file counts as **closed**, an absent one as open. Refusals are counted by `scheduler_admission_refused_gate_total`. Use it for a maintenance window, or let an external agent own it. |
 | `DAGRON_PRESSURE_FILE` | path | — (no gate) | Back-pressure gate for constrained hosts: while this file exists the engine claims **no new tasks** (a file whose first token is `0`, `false`, `off` or `resume` counts as absent, so an agent can flip it without deleting it). In-flight tasks finish and every other loop keeps running; only claiming stops. A thermal, battery or maintenance daemon owns the file. Note a one-shot `dagron <file>.yaml` will not exit while the gate is closed — its runs are still active. |
 | `DAGRON_MIN_FREE_BYTES` | u64 (bytes) | `0` (off) | Free-space floor on the SQLite datastore's filesystem. Below it, **new run creation is refused** rather than risking a half-written datastore: the ops API answers `507` + `Retry-After`, and the ingest source is throttled instead of dead-lettering the payload. Only the embedded backend enforces it; with Postgres the disk belongs to the database server. If the probe itself fails, the floor fails open with one warning. The `edge` profile sets 64 MiB. |
+| `DAGRON_ATTEMPT_LOG_BYTES` | usize (bytes) | `4096` (0 = off) | Tail of each **superseded** attempt's output kept in `task_attempts`, so a `repeat:` loop's log shows every iteration and a retried task shows the attempts that explain the failure — not just the last one. `task_runs.output` is a single column every attempt overwrites, which is why only one was ever readable. A **tail**, because the thing being multiplied is not bounded: executor output has no write-side cap, `max_iterations` is a `u32`, and `GC_RETENTION_SECS` is unset (GC off) by default. Capped at 64 KiB — the knob tightens the bound or loosens it within a compiled limit, never past it. **`0` disables retention entirely**: no rows, no extra transaction work, byte-for-byte the previous consumption. See [docs/ITERATION-LOGS.md](ITERATION-LOGS.md) for the measurements. |
+| `DAGRON_ATTEMPT_LOG_KEEP` | usize | `50` (0 = unlimited) | Superseded attempts kept per task; the oldest fall out first, and the read API reports `evicted` so a history that lost its beginning says so. With `DAGRON_ATTEMPT_LOG_BYTES` this bounds the whole feature at `iterating_tasks × keep × bytes` — a measured **228 KiB** for a 1000-iteration loop, and **zero** for a task that neither loops nor retries. `0` removes the ceiling and is for a debugging session, not a deployment — the rows then grow without bound, though a single read still returns at most the newest 200. |
 | `DAGRON_CLOCK_CHECK_SECS` | u64 (s) | `30` (0 disables) | How often the wall clock is compared against the monotonic clock to detect a step. |
 | `DAGRON_CLOCK_STEP_TOLERANCE_MS` | u64 (ms) | `1000` | A wall-vs-monotonic disagreement above this is a step: the engine records `drifted` on runs it is executing and stamps new ones the same way. |
 | `DAGRON_CLOCK_SYNC_FILE` | path | — (no positive evidence) | A file whose existence means the clock is disciplined (e.g. `/run/systemd/timesync/synchronized`). Present ⇒ runs are stamped `synced`; absent ⇒ `unknown`, which is honest rather than optimistic. Re-checked every tick. |
@@ -98,6 +101,9 @@ All read in `crates/dagron-engine/src/lib.rs` unless noted.
 | `DOCKER_IMAGE` | image ref | `alpine:latest` | Default image for `EXECUTOR=docker` (also k8s fallback). |
 | `K8S_IMAGE` | image ref | `$DOCKER_IMAGE` → `alpine:latest` | Image for KubeExecutor. |
 | `K8S_NAMESPACE` | string | `default` | KubeExecutor namespace. |
+| `DAGRON_INSTALLATION` | string (label-safe) | — (**fleet sweep off**) | Names *which* dagron installation this engine is. Stamped on every pod/container as `dagron.dev/installation`, and it is what **arms the fleet sweep**: the periodic pass that deletes workloads whose task is no longer live. Off without it, and that is not a conservative default but the only safe one — `dagron.dev/managed-by=dagron` says *some* dagron made a workload, not *which*, so a sweep scoped on that alone would read a second installation's pods in a shared namespace, fail to find their task ids in **this** engine's datastore, and delete someone else's running work. dagron cannot infer the value (a namespace can hold two installs, one install can span namespaces, a pod carries no pointer to the database that made it). Must be a valid label value — 1–63 of `[A-Za-z0-9]`, `-`, `_`, `.`, starting and ending alphanumeric; anything else contributes **no** label at all rather than a truncated one that could collide with another installation sharing its prefix. Unrelated to the per-dispatch reap, which selects on a task id and keeps working either way. |
+| `DAGRON_ORPHAN_SWEEP_SECS` | u64 ≥ 30 | `300` | Gap between fleet sweeps. Deliberately slow: the sweep lists every workload carrying this installation's labels, an apiserver/daemon call whose cost scales with the *cluster* rather than with this engine's work, and what it catches — a workload whose scheduler died — does not accumulate quickly. Every **eligible candidate** is judged each pass, where eligible means labelled for this installation, older than `DAGRON_ORPHAN_MIN_AGE_SECS`, carrying a readable `dagron.dev/task-id`, and — on Kubernetes — carrying the uid the delete will be bound to; anything else is skipped rather than judged, because a workload that cannot prove it is stale is not deleted. Among those candidates nothing is truncated — the liveness query is chunked instead, because an apiserver lists in a stable order and capping the candidates would re-examine the same live ones forever while never reaching the leftovers behind them. What is capped is the **deletes**: at most 200 per pass, the rest next time. A datastore error skips the pass's deletes entirely rather than acting on a partial answer. Ignored without `DAGRON_INSTALLATION`. |
+| `DAGRON_ORPHAN_MIN_AGE_SECS` | u64 ≥ 60 | `600` | Age below which a workload is never judged by the fleet sweep. A correctness floor, not a tuning knob: the datastore and the apiserver share no transaction, so the sweep lists first and asks which tasks are live second — a listed workload therefore predates the answer — and this covers the clock skew and replication lag that ordering alone does not. Generous deliberately; waiting costs a leftover living a few more minutes, being wrong costs live work. |
 | `DAGRON_MAX_TASK_TIMEOUT_SECS` | u64 > 0 | unset = **no ceiling** | Upper bound on any single task's wall clock, applied by every executor (local, docker, k8s). A task's own `timeout_secs` is a *request*: it is clamped to this, and so is the 25 s default. Unset changes nothing, which is right for a self-host — it is your hardware. A multi-tenant install wants it set, because plan quotas cap tasks per day and runs per month while nothing capped how long one task may run, leaving worst-case compute per plan unbounded. A value that is not a positive integer (including `0`, which would time out every task instantly) is ignored with a warning rather than silently becoming a ceiling that is not one. |
 | `DAGRON_LOCAL_COMMAND_ALLOWLIST` | comma-separated programs | unset = **any command** | `EXECUTOR=local` only: the programs a task of this pool may run. A pool is an engine process with `RUNNER_CLASSES` set, so a process-wide setting is per-pool. Matching is on the **resolved file**, not the word the task wrote — a bare name is searched on `PATH`, anything with a `/` is a path, and both are canonicalised before comparison, so a planted `dagron-build` on a task-supplied `PATH`, an absolute path to a different file, and a `./` spelling are all refused. The permitted program is then spawned by its canonical path, so the exec does no lookup of its own. An entry that resolves to nothing permits nothing, and an allowlist where nothing resolved refuses every task — the safe direction for a typo, and loud rather than silent. A refusal is a task failure classified as a configuration fault, so it is not retried. **It bounds which program runs, not what that program does.** |
 | `DAGRON_LOCAL_ENV_PASSTHROUGH` | comma-separated variable names | unset = **inherit everything** | `EXECUTOR=local` only: which of the pool's own environment variables reach a task. Set, the subprocess environment is cleared and rebuilt from a fixed baseline (`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `TZ`, `TERM`, `LANG`, `LC_ALL`, `LC_CTYPE`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, and the proxy variables in both cases), plus exactly the names listed here, plus the task's own `env:`. A task whose `env:` names one of the listed variables — or `PATH` — is **refused** rather than quietly overruling the deployment. Unset, a task inherits the engine's whole environment, which is what every local pool did before this existed and why a `build`-class task could read the pool's datastore credential. Note this is a different thing from `DAGRON_REDACT_ENV`, which masks values in stored *output* and cannot stop a task reading one. |
@@ -109,6 +115,7 @@ All read in `crates/dagron-engine/src/lib.rs` unless noted.
 | `DAGRON_TASK_RUNTIME_CLASS` | string | unset | KubeExecutor: `runtimeClassName` (e.g. `gvisor`) — kernel-surface isolation for untrusted task images. |
 | `DAGRON_TASK_NODE_SELECTOR` | `k=v,k=v` | unset | KubeExecutor: pin task pods to specific nodes, e.g. an untrusted-workload pool. |
 | `DAGRON_TASK_ISOLATION_FLOOR` | `hardened`, or `key=value` comma/newline list | unset = no floor | The trust envelope **no task may go below**, whatever its workflow declares. Every knob above it is process-wide — one envelope for every task this scheduler dispatches — which is the wrong shape when the engine runs other people's code. A task declares its own envelope with `isolation:` (see `docs/HOWTO.md`); this floor is raised over it field by field, taking the stronger value and never the weaker, so an author may harden a task **beyond** the floor and never **under** it. A named `runtime_class` in the floor is *pinned*, not compared: which sandbox runtimes a node has is an operator fact. Parsed at **boot** — an unknown key or a floor this executor cannot enforce is a startup failure, because a floor discovered to be invalid at dispatch was not in force for anything dispatched before it. Keys: `runtime_class`, `seccomp` (`runtime_default`/`unconfined`), `read_only_root_fs`, `no_new_privileges`, `drop_all_capabilities`, `run_as_non_root`, `run_as_user`, `service_account_token`. `hardened` is the preset: seccomp `runtime_default`, read-only root, no new privileges, all capabilities dropped, non-root, no service-account token. |
+| `DAGRON_TASK_SECRET_ENV` | `secret`, `inline` | `secret` | KubeExecutor: how a task's secret env vars (`value_from`) reach its pod. `secret` creates a per-task Kubernetes Secret, owned by the pod and deleted with it, and references it with `secretKeyRef`, so the value is **not** in the Pod spec that `get pods` / `describe` / audit logs show. Needs `create`, `patch`, `delete` on `secrets` in the task namespace (the chart's engine Role grants them); if the Secret cannot be created the task **fails** naming that permission, never falling back to plaintext. `inline` puts the value in the pod spec as before, for clusters where the engine has no Secret RBAC. Anything else is refused at startup. The Docker and local executors are unaffected (see docs/HOWTO.md §6). |
 | `DAGRON_TASK_AUTOMOUNT_SA_TOKEN` | `1`/`true` = on | **off** | KubeExecutor: mount a ServiceAccount token into task pods that did NOT declare `service_account:`. **This is the one default that changed**: such a task never asked for an identity, and on an IRSA cluster the token it was being handed is an IAM credential given to arbitrary task code. Set it to restore the old behaviour. Tasks that DO declare `service_account:` are unaffected and keep their token. |
 | `RUNNER_CLASSES` | comma list | unset = claim **every** class | Runner segmentation: restrict this scheduler to claiming tasks whose `runner_class` is in the list (e.g. `etl,pulse`). Names validated like the spec field (`[a-z0-9_-]{1,64}`) — a typo is a startup error, not an unclaimable task class. Unset keeps the single-pool behavior. |
 | `POOLS` | `name:slots` comma list | unset = no pools | Named concurrency pools (#21): capacity per pool, e.g. `POOLS=etl:4,db:2`. A task's `pool:` draws a slot; the claim runs at most `slots` tasks of a pool at once, holding the rest in `ready` until one frees (no run dropped). Names validated like `runner_class`; a non-positive/unparseable slot count is a startup error. On Postgres, pooled claims serialize via a global advisory lock (the unpooled fast path stays lock-free); an unpooled or unconfigured-pool task is unlimited. Keep the value identical across HA replicas. |
@@ -434,10 +441,30 @@ that succeeds when the named dataset records an update **after** the park
 output under `(workflow, task, resolved key)`; a later task with the same key
 reuses it and skips execution; `key` templates against params/`scheduled_time`,
 so backfills are reproducible; `max_age_secs` expires stale entries),
+`defer: { kind, poll_secs?, max_wait_secs?, cost?, http? }` (**external job**
+— the task's `command` is the *submit*: it starts work on a system dagron does
+not own, prints `dagron::handle=<id>` on stdout and exits 0, and the engine parks
+the row on that handle holding **no worker slot** until a reconcile sweep
+resolves it. `kind` routes to a poller — a registered `ExternalPoller` gets
+first refusal, then the built-in `http` transport. `poll_secs` defaults to 30,
+floor 1. `max_wait_secs` bounds the **remote job**; unset means the run's own
+deadline is the only bound, which is deliberate — the right ceiling is a
+property of the job, and guessing one would fail exactly the long workloads
+this exists for; watch `scheduler_external_parked` for a row with no ceiling
+that is not moving. `cost` (default 1) is what one submission of this task is
+worth, in whatever unit the author picked — the engine never learns what it
+means, it only sums it against `budget.external_cost` below.
+`http: { url, headers?, succeed_when, fail_when?, error_from? }` polls a status
+endpoint, templating `{{ handle }}` into the URL
+and matching dotted JSON paths — `fail_when` is evaluated first. **Three
+different timeouts, deliberately separate:** `timeout_secs` bounds the submit
+(default 25 s), `defer.max_wait_secs` bounds the job, `run_timeout_secs` bounds
+the run — [docs/EXTERNAL_JOBS.md](EXTERNAL_JOBS.md)),
 `produces: [<dataset-uri>, …]` (datasets this task updates on success — recorded
 in the registry + lineage ledger, waking dataset sensors and firing
 `on_datasets:` workflows; command tasks only; URIs template per instance —
-[docs/DATASETS.md](DATASETS.md)), plus
+[docs/DATASETS.md](DATASETS.md); a **deferred** task records these when its
+remote job finishes, in the reconcile sweep, not when the submit returns), plus
 executor extras (`docker_image`,
 `resources`, `service_account`, `runner_class`). A `task_defaults:` block sets
 DAG-wide defaults for `max_attempts`, `retry_delay_secs`, `retry_max_delay_secs`,
@@ -447,24 +474,37 @@ and `retry_budgets` merges **per class**, so a task that overrides one class
 still inherits the rest rather than silently dropping them).
 
 DAG-level fields (`DagSpec`): `run_timeout_secs` (hard run deadline → cancel),
-`deadline` (soft SLA → alert), `max_active_runs` (default unlimited; the max number
-of runs of this workflow — by name — that may be `running` at once; further fires
-are held back with a `MaxActiveRunsReached` error → the API returns **429**, queue
-submissions requeue, and schedule/backfill fires wait for a slot), `result_from`,
+`deadline` (soft SLA → alert),
+`budget: { tasks?, external_cost?, external_cost_attribution? }` (ceilings on how
+big one run may get, enforced **at creation** — after expansion both numbers are
+exact, so a run that would break a ceiling never starts instead of being killed
+with work already spent; over the API a **400**. `tasks` caps the task **rows**
+the run would create, not the spec entries an author typed, so a `with_items`
+fan-out or a `gang:` counts as the many rows it becomes. `external_cost` caps the
+summed `defer.cost` of the run's deferred tasks (gang-aware for the same reason);
+these are numbers the *author* declared, never anything dagron measured, so the
+arithmetic is exact and claims nothing about real spend — there is deliberately
+no `spend:` field. `external_cost_attribution` asks for reconciliation of a
+vendor's actual invoice back to the run, and is a validation error in this build
+rather than a silently dropped key — [docs/EXTERNAL_JOBS.md](EXTERNAL_JOBS.md)),
+`max_active_runs` (default unlimited; the max number of runs of this workflow —
+by name — that may be `running` at once; further fires are held back with a
+`MaxActiveRunsReached` error → the API returns **429**, queue submissions
+requeue, and schedule/backfill fires wait for a slot), `result_from`,
 `runner_class`, `environment`, `notify`, `templates`, `parameters`, and
 `tags` (organizational labels, `[A-Za-z0-9_.-]` ≤64 chars each — the workflow
 registry surfaces them on `GET /api/workflows` and filters with `?tag=<t>`; the
 engine ignores them), and `on_datasets` (dataset triggers: fire a run of this
 **registered** workflow when a subscribed dataset records an update, with the
-trigger injected as `{{ trigger_dataset }}`; this build subscribes **one**
-dataset — multi-dataset composition with `datasets_mode: any|all` is not in
-this build; [docs/DATASETS.md](DATASETS.md)).
+trigger injected as `{{ trigger_dataset }}`; subscribe to one dataset, or to
+several composed with `datasets_mode: any|all` — `all` fires only once every
+upstream has refreshed since the last fire; [docs/DATASETS.md](DATASETS.md)).
 
 ## Data formats & compatibility
 
 - **State schema** = embedded sqlx migrations, applied automatically at
-  startup: `crates/dagron-core/migrations/` (SQLite, 001–040) and
-  `migrations_pg/` (Postgres, 001–051). Forward-only — there are no down
+  startup: `crates/dagron-core/migrations/` (SQLite, 001–043) and
+  `migrations_pg/` (Postgres, 001–055). Forward-only — there are no down
   migrations, so **back up before upgrading** (see
   [`OPERATIONS.md`](OPERATIONS.md#backup--restore--what-is-the-state)). `dagron-api` additionally
   ensures its own `users`/`git_repos` tables and the additive

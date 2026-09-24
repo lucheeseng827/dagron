@@ -6,6 +6,1484 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- **Every `dagron-mcp` tool now declares MCP tool annotations.** Before this, a
+  tool definition carried only `name`, `description` and `inputSchema`, so a client
+  that runs a tool unasked only when it says `readOnlyHint: true` asked a person
+  before *every* dagron call, `dagron_list_runs` included. The annotations are
+  derived, not written per tool. `readOnlyHint` is the read/write split
+  `DAGRON_MCP_READONLY` already enforces, so the 24 tools a client may now run
+  unasked are exactly the 24 a read-only server keeps. A write cannot be declared
+  without its other three hints, and it states all three, because the spec reads
+  an absent `destructiveHint` or `openWorldHint` as `true`. Each write's hints
+  were decided against what its route actually does, not its name. Retry, rerun
+  and clear are destructive because they wipe the task's captured output. Update
+  is destructive because it replaces the definition the next scheduled run
+  executes. Reject is open-world because a failed gate releases its `one_failed`
+  handlers. Tests pin every write's hints by name. `initialize` still answers
+  protocol `2024-11-05`: the annotations ride along, and why a bump is its own
+  change is in [docs/MCP.md](docs/MCP.md#tool-annotations). **Behaviour change
+  for gateways that pin tool definitions:** every dagron tool's definition
+  changes once, so a pin that hashes annotations (MCPdef's does) needs one
+  re-approval.
+- **A NetworkPolicy for the engine and the bundled Postgres (`networkPolicy.enabled`, on by
+  default).** The engine's ops API (`POST /runs`, `/cancel`, `/rerun`, approve) has no
+  authentication, and the chart had no network boundary, so any pod in the cluster could
+  submit arbitrary runs; a throwaway pod got a `run_id` back. Ingress to the engine is now
+  allowed only from `networkPolicy.engine.allowFrom` and the `monitoring` namespace (so the
+  ServiceMonitor keeps working); Postgres only from the release's engine, dagron-api, gitops
+  and operator pods, so a task pod can reach neither. **Behaviour change:** anything else
+  that calls the engine over HTTP must be added to `allowFrom`. It needs a CNI that enforces
+  NetworkPolicy (proven on kind with a control test; not tested on EKS, where the VPC CNI's
+  network-policy option must be on). No egress policy, and the API stays unauthenticated
+  for the allowed peers; `docs/HARDENING.md` says exactly what is and is not covered.
+  `loadtest/deploy/security-e2e/netpol.sh` (14 cases) is the proof.
+- **Git-managed workflows.** A workflow synced from a connected repo now remembers
+  its repo (`workflows.managed_by`, migration 060) and what git delivered
+  (`managed_md5`). Consequences, all for the plain (unsigned) sync that most
+  repos use: a sync that changes a spec writes a `workflow_versions` row
+  (`created_by = git:<repo>@<rev>`; before, only signed bundles did, so
+  `GET /versions` was empty and there was nothing to roll back to); a re-sync of
+  the same commit writes nothing (it used to rewrite `updated_at` every poll);
+  `PUT`/`DELETE /api/workflows/{id}` on a managed workflow answer `409` naming the
+  repo and `sync-to-git` (an `admin` may pass `?force=true`), where a console edit
+  used to be accepted and silently reverted at the next poll; the repo row's
+  `drift` is now the number of managed workflows edited since the last sync (it
+  was written `0` and never computed); and `prune: true` on a repo retires the
+  workflows whose file was deleted (row and history kept), only from a sync with
+  no file errors — a file that does not parse is one of those errors, so a typo in
+  a spec suppresses the prune instead of retiring the workflow it broke. Git still wins over a console edit, but the edit stays in
+  `/versions`. Authorization is unchanged: any authenticated user can still
+  connect a repo.
+- **`defer:` and `dagron-step-spark` were validated against a real cluster for
+  the first time.** Until now the step had unit tests only. `loadtest/deploy/spark-kind/`
+  and `loadtest/deploy/spark-eks/` hold the rig (kind + Spark operator 2.5.2, and an
+  EKS variant behind `terraform/` with `enable_eks`), and `spark-eks/RESULTS.md` the
+  numbers: 45 real Spark jobs against a 20-slot pool across three schedulers held the
+  cap with no duplicate and no lost job through a scheduler kill; 2000 synthetic
+  deferred runs peaked at 760 parked rows on ~290 m CPU across three schedulers,
+  resolving p50 4.5 s / p99 6.7 s after the remote job finished; all three schedulers
+  killed at once with ~500 parked came back in 6 s and every job still resolved. It
+  found the three defects fixed below. `terraform/` gained `eks_node_ami_type`
+  (x86 nodes for amd64 images), two ECR repos for the step and a Spark test image,
+  and the EBS CSI driver with an IRSA role, without which a PVC never binds on a
+  current EKS version.
+- **Spark 4.2.0 runs.** `SPARK_IMAGE=spark:4.2.0` completed the workflow on kind
+  and EKS. **Known issue:** the step writes `sparkVersion: "3.5.3"` into the
+  `SparkApplication` whatever the image is; the operator tolerated it, but it is
+  wrong metadata and there is no knob for it yet.
+- **`defer.http.cancel` — a cancelled run, or a `max_wait_secs` that elapsed,
+  now stops the remote job.** The built-in transport only ever GETs, so before
+  this a cancelled Spark run went `cancelled` in dagron while the
+  `SparkApplication` kept running (found on kind: still `RUNNING` two minutes
+  after the cancel, `scheduler_external_orphans_total` still 0).
+
+  ```yaml
+  http:
+    url: "https://…/sparkapplications/{{ handle }}"
+    succeed_when: "status.applicationState.state == COMPLETED"
+    cancel:
+      url: "https://…/sparkapplications/{{ handle }}"   # method: DELETE by default
+  ```
+
+  `method` is `DELETE` (default), `POST`, `PUT` or `PATCH`; `body` is optional
+  JSON. It reuses the block's headers, guarded client and redaction — a `content-type`
+  the block already sets is kept rather than sent twice, and `{{ handle }}` is
+  escaped where it lands inside the body's JSON. 2xx, 404 and
+  410 count as torn down; anything else spends one of the three attempts. With
+  `cancel:` set, `max_wait_secs` fails the task but keeps its handle so the same
+  sweep tears the job down. Without it nothing changes. **The credential must now
+  be allowed to `delete`**, not only `get`. A registered `ExternalPoller` still
+  gets first refusal.
+- **`SPARK_DRIVER_SERVICE_ACCOUNT` on `dagron-step-spark`** sets
+  `spec.driver.serviceAccount`. The driver otherwise runs as the namespace's
+  `default`, which cannot create executor pods, so any job that needs executors
+  failed `Forbidden`. `SPARK_CONF_*` cannot carry this: it lowercases every key
+  and Spark's are case-sensitive, so `…driver.serviceAccountName` went out as
+  `…serviceaccountname` and was ignored.
+- **`with_output_of:` chains off a producer that is itself fanned out.** The
+  limitation `docs/LOOPS.md` shipped with: the producer was looked up by its
+  authored name, so a producer that expansion had already turned into
+  `regions.0`, `regions.1`, … matched no row. It failed at submit with
+  "unknown task", because the validator runs on the expanded graph where the
+  authored name no longer exists.
+
+  ```yaml
+    - name: regions
+      command: ["list-partitions", "{{ item }}"]
+      with_items: ["us", "eu"]
+    - name: process
+      command: ["handle", "{{ item }}"]
+      depends_on: [regions]
+      with_output_of: regions
+  ```
+
+  `regions.0` prints `["a","b"]`, `regions.1` prints `["c"]`, and `process`
+  fans out into three carrying `a`, `b`, `c`. Downstream still depends on
+  `process` alone and never learns there were three.
+
+  **Which rows are read comes from the consumer's own `depends_on`**, which
+  expansion already rewired onto exactly the producer's instances. That is what
+  makes this precise rather than a prefix match against the run: a task the
+  consumer does not depend on is unreachable in principle, there is no pattern
+  to escape, and a workflow may legally have both `a` and `a.b` as authored
+  tasks (an exact match wins over the prefix for that reason).
+
+  Dependency order is instance order, so `regions.0`'s items come before
+  `regions.1`'s. A string sort would put `regions.10` before `regions.2` and
+  pair item lists with the wrong region without ever looking wrong.
+
+  The same rule reaches a producer inside a `templates:` sub-DAG, whose rows
+  are named `<call>.<task>`: `depends_on: [discover]` means the call's exits,
+  so those are what is read. Both nesting shapes fall out of one rule rather
+  than two special cases.
+
+  An instance that printed nothing contributes nothing; every producer empty
+  leaves the barrier succeeding with zero instances, as a single empty producer
+  already did. An instance printing something that is not a list fails the
+  fan-out and the message names **that row** — `regions.1`, not `regions`,
+  which would send a reader to check all of them. `examples/templates/15_chained_fanout.yaml`
+  is the scatter-gather-scatter shape end to end.
+- **`with_output_of:` — fan out over what an earlier step printed.** The loop
+  `docs/LOOPS.md` used to end by saying dagron could not express: *run a task
+  that lists the partitions, then run the next step once per partition.*
+  `with_items:` and `with_param:` are resolved by the expander before the run
+  exists, which is exactly what lets `budget:` refuse a fan-out blow-up at
+  submit — so a fan-out over a *result* could not use that path at all.
+
+  ```yaml
+    - name: process
+      command: ["handle", "{{ item }}"]
+      depends_on: [list-partitions]
+      with_output_of: list-partitions
+  ```
+
+  The authored task becomes **one row that never executes**. When its
+  dependencies are satisfied it parks — `status: running` holding no worker,
+  the shape a wait sensor and a sub-workflow trigger already use — and a new
+  reconcile sweep reads the producer's stdout, parses a JSON array, and inserts
+  one `ready` row per element with `{{ item }}` substituted.
+
+  That row then **stays, as the join point**. The alternative was re-parenting
+  every dependent onto the new instances, which means rewriting dependency
+  edges underneath a scheduler that is concurrently reading them; keeping the
+  barrier means dependents were already wired to the thing they should wait
+  for, `trigger_rule:` and `allow_failure:` keep working unchanged, and the
+  only edges the sweep writes are new ones.
+
+  In the console: Loop → For each item → Items from → **an earlier step's
+  output**, which lists exactly the steps this one depends on — because the
+  producer must be a dependency. That rule is not a nicety: the instance count
+  is read from a task's output, so a producer the step does not wait for would
+  make the count depend on scheduling order. It is refused at submit, and by
+  the panel at the keystroke.
+
+  **This is the one thing in dagron that makes a run bigger after admission**,
+  so the run's task ceiling (`DAGRON_MAX_TASKS_PER_RUN`) is re-checked at
+  insert time: a fan-out that would exceed it fails the task with that message
+  *before* inserting anything. Expansion is one transaction gated on a CAS of
+  the barrier's version, so two schedulers sweeping the same tick cannot both
+  expand it; a crash mid-expansion commits nothing and it is simply expanded
+  again. An empty array **succeeds** with zero instances, unlike
+  `with_items: []` — at submit an empty list is an authoring mistake, but at
+  run time "there were no partitions" is a result.
+
+  (That shipped with one limitation — a producer that was itself fanned out or
+  lived inside a template could not be addressed by its authored name. Lifted
+  above.)
+
+  Two consequences of the barrier being a fifth **park** shape, both caught in
+  review: it is excluded from `POOL_RUNNING_COUNT` like the other four — its
+  instances inherit its `pool`, so a parked barrier holding a cap-1 pool's only
+  slot would deadlock against its own children — and each instance is stamped
+  with the barrier's `version` at creation (`fanout_epoch`, the same idiom as
+  `external_epoch`). A barrier's instances are its *dependencies*, so no reset
+  path's downstream cone reaches them; without the stamp, clearing a producer
+  and re-running would join against the previous attempt's rows and report
+  success having processed the old data.
+- **A loop's log shows every iteration, not just the last one.** `task_runs.output`
+  is a single column, and three writers take turns clobbering it — the live-log
+  chunker on an attempt's first chunk, `retry_task` when an iteration ends, and
+  the success path at the end. `repeat:` routes through `retry_task` (the engine
+  re-uses the retry machinery for loop iterations), so a 30-pass poll stored one
+  pass and discarded twenty-nine. The same overwrite has always cost **retries**
+  their per-attempt output: a task that failed twice and passed on the third try
+  showed only the try that worked.
+
+  Superseded attempts are now retained in a new `task_attempts` table and read
+  at `GET /runs/{id}/tasks/{task_id}/attempts` (engine) and
+  `GET /api/runs/{id}/tasks/{tid}/attempts` (console), with the same filter
+  grammar as the log views. The console's task panel gains **"N earlier
+  attempts"** beside the log pane — collapsed, and fetched only when opened,
+  because the pane beside it polls once a second for as long as a task runs and
+  a history attached to every poll would multiply the hot path by its own size.
+
+  Each row says whether it was a loop pass (`iteration`) or a failure
+  (`failed`), because a healthy 30-iteration poll rendered as 30 errors is a
+  worse answer than none.
+
+  **Retention is bounded, and that is the design, not a limitation.** Keeping
+  attempts whole would multiply three quantities none of which is bounded:
+  executor output has no cap on the write path, `RepeatSpec.max_iterations` is a
+  `u32`, and `GC_RETENTION_SECS` is unset — GC off — by default. So what is kept
+  is a **tail** of each attempt (`DAGRON_ATTEMPT_LOG_BYTES`, default 4096, hard
+  ceiling 64 KiB) and a **window** of attempts per task
+  (`DAGRON_ATTEMPT_LOG_KEEP`, default 50), which makes the added storage a
+  product of two constants known before the run starts. Measured: **228 KiB**
+  for a 1000-iteration loop, 12 KiB for a task that retried three times, and
+  **zero** for a task that neither loops nor retries — the cost is paid only by
+  the tasks whose logs were wrong. `DAGRON_ATTEMPT_LOG_BYTES=0` is a complete
+  opt-out: no rows, no extra transaction work, the previous consumption byte for
+  byte. `evicted` on the read API is how a history that lost its beginning says
+  so, rather than passing itself off as starting at iteration 1.
+
+  The read is bounded independently of retention: one request returns at most
+  the newest 200 attempts, because `DAGRON_ATTEMPT_LOG_KEEP=0` disables
+  eviction and an unlimited retention window must not imply an unlimited
+  response.
+
+  The retention write shares the state transition's transaction, so a retry that
+  loses its CAS — a reclaimed worker's stale completion — writes no history for
+  a task it no longer owns. `docs/ITERATION-LOGS.md` carries the measurements
+  and the reasoning, including what this does *not* fix (`task_runs.output`
+  itself is still uncapped, as it always was).
+- **History reads as a diff, not as a stack of YAML documents.** Definition
+  history listed every version behind a *View* button that printed the whole
+  spec, so answering "what changed in v3" meant opening two of them and
+  comparing by eye. The question people open history with is what changed, and
+  the view answered a different one.
+
+  Both history surfaces now answer it directly:
+
+  * **Definition history** (workflow editor) gains a `Changed` column — `+4 −1`
+    per save, computed from the specs already in hand, so most visits need no
+    click at all. Opening a version diffs it against a base that **defaults to
+    the origin** and stays put as you walk forward, because comparing v1→v2,
+    v1→v3, v1→v4 is how drift is read. Full YAML is still one toggle away; it is
+    how a version gets copied back out.
+  * **Run history** gains *Definition changes*: the page's runs grouped into the
+    definitions they actually ran, oldest first, each diffed from the base. The
+    runs table gains a matching `Spec` column, so a block of failures and the
+    edit that preceded them line up on one screen instead of being correlated by
+    hand.
+
+  Grouping is on the **spec text**, not `definition_id`: every run snapshots its
+  own definition row, so two runs of an untouched workflow have different ids
+  and identical specs. Only chronologically adjacent runs merge — an edit that
+  is later reverted is a third era, not a re-entry into the first, because the
+  workflow really did run something else in between.
+
+  The differ is its own module and has no dependency: common prefix/suffix trim,
+  then an LCS over what is left, with hunk collapsing so a three-line save
+  doesn't render three hundred unchanged lines. Past a size ceiling it reports
+  the changed region as one replacement **and says so on the header**, rather
+  than quietly stopping being a diff. `npm run check:diff` holds it to
+  reconstruction (dropping the additions rebuilds the base; dropping the
+  removals rebuilds the new side) over both hand-written cases and a randomized
+  pass, which is the property a wrong diff violates — and a wrong diff does not
+  look broken, it looks like a change nobody made.
+
+  Costs nothing at rest: *Definition changes* is collapsed by default and
+  fetches only when opened.
+
+- **`GET /api/runs/specs?ids=a,b,c` — many runs' specs in one call, grouped by
+  content.** The view above needs a page of runs' definitions, and there was no
+  way to ask for more than one at a time, so it made a request per run.
+
+  Grouping is the point, not just batching. Every run snapshots its own
+  `workflow_definitions` row, so twenty-five runs of a workflow nobody edited
+  are twenty-five identical specs under twenty-five ids: answering per-run would
+  send the same document twenty-five times to establish that nothing changed.
+  Identical specs collapse into one entry listing the runs that used it — which
+  is also the shape the caller wants, since one group *is* "nothing changed".
+
+  Groups and their `run_ids` follow the **requested** order, because Postgres
+  `= ANY` has none and the caller lines the result up against its own list.
+  Unknown ids are **absent rather than a 404**: a page containing one archived
+  run must still answer for the other twenty-four, and which ids came back is
+  already the answer to which didn't. `400` is reserved for a malformed request
+  — no ids, or more than 200.
+
+- **Loops are a control in the console, not a YAML edit.** Repeating work was
+  authorable but not *editable*: `repeat:` had a palette block and no panel
+  field, so changing "poll 30 times" to "poll 5 times" meant opening the YAML
+  tab — and `with_items:` was worse than that. Fan-out **locked Visual mode
+  outright**, on the honest ground that a `with_items:` task is one node on the
+  canvas and N rows at run time, and a node that quietly claims to be one task
+  is a lie.
+
+  The lock is lifted by fixing the lie rather than tolerating it. A looping node
+  now carries a badge saying what it expands to — `⟳ ×4 parallel`,
+  `⟳ 3× in place`, `⟳ until …` — the same bargain the `sub-DAG · 3 tasks` node
+  has always made. The badge is load-bearing: it is what pays for the unlock.
+
+  The task panel gains a **Loop** section over one vocabulary for the engine's
+  two mechanisms, which are not interchangeable and are no longer presented as
+  though they were:
+
+  * **For each item** → `with_items:` / `with_param:`. Parallel, resolved by the
+    expander at run creation, so the count is known up front and the node can
+    say `×N`. Items come from a count, a literal list, or a workflow parameter,
+    with `instance_key` offered as "name each copy by".
+  * **Repeat N times** → `repeat:`. `RepeatSpec` has no count field, so this
+    writes `until: "{{ attempt }} == N"` with a matching budget, and reads that
+    exact shape back rather than degrading into an opaque condition.
+  * **Repeat until** → `repeat:` with the author's own condition.
+
+- **`⟳ Repeat whole workflow` — running the entire DAG N times.** The engine has
+  no run-level loop, so the control moves the graph into a `templates:` sub-DAG
+  and adds one task that calls it: `with_items:` for N independent copies at
+  once, or a body that recurses with `{{ pass + 1 }}` under a `when:` base case
+  for N passes end to end. Both unroll at run creation into one flat DAG.
+
+  The rewrite stays invisible. The canvas keeps drawing the user's own steps —
+  it edits the loop's *body*, with the recursion task hidden and its
+  `depends_on` rebuilt on every edit so the next pass always waits for the real
+  end of the graph. "Remove loop" puts everything back. Collapsing someone's
+  pipeline into a single `loop-pass` node the moment they tick "repeat" would
+  have been a strange trade for asking to repeat it.
+
+  Sequential passes are capped at 50: a pass *is* a level of template recursion
+  and the expander's depth cap is 64.
+
+- **The external poll batch runs concurrently, and the comment claiming it
+  already did is now true.** The sweep awaited each parked `defer:` row before
+  starting the next, so a batch pointed at a black-holed vendor held the
+  reconcile tick for `EXTERNAL_POLL_BATCH` × the request timeout — 32 × 15 s
+  of nothing happening, with claim, dispatch, log drain and run reaping stalled
+  behind it. The per-request timeout bounds one poll; it never bounded the tick.
+  The code sat under a comment that read *"Concurrent, for the reason the
+  url-sensor batch above is"*, describing the `wait.url` probes, which really
+  are.
+
+  Now three passes, and which work goes in which is the whole design:
+
+  1. **Serial** — the `defer.max_wait_secs` ceiling, decided before anything is
+     polled so a vendor we cannot reach cannot keep a task parked past its
+     budget; and header resolution, the one step that touches the pool and the
+     per-sweep credential cache. Doing it here keeps that cache a plain
+     `&mut HashMap` instead of a mutex every in-flight poll contends on.
+  2. **Concurrent** — the network, and nothing else. A `JoinSet` bounded by the
+     same `EXTERNAL_POLL_BATCH` that already bounds the SQL, exactly as the
+     `wait.url` probes are.
+  3. **Serial** — every datastore transition and every meter bump, back on the
+     reconcile thread one at a time, so the accounting stays single-threaded and
+     `newly_terminal` means what it says. The concurrency bought wall-clock on
+     the network and paid for none of it in the state machine.
+
+  **A timeout is still not a verdict, and is now load-bearing twice.** A hung
+  registered `ExternalPoller` used to stall the loop; concurrency alone would
+  not have fixed that, it would only have moved the stall — one blocked
+  implementation holds a `JoinSet` slot forever and the sweep awaiting the set
+  never finishes its pass. The 30 s deadline expires into the `Err` the sweep
+  already re-parks on, so a slow vendor still cannot fail a six-hour job.
+
+  **What an operator will notice is on the other side of the wire.** A vendor
+  can now see up to 32 simultaneous status requests from one scheduler where it
+  saw one at a time. If that trips a concurrency limit the 429 re-parks rather
+  than failing, and `EXTERNAL_POLL_SECS` still protects the rate
+  ([`EXTERNAL_JOBS.md`](docs/EXTERNAL_JOBS.md)).
+
+  **One regression caught on re-read, before it shipped.** Hoisting header
+  resolution out of the poll made a row whose credential would not resolve skip
+  the poll entirely — including the registered poller, which needs no header of
+  ours and may have been resolving that kind perfectly well. It also reported
+  the row through the once-per-kind *"nothing in this build resolves this
+  defer.kind"* warning, which would send an operator to register a poller when
+  their secret was simply missing. Those are now distinct: an unresolvable
+  credential is a transient the next sweep retries, and only a genuinely absent
+  transport is named.
+
+- **A fleet sweep for workloads whose scheduler died.** 0.10.0 labelled every
+  pod and container with the task that owns it, and made each dispatch delete
+  that task's earlier attempts first. That reap has a blind spot by
+  construction: it runs *when a task is dispatched*, and looks only at that
+  task. A workload whose task never runs again — the run was cancelled while a
+  scheduler was dying, the task failed terminally, retention collected the row
+  — is invisible to it forever, and those are precisely the ones that keep
+  costing.
+
+  Every `DAGRON_ORPHAN_SWEEP_SECS` (default 300) the engine now lists the
+  workloads carrying this installation's labels, asks the datastore which of
+  their task ids are still non-terminal, and deletes the rest, counting
+  `scheduler_orphan_workloads_reaped_total`. Anything but near-zero in steady
+  state is worth alerting on: each increment is a scheduler that died between
+  creating a workload and finishing it.
+
+  **It is opt-in, and that is the whole design rather than caution.**
+  `dagron.dev/managed-by=dagron` says *some* dagron made a workload; it does not
+  say *which*. Two installations sharing one Kubernetes namespace both stamp it,
+  so a sweep scoped on that alone reads the other install's pods, fails to find
+  their task ids in its **own** database, concludes they are orphans, and
+  deletes running work belonging to someone else — absence and foreignness are
+  the same observation. A fifth label, `dagron.dev/installation`, distinguishes
+  them, and dagron cannot infer its value: a namespace can hold two installs,
+  one install can span namespaces, and a pod carries no pointer back to the
+  database that created it. So `DAGRON_INSTALLATION` is the operator's to set,
+  and without it the sweep does not run and says so at boot rather than leaving
+  a metric at zero for a reason nobody can see. The per-dispatch reap is
+  unaffected either way — it selects on a task id, which is a UUID and therefore
+  needs no scope.
+
+  An installation that will not express as a label contributes **no** label
+  rather than a truncated one. Truncation is the dangerous outcome:
+  `prod-eu-1-…` and `prod-eu-2-…` can share the 63-character prefix a
+  sanitiser would produce, and then one installation's sweep selects the other's
+  pods —
+  the exact deletion the label exists to prevent. Contributing nothing leaves a
+  workload unsweepable, which costs a leftover rather than live work.
+
+  **A selector says nothing about the labels it does not name.** It constrains
+  the ones it does — `managed-by=dagron` really is an equality check — but the
+  sweep selects on `managed-by` and `installation` and then reads `task-id` off
+  whatever comes back, and that third label is bound by nothing. A workload can
+  match the first two exactly while carrying a `task-id` that is empty, or holds
+  a slash, or runs to 200 characters.
+  Nothing dagron creates looks like that, because the labelling refuses to
+  label partially; a legacy install, another tool or a hand-edited manifest
+  can. That workload is the sweep's worst case rather than an odd one: an id no
+  row ever had matches no live row, the sweep acts on absence, and it gets
+  deleted. Reading a candidate out of its labels is now the single operation
+  allowed to refuse one — `ManagedWorkload::from_labels`, shared by both
+  backends so neither can drift — and a task id that could never have named a
+  row does not become a deletion candidate. It is the rule the stale-attempt
+  check already applied to `attempt`, applied to the identity the whole
+  judgement rests on rather than only to the tie-breaker. `run_id` and
+  `attempt` stay unvalidated on purpose: they exist for the operator reading
+  the log line, and a real orphan must not lose its cleanup over a field no
+  decision reads.
+
+  **A name addresses a slot; a uid addresses the occupant.** The sweep is
+  spread across time by construction — it lists, asks the datastore, then
+  deletes — and a name is not a promise that all three saw the same object.
+  Taking the name from the listing rather than re-deriving a selector closes
+  the easy half of that; the other half is that between the list and the
+  delete, a name can come to mean something else. Every dagron pod is named
+  `sched-<uuid4>`, so in practice nothing reuses one, but "our names happen to
+  be unguessable" is a convention, not a guarantee, and the sweep's whole
+  premise is deleting things nobody is watching. The Kubernetes delete now
+  carries the listed pod's uid as a **precondition**, which makes it a
+  compare-and-swap on identity: if the name resolves to a different object the
+  apiserver answers `409` and does nothing, and the sweep says so rather than
+  counting a reap. Docker needs no equivalent — a container id already is the
+  identity rather than a name for one — so its deletion stays id-based.
+
+  **Two races, closed two different ways.** The datastore and the apiserver
+  share no transaction, so the sweep lists workloads *before* asking which tasks
+  are live — anything it saw therefore predates the answer, and a task row is
+  always written before its workload is created, so "listed but not live" cannot
+  mean "its row had not been written yet". `DAGRON_ORPHAN_MIN_AGE_SECS` (default
+  600) covers what ordering does not: clock skew, replication lag, and a
+  workload whose creation timestamp is missing entirely, which counts as young
+  because the alternative is judging a workload whose age is unknown.
+
+  **The cap is on deletes, not candidates**, and that distinction was a bug
+  before it was a design note. Capping the candidate list starves: an apiserver
+  lists in a stable order, so a namespace whose first 200 workloads are
+  long-running and live would be re-examined identically every sweep and never
+  reach the leftovers behind them. Every candidate is asked about — the liveness
+  query is chunked rather than truncated — and only the acting is rationed.
+
+  **A datastore error skips the pass rather than failing the tick.** The sweep's
+  listing and its deletes were best-effort from the start; its liveness query
+  was not, and `?` there would have made an opt-in cleanup feature a new way for
+  a transient database blip to terminate the scheduler daemon — `main` returns
+  `run()`'s error straight out. One failed chunk now abandons the pass's deletes
+  entirely rather than acting on a **partial** live set, which is worse than
+  none: a task whose chunk never ran looks dead, and the whole sweep acts on
+  absence.
+
+  The seam is split in two — `Executor::list_orphan_candidates` and
+  `delete_workload`, both provided methods defaulting to no-ops — because only
+  the engine can answer the question in between. "Is this task still live?" is a
+  database query, and handing an `Executor` a connection pool would put schema
+  knowledge behind a trait anyone may implement. The local process pool inherits
+  the no-op correctly: its children die with it.
+
+- **`budget.external_cost` — a ceiling on external work that is arithmetic,
+  not a guess.** `budget: { external_cost: N }` refuses a run whose deferred
+  tasks add up to more than `N`, at creation, before one remote job is
+  submitted. Each deferred task declares what one submission is worth with
+  `defer: { cost: K }`, default `1` — so a spec that declares no unit costs
+  simply caps the number of submissions, and a spec that does gets a weighted
+  sum where the 200-node Spark job outweighs the one-row query.
+
+  `pool:` was the only bound on remote spend this build had, and it bounds the
+  wrong axis. It caps what is burning *simultaneously*; it says nothing about how
+  many jobs a run submits over its life, and those are different failures — one
+  exhausts the cluster now, the other arrives on the invoice.
+
+  The count is task **rows**, the same gang-aware count admission and
+  `budget.tasks` already use. A `gang: { size: 8 }` deferred task is one line in
+  the YAML and eight submissions, so it costs `8 × cost`; budgeting the page
+  would budget nothing. Refusal is at creation for the reason `budget.tasks` is:
+  after expansion the sum is exact, so the run never starts rather than dying
+  partway with cluster-hours already spent. Over the API it is a **400**, beside
+  the `budget.tasks` refusal, because the same submission is refused identically
+  forever.
+
+  **`RunBudget`'s doc comment used to say a spend budget would be "a promise with
+  no measurement behind it, which is worse than no field", and that still
+  stands** — this is not that field, and the distinction is the only reason it
+  could ship. `external_cost` sums numbers the *author* declared on their own
+  tasks. The engine never learns what a cost unit means; it is not dollars, not
+  GPU-hours, not anything dagron can verify. Exact arithmetic on a declaration,
+  never a measurement of spend.
+
+  Reconciling a vendor's actual invoice back to the run, workflow and team that
+  caused it is the separate capability, and `budget: { external_cost_attribution:
+  true }` is refused here with a signpost naming it. The flag is declared in the
+  open struct on purpose: `DagSpec` carries no `deny_unknown_fields`, so serde
+  would have silently dropped the key — a workflow written against a build that
+  has attribution would have validated clean, run, and accounted nothing. A
+  refusal is louder than a drop. The **ceiling** is not the gated part and will
+  not become one; a guardrail you set for yourself over compute you already pay
+  for prices nothing.
+
+- **The funnel has a destination.** Twelve gates across the product end with a
+  link to the README's "What this build does not do", and that section ended:
+  *"The seams exist so an implementation you write — or one someone else ships —
+  drops in without forking a file here. Nothing on this page depends on that
+  happening."* Every signpost in the product converted to self-building. There
+  was nothing to ask about and nobody to ask.
+
+  It now names the six capabilities that are actually gated — managed ingestion
+  connectors, the fleet plane, external dataset events, named connections for
+  external compute, KMS-wrapped envelope encryption, and managed artifact
+  transfer — each beside what this build does instead, and ends
+  with one thing to do. The call to action is an issue on the public repo rather
+  than an inbox: `PRODUCT.md` records `enterprise@dagron.dev` as the contact
+  *and* records that it still needs verifying before it is relied on, and
+  publishing an unverified address as the only route is worse than publishing
+  none.
+
+  **One destination, not four.** `docs/AI_WORKLOADS.md` carried a second section
+  under the identical heading, and `docs/DATASETS.md` and `docs/EXTERNAL_JOBS.md`
+  carried their own variants. Each keeps its page-local detail — the gang claimer,
+  the `produces:` fallback for external events, named connections — because that detail is
+  real and page-specific; what they no longer do is each be a terminus. All three
+  now route to the canonical section. `docs/HPC_AUTOPSY.md`'s "Limits — what this
+  does not do" is deliberately left alone: it is honest tool scope ("it does not
+  schedule anything", "it does not collect telemetry"), not a list of things that
+  ship elsewhere, and collapsing it into a commercial destination would misread
+  it.
+
+- **One test now holds every signpost to the same bar.** The eight anchor-linked
+  gates asserted mutually different subsets of it: `source.rs` checked the
+  fallback and the seam but not the anchor; `fleet.rs` and `link.rs` checked the
+  anchor and the fallback but not the seam; `dagron-crypto` checked only that the
+  gap was named; the engine's `403` was asserted by nothing at all. A funnel
+  whose steps each enforce a different rule is a funnel that leaks.
+
+  The test scans the source tree rather than exposing a helper the gates call,
+  because no such helper can reach them all — `dagron-crypto` has zero dagron
+  dependencies, `dagron-core` and `dagron-source` are *upstream* of
+  `dagron-engine`, and `dagron-api` never builds a `Seams`. One reader covers
+  every crate regardless of which way the arrows point.
+
+  Getting it to actually bite took three corrections, each found by injecting a
+  deliberately dead-end signpost rather than by reading the code:
+
+  1. A fixed character window around the anchor reaches into whatever code sits
+     nearby, and in a large file that almost always contains a marker — so the
+     check passed for a message that said nothing. The window is now the message
+     block: the run of consecutive non-blank lines the anchor sits in.
+  2. `"this build"` is the strongest signal of an alternative ("This build
+     streams with `SOURCE=stream`") and is *also* inside the gap phrase "not in
+     this build" — so matching it against the whole message made the check
+     vacuous. The gap phrase is removed before the alternative is looked for.
+  3. The match had to be case-insensitive, because the alternative is a new
+     sentence and starts with a capital.
+
+  The test is green on the tree and fails on an injected dead end; both
+  directions are verified rather than assumed.
+
+- **A deferred task's `produces:` now reaches the ledger, and `{{ ds }}` exists.**
+  Two small things that together are the difference between a partitioned
+  warehouse story that runs and one that does not.
+
+  `produces:` is a postcondition — "after this task succeeds, the dataset is
+  current" — and a deferred task succeeds in the reconcile sweep, not on the
+  worker-result path where the recorder lived. So `defer:` + `produces:` would
+  have validated, run, and recorded nothing, leaving every downstream sensor and
+  `on_datasets:` consumer parked forever. The sweep now records through the same
+  `record_produces` the worker result and the memoization cache hit already
+  share — a third path into one function rather than a second copy of it —
+  guarded on the resolve having actually landed, so a re-sweep that lost the race
+  cannot fabricate a second lineage row. The validation refusal that stood in for
+  this since the primitive landed is removed, and the `produces:` kind guard's
+  comment, which claimed the worker result was the only recording path, is
+  corrected rather than left quietly false.
+
+  The recorder needs the task's name; it now rides on the park row the sweep
+  already fetched, rather than costing a second query per resolved job.
+
+  **`{{ ds }}` and `{{ ds_nodash }}`** are the fire's logical date — `2026-09-14`
+  and `20260914` — bound wherever `scheduled_time` already was. They did not
+  exist, and their absence failed in a way that pointed nowhere near the cause:
+  `expand::substitute` leaves an unknown placeholder *verbatim*, so a URI written
+  `clickhouse://db/t/{{ ds }}` survived expansion with its braces intact and then
+  tripped `validate_dataset_uri`'s whitespace check — the workflow refused at
+  registration with an error about its URI rather than about a variable that is
+  not bound. Every partitioned-warehouse example in the ecosystem is written with
+  `ds`.
+
+  Bound through one helper rather than three inserts at each of the four fire
+  paths (cron, schedule, backfill, backfill jobs), because the derivation has to
+  agree across all of them: a backfill and a cron fire that partition by the same
+  expression must produce the same string, or they write to different partitions
+  of one table. `ds` is the UTC day of `scheduled_time`, matching the timestamp
+  beside it rather than any local calendar — a fire at 23:30 UTC-05:00 is the
+  15th, not the 14th. A timestamp that will not parse binds `scheduled_time` as
+  before and simply omits `ds`: a fire is never failed over a date format, and a
+  missing variable surfaces as the refusal it always was rather than as a quietly
+  wrong partition.
+
+  `examples/warehouse/` is the whole shape in runnable form — wait for a
+  partition, roll it up on a Spark cluster dagron does not own, announce the
+  partition that came out, gate the publish on a scalar check. A test validates
+  it the way `examples/templates/` is already validated: an example that stops
+  parsing is worse than no example, because it is a working shape a reader copies
+  and then debugs.
+
+  **Not included: the OpenLineage emitter.** The roadmap pairs this work with
+  emitting dataset facets on a terminal run event, but no such emitter exists in
+  the tree — that is building one, not wiring one, and it needs a new
+  `SELECT DISTINCT uri … WHERE run_id = ?` plus an index on `dataset_events`
+  (the only read path today is indexed on `uri`) or it is a full ledger scan on
+  the run-finalization hot path. Left for its own change rather than smuggled in
+  here.
+
+- **`dagron-step-spark` and `dagron-step-sql` — the two things that actually
+  submit.** `defer:` gave the engine somewhere to park a remote job; these are
+  what start one.
+
+  **`dagron-step-spark`** submits and prints `dagron::handle=<id>`. Three
+  backends: a `SparkApplication` CR (default — vendor-free, no account, and the
+  reference adapter), a generic `rest` POST whose body and handle path you
+  supply (one adapter for Databricks, EMR Serverless, Dataproc, Livy, Kyuubi),
+  and `spark-submit` as the honest escape hatch — which needs a version-matched
+  Spark distribution in the *task's* image, that being precisely the dependency
+  problem dagron positions against.
+
+  The job is named `dagron-<DAGRON_TASK_ID>-<DAGRON_EXTERNAL_EPOCH>`, and the
+  name is the idempotency: a retry after a crash reuses it, the cluster answers
+  AlreadyExists, and the step **adopts** the running job rather than starting a
+  second one. Adoption is conditional on the found job being non-terminal —
+  adopting a finished job would park the task on a corpse it can never leave. On
+  the k8s backend that guarantee is the API's own semantics rather than anything
+  dagron invented; on `rest` the same name goes wherever the vendor takes an
+  idempotency token.
+
+  Naming a vendor as the backend (`SPARK_BACKEND=livy`) is refused with a pointer
+  at `rest`, where it already works, rather than silently accepted. A named
+  backend per vendor is a permanent maintenance surface for a request shape the
+  author can already write.
+
+  **`dagron-step-sql`** runs one statement against one store. Named after what
+  people search for — clickhouse, starrocks, doris, trino, postgres, redshift,
+  mysql — and implemented against what actually varies: three wire protocols.
+  Maintenance is bounded by protocol count, not vendor count, which is the
+  conclusion Airflow reached the expensive way when it deprecated
+  `SnowflakeOperator`, `BigQueryExecuteQueryOperator`, `PostgresOperator` and
+  `TrinoOperator` in favour of one generic operator plus a connection.
+
+  **Its output contract is the reason to use it over a `clickhouse-client`
+  one-liner**, which the docs already tell people works. The engine appends every
+  stdout line to the task's `output` column with `output = COALESCE(output,'') ||
+  ?` and **no cap anywhere on that path**, so `SELECT *` to stdout is an
+  unbounded write into the datastore. Therefore rows never go to stdout: `exec`
+  keeps nothing, `scalar` writes one value bounded to 1 KiB (so a downstream
+  `when:` can gate on it), and `rows` writes NDJSON into `$DAGRON_ARTIFACTS`.
+  `SQL_MAX_ROWS` / `SQL_MAX_BYTES` are enforced **while fetching**, before the
+  first byte lands — a check applied after the write is a report, not a budget,
+  and failing the task afterwards does not unwrite anything. `rows` mode
+  **refuses** when `$DAGRON_ARTIFACTS` is unset rather than falling back, because
+  both fallbacks are wrong: stdout is the unbounded write, and the container's
+  filesystem disappears with the task.
+
+  The password goes in `SQL_PASSWORD`, never the DSN, and a DSN carrying an
+  inline credential is refused with the fix named. `Redactor::DEFAULT_PATTERNS`
+  matches task env vars by *name*, so `SQL_DSN=clickhouse://user:pw@host` is
+  masked in no log line and no error message; a separately-named variable the
+  patterns already catch is the difference between redacted everywhere and
+  redacted nowhere. (The redactor's four-character minimum still applies: a
+  shorter password is masked by nothing, here or anywhere.)
+
+  Neither crate depends on `dagron-core`, whose `default = ["sqlite"]` would link
+  a bundled SQLite into every task image running either step — in step-sql's case
+  a *second*, conflicting database. step-sql takes `sqlx` directly instead, the
+  same reasoning that keeps `dagron-gitops` out of the workspace build. The cost
+  is a dozen duplicated lines of dotted-path lookup in step-spark, recorded where
+  it happens.
+
+  Both default to a lean backend set and both **images** carry every backend: a
+  source build vendoring the binary should not be made to carry a Kubernetes
+  client or a wire driver it will never speak, while one image that submits
+  anywhere beats three a user has to choose between. CI compiles and tests the
+  non-default features explicitly, the reason the `mqtt` leg exists — and that
+  leg immediately earned itself by catching a dead import that `-D warnings`
+  would have failed on.
+
+- **Cancelling a run now reaches the cluster.** It was pure SQL: flip the rows
+  terminal, clear the leases, return 200. Nothing touched the system actually
+  running the work, so for a deferred task "we cancelled your run" meant "we
+  stopped watching your cluster bill" — and `cancel_run`, `cancel_overdue_runs`
+  and the API's own inlined SQL all had the same hole.
+
+  A terminated task that still holds an `external_handle` now **owes a
+  teardown**, and a sweep settles it through `ExternalPoller::cancel`.
+
+  The debt is row state rather than something the cancel stamps, which is the
+  design decision the rest follows from. The cancel path most callers actually
+  use is inlined SQL in `dagron-api` — a binary that by design cannot depend on
+  the engine crate and holds no `Seams` — so a teardown the cancel *performed*
+  would be one the SDK and the MCP server never triggered. A cancel that merely
+  leaves evidence is one every caller performs for free.
+
+  The predicate is per task, not per run: holds a handle, is not parked. Per-run
+  is wrong twice over — the happy-path finalizer would issue a redundant vendor
+  cancel for every completed job, and a cancelled gang leaves its run `running`
+  so those rows would never sweep at all. A job that finished by itself owes
+  nothing, because resolving or failing it already cleared the handle.
+
+  **It is best-effort, and now says so out loud.** A job we cannot reach is a job
+  we cannot stop, so teardown gives up after three failed attempts or an hour
+  from the task going terminal, whichever comes first — and when it does, the
+  handle is cleared, `scheduler_external_orphans_total` increments, and a warning
+  names the kind and the handle so it can be stopped by hand. That counter is the
+  feature: the alternative to a visible leak is a silent one.
+
+  `gc_old_runs` will no longer collect a run that still owes a teardown, for the
+  same reason — deleting it drops the only record of a job running on someone
+  else's cluster. The debt settles itself inside the give-up window, so
+  collection is deferred by that and no longer.
+
+  An engine with no poller for a kind hands the row back **without** consuming an
+  attempt: a `RUNNER_CLASSES` pool runs the same binary with different seams, so
+  a replica that cannot do the work must not exhaust the budget of the one that
+  can. The wall-clock bound is what makes teardown terminate regardless of fleet
+  shape — the attempt budget alone would not.
+
+  The sweep is a lease claim every replica runs, not a leader-gated loop:
+  leadership gates only the ops loops, and vendor-side idempotency would bound
+  correctness but not call volume. Teardowns are issued concurrently with the
+  batch bounded, so a vendor that is timing out cannot hold the reconcile tick.
+
+  Note the built-in `defer.http` transport is a GET: it can tell you a job
+  finished, it cannot stop one, so a `defer.http` job whose run is cancelled is
+  orphaned rather than torn down. Registering an `ExternalPoller` whose `cancel`
+  issues the vendor's own call is what turns that into a real teardown.
+
+  **No `cancelling` run status**, deliberately. It is a wire-compatibility break
+  for every shipped SDK — both pin `TERMINAL_RUN_STATUSES` to
+  `{succeeded, failed, cancelled}`, so a pinned client would poll forever — plus
+  a SQLite `CHECK` rebuild of `workflow_runs` that, because `task_runs.run_id`
+  references it, would force dropping and restoring `task_runs` and
+  `task_dependencies` too. The teardown ships inside the existing terminal
+  transition instead.
+
+  One thing checked rather than assumed: a worker whose task is cancelled
+  mid-flight cannot resurrect the row and lose the handle. `cancel_run` does not
+  bump `version`, but it does NULL `claimed_by`, and that is the guard
+  `mark_task_succeeded` actually fences on — so the late result is rejected. A
+  test pins it, because the whole teardown design rests on a cancelled row
+  staying cancelled.
+
+- **`defer.http` — one adapter, and no vendor code in dagron.** A deferred task
+  can now name a status endpoint and two predicates, and the engine polls it to
+  a verdict. That single transport reaches Databricks (`runs/get`), EMR
+  Serverless (`GetJobRun`), Dataproc (`batches.get`), Livy, Kyuubi, YARN and a
+  SparkApplication CR, because every one of them answers "is it done?" with a
+  JSON document containing a state field. The consequence is the point: a vendor
+  API change is a YAML edit by the person it affects, on their schedule, rather
+  than a dagron release on ours.
+
+  ```yaml
+  defer:
+    kind: databricks
+    http:
+      url: "https://dbc.example.com/api/2.1/jobs/runs/get?run_id={{ handle }}"
+      headers: [{ name: Authorization, value_from: { secret: DATABRICKS_TOKEN } }]
+      succeed_when: "state.result_state == SUCCESS"
+      fail_when:    "state.result_state in [FAILED, TIMEDOUT, CANCELED]"
+      error_from:   "state.state_message"
+  ```
+
+  The grammar is `path == V`, `path != V`, `path in [A, B]` over dotted paths
+  that walk objects and arrays alike. Deliberately not expressible: wildcards,
+  filters, recursive descent, arithmetic, boolean connectives — each is a step
+  toward a query language nobody asked this project to maintain, and a response
+  that needs one needs a step binary, which is a seam that already exists. It is
+  also hand-written rather than a JSONPath dependency: `jsonpath-rust` is in
+  `Cargo.lock` already, but only through `kube` behind the non-default
+  `kubernetes` feature, so depending on it would pull it and `pest` into every
+  build including the armv7 release leg — to evaluate a dotted path and a
+  comparison.
+
+  **Everything is parsed at submit.** A typo in `succeed_when` is otherwise a
+  workflow that validates cleanly, starts a six-hour job, and only then discovers
+  it cannot read the answer — the most expensive possible moment to find a typo.
+
+  Three decisions worth stating, because each is the safe side of a coin flip
+  that costs a job when called wrong:
+
+  - **A missing path is `false` for every form, `!=` included.** A vendor that
+    has not written `state.result_state` yet is not a vendor reporting failure.
+    Absent means undecided; the next poll costs seconds and a wrong verdict costs
+    the job.
+  - **`fail_when` is evaluated before `succeed_when`.** If an author's predicates
+    overlap, one is wrong — and the mistakes are not equal. A false failure costs
+    a retry; a false success advances every dependent on a job that produced
+    nothing. The overlap is logged rather than silently resolved.
+  - **A non-2xx, an unparseable body, a reset connection or a timeout is not a
+    verdict.** All re-park. Failing a healthy six-hour job because its vendor
+    answered 503 once is the outcome the three-state `Verdict` exists to prevent.
+
+- **The external-poll sweep claims its rows.** It listed them before, which is
+  the shape the `wait.url` sweep has — and that shape gets away with it only
+  because nobody runs hundreds of HTTP sensors. This is the feature whose selling
+  point is hundreds of parked jobs, and every scheduler sweeps, so an unclaimed
+  read meant N schedulers calling the vendor N times for one job. The claim is a
+  CAS on `next_poll_at` (the shape `claim_due_dataset_triggers` already uses on
+  its cursor), and it doubles as the crash bound: a scheduler that dies
+  mid-request leaves the row due again at the claim's expiry, so there is nothing
+  separate to expire and nothing to reap. The guard is null-safe (`IS` on SQLite,
+  `IS NOT DISTINCT FROM` on Postgres) because a row parked with no interval
+  carries `next_poll_at IS NULL`, and an `=` guard would make exactly those rows
+  unclaimable forever, silently, by every scheduler.
+
+- **The poller's network policy is the inverse of `wait.url`'s, deliberately.**
+  `WAIT_URL_DENY_PRIVATE` is off by default, which is right for an
+  unauthenticated readiness probe whose main use is an in-cluster address. It is
+  wrong for a poll that carries a **bearer token**: the same permissiveness lets
+  a workflow author aim an operator's credential at any address the scheduler can
+  reach, `169.254.169.254` included. So `defer.http` gets its own client with
+  `DEFER_HTTP_DENY_PRIVATE` **on** unless disabled, and `DEFER_HTTP_ALLOW_HOSTS`
+  as the one-line, deliberate way to poll an in-cluster endpoint. The filter
+  lives inside the resolver (so the addresses checked are the addresses dialled
+  and a DNS rebind has no window) and redirects stay refused.
+
+  Credentials resolve per run per sweep — two DB queries and an AES-GCM decrypt,
+  shared across a batch of jobs against one workspace, and re-resolved next tick
+  so a rotation lands without a restart. The redactor is built from the
+  *resolved* headers, so the token is masked out of anything the poller writes
+  back to the task, including a vendor error envelope that echoes `Authorization`
+  straight back. Whatever `error_from` extracts is truncated before it reaches
+  `output`, because nothing on that write path caps it.
+
+  `wait: { url: … }` is untouched: still off-by-default, still no credentials on
+  that field, still byte-identical.
+
+- **`dagron-state` exists, and this is the first release note that says so.** The
+  crate has been a workspace member, mirrored to the public repo, mounted at
+  `/api/state`, and shipping a `dagron-state` binary and a companion doc
+  (`docs/STATE_PLAN_USECASES.md`) — while appearing **zero** times in this
+  changelog across every release. A component nobody was told about is a
+  component nobody uses, and its whole premise is that someone who already runs
+  dagron can adopt it in an afternoon.
+
+  What it does: turns a backfill planner's **state plan** — the minimal,
+  topologically ordered set of SQL models a change requires rebuilding — into a
+  dagron run graph, and submits it. The planner answers "given this SQL change,
+  what actually needs rebuilding?" and stays a library with no binary and no
+  service so any orchestrator can embed it; this crate is the other half, for
+  the orchestrator that happens to be dagron.
+
+  Five mount-relative routes under `/api/state`: `contract` (the wire revision
+  this build reads), `plans` (compile a plan to workflow YAML, submitting
+  nothing), `plans/explain` (why each model rebuilds — summary, rows, markdown,
+  Mermaid), and `plans/submit`. Only the last one creates anything, which is the
+  point of having the first four: `dagron-state explain plan.json` touches no
+  network, no database and no running engine.
+
+  Two boundaries carry the design and neither is a linker edge — the planner
+  reaches it as JSON on a frozen contract, and it reaches its host through one
+  trait. That is what lets the component move without moving dagron, and why
+  `MOUNT_PREFIX` is exported rather than written down twice.
+
+- **`defer:` — a task can hand its work to a system dagron does not own, hold no
+  worker while that work runs, and re-attach to it after the engine dies.** A
+  task that runs a six-hour Spark job by blocking on `spark-submit` holds a
+  worker slot for six hours. That is affordable once and ruinous at a few
+  hundred — and it puts the job's fate in one process: kill the engine and the
+  job is orphaned, while the row is reclaimed by lease recovery and **submitted
+  again**.
+
+  `defer:` splits the two things that were conflated. The task's `command` is the
+  *submit*, and nothing else; the job is a row. The command runs exactly as any
+  command task does — lease, `max_attempts`, `timeout_secs`, fault
+  classification — and on success prints `dagron::handle=<id>`. The engine then
+  parks the row: claim dropped, lease NULLed, `status` still `running`, the
+  handle on the row. A reconcile sweep polls it to a verdict.
+
+  **The NULL lease is the whole crash-recovery argument, and it is a property
+  rather than an intention.** `recover_expired_leases` reclaims rows `WHERE
+  lease_expires_at IS NOT NULL`, so a parked row is provably outside the set
+  that sweep can touch. Kill every scheduler mid-job: the row is untouched, and
+  any replica's next sweep resumes the poll, because the handle is durable state
+  rather than an in-memory registration. Nothing resubmits, because nothing
+  re-ran. A test asserts exactly that sequence.
+
+  Three timeouts now mean three different things, which is the point of the
+  split: `timeout_secs` bounds the submit, `defer.max_wait_secs` bounds the
+  remote job, `run_timeout_secs` bounds the run. Conflating the first two is the
+  mistake this prevents — the executor's 25-second default is right for a submit
+  and absurd for a Spark run.
+
+  **Adoption after the one genuinely dangerous window.** If the engine dies
+  *after* the remote system accepted the job but *before* the park committed, a
+  naive retry starts a second cluster. So the engine injects `DAGRON_TASK_ID`
+  and `DAGRON_EXTERNAL_EPOCH`, and a step names its remote job
+  `dagron-<task_id>-<epoch>`: the task id is stable across lease recovery, so
+  the retried submit reuses the name, the remote system answers AlreadyExists,
+  and the step adopts the running job. `attempt` cannot serve this — it
+  increments on every claim *including* recovery, so a name built from it
+  changes at exactly the moment adoption is needed. The epoch is bumped only
+  where a row that already submitted is deliberately re-armed for a fresh job (a
+  resolved remote failure, `rerun_from_failed`, clearing a task with its
+  downstream), so a retry gets a new job while a recovery adopts the old one.
+
+  **`pool:` means something different for a deferred task, deliberately.** The
+  four existing park shapes wait on something free — a timer, an endpoint, a
+  dataset cursor, a child run — and release their pool slot. A deferred row
+  waits on a job burning someone's cluster the entire time, and keeps its slot.
+  Releasing it would make `POOLS=spark:4` cap *submissions*, which take seconds
+  and bound nothing; keeping it makes the same setting mean "at most four
+  concurrent Spark jobs", which is the only bound on remote spend the open build
+  has.
+
+  A submit that exits 0 but prints no handle is a **failure**. Succeeding it
+  would advance dependents on work that has not happened.
+
+  Backends register through a new `ExternalPoller` seam on
+  `dagron_engine::Seams`, returning `Result<Option<Verdict>>` — the same shape as
+  `SourceFactory::build`. The `Result` arm is load-bearing rather than
+  decorative: three verdicts (`Running` / `Succeeded` / `Failed`) describe the
+  job, while a transport failure describes nothing about it and re-parks. Forced
+  into a verdict, a 429 either kills a healthy job or gets swallowed. A
+  `defer.kind` no poller owns leaves its rows parked with one warning per kind,
+  because an engine rebuilt without the backend that owns a running job should
+  not tear that job's task down on the next tick.
+
+  Validation refuses what would park a row nothing can resolve: `repeat` (two
+  loop operators that disagree about what ends the loop), `gang` (N members
+  parking on N jobs leaves no all-or-nothing), the command-less task kinds, and
+  `defer:` on a `template:` call, which was a real silent drop:
+  expansion reads `defer` off the template's leaf, so a deferral written on the
+  call vanished and left a task that submitted and succeeded immediately, which
+  reads as working.
+
+  `defer.connection:` — a named, access-controlled endpoint registry — is
+  declared in the open struct and refused at validation with a signpost naming
+  the open path. Declared rather than left unknown on purpose: `DagSpec` carries
+  no `deny_unknown_fields`, so serde silently drops an unrecognised key, and a
+  workflow written against a build that has connections would otherwise validate
+  clean here, run, and submit with whatever the task's own env happened to
+  carry, with no diagnostic anywhere.
+
+  See [`docs/EXTERNAL_JOBS.md`](docs/EXTERNAL_JOBS.md). **Upgrade note:** a
+  scheduler predating this release silently ignores `defer:` and succeeds the
+  task while the job runs — roll schedulers before publishing `defer:` specs.
+
+### Security
+- **The read-only `viewer` role is enforced in every build, not just enterprise.** A viewer is
+  refused every mutation — `403 {"error": "viewer role is read-only"}` — by middleware, before
+  the request reaches a handler. `GET` is untouched, and so are `POST /api/login` / `/logout`:
+  a viewer who cannot sign in cannot read either.
+
+  It was gated on `--features enterprise`, which meant a role whose entire definition is
+  "read-only" silently granted writes in the open build. The console only offers the role in
+  the enterprise build, but that was never the whole story: `POST /api/users` accepts
+  `groups: ["viewer"]` in **both**, and an instance downgraded from enterprise keeps the
+  viewers it already had — who would quietly regain the ability to create, edit, run and
+  retire workflows. That is a security bug, not a feature boundary.
+
+  The predicate, the set of paths it applies to, and the refusal now live in `auth.rs` and are
+  shared: the open build enforces the role, the enterprise build enforces it *and* audits, off
+  one definition, so the two cannot drift on what counts as a mutation.
+
+  **Behaviour change for enterprise:** that refusal was a plain-text body and is now the
+  documented JSON envelope, matching every other error the API returns.
+
+  Operators — users with *no* groups — are deliberately untouched: authoring workflows is that
+  role's whole purpose. Per-team ownership, so one operator cannot edit another team's
+  workflows, remains its own change.
+- **Deleting a workflow now requires the `admin` group** (`403` otherwise) —
+  `DELETE /api/workflows/{id}`. It was open to any authenticated session, including the
+  console's "operator" role, which is a user with *no* groups. Delete is the one irreversible
+  control action here and it cascades to the workflow's schedules, so an operator who only
+  wanted to stop a workflow and reached for it lost the schedules too.
+
+  `POST /api/workflows/{id}/state` with `retired` is **not** gated and is the path that was
+  always recommended over delete (`docs/API.md`): it stops the workflow running and keeps its
+  schedules. Creating and editing a workflow are not gated either — those are an operator's
+  job, and a bad edit is recoverable from `/versions`. The `403` body names `state: retired`
+  so the refusal points at the action the caller probably wanted.
+
+  **Breaking** for a deployment where non-admins delete workflows; the same recovery as the
+  repository gate below (an admin grants the group, or `DAGRON_ADMIN_EMAIL` +
+  `DAGRON_ADMIN_PASSWORD` seed one). A `viewer` is refused this and every other mutation by the
+  read-only gate (see the entry above), in both builds.
+- **Connecting a repository, disconnecting one, and setting or clearing its credential now
+  require the `admin` group** (`403` otherwise) — `POST`/`DELETE /api/git-repos` and
+  `PUT`/`DELETE /api/git-repos/{id}/auth`. Until now any authenticated session could do all
+  three. A connected repository is an authority over workflows, not a preference: the worker
+  clones whatever `url` holds and writes the workflows it finds, and with the `prune` flag
+  added in this same release it also *retires* the ones whose file is gone — so connecting a
+  repository was a way for any account to create and remove workflows. The credential is an
+  instance-held secret the caller can never read back.
+
+  **Breaking** for a deployment whose operators are not in `admin`: the console hides those
+  controls and the API refuses them. The group is granted by an admin through
+  `POST /api/users` / the users page, or seeded at startup from `DAGRON_ADMIN_EMAIL` +
+  `DAGRON_ADMIN_PASSWORD` (idempotent — an existing email is left untouched). An instance
+  with no admin at all was already unable to manage users, which is the same recovery path.
+
+  Deliberately **not** gated: listing repositories, which is what the console renders, and
+  `POST /api/git-repos/{id}/sync`, which only asks for the poll `auto_sync` already performs
+  on a timer. Deleting a *workflow* was a separate surface, left to its own change — the entry
+  above, which gates it too, so nothing in this release leaves it open.
+
+### Fixed
+- **A failed dead-letter redrive no longer loses the dead letter.** Both redrive routes
+  deleted the row as their claim and committed that before creating the run.
+  `dagron-api`'s `POST /api/dead-letters/{id}/redrive` then lost the payload, with its
+  `error`, `source`, `failures` and timestamps, on any refusal after the claim: an unknown
+  environment (`400`), the workflow's `max_active_runs` cap (`429`), a datastore error
+  (`500`). A retry answered `404`. The engine's `POST /dead-letters/{id}/redrive` re-parked
+  its two capacity refusals (`503`/`507`) under a new id, with the refusal as the error and
+  fresh timestamps, and lost the payload to a log line on any other failure. Both now
+  commit the run and the delete in one transaction (`db::create_run_from_dead_letter`, both
+  backends): a failed redrive leaves the row exactly as it was, and the same id can be
+  redriven once the cause is fixed. Concurrent redrives of one id still make at most one
+  run. The engine's `503`/`507` keep their codes and `dead_letter_id`, which is now the id
+  that was sent. `docs/API.md` had described the engine's re-park for the `dagron-api`
+  route too, which never did it.
+- **No `ssh://` repository could sync under the chart.** The chart ran the gitops worker as
+  uid 65532 while the image defines uid 10001, and OpenSSH refuses to run for a uid with no
+  passwd entry (`No user exists for uid 65532`), so only https repositories could work. The
+  chart now uses 10001, as the engine and operator charts already did, which also fixes
+  anyone on the published image. Found by running the worker in its container for the first
+  time: `loadtest/deploy/gitops-e2e/` (dagron + the worker + a real sshd on kind) is the
+  suite that now covers it, and it also records, as known gaps, that any authenticated user
+  can connect a repo and delete a workflow.
+- **`sync-to-git` opened its PR where the pull loop was not looking.** The file went
+  to `dags/` while a connected repo watches `dagron/` by default, so a merged PR never
+  fed back. With `GIT_PATH_PREFIX` unset the prefix is now the connected repo's `path`
+  (env still overrides; `dags/` when no connected repo matches `GIT_REPO`).
+- **Polling the in-cluster Kubernetes API needed a setting no doc named.** The
+  poller rejected the apiserver's cluster-CA certificate until the engine had
+  `SSL_CERT_FILE=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` alongside
+  `DEFER_HTTP_ALLOW_HOSTS`; only the second was documented. Also documented:
+  `POOLS` is per-scheduler, so keep it identical through a rolling update.
+- **`repeat:` on a `template:` call is refused instead of silently dropped.**
+  A call is replaced by the template's tasks during expansion and the call's own
+  fields go with it, so the loop never reached a row anything evaluates: the
+  workflow submitted cleanly, ran its body exactly once, and said nothing — the
+  failure mode that reads as a working workflow. Nothing downstream could catch
+  it either, since post-expansion validation only sees leaves, by which point
+  the field is gone.
+
+  Now an error at expansion, beside the identical guard `defer:` already had,
+  and it names the way out (`with_items:` on the call, or the loop on the
+  template's own task). `dag.rs` already refused `repeat` on an approval gate
+  and a wait sensor for exactly this reason; the call was the gap.
+- **`dagron-step-sql`'s two transports disagreed about what a scalar costs.**
+  The HTTP path admits its scalar line against the budget, because it arrives
+  through the same `for_each_line` reader as any other row; the wire path never
+  charged one. The same statement therefore spent a row over ClickHouse and
+  nothing over Postgres or MySQL, which makes `SQL_MAX_ROWS` mean something
+  slightly different per transport. Charged on both now.
+
+  **The two transports also bound memory at different granularities**, which the
+  docs now state rather than imply. The HTTP path sees raw bytes, so
+  `Budget::check_pending` can refuse part-way through a row. The wire path gets
+  a row already decoded by sqlx, so one row is the smallest thing it can refuse
+  and a single enormous cell is resident before the budget is consulted. One row
+  rather than the whole result is a real guarantee — it is just not the same
+  one, and "resident memory is one row plus one chunk" read as though it were.
+
+  **And `docs/dockerhub/dagron-step-sql.md` still carried the old caveat** —
+  "what it does *not* bound is the read" — which the streaming change left
+  behind. That page is the Docker Hub description, so it was the copy most
+  likely to be read by someone deciding whether to use the image, and it
+  described a limitation that no longer exists.
+
+- **A `defer.http` poll could send one vendor's credential to another vendor.**
+  The sweep caches resolved headers so a batch of parked jobs does not re-run
+  two queries and an AES-GCM decrypt per row. It keyed that cache on `run_id`
+  alone — but `defer.http.headers` is a property of the **task**, not the run.
+  A run with two deferred tasks aimed at two systems resolved the first task's
+  headers and then handed them to the second: vendor A's bearer token sent to
+  vendor B's status endpoint, and the wrong principal authenticated even where
+  nothing leaked.
+
+  The key is now the run **and** the unresolved header block — the spec as
+  authored, `value_from` references still unresolved, so the key itself never
+  holds a plaintext credential. Two tasks naming the same secret still share one
+  resolution, which is the whole point of the cache; two naming different ones
+  never do. A spec that will not serialise is not cached rather than sharing a
+  degenerate key: resolving twice costs two queries, sharing costs a credential.
+
+- **A stale attempt could delete the live pod or container that replaced it.**
+  The predecessor reap skipped only the attempt *equal* to its own, so anything
+  carrying a different attempt was reaped — including a **higher** one. A
+  scheduler that stalls between claiming a row and creating the workload can
+  resume after its lease expired and another replica claimed the row, so attempt
+  1 reaches the reaper while attempt 2 is already running. It then deleted
+  attempt 2's live workload and started duplicate work: precisely the fence
+  violation these labels were added to prevent.
+
+  Both executors now share one predicate, `is_stale_attempt`, and only a
+  **strictly lower** attempt is reapable. A missing or unparseable label is left
+  alone on the same principle — a workload that cannot prove it is stale is not
+  deleted, because an orphan that survives is a job for a fleet-wide sweep while
+  a live pod deleted on a guess is work already lost. The comparison is numeric,
+  so `"10"` is not stale against `9`.
+
+- **Predecessor cleanup had no aggregate deadline, so dispatch delay grew with
+  the mess.** Each removal was bounded at 10 s, and per-call timeouts do not
+  compose: N leftovers against a wedged dockerd or an unresponsive apiserver
+  delayed workload creation by N × 10 s. `ctx.timeout_secs` does not cover this
+  — it starts later, at the wait and log collection. The whole reap, list and
+  removals together, now runs inside one 20 s budget, after which dispatch
+  proceeds: cleanup is best-effort by design, and refusing to start because a
+  leftover would not die turns a cleanup failure into an outage.
+
+- **The `defer.http` poller buffered an unbounded status body.** `resp.text()`
+  read whatever the endpoint sent before anything could look at it; the existing
+  512-byte truncation bounded the *log line*, not the memory. A deadline is not
+  a size bound either — an endpoint that streams steadily sends gigabytes inside
+  15 seconds. And this poller runs in the **scheduler**, so an oversized body
+  exhausts the control plane and stops every parked job in the fleet rather than
+  failing the one task that asked. The body is now counted as it arrives and
+  refused past 256 KiB, with `Content-Length` given no authority: it is the
+  sender's claim about a body it has not finished writing.
+
+- **A registered `ExternalPoller` could stall the reconcile loop forever.** The
+  trait carries no timeout contract and the sweep awaits each row before the
+  next, so an implementation that blocks did not delay one job — it stopped
+  every lease, deadline and schedule the loop drives. A seam whose worst case
+  takes down the scheduler is not a seam anyone can safely implement. Each call
+  is now bounded at 30 s, and expiry is deliberately **not** a verdict: it
+  becomes the `Err` the sweep already treats as "no answer" and re-parks, so a
+  slow vendor still cannot fail a six-hour job.
+
+- **`SQL_MODE=scalar` printed the first of several rows as if it were the
+  answer.** Both transports stopped at row one — which is what bounds memory,
+  and was also what let a two-row result drive a downstream `when:` on whichever
+  row the store happened to send first, under an ordering the statement never
+  declared. Both now read **two** rows: the answer, and one more to prove there
+  was no second. The read stays bounded at two rows rather than the result set,
+  and the refusal names `LIMIT 1` and `SQL_MODE=rows`.
+
+- **`SPARK_WAIT=inline` did not wait on a standalone master.** `inline` promises
+  the task holds its worker until the job finishes, and `spark-submit
+  --deploy-mode cluster` honours that on YARN and Kubernetes, whose
+  `waitAppCompletion` properties default to true. Standalone's defaults to
+  **false**, so the CLI returned as soon as the master accepted the driver and
+  the task succeeded against a job that had not run — releasing every dependent
+  against work still in flight, which is the exact failure the `inline` refusal
+  on `k8s` and `rest` exists to prevent, arriving through the one backend where
+  `inline` is legal. The step now sets
+  `spark.standalone.submit.waitAppCompletion=true` for inline submits, and
+  **refuses** a `SPARK_CONF_*` override that would cancel it. Anything that is
+  not literally `true` counts, because Spark reads it as a boolean and a typo is
+  a `false`.
+
+- **Three documentation claims that were true of one backend and written as
+  though true of all.** [`EXTERNAL_JOBS.md`](docs/EXTERNAL_JOBS.md) said the
+  generated job name "is the idempotency" and that a crash-retry adopts the
+  running job, with no backend named — but `AlreadyExists` is the apiserver's
+  guarantee and applies to `k8s` only. On `rest` the retry submits a second job
+  unless `{{ name }}` lands in the vendor's own idempotency field, and on
+  `spark-submit` `--name` is a label and a retry starts a second application.
+  The per-backend table the crate README already carried is now in the doc too.
+  The same page called `k8s` the default without saying that a default-features
+  source build links no Kubernetes client and refuses it. `dagron-step-spark`'s
+  README claimed the binary "never waits", which `SPARK_WAIT=inline` has always
+  contradicted.
+
+- **`dagron-step-sql`'s result budget now bounds the read, not only the write.**
+  It was called before each row was written, so an over-budget statement wrote
+  nothing to the task's `output` column or its artifact — that guarantee held.
+  What it did not do was bound memory, because both transports materialised the
+  whole result set before the budget saw a row: `resp.text()` on the HTTP path,
+  `fetch_all` on the wire path. So `SELECT * FROM huge_table` OOM-killed the
+  process before the refusal naming `SQL_MAX_ROWS` could print, and the operator
+  got an exit code with no explanation — the failure mode the budget exists to
+  replace, arriving by another route.
+
+  Both transports stream now. The HTTP path reads `bytes_stream()` and parses
+  NDJSON incrementally, admitting each line as it completes; the wire path uses
+  `fetch` rather than `fetch_all` and admits each row as sqlx yields it. The
+  first refusal drops the stream, so an over-budget result stops arriving rather
+  than being read in full and rejected afterwards. Resident memory is one row
+  plus one chunk, whatever `SQL_MAX_BYTES` is set to. `exec` reads no body at
+  all beyond a bounded error snippet, and `scalar` stops after the first line.
+
+  **"Admit each row as it arrives" is not on its own a bound**, and assuming it
+  was would have shipped the same bug with better prose: a store answering with
+  one enormous row completes no row, so nothing is ever admitted and the line
+  buffer grows without a check. `Budget::check_pending` refuses a row that is
+  still arriving once the bytes already read exceed what the budget could admit.
+
+  **Streaming the read does not weaken the write.** Writing rows out as they are
+  admitted would leave a truncated artifact behind on a refusal — "cleaned up
+  afterwards", which is exactly what this contract rejects. So `rows` mode
+  writes to a hidden sibling temp file and renames it into place only once the
+  whole result has been admitted; every error path, a budget refusal included,
+  drops the temp file instead. An over-budget statement still leaves nothing at
+  the artifact path.
+
+  The cost is `reqwest`'s `stream` feature and a `futures-util` dependency. The
+  lockfile is refreshed in the same commit, and the churn is one line: the
+  `futures-util` edge on this crate. `stream` pulls `tokio-util`, which the lock
+  already carried from another member's reqwest features, and `futures-util`
+  takes the default feature set `dagron-executor` already resolved. Both are
+  well under the declared 1.88 MSRV, so the `--locked` legs — build, test,
+  clippy in both feature worlds, and the MSRV check — all still hold.
+
+  **Measured against live stores**, which is what the finding was deferred for.
+  A 50k-row / 206 MB result written to an artifact: peak RSS **415 MB → 11.9 MB**
+  on the Postgres wire, **405 MB → 13.6 MB** over HTTP. Refusing a 50-row budget
+  on that same table cost 219 MB and read the whole result first; it now costs
+  11.5 MB and 0.10 s. Against an *unbounded* `SELECT *` over HTTP the old client
+  was still reading — RSS climbing, refusal unprintable — 25 s in; the streaming
+  client exits in 0.33 s with `SQL_MAX_ROWS (50)` named, having pulled one chunk
+  before hanging up on the store. In every refusal the artifact directory is left
+  empty: no result, and no partial file.
+
+  Raised on review of this release and deferred there, because a dependency
+  change could not be integration-tested against a live store in that session.
+
+- **The lease never bounded concurrent execution under `kubernetes` or `docker`.**
+  `ARCHITECTURE.md` claimed it did. What a lease actually bounds is who may mutate
+  `task_runs` — and a pod or container outlives the scheduler that created it.
+  Both backends named their workload `sched-<random uuid>` and kept that name
+  **only on the stack of the `execute()` call that made it**, so:
+
+  - an expired lease let a second scheduler create a *second* pod running the
+    same command beside the first, with nothing connecting either to the task; and
+  - a scheduler crash left its pod unreachable forever — no label, no derivation,
+    nothing to select on. It ran to completion, or indefinitely if the command
+    never exits, and no sweep could have found it.
+
+  `ExecContext` now carries a `TaskIdentity` (`task_id`, `run_id`, `attempt`),
+  both backends label every workload with it (`dagron.dev/task-id`,
+  `dagron.dev/run-id`, `dagron.dev/attempt`, `dagron.dev/managed-by`), and **a
+  dispatch deletes any workload for the same task from an earlier attempt before
+  creating its own**. A reclaim no longer doubles the work.
+
+  The identity validates rather than sanitises: a task id that will not express
+  as a Kubernetes label contributes *no* labels instead of a partial set. Two
+  different ids must never collapse onto one label, because a collision there
+  means one task's reaper deleting another task's live pod — and a workload
+  carrying `managed-by` with no `task-id` is exactly the shape a sweep would
+  match and misread. dagron's own ids are hyphenated v4 UUIDs and pass unchanged.
+
+  Reaping is **best-effort by design**: a transient apiserver or daemon error
+  logs and proceeds to dispatch, because refusing to run would turn a cleanup
+  failure into an outage, and the state it leaves is no worse than the behaviour
+  that preceded this.
+
+  **Still open, and stated rather than implied:** deletion is requested, not
+  instantaneous, so a pod inside its termination grace period briefly overlaps
+  its successor; and a task never re-dispatched — its run cancelled while a
+  scheduler was dying — still leaves a labelled workload that nothing sweeps.
+  The labels are what make such a workload findable at all. A fleet-wide sweep
+  is follow-on work and needs an installation-scoping label first, or it would
+  delete another dagron install's pods in a shared namespace.
+
+- **The `kubernetes` feature world was covered by no CI leg at all** — not
+  clippy, not test, not MSRV — while being one of the three ways a task actually
+  runs. Found while adding the labels above, which is to say: a change to that
+  backend could not have been caught by anything. All three legs added, the same
+  treatment the step crates' feature worlds got and for the same reason.
+
+- **`SQL_MODE=exec` was documented as printing a row count. It prints nothing.**
+  Both transports return after a `tracing::info!` — and they do not even log the
+  same thing, since the HTTP path has no count to report. A log field is not
+  stdout and not a cross-transport contract, so a workflow gating on it would
+  have been gating on nothing. `scalar` is the mode that produces a value.
+
+  While correcting that: `scalar` is bounded by `MAX_SCALAR_BYTES` (1 KiB), not
+  by `SQL_MAX_BYTES` (8 MiB) — the tighter limit applies precisely because it is
+  the one mode that writes to the uncapped output column on purpose. The docs
+  said "byte-bounded" without saying which bound, which invites the wrong one.
+
+- **The teardown claim was not exclusive on Postgres.** `claim_due_external_cancels`
+  read its candidate rows, stamped `next_poll_at` unguarded, and returned *every*
+  row it read. Under READ COMMITTED two schedulers see the same due rows, the
+  second `UPDATE` waits for the first and then overwrites it, and both replicas
+  return the row — so both send a cancel for the same remote job and both spend
+  an `external_cancel_attempts` on it, burning the give-up budget at N× the rate.
+  The SQLite twin survives the identical code only because SQLite serialises
+  writers through one connection.
+
+  It now CAS-guards each stamp on the `next_poll_at` the sweep observed and keeps
+  only the winners — the same shape `claim_due_external_polls` twenty lines above
+  already used. The poll path got this right and the cancel path, written in the
+  same release, did not.
+
+- **`defer.http` could be steered at a private address two ways.** These requests
+  carry the task's own `Authorization` header, so both matter:
+  - The client installed `GuardedResolver` but never called `.no_proxy()`. With
+    a proxy configured, reqwest resolves the *proxy* host — which passes the
+    filter — and asks it to connect to the private address. `wait_url`'s client
+    has called `.no_proxy()` since it was written.
+  - An IP-literal URL never reaches a resolver at all, so `GuardedResolver` never
+    saw `http://169.254.169.254/…`. It now rejects blocked literals before the
+    request, reusing `wait_url`'s already-tested `literal_host_blocked` rather
+    than a second copy of the range list.
+
+- **`SQL_ENGINE=trino` was a name without its protocol.** It selected the HTTP
+  transport, which is a ClickHouse client: it appended `FORMAT JSONEachRow` (which
+  Trino rejects), sent `X-ClickHouse-User`, never followed `nextUri` — Trino's
+  protocol *requires* looping until that field is absent — and in `exec` mode
+  returned success on any 2xx without reading `QueryResults.error`, so a queued
+  query reported success having returned nothing. Trino is removed from `Engine`
+  until it has a transport of its own; the unknown-engine error names it
+  explicitly so the removal reads as deliberate.
+
+- **`SPARK_WAIT=inline` reported completion it had not waited for.** It only
+  warned, then took the same submission path — so on `k8s` and `rest`, which
+  submit and return, the task succeeded the moment the job was *accepted* and
+  released every dependent against work that had not run. It is now refused on
+  those two backends (a warning is not a guard) and stays legal on
+  `spark-submit`, where `Command::output()` genuinely blocks.
+
+- **A deferred `spark-submit` blocked for the whole job.** YARN and Kubernetes
+  cluster mode make `spark-submit` wait for the remote application, so the
+  submit process sat there for hours and `timeout_secs` — which bounds the
+  submit, not the job — killed the task before the handle was ever printed. A
+  deferred submit now sets `spark.yarn.submit.waitAppCompletion=false` and
+  `spark.kubernetes.submission.waitAppCompletion=false`, before `SPARK_CONF_*`
+  so an operator can still override it.
+
+- **A `%` in `SQL_PASSWORD` authenticated as the wrong password.** The encoder
+  escaped `@ : / ? #` but not `%` — the escape character itself — so `pa%73s`
+  spliced in verbatim, the DSN parser decoded `%73` back to `s`, and sqlx
+  connected as `pass`. An auth failure with nothing in the message to explain it.
+
+- **The MSRV job compiled neither step crate's published feature world.**
+  `--workspace` includes both, but resolver 2 does not activate a feature across
+  packages and both declare `default = []` — so Rust 1.88 checked neither the
+  Kubernetes client nor the sqlx wire drivers, which is exactly what the images
+  are built from. A dependency could have raised the effective MSRV for a
+  published image with every required job green.
+
+- **Two step images shipped with blank Docker Hub pages, and a third's overview
+  never published.** `docker.yml` builds and pushes `dagron-step-spark` and
+  `dagron-step-sql`, but neither had an overview in `docs/dockerhub/` nor a row
+  in its index — so both repos would go public describing nothing. Worse,
+  `dagron-step-mcp.md` *existed* and still never reached the Hub: the publisher
+  script's `MAPPING` listed only the six service images, so a file nobody
+  publishes is a file nobody reads. All three are now mapped, with short blurbs
+  that say "task binary, COPY it into your image" — which is the decision
+  someone is actually making when they look at the listing.
+
+  Both step crates also gained the README every other crate in the workspace
+  has, and `defer:` — this release's headline task-level field — is now in
+  [`docs/CONFIG.md`](docs/CONFIG.md)'s field reference rather than only in
+  `EXTERNAL_JOBS.md`. That reference is where someone looks up "what can a task
+  declare", and it listed `wait:`, `cache:` and `produces:` while the new block
+  was absent.
+
+- **`dagron-step-sql` claimed two capabilities it does not have.** Its module
+  doc opened with "four things [a plain `command:`] cannot do" and listed a
+  cancel hook (`KILL QUERY <query_id>`) and a defer handle among them. Neither
+  is built: nothing in the crate captures a query id, and the step never prints
+  `dagron::handle=`, so `defer:` on a `dagron-step-sql` task would park on
+  nothing and a 40-minute query holds its worker for 40 minutes. The doc now
+  claims the two that are real — the fetch-side result budget and one image
+  instead of N vendor CLIs — and names the other two as unbuilt, in the same
+  terms the rest of the product uses for a gap.
+
+- **The quota seam only ever saw half the engine.** `Meter::on_task_completed`
+  is the hook an alternate build accounts usage and enforces limits on. Three
+  call sites reached it, all on the worker-result path — and a task that *parks*
+  holds no worker and resolves in a reconcile sweep, so it never traverses that
+  path at all. Every `wait` sensor, `wait.url` probe, `wait.dataset` sensor,
+  sub-workflow trigger, approval-gate timeout and deferred `defer:` job, plus
+  every memoization cache hit, reached a terminal state while being metered
+  **zero** times. A limit like `max_tasks_per_day` silently stopped bounding all
+  of them, which is worse than having no limit, because it reads as enforced.
+
+  `scheduler_tasks_succeeded_total` and `scheduler_tasks_failed_total`
+  under-reported by exactly the same set, for exactly the same reason — a
+  workflow built from sensors and sub-workflows reported zero completed tasks on
+  `/metrics` while running perfectly.
+
+  Both now fire on all **22** paths that land a task in `succeeded` or `failed`,
+  each honouring its mutation's guard so a stale fence — which changed no row —
+  is not counted.
+
+  The fix is one internal helper, `task_finished`, rather than twenty-two added
+  calls, because "remember to meter" is what failed the first time. The counters
+  and the hook are now unreachable except through it, and a crate test walks
+  `dagron-engine/src` asserting so: a new park shape cannot bump a counter
+  without also metering, because a bare bump no longer passes the test suite.
+  (Verified by injecting one, the way the next park shape would.) The helper's
+  own behaviour is asserted separately — a conformance scan over an empty
+  function would pass while metering nothing.
+
+  **Cancellation is deliberately still not reported.** `cancel_run` and
+  gang-sibling cancellation terminalize rows as `cancelled`, which is neither
+  arm of a `bool`; calling one a failure would spend quota a tenant never used
+  and inflate the failure rate. Counting cancellations needs its own signal.
+
+### Changed
+- **Environment secrets reach Kubernetes task pods by reference, not as a literal in the pod
+  spec.** They were encrypted at rest and never returned by the API, but `build_pod` put the
+  decrypted value in `env[].value`, readable by anyone able to `get`/`describe` pods (and in
+  API-server audit logs). A task with secret-sourced variables now gets a per-task Secret
+  (`<pod>-env`) referenced with `secretKeyRef`, owned by the pod so Kubernetes deletes it
+  with the pod. **Behaviour change:** the engine's Role needs `secrets` `create`/`patch`/
+  `delete` (the chart, the load-test RBAC and the workshop lab are updated; a hand-written
+  Role must be too). If the Secret cannot be created the task fails and names the missing
+  permission; it never falls back to plaintext. `DAGRON_TASK_SECRET_ENV=inline` restores the
+  old behaviour. Anyone who can `get secrets` in the namespace can still read the value, and
+  the Docker and local executors still expose it (`docker inspect`, the process
+  environment). `loadtest/deploy/security-e2e/secret-refs.sh` (12 cases) is the proof.
+- **Multi-dataset fan-in is open.** `on_datasets: [a, b, …]` with
+  `datasets_mode: any|all` used to be refused at validation, and the engine's
+  subscription sweep skipped such specs rather than subscribing to a subset.
+  Both are gone. Nothing was implemented to do it: `sync_dataset_triggers` and
+  `claim_due_dataset_triggers` have handled `mode="all"` on SQLite and Postgres
+  all along — the gate was a refusal with a working implementation behind it.
+
+  It had to go because **the fallback it recommended is wrong**, not merely
+  lesser. The error told you to "keep exactly one `on_datasets` entry … or split
+  consumers into one workflow per upstream dataset", which in practice means
+  trigger on one upstream and put a `wait: { dataset: … }` sensor on the other.
+  A sensor stamps its cursor when the task **parks** (`park_wait_dataset`) and
+  resolves only on `id > cursor`; a subscription stamps its cursor once at
+  registration (`sync_dataset_triggers`) and advances it only when a fire
+  consumes it. So in the canonical nightly mart with two upstreams arriving in
+  no fixed order: the second one to land fires the run, the run reaches the
+  sensor, and the sensor's cursor is now *past* the first upstream's update.
+  It waits for tomorrow's — hanging to `run_timeout_secs`, and tripping
+  `run.deadline_exceeded` first if the workflow declares a `deadline:`.
+  `datasets_mode: all` has no such race: it
+  fires exactly once both upstreams are fresh, consuming both cursors in the
+  one claim, so neither update is replayed and neither is lost.
+
+  A gate whose documented alternative loses data is a gate on correctness, and
+  correctness is not where the line goes. What stays gated on the dataset page
+  is the org-scale surface that *does* have a working fallback: external dataset
+  events (`POST /datasets/events` → `403`; record the dataset from a small
+  `produces:` task instead), freshness SLAs, partitions, and the lineage graph
+  UI.
+
+  Covered by a test that walks the whole shape — all-of stays silent on one
+  upstream, fires once on the second, advances both cursors, and is empty to the
+  next sweeper — plus the validation test, which is deliberately **not**
+  `cfg`-split any more: an open build and an enterprise build must now agree.
+  `dagron-api`'s console mirror is held to the same assertion.
+
+
 ## [0.9.2] - 2026-09-14
 
 ### Added

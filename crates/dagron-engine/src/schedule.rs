@@ -32,7 +32,12 @@ const FAR_FUTURE_DAYS: i64 = 36_500;
 /// Drive the DB-schedule loop until the process exits. Fires only while
 /// `is_leader` is set; `next_fire_at` is shared DB state, so a follower simply
 /// does nothing (no local bookkeeping to keep warm).
-pub async fn run(pool: db::Pool, is_leader: Arc<AtomicBool>, metrics: Arc<Metrics>) {
+pub async fn run(
+    pool: db::Pool,
+    is_leader: Arc<AtomicBool>,
+    metrics: Arc<Metrics>,
+    admission: crate::pressure::AdmissionGate,
+) {
     info!("DB schedule loop running");
     loop {
         tokio::time::sleep(TICK).await;
@@ -97,6 +102,28 @@ pub async fn run(pool: db::Pool, is_leader: Arc<AtomicBool>, metrics: Arc<Metric
                 None => false,
             };
 
+            // An admission refusal is the same KIND of skip as a `when:` gate, so
+            // it rides the same flag rather than jumping past the advancement
+            // below. Both consume the slot without firing: `advance_schedule_gated`
+            // moves `next_fire_at` and leaves `last_fired_at` alone, because
+            // nothing ran.
+            //
+            // An early `continue` here was wrong twice over. The due row stayed
+            // claimable, so every tick re-refused it — a warning line and a
+            // counter increment per tick for as long as the gate stayed closed.
+            // And because the slot was never consumed, reopening the gate fired
+            // the stale slot, which is the opposite of the "skipped, not
+            // deferred" contract this comment used to claim.
+            let gated = if gated {
+                true
+            } else if admission.is_closed() {
+                metrics.inc_admission_refused_gate();
+                warn!(schedule = %s.id, scheduled_time = %s.next_fire_at, "schedule fire skipped — admission gate closed");
+                true
+            } else {
+                false
+            };
+
             if gated {
                 metrics.inc_schedule_gated();
                 info!(schedule = %s.id, when = s.when_expr.as_deref().unwrap_or(""), scheduled_time = %s.next_fire_at, "schedule fire gated (when: false) — skipping");
@@ -106,7 +133,7 @@ pub async fn run(pool: db::Pool, is_leader: Arc<AtomicBool>, metrics: Arc<Metric
                 // row's nominal due time is injected as the `{{ scheduled_time }}`
                 // parameter so tasks can reference their logical date.
                 let mut params = std::collections::BTreeMap::new();
-                params.insert("scheduled_time".to_string(), s.next_fire_at.clone());
+                crate::schedule_time::insert_logical_date(&mut params, &s.next_fire_at);
                 // `{{ env.* }}` variables from the spec's declared environment;
                 // an unknown environment skips the fire (and logs) rather than
                 // running without its variables.

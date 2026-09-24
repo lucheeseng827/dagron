@@ -1,10 +1,10 @@
 //! The golden guard on the duplicated wire contract.
 //!
-//! The planner's `planner-embed` owns the frozen contract and guards its own half
+//! The planner's `freshet-embed` owns the frozen contract and guards its own half
 //! with an exhaustive, no-wildcard match — adding a `BackfillReason` variant fails
 //! to compile there until the contract is updated. This crate has no compiler link
 //! to that, so this fixture is the guard on the dagron half: it is a byte-for-byte
-//! sample of what `planner-embed::PlanResponse` actually serializes, and it must
+//! sample of what `freshet-embed::PlanResponse` actually serializes, and it must
 //! keep deserializing here.
 //!
 //! If this test fails, the contract moved. Fix `wire.rs` and bump
@@ -12,10 +12,10 @@
 
 use dagron_state::compile::{compile, CompileOptions, PlanEnvelope};
 use dagron_state::wire::{
-    PlanResponse, Reason, ReplaceStrategy, ReplaceTarget, Unit, Widening, WIRE_CONTRACT_VERSION,
+    PlanResponse, Reason, ReplaceStrategy, ReplaceTarget, Sql, Unit, Widening, WIRE_CONTRACT_VERSION,
 };
 
-/// Exactly the shape `planner-embed` emits: externally-tagged, snake_case enums,
+/// Exactly the shape `freshet-embed` emits: externally-tagged, snake_case enums,
 /// `next_state` present, `error` omitted.
 const GOLDEN: &str = r#"{
   "models": [
@@ -272,7 +272,7 @@ fn the_golden_plan_compiles_end_to_end() {
 
 #[test]
 fn the_contract_version_is_stamped() {
-    assert_eq!(WIRE_CONTRACT_VERSION, "planner-embed/3");
+    assert_eq!(WIRE_CONTRACT_VERSION, "planner-embed/5");
 }
 
 /// Captured verbatim from the real planner, not hand-written:
@@ -284,7 +284,7 @@ fn the_contract_version_is_stamped() {
 /// ```
 ///
 /// A hand-written fixture only proves this crate agrees with itself. This one
-/// proves it agrees with the planner's `planner-cli` as actually built.
+/// proves it agrees with the planner's `freshet-cli` as actually built.
 const CAPTURED_FROM_PLANNER_CLI: &str = r#"{
   "models": [
     {
@@ -328,4 +328,171 @@ fn real_planner_output_compiles_into_a_run_graph() {
     // The planner's column-level attribution became a real dependency edge.
     assert_eq!(spec.tasks[1].depends_on, vec!["stg_orders"]);
     assert_eq!(spec.tasks[1].input.as_ref().unwrap()["via_columns"][0], "amount");
+}
+
+// ---------------------------------------------------------------- contract v4 --
+
+/// Captured verbatim from the real planner, a restatement rendered for Postgres:
+///
+/// ```sh
+/// freshet restate --project ./models --model events --partitions 2026-06-20 \
+///   --sql postgres --json
+/// ```
+///
+/// `events` declares `insert_overwrite` on a date-typed `dt`; `daily` is a table
+/// downstream of it. Every row-level Postgres write is one statement.
+const CAPTURED_V4_RESTATEMENT: &str = r#"{
+  "models": [
+    {
+      "name": "events",
+      "reason": "directly_changed",
+      "unit": {
+        "partitions": [
+          "2026-06-20"
+        ]
+      },
+      "depends_on": [],
+      "replace": {
+        "strategy": "insert_overwrite",
+        "partition_column": "dt",
+        "target": {
+          "partitions": [
+            "2026-06-20"
+          ]
+        }
+      },
+      "sql": {
+        "dialect": "postgres",
+        "statements": [
+          "WITH freshet_deleted AS (\n  DELETE FROM events WHERE dt IN (DATE '2026-06-20')\n)\nINSERT INTO events (dt, user_id, n)\nSELECT dt, user_id, n FROM (\nselect dt, user_id, n from raw_events\n) AS freshet_model\nWHERE freshet_model.dt IN (DATE '2026-06-20')"
+        ],
+        "atomic": true
+      }
+    },
+    {
+      "name": "daily",
+      "reason": {
+        "downstream": {
+          "because_of": "events",
+          "via_columns": [
+            "dt",
+            "total"
+          ]
+        }
+      },
+      "unit": "full_model",
+      "depends_on": [
+        "events"
+      ],
+      "sql": {
+        "dialect": "postgres",
+        "statements": [
+          "WITH freshet_deleted AS (\n  DELETE FROM daily\n)\nINSERT INTO daily (dt, total)\nSELECT dt, total FROM (\nselect dt, sum(n) as total from events group by dt\n) AS freshet_model"
+        ],
+        "atomic": true
+      }
+    }
+  ]
+}"#;
+
+/// Captured verbatim from the real planner: a cold code-change plan for Postgres, in
+/// which both models are new and so are created — each a four-statement sequence.
+///
+/// ```sh
+/// freshet plan --project ./models --state ./state.json --sql postgres --json
+/// ```
+const CAPTURED_V4_COLD_PLAN: &str = r#"{
+  "models": [
+    {
+      "name": "events",
+      "reason": "directly_changed",
+      "unit": "full_model",
+      "depends_on": [],
+      "replace": {
+        "strategy": "full_refresh",
+        "target": "whole",
+        "widened": {
+          "widened_because": "whole_model_in_plan"
+        }
+      },
+      "sql": {
+        "dialect": "postgres",
+        "statements": [
+          "BEGIN",
+          "DROP TABLE IF EXISTS events",
+          "CREATE TABLE events AS\nselect dt, user_id, n from raw_events",
+          "COMMIT"
+        ],
+        "atomic": true
+      }
+    },
+    {
+      "name": "daily",
+      "reason": "directly_changed",
+      "unit": "full_model",
+      "depends_on": [
+        "events"
+      ],
+      "sql": {
+        "dialect": "postgres",
+        "statements": [
+          "BEGIN",
+          "DROP TABLE IF EXISTS daily",
+          "CREATE TABLE daily AS\nselect dt, sum(n) as total from events group by dt",
+          "COMMIT"
+        ],
+        "atomic": true
+      }
+    }
+  ]
+}"#;
+
+#[test]
+fn a_v4_plan_carries_the_statements_that_perform_each_rebuild() {
+    let plan: PlanResponse = serde_json::from_str(CAPTURED_V4_RESTATEMENT).expect("v4 parses");
+    let events = plan.models[0].sql.as_ref().expect("rendered");
+    assert_eq!(events.dialect, "postgres");
+    assert!(events.atomic);
+    assert_eq!(events.statements.len(), 1);
+    assert!(events.statements[0].contains("DELETE FROM events WHERE dt IN (DATE '2026-06-20')"));
+    assert_eq!(events.script(), events.statements[0], "one statement is passed through untouched");
+
+    let cold: PlanResponse = serde_json::from_str(CAPTURED_V4_COLD_PLAN).expect("v4 parses");
+    let sql: &Sql = cold.models[0].sql.as_ref().unwrap();
+    assert_eq!(sql.statements.first().map(String::as_str), Some("BEGIN"));
+    assert_eq!(
+        sql.script(),
+        "BEGIN;\nDROP TABLE IF EXISTS events;\nCREATE TABLE events AS\nselect dt, user_id, n from raw_events;\nCOMMIT;",
+        "several statements join into one script, each terminated"
+    );
+}
+
+#[test]
+fn a_v4_plan_compiles_into_dagron_step_sql_tasks() {
+    // The recipe the README documents: the statements travel in an env var, never
+    // through a shell command line.
+    let envelope = PlanEnvelope {
+        plan: serde_json::from_str(CAPTURED_V4_COLD_PLAN).unwrap(),
+        graph: None,
+        options: CompileOptions {
+            command_template: vec!["dagron-step-sql".into()],
+            env: [
+                ("SQL_ENGINE", "postgres"),
+                ("SQL_DSN", "postgres://planner@warehouse/analytics"),
+                ("SQL_MODE", "script"),
+                ("SQL_STATEMENT", "{{ sql }}"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+            ..Default::default()
+        },
+    };
+    let spec = compile(&envelope).expect("compiles");
+    assert_eq!(spec.tasks.len(), 2);
+    let events = &spec.tasks[0];
+    assert!(events.env_value("SQL_STATEMENT").unwrap().starts_with("BEGIN;\nDROP TABLE IF EXISTS events;"), "{:?}", events.env);
+    assert_eq!(events.env_value("SQL_MODE").unwrap(), "script", "constant env is untouched");
+    assert_eq!(spec.tasks[1].depends_on, vec!["events"], "and the plan's own edges still order it");
+    assert_eq!(events.input.as_ref().unwrap()["sql_statements"].as_array().unwrap().len(), 4);
 }

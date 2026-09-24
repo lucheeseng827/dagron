@@ -5,9 +5,11 @@ import {
   clearGitRepoAuth,
   connectGitRepo,
   disconnectGitRepo,
+  getMe,
   listGitRepos,
   setGitRepoAuth,
   syncGitRepo,
+  type Me,
 } from "@/lib/dagron-api";
 import GitCredentialFields, {
   emptyCredential,
@@ -62,6 +64,7 @@ function authLabel(r: GitRepo): string {
 }
 
 export default function GitOpsPage() {
+  const [me, setMe] = useState<Me | null>(null);
   const [repos, setRepos] = useState<GitRepo[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -81,6 +84,14 @@ export default function GitOpsPage() {
   const [authFor, setAuthFor] = useState<string | null>(null);
   const [authDraft, setAuthDraft] = useState<GitCredentialValue>(emptyCredential());
 
+  // Connecting, disconnecting and credential changes are admin-only in the API (403
+  // otherwise), so the controls that call them are hidden rather than left to fail. Listing
+  // and Sync stay available to everyone, which is what this page is mostly for. A `null` me
+  // (still in flight) reads as "not admin", so those controls appear once when /me answers
+  // rather than rendering and then being taken away; the notice below is gated on `me` as
+  // well, so an admin never sees it flash by.
+  const isAdmin = me?.groups?.includes("admin") ?? false;
+
   const load = useCallback(() => {
     listGitRepos()
       .then((r) => {
@@ -91,7 +102,10 @@ export default function GitOpsPage() {
       .catch((e) => setError(errMsg(e)))
       .finally(() => setLoading(false));
   }, []);
-  useEffect(() => load(), [load]);
+  useEffect(() => {
+    getMe().then(setMe).catch(() => {});
+    load();
+  }, [load]);
 
   const onConnect = async () => {
     if (!url.trim()) return;
@@ -186,14 +200,26 @@ export default function GitOpsPage() {
             Connect a repo and dagron discovers, syncs and runs its workflows — no UI edits needed.
           </p>
         </div>
-        <button
-          onClick={() => setShowForm((v) => !v)}
-          className="dy-btn"
-          style={{ background: "var(--accent)", borderColor: "var(--accent)", color: "#1a1207", fontWeight: 600 }}
-        >
-          + Connect repository
-        </button>
+        {isAdmin && (
+          <button
+            onClick={() => setShowForm((v) => !v)}
+            className="dy-btn"
+            style={{ background: "var(--accent)", borderColor: "var(--accent)", color: "#1a1207", fontWeight: 600 }}
+          >
+            + Connect repository
+          </button>
+        )}
       </div>
+
+      {me && !isAdmin && (
+        <div className="dy-card" style={{ marginBottom: 16, borderColor: "var(--amber)" }}>
+          <p style={{ margin: 0, color: "var(--amber)" }}>
+            The admin group is required to connect or disconnect a repository, or to change its
+            credential — a connected repository writes and retires workflows, and its credential
+            is a stored secret. You can still see the repositories here and trigger a sync.
+          </p>
+        </div>
+      )}
 
       {/* info banner */}
       <div
@@ -208,7 +234,7 @@ export default function GitOpsPage() {
         </span>
       </div>
 
-      {showForm && (
+      {showForm && isAdmin && (
         <div className="dy-card" style={{ marginBottom: 16, display: "flex", flexDirection: "column", gap: 12 }}>
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
             <input
@@ -293,20 +319,24 @@ export default function GitOpsPage() {
                   <span className="dy-dot" style={{ width: 7, height: 7, background: r.auto_sync ? "var(--green)" : "var(--dim)" }} />
                   Auto-sync {r.auto_sync ? "ON" : "OFF"}
                 </span>
-                <button
-                  onClick={() => (authFor === r.id ? setAuthFor(null) : openAuth(r))}
-                  disabled={busy === r.id}
-                  className="dy-btn"
-                  title="Set or rotate this repository's Git credential"
-                >
-                  {r.auth_kind === "none" ? "🔑 Add credential" : "🔑 Credential"}
-                </button>
+                {isAdmin && (
+                  <button
+                    onClick={() => (authFor === r.id ? setAuthFor(null) : openAuth(r))}
+                    disabled={busy === r.id}
+                    className="dy-btn"
+                    title="Set or rotate this repository's Git credential"
+                  >
+                    {r.auth_kind === "none" ? "🔑 Add credential" : "🔑 Credential"}
+                  </button>
+                )}
                 <button onClick={() => onSync(r.id)} disabled={busy === r.id} className="dy-btn">
                   {busy === r.id ? "…" : "Sync"}
                 </button>
-                <button onClick={() => onDisconnect(r.id)} disabled={busy === r.id} className="dy-btn dy-btn-danger" title="Disconnect">
-                  ✕
-                </button>
+                {isAdmin && (
+                  <button onClick={() => onDisconnect(r.id)} disabled={busy === r.id} className="dy-btn dy-btn-danger" title="Disconnect">
+                    ✕
+                  </button>
+                )}
               </div>
               {/* sub row */}
               <div style={{ display: "flex", alignItems: "center", gap: 14, padding: "0 18px 14px 39px", fontSize: 12.5, color: "var(--muted)" }}>
@@ -323,7 +353,7 @@ export default function GitOpsPage() {
                 </span>
               </div>
 
-              {authFor === r.id && (
+              {authFor === r.id && isAdmin && (
                 <div
                   style={{
                     padding: "14px 18px",

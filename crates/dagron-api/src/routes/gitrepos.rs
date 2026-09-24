@@ -29,6 +29,25 @@ type ApiError = (StatusCode, String);
 /// Default in-repo directory scanned for workflow YAML when none is given.
 const DEFAULT_PATH: &str = "dagron";
 
+/// Connecting a repository, disconnecting one, and setting or clearing its credential are
+/// admin-only. A connected repository is an *authority over workflows*, not a preference: the
+/// worker clones whatever `url` holds and writes the workflows it finds, `prune: true` retires
+/// the ones whose file is gone, and the credential is an instance-held secret that the caller
+/// can neither read back nor be asked to prove they own. Any authenticated user could do all
+/// three until now.
+///
+/// `GET` and `sync` are deliberately left to any authenticated session: listing is what the
+/// console renders, and `sync` only asks for the poll that `auto_sync` already performs on a
+/// timer — gating it would stop an operator hurrying a sync along without changing anything
+/// the system does on its own.
+fn require_admin(claims: &crate::auth::SessionClaims) -> Result<(), ApiError> {
+    if crate::auth::is_admin(claims) {
+        Ok(())
+    } else {
+        Err((StatusCode::FORBIDDEN, "admin group required".to_string()))
+    }
+}
+
 /// Username sent with an HTTPS token when the operator does not name one. Both
 /// GitHub and GitLab accept any non-empty username beside a PAT; this is the one
 /// GitHub documents for its app/installation tokens.
@@ -44,8 +63,13 @@ const DEFAULT_SSH_USER: &str = "git";
 /// into a `Serialize` row would have shipped it to the browser the moment the
 /// column was added. The credential is write-only by construction: the only
 /// things that leave here are its *kind*, its username, and a non-secret hint.
-const COLUMNS: &str = "id, name, url, branch, path, rev, state, auto_sync, workflow_count, drift,
-     last_message, last_synced_at, created_at,
+///
+/// `drift` is computed, not stored: the workflows this repo manages whose spec no longer
+/// matches what git last delivered (a console edit since the sync).
+const COLUMNS: &str = "id, name, url, branch, path, rev, state, auto_sync, workflow_count,
+     (SELECT count(*) FROM workflows w
+       WHERE w.managed_by = git_repos.id AND md5(w.spec) <> w.managed_md5) AS drift,
+     prune, last_message, last_synced_at, created_at,
      auth_kind, auth_username, auth_hint, auth_known_hosts, auth_updated_at";
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -61,6 +85,8 @@ pub struct GitRepo {
     pub auto_sync: i64,
     pub workflow_count: i64,
     pub drift: i64,
+    /// Retire workflows whose file disappeared from the repo (only after a sync with no file errors).
+    pub prune: bool,
     pub last_message: Option<String>,
     pub last_synced_at: Option<String>,
     pub created_at: String,
@@ -105,6 +131,15 @@ pub async fn ensure_schema(pool: &sqlx::postgres::PgPool) -> anyhow::Result<()> 
     )
     .execute(pool)
     .await?;
+    // Git-managed workflows: `prune` per repo; `managed_by` / `managed_md5` on the engine-owned
+    // `workflows` table (also added by migrations_pg/060; tolerant of the table not existing yet).
+    for ddl in [
+        "ALTER TABLE git_repos ADD COLUMN IF NOT EXISTS prune BOOLEAN NOT NULL DEFAULT false",
+        "ALTER TABLE IF EXISTS workflows ADD COLUMN IF NOT EXISTS managed_by TEXT",
+        "ALTER TABLE IF EXISTS workflows ADD COLUMN IF NOT EXISTS managed_md5 TEXT",
+    ] {
+        sqlx::query(ddl).execute(pool).await?;
+    }
     // Sync is executed by the `dagron-gitops` worker, not here: this gateway runs
     // on distroless (no shell, no git binary), which is why every in-process sync
     // failed with "running git: No such file or directory". The Sync button now
@@ -209,6 +244,9 @@ pub struct ConnectBody {
     pub path: Option<String>,
     #[serde(default)]
     pub auto_sync: bool,
+    /// Retire workflows whose file is deleted from the repo (default off).
+    #[serde(default)]
+    pub prune: bool,
     /// Optional credential to store with the repo. Omitted (or `kind: "none"`)
     /// keeps the previous behaviour: public repos, or the worker's process-wide
     /// `DAGRON_GIT_TOKEN` for trusted forge hosts.
@@ -218,10 +256,11 @@ pub struct ConnectBody {
 
 /// `POST /api/git-repos` — connect (register) a repository.
 pub async fn connect_repo(
-    _auth: AuthUser,
+    AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Json(body): Json<ConnectBody>,
 ) -> Result<(StatusCode, Json<GitRepo>), ApiError> {
+    require_admin(&claims)?;
     let url = body.url.trim().to_string();
     if url.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "url is required".into()));
@@ -265,8 +304,8 @@ pub async fn connect_repo(
     let row = sqlx::query_as::<_, GitRepo>(&format!(
         "INSERT INTO git_repos (id, name, url, branch, path, state, auto_sync, created_at,
                                 auth_kind, auth_username, auth_secret, auth_hint,
-                                auth_known_hosts, auth_updated_at)
-         VALUES ($1,$2,$3,$4,$5,'OutOfSync',$6,$7,$8,$9,$10,$11,$12,$13)
+                                auth_known_hosts, auth_updated_at, prune)
+         VALUES ($1,$2,$3,$4,$5,'OutOfSync',$6,$7,$8,$9,$10,$11,$12,$13,$14)
          ON CONFLICT (url) DO NOTHING
          RETURNING {COLUMNS}"
     ))
@@ -283,6 +322,7 @@ pub async fn connect_repo(
     .bind(&auth.hint)
     .bind(&auth.known_hosts)
     .bind(auth.secret.as_ref().map(|_| now.clone()))
+    .bind(body.prune)
     .fetch_optional(&state.write_pool)
     .await
     .map_err(internal)?;
@@ -687,11 +727,12 @@ fn ssh_user_from_url(url: &str) -> Option<String> {
 /// operation, and making it require disconnect-and-reconnect would throw away
 /// the repo's sync history and its `auto_sync` setting to change one secret.
 pub async fn put_auth(
-    _auth: AuthUser,
+    AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<AuthBody>,
 ) -> Result<Json<GitRepo>, ApiError> {
+    require_admin(&claims)?;
     let url: String = sqlx::query_scalar("SELECT url FROM git_repos WHERE id = $1")
         .bind(&id)
         .fetch_optional(&state.read_pool)
@@ -708,10 +749,11 @@ pub async fn put_auth(
 /// `DELETE /api/git-repos/:id/auth` — remove the stored credential. The repo
 /// keeps syncing if it is public or the worker's global token reaches it.
 pub async fn delete_auth(
-    _auth: AuthUser,
+    AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<GitRepo>, ApiError> {
+    require_admin(&claims)?;
     let updated = write_auth(&state, &id, &StoredAuth::none()).await?;
     tracing::info!(repo = %id, "git credential removed");
     Ok(Json(updated))
@@ -856,10 +898,11 @@ fn classify_git_url(url: &str) -> Result<Transport, ApiError> {
 
 /// `DELETE /api/git-repos/:id` — disconnect (stop tracking).
 pub async fn delete_repo(
-    _auth: AuthUser,
+    AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    require_admin(&claims)?;
     let res = sqlx::query("DELETE FROM git_repos WHERE id=$1")
         .bind(&id)
         .execute(&state.write_pool)
@@ -900,6 +943,30 @@ fn internal(e: sqlx::Error) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn claims(groups: &[&str]) -> crate::auth::SessionClaims {
+        crate::auth::SessionClaims {
+            sub: "u1".to_string(),
+            email: "u1@example.com".to_string(),
+            name: "U1".to_string(),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            exp: 0,
+        }
+    }
+
+    /// `connect_repo`, `delete_repo`, `put_auth` and `delete_auth` all gate on this exact
+    /// check. The console's "operator" is a user with *no* groups, so it is the empty case
+    /// — not a named group — that has to be refused, and it was the one that used to get
+    /// through: a repo connect (with `prune: true`) was open to any authenticated session.
+    #[test]
+    fn repo_administration_requires_the_admin_group() {
+        for denied in [&[][..], &["viewer"][..], &["operator"][..], &["admins"][..]] {
+            let err = require_admin(&claims(denied)).unwrap_err();
+            assert_eq!(err.0, StatusCode::FORBIDDEN, "groups {denied:?} must be refused");
+        }
+        require_admin(&claims(&["admin"])).expect("the admin group must pass");
+        require_admin(&claims(&["viewer", "admin"])).expect("admin among other groups must pass");
+    }
 
     #[test]
     fn url_scheme_validation() {
@@ -1092,4 +1159,85 @@ mod tests {
     }
 
     // Real clone + walk + validate against a local file:// repo — offline, no DB.
+}
+
+#[cfg(test)]
+pub(crate) mod managed_tests {
+    use super::*;
+
+    /// Disposable Postgres from `TEST_DATABASE_URL` (skipped when unset) with the real
+    /// `ensure_schema` applied over a minimal engine-owned `workflows` table. DDL runs under a session
+    /// advisory lock: the tests share the database and run in parallel.
+    pub(crate) async fn test_pool() -> Option<sqlx::PgPool> {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("TEST_DATABASE_URL unset - skipping a live-datastore test");
+            return None;
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(4).connect(&url).await.unwrap();
+        let mut lock = pool.acquire().await.unwrap();
+        sqlx::query("SELECT pg_advisory_lock(76544)").execute(&mut *lock).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS workflows (
+                id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL UNIQUE, spec TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                version BIGINT NOT NULL DEFAULT 1, state TEXT NOT NULL DEFAULT 'active')",
+        )
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+        ensure_schema(&pool).await.unwrap();
+        sqlx::query("SELECT pg_advisory_unlock(76544)").execute(&mut *lock).await.unwrap();
+        Some(pool)
+    }
+
+    /// Insert a repo row and return its id.
+    pub(crate) async fn add_repo(pool: &sqlx::PgPool, tag: &str) -> String {
+        let id = format!("repo-{tag}");
+        sqlx::query("INSERT INTO git_repos (id, name, url, created_at) VALUES ($1, 'o/r', $2, 'now')")
+            .bind(&id)
+            .bind(format!("https://example.com/{tag}.git"))
+            .execute(pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    /// Insert a workflow, git-managed when `managed_by` is set, with `managed_md5` of `synced_spec`.
+    pub(crate) async fn add_workflow(pool: &sqlx::PgPool, name: &str, spec: &str, managed_by: Option<&str>, synced_spec: &str) -> String {
+        let id = format!("wf-{name}");
+        sqlx::query(
+            "INSERT INTO workflows (id, name, spec, created_at, updated_at, managed_by, managed_md5)
+             VALUES ($1, $2, $3, 'now', 'now', $4, md5($5))",
+        )
+        .bind(&id)
+        .bind(name)
+        .bind(spec)
+        .bind(managed_by)
+        .bind(synced_spec)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// `drift` counts the repo's own workflows whose stored spec no longer matches what git delivered.
+    #[tokio::test]
+    async fn drift_counts_console_edits_to_the_repos_own_workflows() {
+        let Some(pool) = test_pool().await else { return };
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let repo = add_repo(&pool, &tag).await;
+        let other = add_repo(&pool, &format!("{tag}-other")).await;
+        add_workflow(&pool, &format!("d-clean-{tag}"), "a", Some(&repo), "a").await;
+        add_workflow(&pool, &format!("d-edited-{tag}"), "edited", Some(&repo), "a").await;
+        add_workflow(&pool, &format!("d-unmanaged-{tag}"), "x", None, "y").await;
+        add_workflow(&pool, &format!("d-elsewhere-{tag}"), "edited", Some(&other), "a").await;
+
+        let row = sqlx::query_as::<_, GitRepo>(&format!("SELECT {COLUMNS} FROM git_repos WHERE id = $1"))
+            .bind(&repo)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.drift, 1, "one edited workflow of this repo; not the clean, unmanaged, or other repo's");
+        assert!(!row.prune, "prune defaults off");
+    }
 }

@@ -234,7 +234,8 @@ much harder than those thirty lines, the difficulty is in your run API, not here
 {
   // The planner's PlanResponse, verbatim. From contract v3 each model may carry
   // `replace` — what its rebuild does to the relation, and whether the planner had
-  // to widen the declaration to a full refresh. See "Replace ops" below.
+  // to widen the declaration to a full refresh. See "Replace ops" below. From v4 it
+  // may also carry `sql`, the statements that perform it. See "Rendered SQL".
   "plan": { /* … */ },
 
   // Optional. Two uses: edges for plans from a v1 planner (a v2 plan's own
@@ -246,12 +247,19 @@ much harder than those thirty lines, the difficulty is in your run API, not here
     "workflow_name": "state-plan",
     // Required. `{{ model }}`, `{{ unit }}`, `{{ partitions }}` substitute per
     // model, as do `{{ replace }}`, `{{ partition_column }}` and `{{ unique_key }}`
-    // (empty when the plan carries no replace op).
+    // (empty when the plan carries no replace op), and `{{ sql }}` / `{{ dialect }}`
+    // (contract v4; refused, not emptied, when a model carries no SQL).
     "command_template": ["sh", "-c", "dbt run --select {{ model }}"],
     "ordering": "derived",        // or "sequential"
     "max_attempts": 3,
     "timeout_secs": 600,
+    // Every task's env. Values expand the same placeholders, per model — the way
+    // multi-line SQL reaches a task without a shell quoting it.
     "env": { "DBT_PROFILES_DIR": "/etc/dbt" },
+    // Env resolved from dagron secrets at dispatch: variable -> secret NAME. The
+    // credential never travels in the plan or this envelope; the task gets
+    // `value_from: { secret: … }`. A name in both `env` and here is refused (400).
+    "secret_env": { "SQL_PASSWORD": "WAREHOUSE_PASSWORD" },
     "tags": ["state-plan"]
   }
 }
@@ -262,7 +270,7 @@ much harder than those thirty lines, the difficulty is in your run API, not here
 | Code | When |
 |---|---|
 | `201` | Submitted; body carries the `run_id` |
-| `400` | The planner reported a failure, or no `command_template` was given |
+| `400` | The planner reported a failure, no `command_template` was given, the template uses `{{ sql }}` and the plan carries no SQL, or a variable is in both `env` and `secret_env` |
 | `401` | No valid credential (dagron layers its own auth over this component) |
 | `422` | The plan is **empty** — nothing to rebuild |
 
@@ -279,7 +287,10 @@ needs and exactly what it covers.
 
 This crate does **not** render it. Turning `insert_overwrite` into a statement is
 engine-specific and dagron has no idea which warehouse is on the other end of a
-task's command — the same line the planner draws upstream. What it does instead:
+task's command — the same line the planner draws upstream. (From contract v4 the
+*planner* can render it, for a dialect the caller names; this crate then carries
+those statements, still without reading them — see [Rendered SQL](#rendered-sql).)
+What it does instead:
 
 * **Substitutes** `{{ replace }}`, `{{ partition_column }}` and `{{ unique_key }}`
   into the operator's argv, expanding to the planner's *word*, never to SQL.
@@ -301,6 +312,47 @@ task's command — the same line the planner draws upstream. What it does instea
 declared nothing. Those read differently but mean the same thing here — apply no
 replace-specific behaviour — so unlike `depends_on`, absence is not a version
 signal and this crate does not treat it as one.
+
+## Rendered SQL
+
+From contract **v4** a plan can carry, per model, the SQL that performs its rebuild —
+`sql: { dialect, statements, atomic }` — when the caller asked the planner for a
+dialect (`freshet plan --sql postgres`, or `render` on an embedded `PlanRequest`).
+The planner renders all-or-nothing, so a plan that has it has it on every model.
+
+This crate still writes no SQL. It carries the planner's statements onto the task:
+
+* **Substitutes** `{{ sql }}` — the statements as one script, `;`-separated (a single
+  statement is passed through exactly as rendered, so a one-statement executor gets
+  one statement) — and `{{ dialect }}`, in the command *and* the env.
+* **Refuses** a template that uses `{{ sql }}` against a plan without SQL (`400`,
+  naming the model). Expanding it to nothing would hand an executor an empty
+  statement, or worse, a shell an empty argument.
+* **Records** `sql_dialect`, `sql_statements` and `sql_atomic` on the task's
+  `input`, so a run's history holds the exact statements it ran.
+* **Warns** in `explain`. `atomic: false` means a failure part-way can leave the
+  relation half-written — today that is a Databricks `delete_insert`, which Delta
+  cannot wrap in a transaction — so those models get a `[!CAUTION]` callout, and the
+  explanation says which dialect the plan was rendered for.
+
+The executor that pairs with it is [`dagron-step-sql`](../dagron-step-sql/)'s
+`script` mode, which runs the statements in order on one session. Pass the script
+through the env, where no shell quotes it:
+
+```sh
+freshet plan --project ./models --state .planner/state.json --sql postgres --json \
+  | jq '{plan: ., options: {
+          command_template: ["dagron-step-sql"],
+          env: {SQL_ENGINE: "postgres", SQL_DSN: "postgresql://etl@warehouse/analytics",
+                SQL_MODE: "script", SQL_STATEMENT: "{{ sql }}"},
+          secret_env: {SQL_PASSWORD: "WAREHOUSE_PASSWORD"}}}' \
+  | curl -sS -X POST http://localhost:8080/api/state/plans/submit \
+      -H 'content-type: application/json' -H "authorization: Bearer $DAGRON_TOKEN" -d @-
+```
+
+A partition restatement is the same shape: `freshet restate … --sql postgres --json`
+renders a replace that names exactly the partitions being restated on both sides —
+the rows it deletes and the rows it inserts — so nothing outside them is touched.
 
 ## Dependency edges
 
@@ -357,8 +409,10 @@ buys, and the reason the API level is kept separate.
 `src/wire.rs` mirrors the planner's response DTOs rather than importing them, so the
 duplication needs a guard. Upstream gets one free (an exhaustive, no-wildcard match
 that breaks compilation when a variant is added); this side is guarded by
-`WIRE_CONTRACT_VERSION` plus two fixtures in `tests/wire_contract.rs` — one
-hand-written, and one **captured verbatim from the planner CLI as actually built**.
+`WIRE_CONTRACT_VERSION` (currently `planner-embed/5`) plus fixtures in
+`tests/wire_contract.rs` — one hand-written, and one per contract revision
+**captured verbatim from the planner CLI as actually built** (v2 fan-in, v3 widening,
+v4 cold plan and v4 restatement).
 
 If a contract test fails, the contract moved: fix `wire.rs` and bump the version.
 Do not edit the fixture to match the code.

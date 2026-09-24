@@ -9,6 +9,7 @@ import { useRouteId } from "@/lib/route-id";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import TriggerBadge from "@/components/TriggerBadge";
+import RunSpecHistory from "@/components/RunSpecHistory";
 import { useToast } from "@/components/Toasts";
 import { getRunGraph, getWorkflow, listWorkflowRuns, runWorkflow } from "@/lib/dagron-api";
 import { statusColor, statusLabel } from "@/lib/adapter";
@@ -48,6 +49,10 @@ function WorkflowHistoryPageInner() {
   const [busy, setBusy] = useState(false);
   const [page, setPage] = useState(0);
   const [hasMore, setHasMore] = useState(false);
+  // run id → which definition it ran (0 = the oldest on this page), filled in
+  // by the Definition changes card once it has fetched the specs. Empty while
+  // that card is closed, which is also when the column is hidden.
+  const [specEra, setSpecEra] = useState<Map<string, number>>(new Map());
 
   useEffect(() => {
     getWorkflow(id)
@@ -119,6 +124,12 @@ function WorkflowHistoryPageInner() {
       setBusy(false);
     }
   };
+
+  // The Spec column appears only once the grouping is known, and only when
+  // there is more than one definition — a column reading "#1" on every row is
+  // noise.
+  const showEra = new Set(specEra.values()).size > 1;
+  const cols = showEra ? "24px 1.2fr 1fr 1fr 1fr 60px" : "24px 1.2fr 1fr 1fr 1fr";
 
   return (
     <div className="dy-page" style={{ maxWidth: 1320 }}>
@@ -249,17 +260,20 @@ function WorkflowHistoryPageInner() {
         </div>
       )}
 
+      <RunSpecHistory runs={runs} onGrouping={setSpecEra} />
+
       {/* runs table */}
       <div className="dy-card" style={{ padding: 0, overflow: "hidden" }}>
-        <div style={{ display: "grid", gridTemplateColumns: "24px 1.2fr 1fr 1fr 1fr", gap: 12, padding: "11px 18px", borderBottom: "1px solid var(--border)", fontSize: 11, fontWeight: 600, color: "var(--dim)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+        <div style={{ display: "grid", gridTemplateColumns: cols, gap: 12, padding: "11px 18px", borderBottom: "1px solid var(--border)", fontSize: 11, fontWeight: 600, color: "var(--dim)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
           <div />
           <div>Run</div>
           <div>Started</div>
           <div>Duration</div>
           <div>Trigger</div>
+          {showEra && <div title="Which definition this run used — see Definition changes above">Spec</div>}
         </div>
         {runs.map((r) => (
-          <Link key={r.id} href={`/runs/detail/?id=${r.id}`} className="dy-runrow" style={{ display: "grid", gridTemplateColumns: "24px 1.2fr 1fr 1fr 1fr", gap: 12 }}>
+          <Link key={r.id} href={`/runs/detail/?id=${r.id}`} className="dy-runrow" style={{ display: "grid", gridTemplateColumns: cols, gap: 12 }}>
             <span className="dy-dot" style={{ width: 9, height: 9, background: statusColor(r.status as TaskStatus) }} title={r.status} />
             <span className="mono" style={{ color: "var(--blue)" }}>
               {r.id.slice(0, 8)}
@@ -273,6 +287,14 @@ function WorkflowHistoryPageInner() {
             <span>
               <TriggerBadge kind={r.trigger_kind} />
             </span>
+            {/* The same #N the Definition changes card uses, so "these three
+                failed" and "the spec changed here" line up on one screen. A run
+                whose spec could not be read shows a dash rather than a guess. */}
+            {showEra && (
+              <span className="mono" style={{ fontSize: 11.5, color: "var(--muted)" }}>
+                {specEra.has(r.id) ? `#${specEra.get(r.id)! + 1}` : "—"}
+              </span>
+            )}
           </Link>
         ))}
         {runs.length === 0 && !error && <p className="dy-empty" style={{ padding: 16 }}>No runs yet.</p>}

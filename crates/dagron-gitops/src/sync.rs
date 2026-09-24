@@ -64,6 +64,11 @@ pub struct Reconcile {
     /// line names what was applied, not merely how many. `None` for a plain
     /// repo.
     pub bundle: Option<String>,
+    /// Workflows retired because their file is gone (`Repo::prune`).
+    pub retired: usize,
+    /// `Repo::prune` was on but the sync had file errors, so nothing was retired: a file that failed
+    /// validation must not take its workflow down with it.
+    pub prune_skipped: bool,
 }
 
 /// What a fetch produced, before anything touches the datastore.
@@ -91,6 +96,12 @@ pub enum Fetched {
 
 /// One connected repo, as far as syncing is concerned.
 pub struct Repo {
+    /// `git_repos.id`: stamped on every workflow this repo writes (`workflows.managed_by`).
+    pub id: String,
+    /// Display name, for the version author (`git:<name>@<rev>`).
+    pub name: String,
+    /// Retire workflows whose file disappeared, after a sync with no file errors.
+    pub prune: bool,
     pub url: String,
     pub branch: String,
     pub path: String,
@@ -139,7 +150,7 @@ impl std::fmt::Debug for GitAuth {
 /// missing, …); per-file parse errors are collected into `Reconcile::errors` so
 /// one bad file doesn't block the good ones.
 pub async fn reconcile(pool: &sqlx::PgPool, repo: &Repo) -> Result<Reconcile, String> {
-    let (rev, valid, mut errors, skipped) =
+    let (rev, valid, errors, skipped) =
         match fetch_and_validate(&repo.url, &repo.branch, &repo.path, repo.auth.as_ref()).await? {
             Fetched::Plain { rev, valid, errors, skipped } => (rev, valid, errors, skipped),
             Fetched::Bundle { rev, dir, _scratch } => {
@@ -152,18 +163,40 @@ pub async fn reconcile(pool: &sqlx::PgPool, repo: &Repo) -> Result<Reconcile, St
                         repo.path
                     )
                 })?;
-                let applied = crate::bundle::reconcile_bundle(pool, &dir, &keys).await?;
+                let applied = crate::bundle::reconcile_bundle(pool, &repo.id, &dir, &keys).await?;
+                // A bundle that applied has no per-file errors by construction.
+                let retired = if repo.prune {
+                    retire_missing(pool, &repo.id, &applied.synced).await?
+                } else {
+                    0
+                };
                 return Ok(Reconcile {
                     rev,
                     synced: applied.synced,
                     errors: Vec::new(),
                     skipped: 0,
                     bundle: Some(applied.provenance),
+                    retired,
+                    prune_skipped: false,
                 });
             }
         };
+    apply_plain(pool, repo, rev, valid, errors, skipped).await
+}
+
+/// The datastore half of a plain (unsigned) sync: upsert every valid spec as git-managed, then prune.
+/// Split from [`reconcile`] so it can be tested without a git checkout.
+async fn apply_plain(
+    pool: &sqlx::PgPool,
+    repo: &Repo,
+    rev: String,
+    valid: Vec<(String, String)>,
+    mut errors: Vec<String>,
+    skipped: usize,
+) -> Result<Reconcile, String> {
     let mut synced = Vec::new();
     let mut seen = HashSet::new();
+    let author = format!("git:{}@{}", repo.name, short(&rev));
     for (name, yaml) in valid {
         // `upsert_workflow` keys by name, so two files with the same DAG name
         // would silently clobber each other while `synced` counts both.
@@ -171,12 +204,41 @@ pub async fn reconcile(pool: &sqlx::PgPool, repo: &Repo) -> Result<Reconcile, St
             errors.push(format!("duplicate workflow name '{name}'"));
             continue;
         }
-        match upsert_workflow(pool, &name, &yaml).await {
+        match upsert_workflow(pool, &repo.id, &name, &yaml, &author).await {
             Ok(()) => synced.push(name),
             Err(e) => errors.push(format!("{name}: {e}")),
         }
     }
-    Ok(Reconcile { rev, synced, errors, skipped, bundle: None })
+    // Prune only from a clean sync: a file that failed validation has no name here, so its workflow
+    // would look "gone" and be retired for a typo.
+    let (mut retired, mut prune_skipped) = (0, false);
+    if repo.prune {
+        if errors.is_empty() {
+            match retire_missing(pool, &repo.id, &synced).await {
+                Ok(n) => retired = n,
+                Err(e) => errors.push(format!("prune: {e}")),
+            }
+        } else {
+            prune_skipped = true;
+        }
+    }
+    Ok(Reconcile { rev, synced, errors, skipped, bundle: None, retired, prune_skipped })
+}
+
+/// Retire (soft-delete, history kept) the workflows this repo manages whose name is not in `keep`.
+/// They also stop being managed: the file is gone, so the console may edit them again, and if the
+/// file comes back the next sync revives them (see [`put_managed`]).
+async fn retire_missing(pool: &sqlx::PgPool, repo_id: &str, keep: &[String]) -> Result<usize, String> {
+    sqlx::query(
+        "UPDATE workflows SET state = 'retired', managed_by = NULL
+         WHERE managed_by = $1 AND NOT (name = ANY($2))",
+    )
+    .bind(repo_id)
+    .bind(keep)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected() as usize)
+    .map_err(|e| format!("retiring workflows whose file is gone: {e}"))
 }
 
 /// Clone the branch and look under `path`. A directory carrying a
@@ -258,16 +320,13 @@ async fn fetch_and_validate(
                 continue;
             }
         };
-        // Not a dagron spec → not this repo's problem. `tasks:` is the one
-        // field every workflow has and no unrelated YAML does, so it is the
-        // cheapest honest discriminator.
-        if !looks_like_spec(&yaml) {
-            skipped += 1;
-            continue;
-        }
-        match validate(&yaml) {
-            Ok(name) => valid.push((name, yaml)),
-            Err(msg) => errors.push(format!("{rel}: {msg}")),
+        match spec_shape(&yaml) {
+            Shape::Foreign => skipped += 1,
+            Shape::Unparseable(e) => errors.push(format!("{rel}: {e}")),
+            Shape::Spec => match validate(&yaml) {
+                Ok(name) => valid.push((name, yaml)),
+                Err(msg) => errors.push(format!("{rel}: {msg}")),
+            },
         }
     }
     Ok(Fetched::Plain { rev, valid, errors, skipped })
@@ -285,14 +344,29 @@ fn bundle_required_from(value: Option<&str>) -> bool {
     matches!(value.map(str::trim), Some(v) if v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
-/// Whether a YAML file is a dagron workflow spec at all: a mapping carrying a
-/// `tasks:` key. Anything else in the scanned directory is ignored rather than
-/// reported — see [`Reconcile::skipped`].
-fn looks_like_spec(yaml: &str) -> bool {
-    serde_yaml::from_str::<serde_yaml::Value>(yaml)
-        .ok()
-        .and_then(|v| v.get("tasks").cloned())
-        .is_some()
+/// What a YAML file under the scanned path is, as far as this worker is concerned.
+enum Shape {
+    /// A mapping carrying a `tasks:` key. `tasks:` is the one field every workflow has and
+    /// no unrelated YAML does, so it is the cheapest honest discriminator.
+    Spec,
+    /// Parsed cleanly and carries no `tasks:` — someone else's YAML (a compose file, an
+    /// ApplicationSet), ignored rather than reported. See [`Reconcile::skipped`].
+    Foreign,
+    /// Not YAML at all. Reported as a file error, never ignored: a spec whose syntax a typo
+    /// broke parses no better than a compose file, and counting it as `Foreign` would drop its
+    /// name from the synced set — which under `prune` retires a live workflow for a bad indent.
+    /// Unrelated YAML that is *also* broken costs a warning and one suppressed prune; that is the
+    /// side to err on.
+    Unparseable(String),
+}
+
+/// Classify one YAML file — see [`Shape`].
+fn spec_shape(yaml: &str) -> Shape {
+    match serde_yaml::from_str::<serde_yaml::Value>(yaml) {
+        Err(e) => Shape::Unparseable(e.to_string()),
+        Ok(v) if v.get("tasks").is_some() => Shape::Spec,
+        Ok(_) => Shape::Foreign,
+    }
 }
 
 /// Validate one spec with the **engine's** parser and return its DAG name, so a
@@ -343,113 +417,177 @@ pub(crate) fn validate(yaml: &str) -> Result<String, String> {
     Ok(dag.spec.name.clone())
 }
 
-/// Upsert a workflow definition by name. The reconcile is idempotent — the same
-/// commit synced twice is a no-op beyond `updated_at`.
-async fn upsert_workflow(pool: &sqlx::PgPool, name: &str, yaml: &str) -> Result<(), String> {
-    let now = chrono::Utc::now().to_rfc3339();
-    let id = Uuid::new_v4().to_string();
-    sqlx::query(
-        "INSERT INTO workflows (id, name, spec, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$4)
-         ON CONFLICT (name) DO UPDATE SET spec = EXCLUDED.spec, updated_at = EXCLUDED.updated_at",
-    )
-    .bind(&id)
-    .bind(name)
-    .bind(yaml)
-    .bind(&now)
-    .execute(pool)
-    .await
-    .map(|_| ())
-    .map_err(|e| format!("upsert failed: {e}"))
+/// Upsert one workflow definition by name, git-managed and versioned. Idempotent: the same commit
+/// synced twice writes nothing (no version row, no `updated_at` churn).
+async fn upsert_workflow(
+    pool: &sqlx::PgPool,
+    repo_id: &str,
+    name: &str,
+    yaml: &str,
+    author: &str,
+) -> Result<(), String> {
+    let mut tx = pool.begin().await.map_err(|e| format!("{name}: beginning transaction: {e}"))?;
+    put_managed(&mut tx, repo_id, name, yaml, author, false).await?;
+    tx.commit().await.map_err(|e| format!("{name}: committing: {e}"))
 }
 
-/// Apply a verified set of `(name, yaml)` specs in **one transaction**, each
-/// upserted by name and each recorded as a new `workflow_versions` row with
-/// `created_by = author` — the bundle's provenance string, so the history of
-/// a workflow says which signed bundle put a definition there.
+/// Write `yaml` as the definition of workflow `name`, owned by `repo_id`, recording history.
 ///
-/// This is the signed-bundle counterpart of [`upsert_workflow`]. That one is
-/// per-file and best-effort because a plain repo's files are independent; a
-/// bundle is a single signed statement, so it lands whole or not at all —
-/// either every workflow moves to the bundle's definition or none does, and
-/// the reconcile reports one error for the set.
+/// * new name: insert, version 1;
+/// * spec unchanged: only (re)stamp management, and a version row only when `version_if_unchanged`
+///   (a signed bundle names itself in history even when a workflow did not change);
+/// * spec changed: git wins. If the row's head version is not what is currently stored (an edit that
+///   never got a history row), that spec is recorded first, so nothing overwritten is unrecoverable
+///   (a console edit already has its own version row and is left alone); then the new spec and a
+///   version row `created_by = author`.
 ///
-/// The version bookkeeping mirrors `dagron-api::routes::lifecycle::record_version`
-/// (that crate cannot be depended on from here). The `SELECT … FOR UPDATE`
-/// on the workflow row is what makes the per-workflow version number safe
-/// against a concurrent console edit: the edit's transaction takes the same
-/// lock, so the two serialise rather than both reading the same
-/// `MAX(version)` and colliding on the `UNIQUE (workflow_id, version)`.
+/// A retired workflow no longer managed by anyone (its file was pruned) comes back to `active` when
+/// its file returns. Note: a workflow a human retired that shares a name with a git file is
+/// revived too; git owns the name once the file exists.
+async fn put_managed(
+    tx: &mut sqlx::PgConnection,
+    repo_id: &str,
+    name: &str,
+    yaml: &str,
+    author: &str,
+    version_if_unchanged: bool,
+) -> Result<(), String> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let new_md5: String = sqlx::query_scalar("SELECT md5($1)")
+        .bind(yaml)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| format!("{name}: hashing the spec: {e}"))?;
+    let existing: Option<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT id, md5(spec), spec, version FROM workflows WHERE name = $1 FOR UPDATE",
+    )
+    .bind(name)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| format!("{name}: locking the workflow row: {e}"))?;
+    let Some((id, head_md5, current, version)) = existing else {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO workflows (id, name, spec, created_at, updated_at, managed_by, managed_md5)
+             VALUES ($1,$2,$3,$4,$4,$5,$6)",
+        )
+        .bind(&id)
+        .bind(name)
+        .bind(yaml)
+        .bind(&now)
+        .bind(repo_id)
+        .bind(&new_md5)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("{name}: inserting the workflow: {e}"))?;
+        return record_version(tx, &id, name, yaml, author, &now).await.map(|_| ());
+    };
+    const REVIVE: &str =
+        "state = CASE WHEN managed_by IS NULL AND state = 'retired' THEN 'active' ELSE state END";
+    if head_md5 == new_md5 {
+        sqlx::query(&format!(
+            "UPDATE workflows SET managed_by = $1, managed_md5 = $2, {REVIVE}
+             WHERE id = $3 AND (managed_by IS DISTINCT FROM $1 OR managed_md5 IS DISTINCT FROM $2)"
+        ))
+        .bind(repo_id)
+        .bind(&new_md5)
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("{name}: stamping the workflow: {e}"))?;
+        if version_if_unchanged {
+            record_version(tx, &id, name, yaml, author, &now).await?;
+        }
+        return Ok(());
+    }
+    let head: Option<String> = sqlx::query_scalar(
+        "SELECT spec FROM workflow_versions WHERE workflow_id = $1 AND version = $2",
+    )
+    .bind(&id)
+    .bind(version)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| format!("{name}: reading the head version: {e}"))?;
+    if head.as_deref() != Some(current.as_str()) {
+        record_version(tx, &id, name, &current, "unrecorded edit (kept before a git sync)", &now).await?;
+    }
+    sqlx::query(&format!(
+        "UPDATE workflows SET spec = $1, updated_at = $2, managed_by = $3, managed_md5 = $4, {REVIVE}
+         WHERE id = $5"
+    ))
+    .bind(yaml)
+    .bind(&now)
+    .bind(repo_id)
+    .bind(&new_md5)
+    .bind(&id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("{name}: updating the workflow: {e}"))?;
+    record_version(tx, &id, name, yaml, author, &now).await.map(|_| ())
+}
+
+/// Next per-workflow version number ("version 3" is the third definition of *this* workflow), the
+/// history row, and `workflows.version` pointing at it. Mirrors `dagron-api::routes::lifecycle::record_version`
+/// (that crate cannot be depended on from here); callers hold the workflow row's `FOR UPDATE` lock,
+/// which is what makes the number safe against a concurrent console edit.
+async fn record_version(
+    tx: &mut sqlx::PgConnection,
+    id: &str,
+    name: &str,
+    spec: &str,
+    author: &str,
+    now: &str,
+) -> Result<i64, String> {
+    let next: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(version), 0) + 1 FROM workflow_versions WHERE workflow_id = $1",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| format!("{name}: reading the version history: {e}"))?;
+    sqlx::query(
+        "INSERT INTO workflow_versions (id, workflow_id, version, name, spec, created_at, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(id)
+    .bind(next)
+    .bind(name)
+    .bind(spec)
+    .bind(now)
+    .bind(author)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("{name}: recording version {next}: {e}"))?;
+    sqlx::query("UPDATE workflows SET version = $1 WHERE id = $2")
+        .bind(next)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("{name}: stamping version {next}: {e}"))?;
+    Ok(next)
+}
+
+/// Apply a verified set of `(name, yaml)` specs in **one transaction**, each upserted by name, owned
+/// by `repo_id`, and each recorded as a new `workflow_versions` row with `created_by = author` - the
+/// bundle's provenance string, so the history of a workflow says which signed bundle put a definition
+/// there.
+///
+/// This is the signed-bundle counterpart of [`upsert_workflow`]. That one is per-file and best-effort
+/// because a plain repo's files are independent; a bundle is a single signed statement, so it lands
+/// whole or not at all: either every workflow moves to the bundle's definition or none does, and the
+/// reconcile reports one error for the set. The `SELECT ... FOR UPDATE` in [`put_managed`] serialises
+/// with a concurrent console edit.
 pub async fn apply_specs(
     pool: &sqlx::PgPool,
+    repo_id: &str,
     specs: &[(String, String)],
     author: &str,
 ) -> Result<Vec<String>, String> {
     let mut tx = pool.begin().await.map_err(|e| format!("beginning transaction: {e}"))?;
-    let now = chrono::Utc::now().to_rfc3339();
     let mut applied = Vec::with_capacity(specs.len());
     for (name, yaml) in specs {
-        let existing: Option<String> =
-            sqlx::query_scalar("SELECT id FROM workflows WHERE name = $1 FOR UPDATE")
-                .bind(name)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| format!("{name}: locking the workflow row: {e}"))?;
-        let id = match existing {
-            Some(id) => {
-                sqlx::query("UPDATE workflows SET spec = $1, updated_at = $2 WHERE id = $3")
-                    .bind(yaml)
-                    .bind(&now)
-                    .bind(&id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| format!("{name}: updating the workflow: {e}"))?;
-                id
-            }
-            None => {
-                let id = Uuid::new_v4().to_string();
-                sqlx::query(
-                    "INSERT INTO workflows (id, name, spec, created_at, updated_at) VALUES ($1,$2,$3,$4,$4)",
-                )
-                .bind(&id)
-                .bind(name)
-                .bind(yaml)
-                .bind(&now)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| format!("{name}: inserting the workflow: {e}"))?;
-                id
-            }
-        };
-        // Next per-workflow number — "version 3" is the third definition of
-        // *this* workflow, not the third in the installation.
-        let next: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(version), 0) + 1 FROM workflow_versions WHERE workflow_id = $1",
-        )
-        .bind(&id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| format!("{name}: reading the version history: {e}"))?;
-        sqlx::query(
-            "INSERT INTO workflow_versions (id, workflow_id, version, name, spec, created_at, created_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(&id)
-        .bind(next)
-        .bind(name)
-        .bind(yaml)
-        .bind(&now)
-        .bind(author)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| format!("{name}: recording version {next}: {e}"))?;
-        sqlx::query("UPDATE workflows SET version = $1 WHERE id = $2")
-            .bind(next)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| format!("{name}: stamping version {next}: {e}"))?;
+        put_managed(&mut tx, repo_id, name, yaml, author, true).await?;
         applied.push(name.clone());
     }
     tx.commit().await.map_err(|e| format!("committing the bundle: {e}"))?;
@@ -866,23 +1004,41 @@ mod tests {
     /// must not be reported as failures, but a broken *workflow* still must be.
     #[test]
     fn ignores_yaml_that_is_not_a_spec() {
-        assert!(!looks_like_spec("services:
+        let is_spec = |y| matches!(spec_shape(y), Shape::Spec);
+        let foreign = |y| matches!(spec_shape(y), Shape::Foreign);
+        assert!(foreign("services:
   db:
     image: postgres
 "));
-        assert!(!looks_like_spec("apiVersion: argoproj.io/v1alpha1
+        assert!(foreign("apiVersion: argoproj.io/v1alpha1
 kind: ApplicationSet
 "));
-        assert!(!looks_like_spec("not: yaml: at: all: ["));
-        assert!(looks_like_spec("name: wf
+        assert!(is_spec("name: wf
 tasks:
   - name: a
     command: [\"true\"]
 "));
         // A file that *is* a spec but is malformed stays an error, not a skip.
-        assert!(looks_like_spec("tasks:
+        assert!(is_spec("tasks:
   - name: a
 "));
+    }
+
+    /// YAML that does not parse is neither a spec nor someone else's file: it is reported.
+    /// Counting it as `Foreign` is what let a one-character typo in a managed workflow drop out
+    /// of the synced set with no error — and, under `prune`, retire the live workflow.
+    #[test]
+    fn unparseable_yaml_is_an_error_not_a_silent_skip() {
+        assert!(matches!(spec_shape("not: yaml: at: all: ["), Shape::Unparseable(_)));
+        // The realistic one: a spec whose block sequence lost an indent level.
+        assert!(matches!(
+            spec_shape("name: churn-model
+tasks:
+  - name: t
+   command: [\"echo\"]
+"),
+            Shape::Unparseable(_)
+        ));
     }
 
     #[test]
@@ -915,6 +1071,24 @@ tasks:
         let name =
             validate("name: chain\ntasks:\n  - name: call\n    workflow_ref: other\n").unwrap();
         assert_eq!(name, "chain");
+    }
+
+    /// Serialises the tests that run [`fetch_and_validate`] against each other. Restoring a
+    /// variable on drop, as [`EnvGuard`] does, keeps nothing leaking *past* a test, but the
+    /// variable is still process-wide *during* one: `BUNDLE_REQUIRE_ENV`, set inside
+    /// `a_manifest_turns_the_checkout_into_a_bundle_hand_off`, is otherwise visible to a sync
+    /// running on a parallel thread, and fails it at random in a full run. Every test that sets or
+    /// reads that variable through production code takes this for its whole body.
+    ///
+    /// Deliberately not folded into `EnvGuard`: `std::sync::Mutex` is not reentrant and a single
+    /// test may hold two guards at once (see `worker_wide_token_only_goes_to_trusted_https_hosts`),
+    /// which would deadlock against itself.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take [`ENV_LOCK`], stepping over a poisoning: one test panicking inside the lock must not
+    /// turn every other env-touching test red as well.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Sets an environment variable for the length of a test and restores it on
@@ -1141,6 +1315,8 @@ tasks:
     /// for the verifier. Offline, against a `file://` repo.
     #[tokio::test]
     async fn a_manifest_turns_the_checkout_into_a_bundle_hand_off() {
+        // Sets BUNDLE_REQUIRE_ENV below, which a parallel test's sync reads. See [`ENV_LOCK`].
+        let _env = env_lock();
         let root = std::env::temp_dir().join(format!("dagron-gitops-test-{}", Uuid::new_v4()));
         let _guard = TempDir(root.clone());
         let repo = root.join("repo");
@@ -1199,37 +1375,70 @@ tasks:
         assert!(!dir.exists(), "scratch checkout leaked at {}", dir.display());
     }
 
+    /// A workflow file whose YAML no longer parses must land in `errors`, beside the good files.
+    /// That is what makes `apply_plain` set `prune_skipped` rather than treat the workflow as
+    /// deleted: `errors` is the only signal the prune guard has, and a syntax error used to
+    /// produce none. Offline, against a `file://` repo.
+    #[tokio::test]
+    async fn a_broken_workflow_file_is_reported_not_skipped() {
+        // `fetch_and_validate` reads BUNDLE_REQUIRE_ENV, which a parallel test sets. See [`ENV_LOCK`]:
+        // without this the test passes alone and fails at random in a full run.
+        let _env = env_lock();
+        let root = std::env::temp_dir().join(format!("dagron-gitops-test-{}", Uuid::new_v4()));
+        let _guard = TempDir(root.clone());
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join("dagron")).unwrap();
+        std::fs::write(
+            repo.join("dagron/good.yaml"),
+            "name: good\ntasks:\n  - name: t\n    command: [\"true\"]\n",
+        )
+        .unwrap();
+        // `command:` under-indented by one: valid-looking, and not YAML.
+        std::fs::write(
+            repo.join("dagron/typo.yaml"),
+            "name: typo\ntasks:\n  - name: t\n   command: [\"true\"]\n",
+        )
+        .unwrap();
+        // Unrelated YAML still costs nothing but a skip.
+        std::fs::write(repo.join("dagron/compose.yaml"), "services:\n  db:\n    image: postgres\n").unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "one good, one broken, one foreign"]);
+
+        let Fetched::Plain { valid, errors, skipped, .. } =
+            fetch_and_validate(&format!("file://{}", repo.display()), "main", "dagron", None).await.unwrap()
+        else {
+            panic!("a plain repo was taken for a bundle")
+        };
+        assert_eq!(valid.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["good"]);
+        assert_eq!(skipped, 1, "only the compose file is foreign");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("typo.yaml"), "{errors:?}");
+        // A non-empty `errors` is what makes `apply_plain` set `prune_skipped` instead of
+        // retiring `typo`'s workflow — see `prune_retires_only_from_a_clean_sync`.
+    }
+
     /// Live-datastore check of the one-transaction apply, gated on
     /// `TEST_DATABASE_URL` (a disposable Postgres; the tables are created here
     /// with the same shape dagron-api's migrations give them).
     #[tokio::test]
     async fn apply_specs_writes_one_version_row_per_workflow_or_nothing() {
-        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
-            eprintln!("TEST_DATABASE_URL unset — skipping the live apply_specs test");
-            return;
-        };
-        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
-        for ddl in [
-            "CREATE TABLE IF NOT EXISTS workflows (
-                id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL UNIQUE, spec TEXT NOT NULL,
-                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                version BIGINT NOT NULL DEFAULT 1, state TEXT NOT NULL DEFAULT 'active')",
-            "CREATE TABLE IF NOT EXISTS workflow_versions (
-                id TEXT PRIMARY KEY NOT NULL,
-                workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
-                version BIGINT NOT NULL, name TEXT NOT NULL, spec TEXT NOT NULL,
-                created_at TEXT NOT NULL, created_by TEXT, UNIQUE (workflow_id, version))",
-        ] {
-            sqlx::query(ddl).execute(&pool).await.unwrap();
-        }
+        let Some(pool) = test_pool().await else { return };
         let tag = Uuid::new_v4();
+        let repo = format!("repo-{tag}");
         let a = format!("bundle-a-{tag}");
         let b = format!("bundle-b-{tag}");
 
         // First apply: both created at version 1, stamped with the provenance.
         let specs = vec![(a.clone(), "name: a\ntasks: []\n".to_string()), (b.clone(), "name: b\ntasks: []\n".to_string())];
-        let applied = apply_specs(&pool, &specs, "bundle:t@1#aaaaaaaaaaaa").await.unwrap();
+        let applied = apply_specs(&pool, &repo, &specs, "bundle:t@1#aaaaaaaaaaaa").await.unwrap();
         assert_eq!(applied, vec![a.clone(), b.clone()]);
+        let managed: Option<String> = sqlx::query_scalar("SELECT managed_by FROM workflows WHERE name = $1")
+            .bind(&a)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(managed.as_deref(), Some(repo.as_str()), "a bundle-applied workflow is managed by its repo");
         let head = |name: String| {
             let pool = pool.clone();
             async move {
@@ -1250,7 +1459,7 @@ tasks:
         // Second apply of a changed definition: same row, version 2, head
         // spec moved, both history rows kept.
         let specs = vec![(a.clone(), "name: a\ntasks: []\n# v2\n".to_string())];
-        apply_specs(&pool, &specs, "bundle:t@2#bbbbbbbbbbbb").await.unwrap();
+        apply_specs(&pool, &repo, &specs, "bundle:t@2#bbbbbbbbbbbb").await.unwrap();
         let (id_a2, version, spec, by) = head(a.clone()).await;
         assert_eq!(id_a2, id_a, "an upsert must keep the workflow id");
         assert_eq!((version, by.as_deref()), (2, Some("bundle:t@2#bbbbbbbbbbbb")));
@@ -1268,7 +1477,7 @@ tasks:
         let c = format!("bundle-c-{tag}");
         let d = format!("bundle-d-{tag}");
         let specs = vec![(c.clone(), "name: c\ntasks: []\n".to_string()), (d.clone(), "name: d\0\n".to_string())];
-        let err = apply_specs(&pool, &specs, "bundle:t@3#cccccccccccc").await.unwrap_err();
+        let err = apply_specs(&pool, &repo, &specs, "bundle:t@3#cccccccccccc").await.unwrap_err();
         assert!(err.contains(&d), "{err}");
         let orphan: i64 = sqlx::query_scalar("SELECT count(*) FROM workflows WHERE name = $1")
             .bind(&c)
@@ -1282,6 +1491,221 @@ tasks:
             .execute(&pool)
             .await
             .unwrap();
+    }
+
+
+    /// Disposable Postgres from `TEST_DATABASE_URL` (skipped when unset), with the tables shaped like
+    /// dagron's migrations give them. DDL runs under one advisory lock: the tests below share the
+    /// database and run in parallel, and concurrent `CREATE TABLE IF NOT EXISTS` races in the catalog.
+    async fn test_pool() -> Option<sqlx::PgPool> {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("TEST_DATABASE_URL unset - skipping a live-datastore test");
+            return None;
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(4).connect(&url).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(76543)").execute(&mut *tx).await.unwrap();
+        for ddl in [
+            "CREATE TABLE IF NOT EXISTS workflows (
+                id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL UNIQUE, spec TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                version BIGINT NOT NULL DEFAULT 1, state TEXT NOT NULL DEFAULT 'active')",
+            "ALTER TABLE workflows ADD COLUMN IF NOT EXISTS managed_by TEXT",
+            "ALTER TABLE workflows ADD COLUMN IF NOT EXISTS managed_md5 TEXT",
+            "CREATE TABLE IF NOT EXISTS workflow_versions (
+                id TEXT PRIMARY KEY NOT NULL,
+                workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+                version BIGINT NOT NULL, name TEXT NOT NULL, spec TEXT NOT NULL,
+                created_at TEXT NOT NULL, created_by TEXT, UNIQUE (workflow_id, version))",
+        ] {
+            sqlx::query(ddl).execute(&mut *tx).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+        Some(pool)
+    }
+
+    fn spec(name: &str, extra: &str) -> String {
+        format!("name: {name}\ntasks:\n  - name: t\n    command: [\"true\"]\n{extra}")
+    }
+
+    fn repo_of(id: &str, prune: bool) -> Repo {
+        Repo {
+            id: id.into(),
+            name: "acme/flows".into(),
+            prune,
+            url: "file:///unused".into(),
+            branch: "main".into(),
+            path: "dagron".into(),
+            auth: None,
+        }
+    }
+
+    /// `(version, spec, created_by)`, oldest first.
+    async fn history(pool: &sqlx::PgPool, name: &str) -> Vec<(i64, String, Option<String>)> {
+        sqlx::query_as(
+            "SELECT v.version, v.spec, v.created_by FROM workflow_versions v
+             JOIN workflows w ON w.id = v.workflow_id WHERE w.name = $1 ORDER BY v.version",
+        )
+        .bind(name)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// What `PUT /api/workflows/{id}` leaves behind: the new spec, and (`record`) a version row.
+    async fn console_edit(pool: &sqlx::PgPool, name: &str, new_spec: &str, record: bool) {
+        sqlx::query("UPDATE workflows SET spec = $1 WHERE name = $2").bind(new_spec).bind(name).execute(pool).await.unwrap();
+        if record {
+            sqlx::query(
+                "INSERT INTO workflow_versions (id, workflow_id, version, name, spec, created_at, created_by)
+                 SELECT $1, id, (SELECT max(version) + 1 FROM workflow_versions WHERE workflow_id = workflows.id),
+                        name, $2, $3, 'me@example.com' FROM workflows WHERE name = $4",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(new_spec)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(name)
+            .execute(pool)
+            .await
+            .unwrap();
+            sqlx::query("UPDATE workflows SET version = (SELECT max(version) FROM workflow_versions v WHERE v.workflow_id = workflows.id) WHERE name = $1")
+                .bind(name)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn is_drifted(pool: &sqlx::PgPool, name: &str) -> bool {
+        sqlx::query_scalar("SELECT md5(spec) <> managed_md5 FROM workflows WHERE name = $1")
+            .bind(name)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// A git sync leaves history, stamped with the commit, and a re-sync of the same commit writes
+    /// nothing - not a version row, not `updated_at`.
+    #[tokio::test]
+    async fn a_git_sync_records_history_only_when_the_spec_changes() {
+        let Some(pool) = test_pool().await else { return };
+        let tag = Uuid::new_v4();
+        let (repo, name) = (repo_of(&format!("repo-{tag}"), false), format!("gm-hist-{tag}"));
+        let v1 = spec(&name, "");
+        let sync = |rev: &str, yaml: &str| {
+            let (pool, repo, name, rev, yaml) = (pool.clone(), &repo, name.clone(), rev.to_string(), yaml.to_string());
+            async move { apply_plain(&pool, repo, rev, vec![(name, yaml)], vec![], 0).await.unwrap() }
+        };
+
+        sync("aaaaaaaabbbb", &v1).await;
+        let h = history(&pool, &name).await;
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].2.as_deref(), Some("git:acme/flows@aaaaaaaa"));
+        let managed: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT managed_by, managed_md5 FROM workflows WHERE name = $1").bind(&name).fetch_one(&pool).await.unwrap();
+        assert_eq!(managed.0.as_deref(), Some(repo.id.as_str()));
+        assert!(managed.1.is_some());
+        let stamp: String = sqlx::query_scalar("SELECT updated_at FROM workflows WHERE name = $1").bind(&name).fetch_one(&pool).await.unwrap();
+
+        sync("cccccccccccc", &v1).await;
+        assert_eq!(history(&pool, &name).await.len(), 1, "an unchanged spec must not add a version");
+        let again: String = sqlx::query_scalar("SELECT updated_at FROM workflows WHERE name = $1").bind(&name).fetch_one(&pool).await.unwrap();
+        assert_eq!(again, stamp, "an unchanged spec must not rewrite updated_at");
+
+        let v2 = spec(&name, "# v2\n");
+        sync("dddddddddddd", &v2).await;
+        let h = history(&pool, &name).await;
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[1].2.as_deref(), Some("git:acme/flows@dddddddd"));
+        let (head, version): (String, i64) =
+            sqlx::query_as("SELECT spec, version FROM workflows WHERE name = $1").bind(&name).fetch_one(&pool).await.unwrap();
+        assert_eq!((head, version), (v2, 2));
+    }
+
+    /// Git wins over a console edit - and the edit is not lost: a `PUT` already has its own version
+    /// row; an edit with none (written around the API) is recorded before it is overwritten.
+    #[tokio::test]
+    async fn git_wins_over_a_console_edit_but_the_edit_stays_in_history() {
+        let Some(pool) = test_pool().await else { return };
+        let tag = Uuid::new_v4();
+        let (repo, name) = (repo_of(&format!("repo-{tag}"), false), format!("gm-edit-{tag}"));
+        let git = |n: u32, yaml: String| {
+            let (pool, repo, name) = (pool.clone(), &repo, name.clone());
+            async move { apply_plain(&pool, repo, format!("{n:08}abcd"), vec![(name, yaml)], vec![], 0).await.unwrap() }
+        };
+        git(1, spec(&name, "")).await;
+
+        // A PUT: new spec + its own version row (v2). Drift is visible until the next sync.
+        let edited = spec(&name, "# edited in the console\n");
+        console_edit(&pool, &name, &edited, true).await;
+        assert!(is_drifted(&pool, &name).await, "a console edit must show as drift");
+        git(2, spec(&name, "# git v2\n")).await;
+        let h = history(&pool, &name).await;
+        let by: Vec<_> = h.iter().map(|r| r.2.clone().unwrap_or_default()).collect();
+        assert_eq!(by, ["git:acme/flows@00000001", "me@example.com", "git:acme/flows@00000002"], "{by:?}");
+        assert_eq!(h[1].1, edited, "the console edit stays recoverable from /versions");
+        assert!(!is_drifted(&pool, &name).await, "git's definition is back");
+
+        // The same git spec re-synced after another edit still reverts it.
+        console_edit(&pool, &name, &spec(&name, "# again\n"), true).await;
+        git(3, spec(&name, "# git v2\n")).await;
+        assert!(!is_drifted(&pool, &name).await);
+
+        // An edit with no history row of its own is recorded first, then overwritten.
+        let raw = spec(&name, "# unrecorded\n");
+        console_edit(&pool, &name, &raw, false).await;
+        git(4, spec(&name, "# git v3\n")).await;
+        let h = history(&pool, &name).await;
+        let kept = h.iter().find(|r| r.1 == raw).expect("the unrecorded edit was kept");
+        assert!(kept.2.as_deref().unwrap_or("").starts_with("unrecorded edit"), "{:?}", kept.2);
+        assert_eq!(h.last().unwrap().2.as_deref(), Some("git:acme/flows@00000004"));
+    }
+
+    /// Prune retires a workflow whose file is gone - only from a clean sync, only when the repo asked
+    /// for it - keeps its history, and revives it if the file returns.
+    #[tokio::test]
+    async fn prune_retires_only_from_a_clean_sync() {
+        let Some(pool) = test_pool().await else { return };
+        let tag = Uuid::new_v4();
+        let id = format!("repo-{tag}");
+        let (a, b) = (format!("gm-prune-a-{tag}"), format!("gm-prune-b-{tag}"));
+        let files = |names: &[&String]| names.iter().map(|n| ((*n).clone(), spec(n, ""))).collect::<Vec<_>>();
+        let state = |n: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (String, Option<String>)>("SELECT state, managed_by FROM workflows WHERE name = $1")
+                    .bind(n)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // prune off: a missing file leaves its workflow alone.
+        let off = repo_of(&id, false);
+        apply_plain(&pool, &off, "1".repeat(12), files(&[&a, &b]), vec![], 0).await.unwrap();
+        let r = apply_plain(&pool, &off, "2".repeat(12), files(&[&a]), vec![], 0).await.unwrap();
+        assert_eq!((r.retired, r.prune_skipped), (0, false));
+        assert_eq!(state(b.clone()).await.0, "active");
+
+        let on = repo_of(&id, true);
+        // a clean sync without b's file retires b, keeping its row and history.
+        let r = apply_plain(&pool, &on, "3".repeat(12), files(&[&a]), vec![], 0).await.unwrap();
+        assert_eq!((r.retired, r.prune_skipped), (1, false));
+        assert_eq!(state(b.clone()).await, ("retired".to_string(), None), "retired and no longer git-managed");
+        assert_eq!(state(a.clone()).await.0, "active");
+        assert_eq!(history(&pool, &b).await.len(), 1, "history survives");
+
+        // the file returns: the workflow comes back, managed again.
+        apply_plain(&pool, &on, "4".repeat(12), files(&[&a, &b]), vec![], 0).await.unwrap();
+        assert_eq!(state(b.clone()).await, ("active".to_string(), Some(id.clone())));
+
+        // a sync with a file error must not retire anything: the broken file's workflow has no name here.
+        let r = apply_plain(&pool, &on, "5".repeat(12), files(&[&a]), vec!["dagron/b.yaml: task 'x' depends on unknown task".into()], 0)
+            .await
+            .unwrap();
+        assert_eq!((r.retired, r.prune_skipped), (0, true));
+        assert_eq!(state(b.clone()).await.0, "active", "a typo in b.yaml must not retire b");
     }
 
     /// The worker clones whatever the row holds, so the URL is re-checked here.

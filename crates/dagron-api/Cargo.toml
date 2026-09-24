@@ -2,6 +2,8 @@
 name = "dagron-api"
 version = "0.1.0"
 edition = "2021"
+# MSRV — see the root Cargo.toml for how 1.88 was measured.
+rust-version = "1.88"
 description = "dagron management API — read-mostly axum service over the dagron Postgres, with LISTEN/NOTIFY → SSE live updates."
 
 [[bin]]
@@ -97,3 +99,9 @@ object_store = { version = "0.11", optional = true }
 # Enterprise fleet link (routes/link_ee.rs): licence verification.
 ed25519-dalek = { version = "2", optional = true }
 hex = { version = "0.4", optional = true }
+
+[dev-dependencies]
+# Only for `ServiceExt::oneshot`, which drives a `Router` in-process so the
+# route table can be asserted without binding a port or a database. Already in
+# the tree — axum 0.8 builds on it.
+tower = { version = "0.5", features = ["util"] }

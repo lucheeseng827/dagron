@@ -54,10 +54,13 @@ along that path.
 | [`mancube/dagron-frontend`](https://hub.docker.com/r/mancube/dagron-frontend) | [`dagron-frontend.md`](./dagron-frontend.md) | ⛔ discontinued after 0.8.1 — the console ships in `dagron-api` |
 | [`mancube/dagron-mcp`](https://hub.docker.com/r/mancube/dagron-mcp) | [`dagron-mcp.md`](./dagron-mcp.md) | MCP server (drive dagron from an AI agent) |
 | [`mancube/dagron-gitops`](https://hub.docker.com/r/mancube/dagron-gitops) | [`dagron-gitops.md`](./dagron-gitops.md) | GitOps worker (repo → workflow definitions; the only image with `git`) |
+| [`mancube/dagron-step-mcp`](https://hub.docker.com/r/mancube/dagron-step-mcp) | [`dagron-step-mcp.md`](./dagron-step-mcp.md) | MCP-tool *step* (drive an agent's tools from a DAG) — a task binary, usually `COPY --from`'d into your task's image |
+| [`mancube/dagron-step-spark`](https://hub.docker.com/r/mancube/dagron-step-spark) | [`dagron-step-spark.md`](./dagron-step-spark.md) | Spark *step* (submit a job, hand back its id, park on it) — a task binary |
+| [`mancube/dagron-step-sql`](https://hub.docker.com/r/mancube/dagron-step-sql) | [`dagron-step-sql.md`](./dagron-step-sql.md) | SQL *step* (one statement against an analytical store, bounded result) — a task binary |
 | [`mancube/dagron-engine-localdev`](https://hub.docker.com/r/mancube/dagron-engine-localdev) | [`dagron-engine-localdev.md`](./dagron-engine-localdev.md) | the engine on debian-slim — has a shell, so `EXECUTOR=local` tasks resolve |
 | `oci://registry-1.docker.io/mancube/dagron` | [`dagron-chart.md`](./dagron-chart.md) | Helm chart (the full stack) |
 
-All six images are published **`linux/amd64` + `linux/arm64`** at the release version + `latest`.
+All eight images are published **`linux/amd64` + `linux/arm64`** at the release version + `latest`.
 
 Publish them with [`../../scripts/publish-dockerhub-descriptions.py`](../../scripts/publish-dockerhub-descriptions.py)
 rather than pasting: it carries UTF-8 through (hand-pasting once replaced every em

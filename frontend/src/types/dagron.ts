@@ -285,6 +285,46 @@ export interface TaskLogs {
   filtered: boolean;
 }
 
+/// One superseded attempt of a task — a `repeat:` iteration whose `until` had
+/// not held yet, or an attempt that failed and was retried.
+///
+/// These used to be unreadable: `task_runs.output` is a single column that
+/// every attempt overwrites, so the log showed one pass of a loop and one
+/// attempt of a retry. They are now retained as a bounded tail — see
+/// `docs/ITERATION-LOGS.md` for why it is a tail and not the whole thing.
+export interface TaskAttemptLog {
+  /// 1-based, the same counter `TaskLogs.attempt` reports.
+  attempt: number;
+  /// `iteration` — a loop pass — or `failed`, an attempt that errored.
+  reason: "iteration" | "failed";
+  output: string;
+  /// Output was dropped to fit the retention cap. Distinct from `truncated`,
+  /// which is the *filter's* line cap on this response.
+  retention_truncated: boolean;
+  finished_at: string;
+  lines?: LogLine[];
+  total: number;
+  matched: number;
+  truncated: boolean;
+}
+
+/// GET /api/runs/:id/tasks/:tid/attempts — the iterations the log view can't show.
+export interface TaskAttempts {
+  task_id: string;
+  name: string;
+  /// The attempt on the task row. Deliberately *not* in `attempts`: its output
+  /// is in `task_runs.output`, whole, and the log pane above already shows it.
+  current_attempt: number;
+  /// Oldest first.
+  attempts: TaskAttemptLog[];
+  /// The history does not start at attempt 1 — earlier attempts existed and
+  /// are not here, either because the retention window dropped them or because
+  /// the response hit its read cap. A history that silently starts at
+  /// iteration 51 would be a lie either way.
+  evicted: boolean;
+  filtered: boolean;
+}
+
 /// SSE event payload from GET /api/runs/:id/stream (one run) and
 /// GET /api/events/stream (account-wide, feeds the list pages' live mode).
 export interface TaskEvent {
@@ -330,6 +370,16 @@ export interface Workflow extends WorkflowSummary {
 
 /// One entry in a workflow's definition history. Append-only: an edit adds a
 /// version, it never rewrites one.
+/// One distinct spec and the runs created from it — `GET /api/runs/specs`.
+/// Grouped by content server-side because every run snapshots its own
+/// definition row, so N runs of an unedited workflow are N copies of one spec.
+export interface RunSpecGroup {
+  yaml: string;
+  name: string | null;
+  /// The requested runs that ran this exact spec, in the order asked for.
+  run_ids: string[];
+}
+
 export interface WorkflowVersion {
   id: string;
   version: number;

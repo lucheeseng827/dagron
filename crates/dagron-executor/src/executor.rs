@@ -116,6 +116,13 @@ pub struct ExecContext {
     /// output here as it arrives; when `None` the output is only returned in full
     /// at exit (the original behaviour). The worker wires this up per attempt.
     pub log_sink: Option<LogSink>,
+    /// Which task row this execution belongs to, and which attempt of it.
+    ///
+    /// `None` for callers with no task row behind them — tests and the internal
+    /// no-op fallback. A backend that creates a remote workload (a pod, a
+    /// container) **labels it with this** so the workload can be found again by
+    /// something other than the process that created it. See [`TaskIdentity`].
+    pub identity: Option<TaskIdentity>,
 }
 
 impl ExecContext {
@@ -131,6 +138,7 @@ impl ExecContext {
             service_account: None,
             isolation: None,
             log_sink: None,
+            identity: None,
         }
     }
 }
@@ -143,6 +151,287 @@ impl ExecContext {
 #[async_trait]
 pub trait Executor: Send + Sync + 'static {
     async fn execute(&self, ctx: &ExecContext) -> Result<ExecOutput>;
+
+    /// Every workload this installation owns that is old enough to judge.
+    ///
+    /// The **listing** half of the fleet sweep. It is split from the deleting
+    /// half because only the engine can answer the question in between — "is
+    /// this task still live?" is a database query, and an `Executor` has no
+    /// database. Handing the executor a pool instead would put schema knowledge
+    /// behind a trait anyone may implement.
+    ///
+    /// Default: an empty list, so an executor with nothing to sweep (the local
+    /// process pool, whose children die with it) inherits a correct no-op
+    /// rather than being forced to write one.
+    async fn list_orphan_candidates(&self, _scope: &OrphanScope<'_>) -> Result<Vec<ManagedWorkload>> {
+        Ok(Vec::new())
+    }
+
+    /// Delete one workload [`Executor::list_orphan_candidates`] returned.
+    ///
+    /// Takes the handle from the listing rather than re-deriving one, so the
+    /// thing deleted is the thing judged. A backend that cannot delete says so
+    /// with an `Err`; the sweep logs it and moves on, because one undeletable
+    /// leftover must not stop the rest.
+    async fn delete_workload(&self, _w: &ManagedWorkload) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// What a fleet sweep is allowed to look at.
+///
+/// Both fields narrow, and neither has a safe default — which is why this is a
+/// parameter rather than executor state read from the environment.
+#[derive(Debug, Clone)]
+pub struct OrphanScope<'a> {
+    /// The [`LABEL_INSTALLATION`] value to select on. Required, and the reason
+    /// the whole sweep is opt-in: see that constant.
+    pub installation: &'a str,
+    /// Workloads younger than this are never candidates.
+    ///
+    /// Not a tuning knob — a correctness one. The sweep asks the database
+    /// which tasks are live, and a workload created *after* that answer was
+    /// computed would look orphaned because its row had not been written yet.
+    /// Listing before querying narrows the window; refusing to judge anything
+    /// young closes it, without needing the two to be atomic across a
+    /// datastore and an apiserver that share no transaction.
+    pub min_age: std::time::Duration,
+}
+
+/// A workload a fleet sweep found, and enough identity to judge it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedWorkload {
+    /// Backend-specific handle — a pod name, a container id. Whatever
+    /// [`Executor::delete_workload`] needs to address exactly this one.
+    pub handle: String,
+    /// The task this workload says it belongs to. The sweep's whole question is
+    /// whether that task is still live.
+    pub task_id: String,
+    /// For the operator reading the log line, not for the decision.
+    pub run_id: Option<String>,
+    /// Likewise — it says which attempt left this behind.
+    pub attempt: Option<String>,
+    /// The backend's own identity for this exact object, where it has one.
+    ///
+    /// A handle names a **slot**; this names the **occupant**. The distinction
+    /// is only visible across time, which is exactly the gap a sweep opens: it
+    /// lists, then asks the datastore, then deletes, and a name is not a
+    /// promise that the three saw the same object. Kubernetes stamps every
+    /// object with a UID and will refuse a delete whose precondition names a
+    /// different one, so carrying it turns "delete the pod I judged" from a
+    /// convention about how names are minted into something the apiserver
+    /// enforces.
+    ///
+    /// `None` where the backend has no equivalent: a Docker container id is
+    /// already the identity rather than a name for one, so deletion there
+    /// stays id-based and nothing is lost.
+    pub uid: Option<String>,
+}
+
+impl ManagedWorkload {
+    /// Build a candidate from a workload's labels, or refuse it.
+    ///
+    /// The refusal is the point, and it belongs here rather than in each
+    /// backend's listing. A label **selector** constrains only the labels it
+    /// names, and says nothing at all about the rest, so a workload can match
+    /// `managed-by` and `installation` exactly while carrying a `task-id` that
+    /// is empty or not a usable label value. Nothing dagron creates looks like that —
+    /// [`TaskIdentity::labels`] refuses to label partially — but a legacy
+    /// install, another tool, or a hand-edited manifest can.
+    ///
+    /// Such a workload would sail through the sweep exactly like a real
+    /// orphan: its task id matches no live row, because no row ever had that
+    /// id, and the sweep acts on absence. It would then be **deleted**, which
+    /// inverts the rule the rest of this module is built on — a workload that
+    /// cannot prove it is stale is left alone. [`is_stale_attempt`] already
+    /// refuses a missing or unparseable *attempt* for that reason; the task
+    /// id, which the whole judgement rests on, deserves it more.
+    ///
+    /// `run_id` and `attempt` are not validated: they are for the operator
+    /// reading the log line, and no decision reads them.
+    /// `uid` is the backend's, passed in rather than read from a label: it is
+    /// the backend's own identity for the object, not something dagron wrote.
+    /// Whether its absence is anomalous is the caller's to decide, because the
+    /// answer differs — see [`ManagedWorkload::uid`].
+    pub fn from_labels<'a>(
+        handle: String,
+        uid: Option<String>,
+        get: impl Fn(&str) -> Option<&'a String>,
+    ) -> Option<Self> {
+        let task_id = get(LABEL_TASK_ID)?;
+        label_value(task_id)?;
+        Some(Self {
+            handle,
+            task_id: task_id.clone(),
+            run_id: get(LABEL_RUN_ID).cloned(),
+            attempt: get(LABEL_ATTEMPT).cloned(),
+            uid,
+        })
+    }
+}
+
+// ── Task identity, and why a remote workload must carry it ───────────────────
+
+/// Who a remote workload belongs to.
+///
+/// Before this existed, `KubeExecutor` and `DockerExecutor` both named their
+/// workload `sched-<random uuid>` and kept that name **only on the stack of the
+/// `execute()` call that created it**. Two things follow, and both are bugs:
+///
+/// 1. `ARCHITECTURE.md` claims "the lease bounds *concurrent* execution to one
+///    holder". Under these two backends it did not. A lease expires while the
+///    pod is still running, another scheduler claims the task and creates a
+///    *second* pod, and nothing connects either one to the task row — so both
+///    run the command at once. The lease bounded which scheduler owned the
+///    *row*, never which workloads were running.
+/// 2. If the scheduler process dies mid-execution, the random name dies with
+///    it. The pod is then unreachable: no label, no derivation, nothing to
+///    select on. It runs to completion — or forever, if the command does not
+///    exit — and no sweep can ever find it.
+///
+/// Labelling the workload with the task row fixes both: a dispatch can find and
+/// delete a predecessor before starting, and a workload outlives the process
+/// that made it without becoming anonymous.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskIdentity {
+    /// `task_runs.id` — stable across lease recovery, so it identifies the
+    /// *task*, not one attempt at it.
+    pub task_id: String,
+    /// `task_runs.run_id`, for operators grepping by run.
+    pub run_id: String,
+    /// `task_runs.attempt` — increments on every claim, including a recovery.
+    /// That ordering is what makes it the right discriminator here: a workload
+    /// carrying a **lower** attempt for the same task is a predecessor, and a
+    /// predecessor is what must be reaped before this one starts. A *higher*
+    /// one is not — see [`is_stale_attempt`].
+    pub attempt: i64,
+    /// Which dagron installation this workload belongs to
+    /// ([`LABEL_INSTALLATION`]). `None` when the operator has not set
+    /// [`DAGRON_INSTALLATION`] — the workload is then labelled with everything
+    /// else and the fleet sweep stays off, because a sweep that cannot tell
+    /// this install's workloads from another's is a sweep that deletes the
+    /// wrong ones.
+    pub installation: Option<String>,
+}
+
+/// Whether a workload labelled with `labelled` is a predecessor this dispatch
+/// may reap, given that this dispatch is attempt `mine`.
+///
+/// **Only a strictly lower attempt is stale**, and the two rejected cases are
+/// each a way to destroy live work:
+///
+/// - *Equal* is this dispatch's own workload, on a same-attempt re-entry.
+/// - *Higher* is a *newer* attempt, and it is very likely running. A scheduler
+///   that stalls between claiming a row and creating the workload can resume
+///   after its lease expired and another replica claimed the row — so attempt 1
+///   can reach this code while attempt 2 is already executing. Reaping
+///   "anything not mine" would kill the live successor and then start duplicate
+///   work: exactly the fence violation these labels exist to prevent.
+/// - *Missing or unparseable* is ignored on the same principle. A workload that
+///   cannot prove it is stale is not deleted. An orphan that survives is a job
+///   for a fleet-wide sweep, which can weigh liveness against the datastore; a
+///   live workload deleted by a stale attempt is work already lost.
+pub fn is_stale_attempt(labelled: Option<&str>, mine: i64) -> bool {
+    labelled.and_then(|a| a.parse::<i64>().ok()).is_some_and(|a| a < mine)
+}
+
+/// Label key marking a workload as this project's, so a sweep can scope itself
+/// and never touch a pod or container someone else created.
+pub const LABEL_MANAGED_BY: &str = "dagron.dev/managed-by";
+/// Label key carrying [`TaskIdentity::task_id`].
+pub const LABEL_TASK_ID: &str = "dagron.dev/task-id";
+/// Label key carrying [`TaskIdentity::run_id`].
+pub const LABEL_RUN_ID: &str = "dagron.dev/run-id";
+/// Label key carrying [`TaskIdentity::attempt`].
+pub const LABEL_ATTEMPT: &str = "dagron.dev/attempt";
+/// The value [`LABEL_MANAGED_BY`] always carries.
+pub const MANAGED_BY: &str = "dagron";
+/// Label key naming **which dagron installation** owns a workload.
+///
+/// [`LABEL_MANAGED_BY`] says "some dagron made this"; it does not say *which*.
+/// That distinction is the whole reason a fleet-wide sweep is dangerous without
+/// this label: two installations sharing one Kubernetes namespace both stamp
+/// `managed-by=dagron`, so a sweep scoped only on that reads the other install's
+/// pods, fails to find their task ids in its **own** database, concludes they
+/// are orphans, and deletes running work belonging to someone else.
+///
+/// The per-task reap does not need it — it selects on a task id, which is a
+/// UUID and therefore globally distinct. A fleet sweep has no such anchor: it
+/// looks for workloads whose task is *absent*, and absence is exactly what a
+/// foreign installation's workload looks like.
+///
+/// So the value is operator-supplied ([`DAGRON_INSTALLATION`]) and the sweep is
+/// **off** without it. dagron cannot infer it: a namespace can hold two
+/// installs, one install can span namespaces, and a pod carries no pointer back
+/// to the database that created it.
+pub const LABEL_INSTALLATION: &str = "dagron.dev/installation";
+/// Environment variable supplying [`LABEL_INSTALLATION`]'s value.
+pub const DAGRON_INSTALLATION: &str = "DAGRON_INSTALLATION";
+
+/// Longest value a Kubernetes label may hold.
+const MAX_LABEL_VALUE: usize = 63;
+
+impl TaskIdentity {
+    /// The labels a workload carries. Empty when the identity cannot be
+    /// expressed as valid labels, which is a refusal to label *partially*:
+    /// a pod carrying `managed-by` but no `task-id` would be selected by a
+    /// sweep and match no task, which is precisely how a reaper deletes live
+    /// work.
+    pub fn labels(&self) -> std::collections::BTreeMap<String, String> {
+        let mut out = std::collections::BTreeMap::new();
+        let (Some(task), Some(run)) = (label_value(&self.task_id), label_value(&self.run_id))
+        else {
+            return out;
+        };
+        out.insert(LABEL_MANAGED_BY.to_string(), MANAGED_BY.to_string());
+        out.insert(LABEL_TASK_ID.to_string(), task);
+        out.insert(LABEL_RUN_ID.to_string(), run);
+        out.insert(LABEL_ATTEMPT.to_string(), self.attempt.to_string());
+        // Only when it expresses as a label. A workload silently carrying a
+        // TRUNCATED installation could be selected by another install whose
+        // name shares that prefix — so an unusable value contributes nothing
+        // and leaves the sweep unable to claim this workload, which is the safe
+        // direction.
+        if let Some(inst) = self.installation.as_deref().and_then(label_value) {
+            out.insert(LABEL_INSTALLATION.to_string(), inst);
+        }
+        out
+    }
+
+    /// Selector matching every workload this project owns for this task,
+    /// whatever attempt made it. `None` when the id will not express as a label
+    /// — and then nothing is selected, rather than a selector matching more
+    /// than intended.
+    pub fn task_selector(&self) -> Option<String> {
+        let task = label_value(&self.task_id)?;
+        Some(format!("{LABEL_MANAGED_BY}={MANAGED_BY},{LABEL_TASK_ID}={task}"))
+    }
+}
+
+/// A value usable as a Kubernetes label (and therefore as a Docker one, whose
+/// rules are looser).
+///
+/// Validates rather than sanitises. Two different task ids must never map to
+/// one label — a sanitiser that strips offending characters can collide, and a
+/// collision here means reaping another task's pod. dagron's own ids are
+/// hyphenated v4 UUIDs and pass unchanged; anything else is refused and the
+/// workload simply goes unlabelled, which is the pre-existing behaviour rather
+/// than a new hazard.
+pub fn label_value(raw: &str) -> Option<String> {
+    if raw.is_empty() || raw.len() > MAX_LABEL_VALUE {
+        return None;
+    }
+    let ok_edge = |c: char| c.is_ascii_alphanumeric();
+    let ok_inner = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.';
+    let mut chars = raw.chars();
+    let first = chars.next()?;
+    if !ok_edge(first) || !raw.chars().all(ok_inner) {
+        return None;
+    }
+    if !raw.chars().next_back().is_some_and(ok_edge) {
+        return None;
+    }
+    Some(raw.to_string())
 }
 
 // ── LocalExecutor ─────────────────────────────────────────────────────────────
@@ -471,6 +760,126 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
+    fn ident() -> TaskIdentity {
+        TaskIdentity {
+            task_id: "0b5d8f2e-3a41-4c7b-9e60-1f2a3b4c5d6e".into(),
+            run_id: "9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f".into(),
+            attempt: 3,
+            installation: None,
+        }
+    }
+
+    /// dagron's own ids are hyphenated v4 UUIDs, and they must pass unchanged —
+    /// the whole reaper rests on the label round-tripping the task id exactly.
+    #[test]
+    fn a_task_uuid_is_a_valid_label_value() {
+        let id = "0b5d8f2e-3a41-4c7b-9e60-1f2a3b4c5d6e";
+        assert_eq!(label_value(id).as_deref(), Some(id));
+    }
+
+    /// Validate, never sanitise.
+    ///
+    /// A sanitiser that strips offending characters can map two different task
+    /// ids onto one label, and a collision here means one task's reaper
+    /// deleting another task's live pod. Refusing is the safe direction: the
+    /// workload goes unlabelled, which is exactly the behaviour that shipped
+    /// before this existed.
+    #[test]
+    fn an_unlabellable_id_is_refused_rather_than_mangled() {
+        assert_eq!(label_value(""), None, "empty");
+        assert_eq!(label_value(&"a".repeat(64)), None, "over the 63-byte k8s cap");
+        assert_eq!(label_value("-leading"), None, "must start alphanumeric");
+        assert_eq!(label_value("trailing-"), None, "must end alphanumeric");
+        assert_eq!(label_value("has spaces"), None);
+        assert_eq!(label_value("has/slash"), None);
+        assert_eq!(label_value("has:colon"), None);
+        // Exactly at the cap is fine — the boundary is inclusive.
+        assert!(label_value(&"a".repeat(63)).is_some());
+        // The inner set k8s allows.
+        assert!(label_value("a-b_c.d9").is_some());
+    }
+
+    #[test]
+    fn labels_carry_the_whole_identity() {
+        let l = ident().labels();
+        assert_eq!(l.get(LABEL_MANAGED_BY).map(String::as_str), Some(MANAGED_BY));
+        assert_eq!(l.get(LABEL_TASK_ID).map(String::as_str), Some("0b5d8f2e-3a41-4c7b-9e60-1f2a3b4c5d6e"));
+        assert_eq!(l.get(LABEL_RUN_ID).map(String::as_str), Some("9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f"));
+        assert_eq!(l.get(LABEL_ATTEMPT).map(String::as_str), Some("3"), "attempt is the discriminator");
+    }
+
+    /// The fence, in one predicate. Only a strictly lower attempt is a
+    /// predecessor — every other answer here is a way to delete live work.
+    #[test]
+    fn only_a_strictly_lower_attempt_is_reapable() {
+        assert!(is_stale_attempt(Some("1"), 2), "an earlier attempt is a predecessor");
+        assert!(is_stale_attempt(Some("1"), 9));
+    }
+
+    /// The bug this predicate replaced: the old check skipped only the EQUAL
+    /// attempt, so attempt 1 waking up after its lease expired would delete
+    /// attempt 2's live pod and then start duplicate work.
+    #[test]
+    fn a_newer_attempt_is_never_reaped_by_an_older_one() {
+        assert!(!is_stale_attempt(Some("2"), 1), "attempt 2 is probably running right now");
+        assert!(!is_stale_attempt(Some("2"), 2), "and this one is our own");
+    }
+
+    /// A workload that cannot prove it is stale is left alone. An orphan that
+    /// survives is a job for a fleet-wide sweep; a live pod deleted on a guess
+    /// is work already lost.
+    #[test]
+    fn an_unprovable_attempt_is_left_alone() {
+        assert!(!is_stale_attempt(None, 5), "unlabelled");
+        assert!(!is_stale_attempt(Some(""), 5), "empty");
+        assert!(!is_stale_attempt(Some("one"), 5), "not a number");
+        assert!(!is_stale_attempt(Some("3x"), 5), "not entirely a number");
+        assert!(!is_stale_attempt(Some("99999999999999999999"), 5), "overflows i64");
+    }
+
+    /// Lexical comparison would call "10" stale against 9. It is not.
+    #[test]
+    fn the_comparison_is_numeric_not_lexical() {
+        assert!(!is_stale_attempt(Some("10"), 9), "10 > 9, whatever string order says");
+        assert!(is_stale_attempt(Some("9"), 10));
+    }
+
+    /// All-or-nothing, and this is the load-bearing case.
+    ///
+    /// A workload labelled `managed-by=dagron` with no `task-id` is selected by
+    /// the reaper's `managed-by` clause and matches no task — which is precisely
+    /// the shape that gets live work deleted. So an identity that cannot be
+    /// fully expressed contributes no labels at all.
+    #[test]
+    fn a_partial_identity_contributes_no_labels_at_all() {
+        let bad = TaskIdentity {
+            task_id: "has/slash".into(),
+            run_id: "ok".into(),
+            attempt: 1,
+            installation: None,
+        };
+        assert!(bad.labels().is_empty(), "no managed-by without a task-id");
+        assert!(bad.task_selector().is_none(), "and nothing to select on");
+    }
+
+    /// The selector is scoped twice over: to this project, and to this task.
+    /// Either clause alone would over-select.
+    #[test]
+    fn the_selector_names_both_owner_and_task() {
+        let sel = ident().task_selector().expect("a uuid selects");
+        assert!(sel.contains(&format!("{LABEL_MANAGED_BY}={MANAGED_BY}")), "{sel}");
+        assert!(sel.contains(&format!("{LABEL_TASK_ID}=0b5d8f2e-3a41-4c7b-9e60-1f2a3b4c5d6e")), "{sel}");
+        assert!(!sel.contains(LABEL_ATTEMPT), "attempt must NOT narrow it — the point is to find OTHER attempts");
+    }
+
+    /// A context with no task row behind it carries no identity, and that path
+    /// must keep working: it is what tests and the no-op fallback use.
+    #[test]
+    fn a_context_without_a_task_row_has_no_identity() {
+        let ctx = ExecContext::new(vec!["true".into()], None, None);
+        assert!(ctx.identity.is_none());
+    }
+
     /// LocalExecutor streams each stdout line to the sink as a chunk (first-flagged
     /// on the first) while still returning the full accumulated output (#17).
     #[tokio::test]
@@ -486,6 +895,7 @@ mod tests {
             service_account: None,
             isolation: None,
             log_sink: Some(sink),
+            identity: None,
         };
 
         let out = LocalExecutor.execute(&ctx).await.unwrap();
@@ -538,6 +948,7 @@ mod tests {
             service_account: None,
             isolation: None,
             log_sink: Some(sink),
+            identity: None,
         };
         let err = LocalExecutor.execute(&ctx).await.expect_err("must time out");
         assert!(err.is::<TimeoutError>(), "streaming timeout must be a TimeoutError, got: {err}");
@@ -566,6 +977,7 @@ mod tests {
             service_account: None,
             isolation: None,
             log_sink: None,
+            identity: None,
         };
         let out = LocalExecutor.execute(&ctx).await.unwrap();
         assert!(out.success);
@@ -591,6 +1003,7 @@ mod tests {
             service_account: None,
             isolation: None,
             log_sink: None,
+            identity: None,
         };
         let out = LocalExecutor.execute(&ctx).await.unwrap();
         assert!(!out.success);
@@ -616,6 +1029,7 @@ mod tests {
             service_account: None,
             isolation: None,
             log_sink: Some(sink),
+            identity: None,
         };
         let out = LocalExecutor.execute(&ctx).await.unwrap();
         assert!(!out.success);
@@ -658,5 +1072,146 @@ mod tests {
         assert_eq!(with_stderr_on_failure(1, "out".into(), "   \n "), "out");
         // No stdout at all: the output is just the stderr, with no stray blank line.
         assert_eq!(with_stderr_on_failure(1, String::new(), "boom"), "boom");
+    }
+
+    /// Without an installation the workload is still fully labelled — just not
+    /// claimable by a fleet sweep. That is the whole opt-in: the per-dispatch
+    /// reap keeps working, and nothing sweeps on a scope nobody set.
+    #[test]
+    fn no_installation_still_labels_everything_else() {
+        let l = ident().labels();
+        assert!(!l.contains_key(LABEL_INSTALLATION), "nothing to scope a sweep by");
+        assert_eq!(l.get(LABEL_MANAGED_BY).map(String::as_str), Some(MANAGED_BY));
+        assert!(l.contains_key(LABEL_TASK_ID), "the per-task reap still works");
+    }
+
+    #[test]
+    fn an_installation_is_carried_when_it_is_set() {
+        let mut i = ident();
+        i.installation = Some("prod-eu-1".into());
+        assert_eq!(i.labels().get(LABEL_INSTALLATION).map(String::as_str), Some("prod-eu-1"));
+    }
+
+    /// An unusable installation contributes NO label rather than a truncated or
+    /// sanitised one.
+    ///
+    /// A truncated value is the dangerous outcome: `prod-eu-1-very-long…` and
+    /// `prod-eu-2-very-long…` can share the 63-character prefix a sanitiser
+    /// would produce, and then one installation's sweep selects the other's
+    /// pods — the exact cross-installation deletion the label exists to
+    /// prevent. Contributing nothing leaves the workload unsweepable, which
+    /// costs a leftover rather than live work.
+    #[test]
+    fn an_unusable_installation_contributes_no_label_rather_than_a_truncated_one() {
+        for bad in ["has/slash", "has space", &"a".repeat(64), "", "-leading"] {
+            let mut i = ident();
+            i.installation = Some(bad.to_string());
+            assert!(
+                !i.labels().contains_key(LABEL_INSTALLATION),
+                "{bad:?} must not become a label"
+            );
+            assert!(
+                i.labels().contains_key(LABEL_TASK_ID),
+                "{bad:?} must not cost the task label either"
+            );
+        }
+    }
+
+    /// The installation is not part of the per-task selector. That selector
+    /// already narrows to one task id — a UUID — and adding the installation
+    /// would make the per-dispatch reap silently stop working the moment an
+    /// operator renamed their installation, leaving predecessors alive.
+    #[test]
+    fn the_per_task_selector_does_not_depend_on_the_installation() {
+        let mut i = ident();
+        i.installation = Some("prod-eu-1".into());
+        let with = i.task_selector().expect("selector");
+        i.installation = None;
+        assert_eq!(with, i.task_selector().expect("selector"), "same either way");
+        assert!(!with.contains("installation"));
+    }
+
+    fn labels_of(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn a_well_labelled_workload_becomes_a_candidate() {
+        let l = labels_of(&[
+            (LABEL_MANAGED_BY, MANAGED_BY),
+            (LABEL_TASK_ID, "0b5d8f2e-3a41-4c7b-9e60-1f2a3b4c5d6e"),
+            (LABEL_RUN_ID, "9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f"),
+            (LABEL_ATTEMPT, "2"),
+        ]);
+        let w = ManagedWorkload::from_labels("pod-x".into(), Some("u-1".into()), |k| l.get(k)).expect("candidate");
+        assert_eq!(w.task_id, "0b5d8f2e-3a41-4c7b-9e60-1f2a3b4c5d6e");
+        assert_eq!(w.attempt.as_deref(), Some("2"));
+    }
+
+    /// The reason this validates rather than merely checking presence. A label
+    /// SELECTOR constrains only the labels it names and says nothing about the
+    /// rest — so a workload can match `managed-by` and `installation` exactly
+    /// while carrying a task id that is empty or not a usable label value.
+    ///
+    /// Such a workload matches no live row, because no row ever had that id, and
+    /// the sweep acts on absence — so without this it would be DELETED, which
+    /// inverts the rule the rest of this module rests on.
+    #[test]
+    fn a_task_id_that_could_never_name_a_row_is_refused() {
+        for bad in ["", "has/slash", "has space", &"a".repeat(64), "-leading"] {
+            let l = labels_of(&[(LABEL_MANAGED_BY, MANAGED_BY), (LABEL_TASK_ID, bad)]);
+            assert!(
+                ManagedWorkload::from_labels("pod-x".into(), Some("u-1".into()), |k| l.get(k)).is_none(),
+                "{bad:?} must not become a deletion candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn a_workload_with_no_task_id_at_all_is_refused() {
+        let l = labels_of(&[(LABEL_MANAGED_BY, MANAGED_BY), (LABEL_ATTEMPT, "1")]);
+        assert!(ManagedWorkload::from_labels("pod-x".into(), Some("u-1".into()), |k| l.get(k)).is_none());
+    }
+
+    /// `run_id` and `attempt` are for the log line, and no decision reads them,
+    /// so a missing or odd value must not cost a real orphan its cleanup.
+    #[test]
+    fn the_informational_labels_are_not_validated() {
+        let l = labels_of(&[
+            (LABEL_TASK_ID, "0b5d8f2e-3a41-4c7b-9e60-1f2a3b4c5d6e"),
+            (LABEL_RUN_ID, "not/a/label/value"),
+        ]);
+        let w = ManagedWorkload::from_labels("pod-x".into(), Some("u-1".into()), |k| l.get(k)).expect("candidate");
+        assert_eq!(w.run_id.as_deref(), Some("not/a/label/value"));
+        assert_eq!(w.attempt, None);
+    }
+
+    /// The pair of rules read together: what a sweep may delete is a workload
+    /// whose task id is usable AND whose attempt, where present, is provably
+    /// older. Neither rule covers for the other.
+    #[test]
+    fn identity_round_trips_from_labels_back_into_a_candidate() {
+        let mut i = ident();
+        i.installation = Some("prod-eu-1".into());
+        let l = i.labels();
+        let w = ManagedWorkload::from_labels("pod-x".into(), Some("u-1".into()), |k| l.get(k))
+            .expect("what dagron writes, the sweep can read back");
+        assert_eq!(w.task_id, i.task_id);
+        assert_eq!(w.attempt.as_deref(), Some("3"));
+    }
+
+    /// The uid is the backend's, not a label, and it rides through untouched —
+    /// including its absence, which is normal for a backend whose handle is
+    /// already an identity.
+    #[test]
+    fn the_backends_own_identity_rides_through_unread() {
+        let l = labels_of(&[(LABEL_TASK_ID, "0b5d8f2e-3a41-4c7b-9e60-1f2a3b4c5d6e")]);
+        let with = ManagedWorkload::from_labels("pod-x".into(), Some("u-9".into()), |k| l.get(k))
+            .expect("candidate");
+        assert_eq!(with.uid.as_deref(), Some("u-9"));
+
+        let without =
+            ManagedWorkload::from_labels("c0ffee".into(), None, |k| l.get(k)).expect("candidate");
+        assert_eq!(without.uid, None);
     }
 }

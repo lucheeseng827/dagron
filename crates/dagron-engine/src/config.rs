@@ -62,11 +62,19 @@ pub fn knobs() -> &'static [Knob] {
             KR("AZURE_TENANT_ID", "—"),
             K("BACKFILL_PACE_PER_TICK", "1"),
             K("CRON_CONFIG", "— (cron disabled)"),
+            K("DAGRON_ADMISSION_FILE", "— (admission always open)"),
             K("DAGRON_ARTIFACT_DIR", "— (artifacts off)"),
             K("DAGRON_ARTIFACT_SYNC_SECS", "60 (0 disables)"),
             K("DAGRON_ARTIFACT_TIER", "— (tiering off)"),
             K("DAGRON_ARTIFACT_UPLINK_BYTES_PER_DAY", "— (unlimited)"),
             K("DAGRON_ARTIFACT_URL", "— (cloud artifacts off)"),
+            // Per-attempt output retention (dagron_core::attempt_log). Registered
+            // so an operator who turns retention down — the reason this knob
+            // exists — is not told the knob is not one; the same omission that
+            // made DAGRON_MAX_TASK_TIMEOUT_SECS warn for every deployment that
+            // set it.
+            K("DAGRON_ATTEMPT_LOG_BYTES", "4096 (0 = retention off)"),
+            K("DAGRON_ATTEMPT_LOG_KEEP", "50 (0 = unlimited)"),
             K("DAGRON_BUNDLE_PUBKEYS", "— (signed bundles refused)"),
             K("DAGRON_CLOCK_CHECK_SECS", "30"),
             K("DAGRON_CLOCK_STEP_TOLERANCE_MS", "1000"),

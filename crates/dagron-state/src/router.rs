@@ -174,7 +174,10 @@ async fn submit<S: PlanSubmitter>(
 fn compile_status(e: CompileError) -> (StatusCode, String) {
     let status = match e {
         CompileError::EmptyPlan => StatusCode::UNPROCESSABLE_ENTITY,
-        CompileError::PlannerFailed { .. } | CompileError::NoCommand => StatusCode::BAD_REQUEST,
+        CompileError::PlannerFailed { .. }
+        | CompileError::NoCommand
+        | CompileError::MissingSql { .. }
+        | CompileError::EnvConflict { .. } => StatusCode::BAD_REQUEST,
     };
     (status, e.to_string())
 }

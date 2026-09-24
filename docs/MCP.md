@@ -24,15 +24,24 @@ failed and what I did about it" without a human dropping to `curl`.
 eighteen of them from `tools/list` *and* refuses them on call — see
 [read-only mode](#read-only-mode).
 
+**Hints** is what each tool declares in its MCP `annotations`, which a client
+reads to decide whether a call needs a person's approval. `read-only` is
+`readOnlyHint: true`. A write states all three of `destructiveHint`,
+`idempotentHint` and `openWorldHint`, and the column lists the ones that are
+`true` as `destructive`, `idempotent` and `open-world`. On a dagron tool,
+`open-world` means the call can set task code running. See
+[tool annotations](#tool-annotations) for what each one means here and why each
+write got its hints.
+
 ### Drive runs
 
-| Tool | Arguments | dagron-api |
-|---|---|---|
-| `dagron_list_runs` | `status?`, `name?`, `trigger?`, `limit?`, `offset?` | `GET /api/runs` |
-| `dagron_get_run` | `run_id` | `GET /api/runs/{id}` |
-| **W** `dagron_submit_run` | `yaml`, `parameters?`, `idempotency_key?` | `POST /api/runs` |
-| **W** `dagron_cancel_run` | `run_id` | `POST /api/runs/{id}/cancel` |
-| `dagron_wait_run` | `run_id`, `timeout_secs?` (1–600, default 30) | `GET /api/runs/{id}/wait` |
+| Tool | Arguments | dagron-api | Hints |
+|---|---|---|---|
+| `dagron_list_runs` | `status?`, `name?`, `trigger?`, `limit?`, `offset?` | `GET /api/runs` | read-only |
+| `dagron_get_run` | `run_id` | `GET /api/runs/{id}` | read-only |
+| **W** `dagron_submit_run` | `yaml`, `parameters?`, `idempotency_key?` | `POST /api/runs` | open-world |
+| **W** `dagron_cancel_run` | `run_id` | `POST /api/runs/{id}/cancel` | destructive · idempotent |
+| `dagron_wait_run` | `run_id`, `timeout_secs?` (1–600, default 30) | `GET /api/runs/{id}/wait` | read-only |
 
 `dagron_wait_run` earns its own line. Without it an agent polls
 `dagron_get_run` in a loop, spending a JSON-RPC round trip and a slice of
@@ -47,17 +56,17 @@ exactly the case that header exists for.
 
 ### Author and run registered workflows
 
-| Tool | Arguments | dagron-api |
-|---|---|---|
-| `dagron_list_workflows` | `tag?` | `GET /api/workflows` |
-| `dagron_get_workflow` | `workflow_id` | `GET /api/workflows/{id}` |
-| **W** `dagron_create_workflow` | `spec`, `name?`, `description?` | `POST /api/workflows` → `201`; `409` duplicate name |
-| **W** `dagron_update_workflow` | `workflow_id`, `spec`, `name?`, `description?` | `PUT /api/workflows/{id}` (records the prior definition as a version) |
-| **W** `dagron_delete_workflow` | `workflow_id` | `DELETE /api/workflows/{id}` |
-| **W** `dagron_set_workflow_state` | `workflow_id`, `state` (`active`/`paused`/`retired`) | `POST /api/workflows/{id}/state` |
-| **W** `dagron_run_workflow` | `workflow_id`, `parameters?` | `POST /api/workflows/{id}/run` → `201 {run_id}`; `409` paused/retired |
-| `dagron_list_workflow_runs` | `workflow_id`, `limit?`, `offset?` | `GET /api/workflows/{id}/runs` |
-| `dagron_list_workflow_versions` | `workflow_id` | `GET /api/workflows/{id}/versions` |
+| Tool | Arguments | dagron-api | Hints |
+|---|---|---|---|
+| `dagron_list_workflows` | `tag?` | `GET /api/workflows` | read-only |
+| `dagron_get_workflow` | `workflow_id` | `GET /api/workflows/{id}` | read-only |
+| **W** `dagron_create_workflow` | `spec`, `name?`, `description?` | `POST /api/workflows` → `201`; `409` duplicate name | idempotent · open-world |
+| **W** `dagron_update_workflow` | `workflow_id`, `spec`, `name?`, `description?` | `PUT /api/workflows/{id}` (records the prior definition as a version) | destructive · open-world |
+| **W** `dagron_delete_workflow` | `workflow_id` | `DELETE /api/workflows/{id}` | destructive · idempotent |
+| **W** `dagron_set_workflow_state` | `workflow_id`, `state` (`active`/`paused`/`retired`) | `POST /api/workflows/{id}/state` | idempotent · open-world |
+| **W** `dagron_run_workflow` | `workflow_id`, `parameters?` | `POST /api/workflows/{id}/run` → `201 {run_id}`; `409` paused/retired | open-world |
+| `dagron_list_workflow_runs` | `workflow_id`, `limit?`, `offset?` | `GET /api/workflows/{id}/runs` | read-only |
+| `dagron_list_workflow_versions` | `workflow_id` | `GET /api/workflows/{id}/versions` | read-only |
 
 Registering a **named** workflow is what unlocks the parent/child DAG: a
 `type: workflow` task resolves its child *by registered name*, so without
@@ -71,16 +80,16 @@ offers `tag` and returns the registry whole.
 
 ### Recover from a failure
 
-| Tool | Arguments | dagron-api |
-|---|---|---|
-| **W** `dagron_rerun_run` | `run_id`, `from?` | `POST /api/runs/{id}/rerun` |
-| **W** `dagron_resubmit_run` | `run_id` | `POST /api/runs/{id}/resubmit` → `201` fresh run from the same spec |
-| **W** `dagron_retry_task` | `run_id`, `task_id` | `POST /api/runs/{id}/tasks/{tid}/retry` |
-| **W** `dagron_clear_task` | `run_id`, `task_id` | `POST /api/runs/{id}/tasks/{tid}/clear` (task + downstream cone) |
-| **W** `dagron_redrive_dead_letter` | `id` | `POST /api/dead-letters/{id}/redrive` |
-| **W** `dagron_delete_dead_letter` | `id` | `DELETE /api/dead-letters/{id}` |
-| **W** `dagron_triage_run` | `run_id`, `state` (`acknowledged`/`resolved`/`ignored`), `note?` | `POST /api/runs/{id}/triage` |
-| **W** `dagron_clear_triage` | `run_id` | `DELETE /api/runs/{id}/triage` |
+| Tool | Arguments | dagron-api | Hints |
+|---|---|---|---|
+| **W** `dagron_rerun_run` | `run_id`, `from?` | `POST /api/runs/{id}/rerun` | destructive · open-world |
+| **W** `dagron_resubmit_run` | `run_id` | `POST /api/runs/{id}/resubmit` → `201` fresh run from the same spec | open-world |
+| **W** `dagron_retry_task` | `run_id`, `task_id` | `POST /api/runs/{id}/tasks/{tid}/retry` | destructive · open-world |
+| **W** `dagron_clear_task` | `run_id`, `task_id` | `POST /api/runs/{id}/tasks/{tid}/clear` (task + downstream cone) | destructive · open-world |
+| **W** `dagron_redrive_dead_letter` | `id` | `POST /api/dead-letters/{id}/redrive` | destructive · idempotent · open-world |
+| **W** `dagron_delete_dead_letter` | `id` | `DELETE /api/dead-letters/{id}` | destructive · idempotent |
+| **W** `dagron_triage_run` | `run_id`, `state` (`acknowledged`/`resolved`/`ignored`), `note?` | `POST /api/runs/{id}/triage` | destructive · idempotent |
+| **W** `dagron_clear_triage` | `run_id` | `DELETE /api/runs/{id}/triage` | destructive · idempotent |
 
 The triage pair is the one write in this group a reviewer *reads* rather than
 reruns: it is where an agent writes down what it concluded about a failed run
@@ -88,11 +97,11 @@ reruns: it is where an agent writes down what it concluded about a failed run
 
 ### Resolve approval gates
 
-| Tool | Arguments | dagron-api |
-|---|---|---|
-| `dagron_list_approvals` | — | `GET /api/approvals` (the human-in-the-loop worklist) |
-| **W** `dagron_approve_task` | `run_id`, `task_id` | `POST /api/runs/{id}/tasks/{tid}/approve` |
-| **W** `dagron_reject_task` | `run_id`, `task_id` | `POST /api/runs/{id}/tasks/{tid}/reject` |
+| Tool | Arguments | dagron-api | Hints |
+|---|---|---|---|
+| `dagron_list_approvals` | — | `GET /api/approvals` (the human-in-the-loop worklist) | read-only |
+| **W** `dagron_approve_task` | `run_id`, `task_id` | `POST /api/runs/{id}/tasks/{tid}/approve` | idempotent · open-world |
+| **W** `dagron_reject_task` | `run_id`, `task_id` | `POST /api/runs/{id}/tasks/{tid}/reject` | destructive · idempotent · open-world |
 
 A `type: approval` task parks a run until someone resolves the gate. Before
 these three, a DAG with a human-in-the-middle gate was a DAG an MCP agent could
@@ -100,15 +109,15 @@ start and then never finish.
 
 ### Read logs, artifacts and structure
 
-| Tool | Arguments | dagron-api |
-|---|---|---|
-| `dagron_get_task_logs` | `run_id`, `task_id`, + [log filter](API.md#log-filter) | `GET /api/runs/{id}/tasks/{tid}/logs` |
-| `dagron_get_run_logs` | `run_id`, `task`, + [log filter](API.md#log-filter) | `GET /api/runs/{id}/logs` |
-| `dagron_get_run_graph` | `run_id` | `GET /api/runs/{id}/graph` — `{nodes[], edges[]}` |
-| `dagron_get_run_spec` | `run_id` | `GET /api/runs/{id}/spec` — the YAML a run was actually made from |
-| `dagron_get_artifact` | `run_id`, `task`, `name` | `GET /api/runs/{run_id}/artifacts/{task}/{name}` |
-| `dagron_artifact_exists` | `run_id`, `task`, `name` | `GET /api/runs/{run_id}/artifacts/{task}/{name}/exists` |
-| **W** `dagron_put_artifact` | `run_id`, `task`, `name`, `content` | `PUT /api/runs/{run_id}/artifacts/{task}/{name}` — seed an input file |
+| Tool | Arguments | dagron-api | Hints |
+|---|---|---|---|
+| `dagron_get_task_logs` | `run_id`, `task_id`, + [log filter](API.md#log-filter) | `GET /api/runs/{id}/tasks/{tid}/logs` | read-only |
+| `dagron_get_run_logs` | `run_id`, `task`, + [log filter](API.md#log-filter) | `GET /api/runs/{id}/logs` | read-only |
+| `dagron_get_run_graph` | `run_id` | `GET /api/runs/{id}/graph` — `{nodes[], edges[]}` | read-only |
+| `dagron_get_run_spec` | `run_id` | `GET /api/runs/{id}/spec` — the YAML a run was actually made from | read-only |
+| `dagron_get_artifact` | `run_id`, `task`, `name` | `GET /api/runs/{run_id}/artifacts/{task}/{name}` | read-only |
+| `dagron_artifact_exists` | `run_id`, `task`, `name` | `GET /api/runs/{run_id}/artifacts/{task}/{name}/exists` | read-only |
+| **W** `dagron_put_artifact` | `run_id`, `task`, `name`, `content` | `PUT /api/runs/{run_id}/artifacts/{task}/{name}` — seed an input file | destructive · idempotent |
 
 `dagron_get_run_logs` is the one to reach for when a run failed: it returns
 **every** task's output as one attributed, server-filtered stream, so the agent
@@ -130,14 +139,14 @@ way to recover what it ran.
 
 So the agent can reason about what the engine is doing, not just send commands:
 
-| Tool | Arguments | dagron-api |
-|---|---|---|
-| `dagron_get_metrics` | — | `GET /api/metrics` (runs/tasks by status + dead-letter total) |
-| `dagron_get_metrics_timeseries` | `days?` (1–90, default 14), `name?` | `GET /api/metrics/timeseries` |
-| `dagron_get_health` | — | `GET /api/health` — `scheduler_leader`, `event_listener`, `active_runs`, `awaiting_approvals`, `dead_letters` |
-| `dagron_search` | `q`, `limit?` (1–20, default 8) | `GET /api/search` — workflows/runs/schedules by name or id prefix |
-| `dagron_list_dead_letters` | `limit?` (1–500, default 100) | `GET /api/dead-letters?limit=` |
-| `dagron_get_run_events` | `run_id`, `wait_ms?` (100–10000, default 2000) | bounded read of `GET /api/runs/{id}/stream` (SSE) |
+| Tool | Arguments | dagron-api | Hints |
+|---|---|---|---|
+| `dagron_get_metrics` | — | `GET /api/metrics` (runs/tasks by status + dead-letter total) | read-only |
+| `dagron_get_metrics_timeseries` | `days?` (1–90, default 14), `name?` | `GET /api/metrics/timeseries` | read-only |
+| `dagron_get_health` | — | `GET /api/health` — `scheduler_leader`, `event_listener`, `active_runs`, `awaiting_approvals`, `dead_letters` | read-only |
+| `dagron_search` | `q`, `limit?` (1–20, default 8) | `GET /api/search` — workflows/runs/schedules by name or id prefix | read-only |
+| `dagron_list_dead_letters` | `limit?` (1–500, default 100) | `GET /api/dead-letters?limit=` | read-only |
+| `dagron_get_run_events` | `run_id`, `wait_ms?` (100–10000, default 2000) | bounded read of `GET /api/runs/{id}/stream` (SSE) | read-only |
 
 `dagron_search` is the quiet unlock. Every id-taking tool above assumes the
 agent already holds a uuid; without it the only way to turn "the nightly ETL"
@@ -152,12 +161,85 @@ poll the tool in a loop instead of holding a long-lived stream.
 
 ### Lineage and archive
 
-| Tool | Arguments | dagron-api |
-|---|---|---|
-| `dagron_list_datasets` | `limit?` | `GET /api/datasets` — registry with `consumers[]` |
-| `dagron_get_dataset_events` | `uri?`, `limit?` | `GET /api/datasets/events` — the lineage ledger |
-| `dagron_list_archived_runs` | `name?`, `limit?`, `offset?` | `GET /api/archive/runs` |
-| `dagron_get_archived_run` | `run_id` | `GET /api/archive/runs/{id}` — `410` once compacted to Parquet |
+| Tool | Arguments | dagron-api | Hints |
+|---|---|---|---|
+| `dagron_list_datasets` | `limit?` | `GET /api/datasets` — registry with `consumers[]` | read-only |
+| `dagron_get_dataset_events` | `uri?`, `limit?` | `GET /api/datasets/events` — the lineage ledger | read-only |
+| `dagron_list_archived_runs` | `name?`, `limit?`, `offset?` | `GET /api/archive/runs` | read-only |
+| `dagron_get_archived_run` | `run_id` | `GET /api/archive/runs/{id}` — `410` once compacted to Parquet | read-only |
+
+### Tool annotations
+
+Every tool in `tools/list` carries MCP `annotations`, the hints a client reads
+to decide whether a call needs a person's approval. Some clients run a tool
+without asking only when it declares `readOnlyHint: true`, so before these
+existed every dagron call waited for a person, `dagron_list_runs` included.
+
+They are derived rather than written per tool. `readOnlyHint` is the same
+read/write split `DAGRON_MCP_READONLY` enforces, so the 24 tools a client may
+run unasked are exactly the 24 a read-only server keeps. A write cannot be
+declared without its other three hints, and it states all three, `false` ones
+included, because the spec reads an absent `destructiveHint` or `openWorldHint`
+as `true`. For the same reason every read declares `openWorldHint: false`
+(`destructiveHint` and `idempotentHint` mean nothing on a read-only tool, so a
+read leaves them out). Tests hold every tool to this, and pin each write's hints
+by name.
+
+What each hint means on a dagron tool:
+
+- **`destructiveHint`**: the call can end, discard, delete or overwrite
+  something that already exists: a run or task in flight, a task's captured
+  output, a record, a stored value or definition. `false` means it only adds
+  (a run, a record, a step forward) or flips a lifecycle state that the same
+  call flips back.
+- **`idempotentHint`**: a repeat with the same arguments leaves things as the
+  first call did. It is refused (`404`/`409`), finds nothing left to do, or
+  writes the same values again, timestamps aside. A call that adds a record
+  every time, whether a run or a version, is not idempotent.
+- **`openWorldHint`**: the call can set task code running with no further call.
+  It starts or re-runs tasks, releases the tasks behind a gate, or arms or
+  changes what a schedule or dataset trigger runs. A task runs whatever commands
+  its spec names, so what such a call reaches is not bounded by dagron, and
+  whether *that* code destroys anything is the workflow's business, which
+  `destructiveHint` cannot know. Read `openWorldHint: true` as **runs code**: a
+  client that relaxes approval for `destructiveHint: false` should not relax it
+  for this.
+
+The writes whose hints a reader might not expect:
+
+| Tool | Why |
+|---|---|
+| `dagron_submit_run`, `dagron_run_workflow`, `dagron_resubmit_run` | Not destructive, because each adds a run and touches nothing that exists. Not idempotent, because each call is one more run. `idempotency_key` makes a *keyed* repeat of a submit return the same run, but the hint describes the tool, and an unkeyed repeat is a second run. |
+| `dagron_rerun_run`, `dagron_retry_task`, `dagron_clear_task` | Destructive: each resets tasks in place and clears their captured output. For rerun and retry that is the failed attempt's log; for clear it is the results of the task and everything downstream of it. |
+| `dagron_approve_task` | Not destructive (a step forward), but open-world: the tasks behind the gate run next. |
+| `dagron_reject_task` | Open-world too: failing the gate releases any `one_failed`/`all_done` task behind it. |
+| `dagron_triage_run`, `dagron_put_artifact` | Destructive: each overwrites what was there (a triage note, an artifact's bytes), and nothing keeps the old one. |
+| `dagron_create_workflow` | Idempotent, because a repeat is a `409` duplicate. Open-world, because a spec with `on_datasets:` starts runs on its own from then on. |
+| `dagron_update_workflow` | Destructive: it replaces the live definition that the next scheduled or triggered run executes. Earlier versions are kept, but recording one is best-effort. Not idempotent, because a repeat records one more version. |
+| `dagron_set_workflow_state` | Not destructive, because every state can be set back. Open-world, because `active` lets the workflow's schedules fire again, an overdue slot on the next tick. |
+| `dagron_redrive_dead_letter` | Destructive: it deletes the dead letter, error and failure history included, in the transaction that creates the run. A redrive that fails deletes nothing. Idempotent: a repeat after a success is a `404`, never a second run. |
+
+**Hints, not a boundary.** The spec tells a client not to trust annotations
+from a server it does not trust, and nothing here depends on one doing so: the
+hints decide who is asked, while `DAGRON_MCP_READONLY` and the token's scope
+decide what can run. A gateway that pins tool definitions, and hashes
+`annotations` into the pin as MCPdef does, sees every dagron tool it had
+already pinned as changed on the upgrade that adds them; re-approve those pins
+once. A tool it has never seen is pinned on first sight, as usual.
+
+**Protocol revision.** `initialize` still answers `2024-11-05`, although
+annotations arrived in `2025-03-26`. A `2024-11-05` tool definition does not
+forbid extra fields, and a client that acts on annotations reads them from the
+tool whatever revision was negotiated. One that honours them only under a newer
+revision falls back to asking before every call, which is how this server
+behaved before it sent any, and the safe direction. Advertising a newer
+revision is a separate change. The server answers one fixed revision whatever
+the client asked for, so raising it would hand a client that speaks only older
+ones a revision it cannot use. Doing it properly means negotiating, and each
+revision claimed brings rules this server does not meet yet: `2025-03-26`
+requires accepting a JSON-RPC batch, which the stdio loop leaves unanswered
+today, and `2025-06-18` requires an HTTP transport to refuse an unsupported
+`MCP-Protocol-Version` header with `400`.
 
 ## Coverage — the agent-API gap, closed
 
@@ -531,13 +613,68 @@ Full example: [`examples/ai/mcp_tool_step.yaml`](../examples/ai/mcp_tool_step.ya
 
 | Env | Purpose |
 |---|---|
-| `DAGRON_MCP_STEP_SERVER` | MCP server program to spawn (**required**) |
+| `DAGRON_MCP_STEP_SERVER` | MCP server program to spawn (**required**, unless a gateway is set) |
 | `DAGRON_MCP_STEP_SERVER_ARGS` | JSON **array** of its arguments |
+| `DAGRON_MCP_STEP_GATEWAY` | call a governed **gateway** instead of spawning a server — see below |
+| `DAGRON_MCP_STEP_GATEWAY_TOKEN` | bearer token, if the gateway requires auth |
 | `DAGRON_MCP_STEP_TOOL` | tool name to call (**required**) |
 | `DAGRON_MCP_STEP_ARGS` | JSON **object** of tool arguments (default `{}`) |
 | `DAGRON_MCP_STEP_ARGS_FILE` | read them from a file instead (`-` = stdin) |
 | `DAGRON_MCP_STEP_OUTPUT` | write the result here instead of stdout |
 | `DAGRON_MCP_STEP_TIMEOUT_SECS` | whole-exchange deadline (default 300) |
+
+### Calling through a gateway
+
+Set `DAGRON_MCP_STEP_GATEWAY` and the step stops spawning the server itself. It
+POSTs the same JSON-RPC to a gateway over Streamable HTTP, and the gateway routes
+to the real server:
+
+```yaml
+env:
+  - { name: DAGRON_MCP_STEP_GATEWAY, value: "127.0.0.1:7878" }
+  - { name: DAGRON_MCP_STEP_TOOL, value: "read_file" }
+  - { name: DAGRON_MCP_STEP_ARGS, value: '{"path": "{{ doc }}"}' }
+```
+
+Nothing else about the task changes. What the task *gains* is whatever the
+gateway enforces — an allow-list, per-argument policy, a tool-definition pin that
+catches a server changing a tool after approval, a rate limit, and an audit
+record of the call. dagron keeps what it already owned: the retry, the timeout,
+the artifact, the approval gate in front of it.
+
+Details worth knowing:
+
+- **A bare `host:port` is fine** and means `http://host:port/mcp`. A full URL
+  keeps its path.
+- **Plain HTTP only.** `https://` is refused rather than silently downgraded.
+  The step is meant to reach a loopback or cluster-local gateway; if TLS is in
+  the way, terminate it in front of the step.
+- **`DAGRON_MCP_STEP_SERVER` is ignored** when a gateway is set, and the step
+  logs that once. A workflow that already names its server can gain governance by
+  setting one variable on the task, without being edited.
+- **A denial is a task failure with the reason.** A gateway that refuses the call
+  answers with an MCP tool error, which this step treats like any other failing
+  tool: non-zero exit, the reason in the run's logs, and the engine's retry
+  policy applies.
+- **Stateful gateways work.** An `Mcp-Session-Id` returned from `initialize` is
+  carried on every later request of the step, and so is the protocol version the
+  handshake settled on. A gateway that mints no session — MCPdef does not — sends
+  no header and nothing is carried.
+- **Streamed answers work.** A `text/event-stream` reply is read for the response
+  to *this* request; progress notifications ahead of it are stepped over rather
+  than mistaken for the result. Chunked bodies are decoded, which is how such a
+  reply normally arrives.
+- **A bearer token on a non-loopback gateway is logged as a warning.** Plain HTTP
+  means anything on the path can read it. It is a warning and not a refusal,
+  because a pod-local gateway is a legitimate deployment.
+- **Tested end to end** against stand-in gateways — `crates/dagron-step-mcp/tests/gateway.rs`
+  covers the handshake, the bearer token, the denial path, a stateful gateway
+  that 404s without its session id, a chunked SSE answer behind two progress
+  notifications, and an IPv6 endpoint.
+
+`module_58` (MCPdef) is the in-house gateway this was built against; any
+Streamable-HTTP MCP gateway that speaks the same wire works — with the one
+exception above, that it must be reachable without TLS.
 
 Details worth knowing before you write one:
 
@@ -615,8 +752,10 @@ Register it with an MCP client — either the binary or the image (example
 }
 ```
 
-The transport is newline-delimited JSON-RPC 2.0 on stdio (protocol `2024-11-05`);
-logs go to **stderr** so stdout carries only protocol messages.
+The transport is newline-delimited JSON-RPC 2.0 on stdio (protocol `2024-11-05`,
+with tool annotations sent anyway; see the
+[protocol revision note](#tool-annotations)); logs go to **stderr** so stdout
+carries only protocol messages.
 
 ### Lifecycle — one process per client session, not per tool call
 
@@ -746,6 +885,13 @@ Reach for it whenever the agent's prompt carries text you don't control, and
 treat enabling writes as a decision with the same weight as the token's scope.
 The two compose: a narrow token bounds *what* the agent can reach, read-only
 mode bounds *what it can do* with it.
+
+Annotations do not set a client's approval policy; the client does. A client
+whose policy is to ask before every tool not marked `readOnlyHint: true`, and
+only before those, asks a person before each of the eighteen and runs the 24
+reads unasked. Another client may ask before every call, or skip approval on
+other hints. Either way the [tool annotations](#tool-annotations) are only what
+the policy reads. The switch is the part that holds whatever the client does.
 
 ### Use a dedicated, least-privilege session token
 

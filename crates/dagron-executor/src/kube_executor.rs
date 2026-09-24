@@ -18,8 +18,8 @@
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
-use k8s_openapi::api::core::v1::Pod;
-use kube::api::{Api, DeleteParams, ListParams, LogParams, PostParams};
+use k8s_openapi::api::core::v1::{Pod, Secret};
+use kube::api::{Api, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams};
 use kube::Client;
 use tokio::time::{sleep, timeout, Duration};
 use uuid::Uuid;
@@ -29,6 +29,24 @@ use crate::executor::{ExecContext, ExecOutput, Executor};
 /// How often to poll a pod's phase while waiting for it to finish.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// One budget for the WHOLE predecessor reap, list and deletes together.
+///
+/// Per-delete timeouts do not compose: they bound each call and therefore add
+/// up, so N stale pods against an unresponsive apiserver delay pod creation by
+/// N × 10s — an unbounded dispatch delay that grows with exactly the mess the
+/// reap exists to clear. `ctx.timeout_secs` does not cover this; it starts
+/// later, at the wait and log collection.
+///
+/// When the budget expires, dispatch proceeds. Cleanup is best-effort by
+/// design: refusing to start because a leftover would not die turns a cleanup
+/// failure into an outage.
+const REAP_BUDGET_SECS: u64 = 20;
+
+/// Deadline on one apiserver call made by the fleet sweep (the list, and each
+/// delete). The sweep runs on a slow cadence and its work is bounded per call,
+/// so a wedged apiserver costs one skipped sweep rather than a stuck loop.
+const SWEEP_CALL_TIMEOUT_SECS: u64 = 10;
+
 /// Kubernetes executor — each task runs in a freshly created one-shot pod.
 pub struct KubeExecutor {
     /// Default image when a task does not specify `docker_image`.
@@ -36,6 +54,20 @@ pub struct KubeExecutor {
     /// Namespace the task pods are created in.
     namespace: String,
     client: Client,
+    /// `DAGRON_TASK_SECRET_ENV=inline`: put secret-sourced env values in the pod
+    /// spec as literals (the pre-Secret behaviour). Default off: they are handed
+    /// to the pod by `secretKeyRef` — see [`env_secret_object`].
+    inline_secrets: bool,
+}
+
+/// Parse `DAGRON_TASK_SECRET_ENV`: `secret` (default) or `inline`. A typo is an
+/// error at startup, not a silent choice between two security postures.
+fn parse_secret_env_mode(v: Option<&str>) -> Result<bool> {
+    match v.map(str::trim).filter(|v| !v.is_empty()) {
+        None | Some("secret") => Ok(false),
+        Some("inline") => Ok(true),
+        Some(other) => bail!("DAGRON_TASK_SECRET_ENV must be 'secret' or 'inline', got '{other}'"),
+    }
 }
 
 impl KubeExecutor {
@@ -56,7 +88,9 @@ impl KubeExecutor {
             anyhow::anyhow!("kube apiserver unreachable or namespace '{namespace}' inaccessible: {e}")
         })?;
 
-        Ok(Self { default_image: default_image.into(), namespace, client })
+        let inline_secrets =
+            parse_secret_env_mode(std::env::var("DAGRON_TASK_SECRET_ENV").ok().as_deref())?;
+        Ok(Self { default_image: default_image.into(), namespace, client, inline_secrets })
     }
 
     /// Best-effort pod deletion (cleanup); errors and a stalled request are
@@ -64,10 +98,204 @@ impl KubeExecutor {
     async fn cleanup(pods: &Api<Pod>, name: &str) {
         let _ = timeout(Duration::from_secs(10), pods.delete(name, &DeleteParams::default())).await;
     }
+
+    /// [`Self::cleanup`] plus the task's env Secret, if it has one. The Secret is
+    /// also owned by the pod (garbage-collected with it), so this is the prompt
+    /// path and the ownerReference is the net under a crash.
+    async fn cleanup_task(&self, pods: &Api<Pod>, name: &str, secret: Option<&str>) {
+        Self::cleanup(pods, name).await;
+        if let Some(sn) = secret {
+            let secrets: Api<Secret> = Api::namespaced(self.client.clone(), &self.namespace);
+            let _ = timeout(Duration::from_secs(10), secrets.delete(sn, &DeleteParams::default())).await;
+        }
+    }
+
+    /// Delete any pod this project owns for the same task from an **earlier
+    /// attempt**, before starting this one.
+    ///
+    /// This is what makes `ARCHITECTURE.md`'s "the lease bounds *concurrent*
+    /// execution to one holder" true here. The lease only ever bounded which
+    /// scheduler owned the row: when one expired mid-execution, the reclaiming
+    /// scheduler created a second pod and both ran the command at once. Now the
+    /// reclaimer deletes its predecessor first.
+    ///
+    /// **Best-effort, and deliberately so.** A transient apiserver error must
+    /// not block dispatch — refusing to run the task would convert a cleanup
+    /// problem into an outage, and the pre-existing behaviour (both running)
+    /// is no worse than what a failure here leaves. It is logged, never fatal.
+    ///
+    /// Scoped by `managed-by` AND `task-id`, so it can never select a pod this
+    /// project did not create, and never one belonging to a different task.
+    async fn reap_predecessors(pods: &Api<Pod>, ctx: &ExecContext) {
+        let (Some(id), Some(selector)) =
+            (&ctx.identity, ctx.identity.as_ref().and_then(|i| i.task_selector()))
+        else {
+            return;
+        };
+        // The whole reap runs inside one deadline, so an unresponsive apiserver
+        // costs a bounded dispatch delay rather than one per leftover pod.
+        let budget = tokio::time::Instant::now() + Duration::from_secs(REAP_BUDGET_SECS);
+        let listed =
+            tokio::time::timeout_at(budget, pods.list(&ListParams::default().labels(&selector)))
+                .await;
+        let found = match listed {
+            Ok(Ok(list)) => list,
+            Ok(Err(e)) => {
+                tracing::warn!(task_id = %id.task_id, error = %e, "could not list prior task pods — dispatching anyway");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(task_id = %id.task_id, "listing prior task pods timed out — dispatching anyway");
+                return;
+            }
+        };
+        for pod in found {
+            let Some(pod_name) = pod.metadata.name.as_deref() else { continue };
+            // Only a strictly LOWER attempt is a predecessor. Equal is this
+            // dispatch's own pod; higher is a newer attempt that is probably
+            // running right now, and deleting it would be the fence violation
+            // these labels exist to prevent — see `is_stale_attempt`.
+            let attempt = pod
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(crate::executor::LABEL_ATTEMPT))
+                .map(String::as_str);
+            if !crate::executor::is_stale_attempt(attempt, id.attempt) {
+                continue;
+            }
+            tracing::warn!(
+                task_id = %id.task_id, pod = %pod_name, stale_attempt = attempt.unwrap_or("<unlabelled>"),
+                current_attempt = %id.attempt,
+                "reaping a pod left by an earlier attempt of this task — it was still running the same command"
+            );
+            if tokio::time::timeout_at(budget, Self::cleanup(pods, pod_name)).await.is_err() {
+                tracing::warn!(
+                    task_id = %id.task_id,
+                    "predecessor cleanup budget expired with pods still present — \
+                     dispatching anyway, because refusing here would turn a cleanup \
+                     failure into an outage"
+                );
+                return;
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl Executor for KubeExecutor {
+    /// Every pod in this namespace carrying this installation's labels and old
+    /// enough to judge.
+    ///
+    /// Selects on installation as well as `managed-by`, so a second dagron
+    /// sharing this namespace is invisible here rather than being mistaken for
+    /// an orphan. A pod missing `task-id` is skipped: `labels()` refuses to
+    /// label partially, so such a pod is not one this project made, and
+    /// deleting what we cannot identify is the failure mode the whole label
+    /// scheme exists to avoid.
+    async fn list_orphan_candidates(
+        &self,
+        scope: &crate::executor::OrphanScope<'_>,
+    ) -> Result<Vec<crate::executor::ManagedWorkload>> {
+        use crate::executor::{LABEL_INSTALLATION, LABEL_MANAGED_BY, MANAGED_BY};
+        let Some(installation) = crate::executor::label_value(scope.installation) else {
+            bail!(
+                "DAGRON_INSTALLATION={:?} is not usable as a label value, so the fleet sweep \
+                 cannot scope itself and will not run. Use 1-63 alphanumerics, '-', '_' or '.', \
+                 starting and ending alphanumeric.",
+                scope.installation
+            );
+        };
+        let selector = format!(
+            "{LABEL_MANAGED_BY}={MANAGED_BY},{LABEL_INSTALLATION}={installation}"
+        );
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        let list = timeout(
+            Duration::from_secs(SWEEP_CALL_TIMEOUT_SECS),
+            pods.list(&ListParams::default().labels(&selector)),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("listing pods for the fleet sweep timed out"))??;
+
+        let cutoff = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().saturating_sub(scope.min_age.as_secs()) as i64)
+            .unwrap_or(0);
+
+        let mut out = Vec::new();
+        for pod in list {
+            let Some(name) = pod.metadata.name.clone() else { continue };
+            // Young pods are not judged at all — see `OrphanScope::min_age`.
+            // A pod whose creation timestamp is missing is treated as young,
+            // because the alternative is judging a pod whose age is unknown.
+            let born = pod.metadata.creation_timestamp.as_ref().map(|t| t.0.as_second());
+            if born.is_none_or(|b| b > cutoff) {
+                continue;
+            }
+            // The apiserver stamps a uid on every object it creates, so a
+            // listed pod without one is not something it handed back normally.
+            // Without it the delete cannot be bound to this exact pod, and a
+            // sweep that cannot address what it judged does not delete.
+            let Some(uid) = pod.metadata.uid.clone() else { continue };
+            let labels = pod.metadata.labels.unwrap_or_default();
+            // Refused here, not filtered: the selector constrains only the
+            // labels it names and says nothing about the rest — see
+            // `from_labels`.
+            let Some(w) =
+                crate::executor::ManagedWorkload::from_labels(name, Some(uid), |k| labels.get(k))
+            else {
+                continue;
+            };
+            out.push(w);
+        }
+        Ok(out)
+    }
+
+    /// Delete one pod the sweep judged leftover — that pod, not whatever holds
+    /// its name by the time the request lands.
+    ///
+    /// The name comes from the listing rather than a re-derived selector, which
+    /// closes the easy half of the problem. The other half is that a name
+    /// addresses a slot, not an occupant, and a sweep is spread across time: it
+    /// lists, asks the datastore, then deletes. Binding the request to the
+    /// listed pod's **uid** makes the delete a compare-and-swap on identity —
+    /// the apiserver answers `409` and does nothing if the name now resolves to
+    /// some other object, so the guarantee holds without depending on how pod
+    /// names happen to be minted.
+    ///
+    /// Deletion is a request, not an act: the pod enters `Terminating` and its
+    /// grace period runs before the container stops. `Ok(())` therefore means
+    /// the apiserver accepted the request, not that the workload is gone.
+    async fn delete_workload(&self, w: &crate::executor::ManagedWorkload) -> Result<()> {
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        let params = DeleteParams {
+            preconditions: w.uid.clone().map(|uid| kube::api::Preconditions {
+                uid: Some(uid),
+                resource_version: None,
+            }),
+            ..Default::default()
+        };
+        let res = timeout(
+            Duration::from_secs(SWEEP_CALL_TIMEOUT_SECS),
+            pods.delete(&w.handle, &params),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("deleting pod '{}' timed out", w.handle))?;
+        match res {
+            Ok(_) => Ok(()),
+            // The precondition doing its job. The name still resolves, but not
+            // to the pod the sweep judged, so nothing was deleted — which is
+            // the right outcome, reported rather than swallowed because the
+            // sweep's contract is that every delete either happened or is
+            // explained.
+            Err(kube::Error::Api(s)) if s.code == 409 => Err(anyhow::anyhow!(
+                "pod '{}' is no longer the pod the sweep judged, so it was left alone",
+                w.handle
+            )),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     async fn execute(&self, ctx: &ExecContext) -> Result<ExecOutput> {
         if ctx.command.is_empty() {
             bail!("empty command");
@@ -78,10 +306,55 @@ impl Executor for KubeExecutor {
         let name = format!("sched-{}", Uuid::new_v4().simple());
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
 
-        let pod = build_pod(&name, image, &ctx.command, ctx)?;
-        pods.create(&PostParams::default(), &pod)
-            .await
-            .map_err(|e| anyhow::anyhow!("create pod '{name}': {e}"))?;
+        // Before creating: kill anything an earlier attempt of this same task
+        // left running. Without this the lease bounds the row, not the work.
+        Self::reap_predecessors(&pods, ctx).await;
+
+        // Secret-sourced env vars (`value_from`, resolved by the engine just
+        // before dispatch) go to the pod by reference, so the plaintext is never
+        // in the Pod spec that `get pods` / `describe` / audit logs show. The
+        // Secret is created FIRST: a pod whose secretKeyRef does not exist yet
+        // waits in CreateContainerConfigError on the kubelet's retry backoff.
+        let secret_name = (!self.inline_secrets && has_secret_env(ctx)).then(|| format!("{name}-env"));
+        if let Some(sn) = &secret_name {
+            let secrets: Api<Secret> = Api::namespaced(self.client.clone(), &self.namespace);
+            secrets.create(&PostParams::default(), &env_secret_object(sn, ctx)?).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "create Secret '{sn}' for the task's secret env vars: {e}. The engine needs \
+                     create, patch and delete on `secrets` in namespace '{}' (the chart grants them); \
+                     or set DAGRON_TASK_SECRET_ENV=inline to keep secret values in the pod spec, \
+                     readable by anyone who can get pods",
+                    self.namespace
+                )
+            })?;
+        }
+
+        let pod = match build_pod_with_secrets(&name, image, &ctx.command, ctx, secret_name.as_deref()) {
+            Ok(p) => p,
+            Err(e) => {
+                self.cleanup_task(&pods, &name, secret_name.as_deref()).await;
+                return Err(e);
+            }
+        };
+        let created = match pods.create(&PostParams::default(), &pod).await {
+            Ok(p) => p,
+            Err(e) => {
+                self.cleanup_task(&pods, &name, secret_name.as_deref()).await;
+                return Err(anyhow::anyhow!("create pod '{name}': {e}"));
+            }
+        };
+        if let (Some(sn), Some(uid)) = (&secret_name, created.metadata.uid.as_deref()) {
+            // Own the Secret by the pod so Kubernetes deletes it with the pod even
+            // if this process dies before the explicit delete below. A failure is
+            // not fatal: the explicit delete still runs on every path out of here.
+            let secrets: Api<Secret> = Api::namespaced(self.client.clone(), &self.namespace);
+            let patch = serde_json::json!({"metadata": {"ownerReferences": [
+                {"apiVersion": "v1", "kind": "Pod", "name": name, "uid": uid}
+            ]}});
+            if let Err(e) = secrets.patch(sn, &PatchParams::default(), &Patch::Merge(&patch)).await {
+                tracing::warn!(secret = %sn, error = %e, "could not attach the env Secret to its pod; it will be deleted explicitly");
+            }
+        }
 
         // ── Wait for a terminal phase, bounded by the task timeout ───────────
         let waited = timeout(Duration::from_secs(secs), async {
@@ -103,11 +376,11 @@ impl Executor for KubeExecutor {
         let phase = match waited {
             Ok(Ok(phase)) => phase,
             Ok(Err(e)) => {
-                Self::cleanup(&pods, &name).await;
+                self.cleanup_task(&pods, &name, secret_name.as_deref()).await;
                 return Err(e);
             }
             Err(_) => {
-                Self::cleanup(&pods, &name).await;
+                self.cleanup_task(&pods, &name, secret_name.as_deref()).await;
                 // Typed TimeoutError so the worker can gate retry-on-timeout (#24).
                 return Err(anyhow::Error::new(crate::executor::TimeoutError { secs }));
             }
@@ -130,7 +403,7 @@ impl Executor for KubeExecutor {
                 String::new()
             }
         };
-        Self::cleanup(&pods, &name).await;
+        self.cleanup_task(&pods, &name, secret_name.as_deref()).await;
 
         Ok(ExecOutput { success: phase == "Succeeded", output })
     }
@@ -358,11 +631,63 @@ pub fn apply_hardening(pod: &mut serde_json::Value, h: &PodHardening, wants_sa: 
 /// * `resources` → container `resources.requests/limits` so the k8s scheduler
 ///   packs/evicts/OOMKills pods like production;
 /// * `service_account` → the IRSA seam, so the pod assumes an IAM role for S3.
+#[cfg(test)]
 fn build_pod(name: &str, image: &str, command: &[String], ctx: &ExecContext) -> Result<Pod> {
+    build_pod_with_secrets(name, image, command, ctx, None)
+}
+
+/// Whether the task carries any secret-sourced env var. `value_from` stays set
+/// on a resolved var precisely so the redactor knows its value is a secret
+/// (`secrets::resolve`, `environments::resolve_secrets`); it is the same marker.
+fn has_secret_env(ctx: &ExecContext) -> bool {
+    ctx.env.iter().any(|e| e.value_from.is_some())
+}
+
+/// The per-task Secret holding the secret-sourced env values, keyed by variable
+/// name. Labelled like the pod so an operator can find leftovers.
+fn env_secret_object(name: &str, ctx: &ExecContext) -> Result<Secret> {
+    let data: serde_json::Map<String, serde_json::Value> = ctx
+        .env
+        .iter()
+        .filter(|e| e.value_from.is_some())
+        .map(|e| (e.name.clone(), serde_json::Value::String(e.value.clone())))
+        .collect();
+    let mut labels = serde_json::Map::new();
+    labels.insert("app.kubernetes.io/managed-by".to_string(), serde_json::json!("dagron"));
+    if let Some(id) = &ctx.identity {
+        for (k, v) in id.labels() {
+            labels.insert(k, serde_json::Value::String(v));
+        }
+    }
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "type": "Opaque",
+        "metadata": {"name": name, "labels": serde_json::Value::Object(labels)},
+        "stringData": data,
+    }))
+    .map_err(|e| anyhow::anyhow!("build env Secret: {e}"))
+}
+
+/// [`build_pod`] with secret-sourced env vars referenced from Secret
+/// `secret_name` instead of inlined. `None` = inline (the legacy shape).
+fn build_pod_with_secrets(
+    name: &str,
+    image: &str,
+    command: &[String],
+    ctx: &ExecContext,
+    secret_name: Option<&str>,
+) -> Result<Pod> {
     let env: Vec<serde_json::Value> = ctx
         .env
         .iter()
-        .map(|e| serde_json::json!({ "name": e.name, "value": e.value }))
+        .map(|e| match secret_name {
+            Some(sn) if e.value_from.is_some() => serde_json::json!({
+                "name": e.name,
+                "valueFrom": { "secretKeyRef": { "name": sn, "key": e.name } },
+            }),
+            _ => serde_json::json!({ "name": e.name, "value": e.value }),
+        })
         .collect();
 
     // `effective_limits` folds the `resources.gpu` accelerator sugar into the
@@ -394,12 +719,24 @@ fn build_pod(name: &str, image: &str, command: &[String], ctx: &ExecContext) -> 
         spec["serviceAccountName"] = serde_json::Value::String(sa.to_string());
     }
 
+    // Identity labels, so this pod can be found by something other than the
+    // process that created it — see `TaskIdentity`. An unlabellable identity
+    // adds nothing rather than adding a partial set, because a pod carrying
+    // `managed-by` and no `task-id` is exactly what a reaper would delete.
+    let mut labels = serde_json::Map::new();
+    labels.insert("app".to_string(), serde_json::json!("module-54-scheduler"));
+    if let Some(id) = &ctx.identity {
+        for (k, v) in id.labels() {
+            labels.insert(k, serde_json::Value::String(v));
+        }
+    }
+
     let mut manifest = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Pod",
         "metadata": {
             "name": name,
-            "labels": { "app": "module-54-scheduler" },
+            "labels": serde_json::Value::Object(labels),
         },
         "spec": spec,
     });
@@ -594,6 +931,42 @@ mod tests {
         );
     }
 
+    /// The labels must actually reach the manifest — everything the reaper does
+    /// is a label selector, so an unlabelled pod is an unreachable pod.
+    #[test]
+    fn a_pod_carries_the_task_identity_it_was_dispatched_for() {
+        let mut ctx = ExecContext::new(vec!["sh".into()], None, Some("alpine:3.19".into()));
+        ctx.identity = Some(crate::executor::TaskIdentity {
+            task_id: "0b5d8f2e-3a41-4c7b-9e60-1f2a3b4c5d6e".into(),
+            run_id: "9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f".into(),
+            attempt: 2,
+            installation: None,
+        });
+        let pod = build_pod("sched-x", "alpine:3.19", &ctx.command, &ctx).unwrap();
+        let labels = pod.metadata.labels.expect("pod is labelled");
+
+        assert_eq!(labels.get(crate::executor::LABEL_TASK_ID).map(String::as_str),
+                   Some("0b5d8f2e-3a41-4c7b-9e60-1f2a3b4c5d6e"));
+        assert_eq!(labels.get(crate::executor::LABEL_ATTEMPT).map(String::as_str), Some("2"));
+        assert_eq!(labels.get(crate::executor::LABEL_MANAGED_BY).map(String::as_str),
+                   Some(crate::executor::MANAGED_BY));
+        // The pre-existing selector stays — operators and any dashboards built
+        // on it must not break because identity labels arrived beside it.
+        assert_eq!(labels.get("app").map(String::as_str), Some("module-54-scheduler"));
+    }
+
+    /// No identity (tests, the no-op fallback) must still build a valid pod —
+    /// with the original label and nothing half-written.
+    #[test]
+    fn a_pod_without_an_identity_keeps_the_original_label_only() {
+        let ctx = ExecContext::new(vec!["sh".into()], None, Some("alpine:3.19".into()));
+        let pod = build_pod("sched-x", "alpine:3.19", &ctx.command, &ctx).unwrap();
+        let labels = pod.metadata.labels.expect("app label survives");
+        assert_eq!(labels.get("app").map(String::as_str), Some("module-54-scheduler"));
+        assert!(!labels.contains_key(crate::executor::LABEL_MANAGED_BY),
+                "an unowned pod must not claim to be managed — the reaper selects on it");
+    }
+
     #[test]
     fn build_pod_applies_the_context_envelope_end_to_end() {
         use dagron_core::isolation::Seccomp;
@@ -762,6 +1135,7 @@ mod tests {
             service_account: Some("dagron-etl".to_string()),
             isolation: None,
             log_sink: None,
+            identity: None,
         };
         let pod = build_pod("sched-xyz", "etl-task:latest", &ctx.command, &ctx).unwrap();
 
@@ -779,5 +1153,84 @@ mod tests {
         assert_eq!(reqs["memory"].0, "256Mi");
         let lims = res.limits.as_ref().expect("limits");
         assert_eq!(lims["memory"].0, "512Mi");
+    }
+
+    // ── Secret-sourced env vars reach the pod by reference ────────────────
+    fn ctx_with_secret() -> ExecContext {
+        use dagron_core::dag::{EnvVar, SecretRef};
+        let mut ctx = ExecContext::new(vec!["sh".into(), "-c".into(), "true".into()], None, None);
+        ctx.env = vec![
+            EnvVar { name: "S3_BUCKET".into(), value: "dagron-lt".into(), value_from: None },
+            // What `resolve_secrets` leaves behind: the decrypted value, with the
+            // `value_from` marker kept so the redactor (and now the executor) know.
+            EnvVar {
+                name: "API_KEY".into(),
+                value: "s3cr3t-plaintext".into(),
+                value_from: Some(SecretRef { secret: "API_KEY".into() }),
+            },
+        ];
+        ctx
+    }
+
+    #[test]
+    fn a_secret_env_var_is_a_secret_key_ref_and_its_plaintext_is_not_in_the_pod() {
+        let ctx = ctx_with_secret();
+        assert!(has_secret_env(&ctx));
+        let pod = build_pod_with_secrets("sched-x", "alpine", &ctx.command, &ctx, Some("sched-x-env")).unwrap();
+
+        let wire = serde_json::to_string(&pod).unwrap();
+        assert!(!wire.contains("s3cr3t-plaintext"), "plaintext must not be in the Pod spec: {wire}");
+
+        let env = pod.spec.unwrap().containers[0].env.clone().unwrap();
+        let key = env.iter().find(|e| e.name == "API_KEY").unwrap();
+        assert!(key.value.is_none());
+        let r = key.value_from.as_ref().unwrap().secret_key_ref.as_ref().unwrap();
+        assert_eq!((r.name.as_str(), r.key.as_str()), ("sched-x-env", "API_KEY"));
+        // A plain var is untouched.
+        let plain = env.iter().find(|e| e.name == "S3_BUCKET").unwrap();
+        assert_eq!(plain.value.as_deref(), Some("dagron-lt"));
+        assert!(plain.value_from.is_none());
+    }
+
+    #[test]
+    fn inline_mode_keeps_the_literal_the_old_way() {
+        let ctx = ctx_with_secret();
+        let pod = build_pod("sched-x", "alpine", &ctx.command, &ctx).unwrap();
+        let env = pod.spec.unwrap().containers[0].env.clone().unwrap();
+        let key = env.iter().find(|e| e.name == "API_KEY").unwrap();
+        assert_eq!(key.value.as_deref(), Some("s3cr3t-plaintext"));
+        assert!(key.value_from.is_none());
+    }
+
+    #[test]
+    fn the_env_secret_holds_only_the_secret_vars_keyed_by_name() {
+        let ctx = ctx_with_secret();
+        let sec = env_secret_object("sched-x-env", &ctx).unwrap();
+        assert_eq!(sec.metadata.name.as_deref(), Some("sched-x-env"));
+        assert_eq!(sec.type_.as_deref(), Some("Opaque"));
+        let data = sec.string_data.unwrap();
+        assert_eq!(data.len(), 1, "the plain var must not be copied into the Secret");
+        assert_eq!(data["API_KEY"], "s3cr3t-plaintext");
+        assert_eq!(
+            sec.metadata.labels.unwrap().get("app.kubernetes.io/managed-by").map(String::as_str),
+            Some("dagron")
+        );
+    }
+
+    #[test]
+    fn a_task_without_secret_vars_needs_no_secret() {
+        let mut ctx = ctx_with_secret();
+        ctx.env.retain(|e| e.value_from.is_none());
+        assert!(!has_secret_env(&ctx));
+    }
+
+    #[test]
+    fn the_secret_env_mode_defaults_to_reference_and_rejects_a_typo() {
+        assert!(!parse_secret_env_mode(None).unwrap());
+        assert!(!parse_secret_env_mode(Some("")).unwrap());
+        assert!(!parse_secret_env_mode(Some("secret")).unwrap());
+        assert!(parse_secret_env_mode(Some(" inline ")).unwrap());
+        let e = parse_secret_env_mode(Some("inlin")).unwrap_err().to_string();
+        assert!(e.contains("'secret' or 'inline'"), "{e}");
     }
 }

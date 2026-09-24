@@ -62,6 +62,47 @@ impl std::fmt::Display for TaskBudgetExceeded {
 
 impl std::error::Error for TaskBudgetExceeded {}
 
+/// A run was refused because the **declared** cost of its external work exceeds
+/// the spec's `budget.external_cost`.
+///
+/// Sibling of [`TaskBudgetExceeded`] and refused for the same reason at the same
+/// moment: after expansion the sum is exact, so the run never starts rather than
+/// dying partway with cluster-hours already spent.
+///
+/// The numbers are the author's own — `defer.cost` per task, default 1 — so this
+/// error reports a declaration against a declaration. It is not a statement
+/// about money the engine observed, because the engine observes none.
+///
+/// Non-transient, like its sibling: the same submission is refused identically
+/// forever, so the API answers 400 rather than 429.
+#[derive(Debug, Clone)]
+pub struct ExternalBudgetExceeded {
+    /// The workflow whose ceiling was exceeded.
+    pub name: String,
+    /// The declared `budget.external_cost`.
+    pub max: u64,
+    /// The summed `defer.cost` the run would have committed to.
+    pub planned: u64,
+    /// How many deferred tasks contributed to that sum — the difference between
+    /// "one very expensive job" and "a fan-out nobody meant to write".
+    pub deferred_tasks: u64,
+}
+
+impl std::fmt::Display for ExternalBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "workflow '{}' would submit {} deferred task(s) of declared cost {}, over its \
+             budget.external_cost of {}. These are the costs the spec itself declares \
+             (`defer.cost`, default 1) — raise the ceiling if you meant it, or lower the \
+             fan-out",
+            self.name, self.deferred_tasks, self.planned, self.max
+        )
+    }
+}
+
+impl std::error::Error for ExternalBudgetExceeded {}
+
 /// A run was refused because the SQLite datastore's filesystem is under the
 /// free-space floor (`DAGRON_MIN_FREE_BYTES`, constrained hosts).
 ///
@@ -476,6 +517,14 @@ pub struct TaskRun {
     pub wait_dataset: Option<String>,
     #[sqlx(default)]
     pub sub_run_id: Option<String>,
+    /// Submission generation for a `defer:` task (migration 042/053). Dispatch
+    /// injects it as `DAGRON_EXTERNAL_EPOCH` so a step can name its remote job
+    /// `dagron-<task_id>-<epoch>` — stable across lease recovery (so a
+    /// post-crash resubmit adopts), fresh after a deliberate re-arm (so a retry
+    /// does not adopt the job that just failed).
+    /// `#[sqlx(default)]` → 0 on a projection that does not select it.
+    #[sqlx(default)]
+    pub external_epoch: i64,
     /// Fault attribution for the attempt that failed (migration 040/050):
     /// the kebab-case [`crate::fault::FaultClass`], the line that produced it,
     /// and how much the verdict should be trusted.
@@ -491,6 +540,49 @@ pub struct TaskRun {
     pub fault_detail: Option<String>,
     #[sqlx(default)]
     pub fault_confidence: Option<String>,
+}
+
+/// What one sweep tick did to a parked runtime fan-out barrier.
+///
+/// Returned rather than only logged so the engine can meter it: an expansion is
+/// N new tasks appearing mid-run, which is the one thing about this feature an
+/// operator watching a dashboard needs to be able to see happen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FanoutOutcome {
+    /// The producer's output was read and this many instance rows were
+    /// inserted. The barrier stays parked, now as the join point.
+    Expanded { instances: usize },
+    /// Every instance reached a terminal state and the barrier resolved with
+    /// them. `succeeded` is false when an instance failed and the barrier does
+    /// not `allow_failure`.
+    Joined { succeeded: bool, instances: usize },
+    /// The fan-out could not be resolved — unreadable output, not a JSON
+    /// array, duplicate labels, or over the run's task ceiling. The barrier is
+    /// `failed` with `reason` as its output; nothing was inserted.
+    Failed { reason: String },
+}
+
+/// One **superseded** attempt of a task: a `repeat:` iteration whose `until`
+/// had not held yet, or an attempt that failed and is being retried.
+///
+/// The attempt currently on the row is deliberately absent from this type and
+/// from the table behind it — it lives in `task_runs.output`, whole, where the
+/// live tail has always read it. These are the ones that used to be overwritten
+/// and are now kept as a bounded tail (see [`crate::attempt_log`]).
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct TaskAttempt {
+    pub task_id: String,
+    /// 1-based, the same counter `TaskRun::attempt` carries.
+    pub attempt: i64,
+    /// `iteration` | `failed` — see [`crate::attempt_log::AttemptEnd`].
+    pub reason: String,
+    /// The retained tail, or `None` when the attempt printed nothing.
+    pub output: Option<String>,
+    /// Whether output was dropped to fit the cap. Stored rather than inferred:
+    /// a reader must be able to say "there was more" without knowing what the
+    /// cap happened to be when the row was written.
+    pub truncated: bool,
+    pub finished_at: String,
 }
 
 // Constructed only by the ops read API (`db::get_run`); a lean build never
@@ -692,6 +784,67 @@ pub struct DatasetFire {
     /// Every cursor this claim advanced: `(uri, previous, new)`. Kept for
     /// rollback when the fire cannot create its run.
     pub advanced: Vec<(String, i64, i64)>,
+}
+
+/// One parked external job due for a poll — what a sweep needs to ask the
+/// remote system "is it done?" without reading the workflow spec again.
+///
+/// Everything here is on the task row, which is the point: the handle is
+/// durable state, not an in-memory registration. Any scheduler that survives
+/// can poll a job any other scheduler submitted, because the row is the whole
+/// contract.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ExternalPark {
+    /// The parked `task_runs.id`.
+    pub id: String,
+    /// The task's name, for the lineage row a `produces:` records. Read off the
+    /// row the sweep already fetched rather than through a second query.
+    pub name: String,
+    /// The run it belongs to — the poller's identity for logs and, later, for
+    /// resolving a connection.
+    pub run_id: String,
+    /// Which poller resolves it (`defer.kind`).
+    pub external_kind: String,
+    /// The remote job's opaque identity.
+    pub external_handle: String,
+    /// Where to reach it, pinned at submit. `None` when the handle suffices.
+    pub external_endpoint: Option<String>,
+    /// Submission generation — part of the remote job's name.
+    pub external_epoch: i64,
+    /// When to stop waiting, or `None` for no ceiling beyond the run's own.
+    pub external_deadline_at: Option<String>,
+    /// The task's persisted spec JSON (`task_runs.input`), which carries
+    /// `defer.http` — the URL, headers and predicates the built-in poller needs.
+    ///
+    /// Read from the row rather than from the workflow registry on purpose: this
+    /// is the spec that actually ran, so editing the workflow while a six-hour
+    /// job is in flight cannot redirect the poll of a job that was submitted
+    /// against the old definition.
+    pub input: Option<String>,
+}
+
+/// One row that owes a remote teardown: it still holds an `external_handle`
+/// but is no longer parked, so a cancelled (or otherwise terminated) task left
+/// a job running on someone else's cluster.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ExternalCancel {
+    pub id: String,
+    pub run_id: String,
+    pub external_kind: String,
+    pub external_handle: String,
+    pub external_endpoint: Option<String>,
+    pub external_epoch: i64,
+    /// Failed teardown attempts so far. Only a genuine failure increments it —
+    /// a sweep that found no poller for the kind tried nothing.
+    pub external_cancel_attempts: i64,
+    /// The task's persisted spec JSON (`task_runs.input`), which carries the
+    /// `defer.http.cancel` block the teardown sweep sends. Read off the row for
+    /// the same reason [`ExternalPark::input`] is.
+    pub input: Option<String>,
+    /// When the task went terminal. The wall-clock give-up bound is measured
+    /// from here, so teardown terminates regardless of how many replicas can or
+    /// cannot reach the remote system.
+    pub finished_at: Option<String>,
 }
 
 #[cfg(test)]

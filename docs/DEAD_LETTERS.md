@@ -75,8 +75,10 @@ to reach this queue.
 
 **Redrive fixes nothing by itself.** It re-attempts the same payload, so it only
 helps once the cause is gone: the schema was corrected, the dependency came
-back, the bug was deployed. Redriving into an unfixed cause just parks it again
-with the failure count one higher.
+back, the bug was deployed. Redriving into an unfixed cause fails and changes
+nothing: the dead letter keeps its id, error and failure count, ready to redrive
+once the fix is in. That holds for `dagron-api` (the console, the REST call
+above, both SDKs) and for the engine's own ops API alike.
 
 ## Retry policy
 

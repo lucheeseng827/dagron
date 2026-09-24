@@ -3,10 +3,19 @@
 // The visual editor draws one node per task and edits a fixed set of fields.
 // Anything it doesn't model is carried verbatim through the round-trip
 // (`Task._extra`), which keeps *saving* lossless — but lossless is not the same
-// as honest. A `with_items:` task is one node on the canvas and N tasks at run
-// time; a `type: wait` sensor has no command but the panel offers a command box;
-// a `hook:` task is wired to every other task by edges the canvas never draws.
-// Editing those is how a spec gets quietly corrupted.
+// as honest. A `type: wait` sensor has no command but the panel offers a command
+// box; a `hook:` task is wired to every other task by edges the canvas never
+// draws. Editing those is how a spec gets quietly corrupted.
+//
+// "One node, many rows" is *not* on that list, and deliberately so. A template
+// call has always drawn as a single node reading `sub-DAG · 3 tasks`, because a
+// node that says what it expands to is not pretending to be a leaf. A loop is
+// the same bargain: `with_items:` draws one node badged `⟳ ×3 parallel`, and
+// `repeat:` draws one node badged `⟳ 3× in place` — which is also the literal
+// truth about `repeat`, since it really is one row run repeatedly. What made
+// fan-out dishonest before was the *silence*: an unbadged node claiming to be a
+// single task. The badge is what pays for the unlock, so it is load-bearing —
+// see `describeLoop` in `loop-model.ts` and the loop row in `StatusNode`.
 //
 // So this module answers one question — is the drawn graph the graph that runs?
 // — and the editor refuses Visual mode when the answer is no, pointing at the
@@ -28,7 +37,6 @@ const CARRIED_TASK_KEYS = new Set([
   "retry_max_delay_secs",
   "retry_on_timeout",
   "when", // conditional skip — still exactly one node
-  "repeat", // re-runs in place — still exactly one node
   "allow_failure",
   "priority",
   "pool",
@@ -43,9 +51,6 @@ const CARRIED_TASK_KEYS = new Set([
 /// (Keys absent from every set are reported as unknown — same lock, different
 /// message.) Kept in the engine's vocabulary so the message matches the YAML.
 const UNSUPPORTED_TASK_KEYS: Record<string, string> = {
-  with_items: "fans out into one task per item — the canvas would draw a single node",
-  with_param: "fans out into one task per item — the canvas would draw a single node",
-  instance_key: "labels fan-out instances, which the canvas doesn't draw",
   gang: "expands into co-scheduled member tasks the canvas doesn't draw",
   gang_member: "is engine-internal gang bookkeeping, not an authored field",
   hook: "is auto-wired to every other task by edges the canvas doesn't draw",
@@ -150,6 +155,72 @@ function taskReasons(raw: unknown, insideTemplate = false): string[] {
   }
   if (typeof t.type === "string" && !SUPPORTED_TASK_TYPES.has(t.type)) {
     out.push(`task '${name}': \`type: ${t.type}\` is a task kind the visual editor can't edit`);
+  }
+  out.push(...loopReasons(t, name));
+  return out;
+}
+
+/// Value-shape checks for the loop keys. These are *modeled* fields, so unlike
+/// an unknown key they are not carried in `_extra` — `parseModel` reads them
+/// into typed slots and `modelToYaml` writes those slots back. A value in the
+/// wrong shape reads as nothing and would therefore be **dropped** on the
+/// round-trip, which is the one outcome this module exists to prevent. So a
+/// misshapen loop locks the tab instead, the same way `type:` does above.
+function loopReasons(t: Record<string, unknown>, name: string): string[] {
+  const out: string[] = [];
+  const has = (k: string) => t[k] !== undefined && t[k] !== null;
+  if (has("with_items") && !Array.isArray(t.with_items)) {
+    out.push(`task '${name}': \`with_items\` must be a list for the visual editor to show the fan-out`);
+  }
+  for (const k of ["with_param", "with_output_of", "instance_key"]) {
+    if (has(k) && typeof t[k] !== "string") {
+      out.push(`task '${name}': \`${k}\` must be a string for the visual editor to show the fan-out`);
+    }
+  }
+  // The engine rejects this pair outright ("sets both with_items and
+  // with_param"); the editor's loop model has one source, so it would silently
+  // keep one and drop the other on the way back out.
+  const sources = ["with_items", "with_param", "with_output_of"].filter(has);
+  if (sources.length > 1) {
+    out.push(
+      `task '${name}': ${sources.map((k) => `\`${k}\``).join(" and ")} are set together — a task fans out from one source`,
+    );
+  }
+  if (has("repeat")) out.push(...repeatReasons(t.repeat, name));
+  return out;
+}
+
+/// The keys `Task.repeat` models. Anything else inside a `repeat:` block is
+/// dropped by `parseRepeat`, so its presence has to lock the tab.
+const REPEAT_KEYS = new Set(["until", "max_iterations", "delay_secs"]);
+
+/// Why this `repeat:` block can't round-trip, or nothing when it can.
+///
+/// Held to exactly what `parseRepeat` accepts, key for key — this check and
+/// that parser are two halves of one contract, and every gap between them is a
+/// field that reads as nothing and is therefore **deleted** on the way back
+/// out. `typeof x === "number"` is the subtle one: it is true of `NaN` and
+/// `Infinity`, which `parseRepeat` rejects via `Number.isFinite`, so a spec
+/// with `max_iterations: .nan` would pass this gate and lose its whole
+/// `repeat:` block to a Visual-mode save.
+function repeatReasons(raw: unknown, name: string): string[] {
+  const where = `task '${name}': \`repeat\``;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return [`${where} must be a mapping for the visual editor to show the loop`];
+  }
+  const r = raw as Record<string, unknown>;
+  const finite = (v: unknown) => typeof v === "number" && Number.isFinite(v);
+  const out: string[] = [];
+  if (typeof r.until !== "string") out.push(`${where}.until must be a string`);
+  if (!finite(r.max_iterations)) {
+    out.push(`${where}.max_iterations must be a finite number`);
+  }
+  if (r.delay_secs !== undefined && r.delay_secs !== null && !finite(r.delay_secs)) {
+    out.push(`${where}.delay_secs must be a finite number`);
+  }
+  const extra = Object.keys(r).filter((k) => !REPEAT_KEYS.has(k));
+  if (extra.length) {
+    out.push(`${where} has ${extra.map((k) => `\`${k}\``).join(", ")}, which the visual editor doesn't model`);
   }
   return out;
 }

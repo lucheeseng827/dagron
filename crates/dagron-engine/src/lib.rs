@@ -111,6 +111,12 @@ mod clock;
 // pod could not (see the module docs for the threat model).
 mod wait_url;
 
+// The built-in `defer.http` poller. Separate from wait_url because the policy
+// inverts: that client issues an unauthenticated GET and defaults to permitting
+// private addresses, this one carries the task's headers — including a bearer
+// token — and defaults to refusing them.
+mod defer_http;
+
 // The engine logic now lives in three library crates. Re-alias them to the module
 // paths the wiring below (and the ops modules) already use — `db::`, `dag::`,
 // `executor::`, `source::`, … — so the split is pure plumbing: no call site moved.
@@ -130,7 +136,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 use ractor::Actor;
 
@@ -175,8 +181,410 @@ impl worker::LeaseKeeper for DbLeaseKeeper {
 /// much outbound HTTP one tick can take on; the rest roll to the next tick.
 const WAIT_URL_BATCH: i64 = 32;
 
+/// Max parked `defer:` external jobs polled in a single reconcile tick, for the
+/// same reason [`WAIT_URL_BATCH`] exists: one tick's outbound work is bounded,
+/// and the remainder rolls to the next tick. The partial index from migration
+/// 042/054 makes the SELECT cheap regardless of how many rows are parked.
+///
+/// The batch is polled concurrently, so this bounds how many vendor calls are in
+/// flight at once rather than how long the batch takes end to end — it costs
+/// about one call's deadline, not this many.
+const EXTERNAL_POLL_BATCH: i64 = 32;
+
+/// Ceiling on one registered [`hooks::ExternalPoller::poll`] call.
+///
+/// The trait carries no timeout contract, so without this an implementation that
+/// blocks forever does not stall one job — it holds a `JoinSet` slot forever,
+/// the sweep that awaits the set never finishes its pass, and that stalls the
+/// reconcile loop and with it every lease, deadline and schedule the loop
+/// drives. Polling the batch concurrently does not help here: it bounds the
+/// *sum* of calls that return, and says nothing about one that never does. A
+/// seam whose worst case takes down the scheduler is not a seam anyone can
+/// safely implement.
+///
+/// Expiry is deliberately **not** a verdict: it becomes an `Err`, which the
+/// sweep already treats as "no answer" and re-parks. A slow vendor must not
+/// fail a six-hour job.
+const EXTERNAL_POLLER_TIMEOUT_SECS: u64 = 30;
+
+/// Max workloads the fleet sweep DELETES in one pass.
+///
+/// The cap is on deletes, never on candidates. Capping candidates would starve:
+/// an apiserver lists in a stable order, so a namespace whose first N workloads
+/// are long-running and live would be re-examined identically every sweep and
+/// never reach the leftovers behind them. Every candidate is asked about; only
+/// the acting is rationed, and the remainder is picked up next sweep because
+/// leftovers are expensive rather than urgent.
+const ORPHAN_DELETE_BATCH: usize = 200;
+
+/// How many task ids the fleet sweep asks about per query.
+///
+/// The liveness question is chunked rather than truncated, so a namespace with
+/// thousands of workloads is still fully covered while each `IN` list stays a
+/// size SQLite will accept and Postgres will plan well.
+const ORPHAN_QUERY_CHUNK: usize = 200;
+
+/// Default gap between fleet sweeps (`DAGRON_ORPHAN_SWEEP_SECS`), floored at 30.
+///
+/// Slow on purpose. This sweep lists every workload in the namespace, which is
+/// an apiserver call whose cost scales with the cluster rather than with this
+/// engine's work, and what it catches — a workload whose scheduler died — does
+/// not accumulate quickly.
+const ORPHAN_SWEEP_SECS_DEFAULT: u64 = 300;
+
+/// Default age below which a workload is never judged
+/// (`DAGRON_ORPHAN_MIN_AGE_SECS`), floored at 60.
+///
+/// Generous deliberately. The cost of waiting is a leftover living a few more
+/// minutes; the cost of being wrong is deleting live work. See
+/// `OrphanScope::min_age` for why any floor is needed at all.
+const ORPHAN_MIN_AGE_SECS_DEFAULT: u64 = 600;
+
+/// Max teardowns attempted in a single reconcile tick, for the same reason
+/// [`EXTERNAL_POLL_BATCH`] exists.
+const EXTERNAL_CANCEL_BATCH: i64 = 16;
+
+/// Failed teardown attempts before a remote job is declared an orphan.
+///
+/// Small on purpose. Teardown is best-effort — a job we cannot reach is a job
+/// we cannot stop — and the value of retrying a vendor that has refused us
+/// three times is lower than the value of telling the operator, loudly and by
+/// handle, that something is still running.
+const EXTERNAL_CANCEL_ATTEMPTS: i64 = 3;
+
+/// How long a row may owe a teardown before it is orphaned regardless of
+/// attempts, measured from when the task went terminal.
+///
+/// The attempt budget alone does not terminate: a replica with no poller for a
+/// kind hands the row back *without* consuming an attempt (so it cannot exhaust
+/// the budget belonging to a replica that could do the work), which means a
+/// fleet where nothing owns the kind would sweep the row forever. This is the
+/// bound that does not depend on fleet shape.
+const EXTERNAL_CANCEL_GIVEUP_SECS: i64 = 3600;
+
+/// Give up on tearing a remote job down: settle the row's debt, count it, and
+/// say so by handle.
+///
+/// This is the honest end of a best-effort contract. A job we cannot reach is a
+/// job we cannot stop, and the alternative to admitting that is a row that
+/// sweeps forever and an operator who never learns their cluster is still
+/// running work for a run they cancelled an hour ago. The log line carries the
+/// kind and the handle precisely so it can be acted on by hand.
+async fn orphan(
+    pool: &db::Pool,
+    metrics: &dagron_core::metrics::Metrics,
+    row: &dagron_core::models::ExternalCancel,
+    why: &str,
+) -> anyhow::Result<()> {
+    if db::clear_external_handle(pool, &row.id, &row.external_handle).await? {
+        metrics.inc_external_orphans();
+        warn!(
+            task_id = %row.id,
+            run_id = %row.run_id,
+            kind = %row.external_kind,
+            handle = %row.external_handle,
+            "ORPHANED a remote job: {why}. The task is terminal but the job may still be \
+             running and consuming cluster-hours — stop it by hand using this handle. \
+             (scheduler_external_orphans_total)"
+        );
+    }
+    Ok(())
+}
+
+/// The task's `defer.http` block, when it declares a `cancel:` — read from the
+/// spec JSON persisted on the row, like the poll path reads its own block.
+/// `None` means nothing generic can stop this job.
+fn http_with_cancel(input: Option<&str>) -> Option<dag::DeferHttpSpec> {
+    input
+        .and_then(|j| serde_json::from_str::<dag::TaskSpec>(j).ok())
+        .and_then(|t| t.defer)
+        .and_then(|d| d.http)
+        .filter(|h| h.cancel.is_some())
+}
+
+/// How the teardown sweep could stop this job, named for the failure reason, or
+/// `None` when nothing here can stop it.
+///
+/// Both transports count, because the sweep tries both: a registered
+/// [`ExternalPoller`] gets first refusal and `defer.http.cancel` is the generic
+/// fallback. Only `defer.http.cancel` was checked before, so a deployment whose
+/// poller CAN cancel still had its handle cleared at the `max_wait_secs` ceiling
+/// and was never asked — the handle IS the teardown debt, so dropping it here is
+/// exactly what leaves a job running with nothing tracking it.
+///
+/// A poller that turns out not to claim this kind answers `Ok(None)`, which the
+/// sweep releases without spending an attempt; the row then ages out to an orphan
+/// and increments `scheduler_external_orphans_total`. That is the honest end for a
+/// job this engine could not stop, and better than the silent drop it replaces.
+fn cancel_transport(input: Option<&str>, has_poller: bool) -> Option<&'static str> {
+    match (has_poller, http_with_cancel(input).is_some()) {
+        (true, true) => Some("the registered poller, else defer.http.cancel"),
+        (true, false) => Some("the registered poller"),
+        (false, true) => Some("defer.http.cancel"),
+        (false, false) => None,
+    }
+}
+
+/// Cache key for a sweep's resolved `defer.http` headers.
+///
+/// Both halves are load-bearing. `run_id` scopes the resolution to the run
+/// whose `environment:` supplied the secrets. `block` is the *unresolved*
+/// header list — the spec as authored, credentials still as `value_from`
+/// references — so two tasks in one run that name different secrets get
+/// different entries, and two that name the same one still share a resolution.
+///
+/// The unresolved form is what is compared, deliberately: it is what
+/// distinguishes the specs, and it never holds a plaintext credential.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct HeaderCacheKey {
+    run_id: String,
+    block: String,
+}
+
+impl HeaderCacheKey {
+    /// `None` for a spec that will not serialise, which means *do not cache* —
+    /// never share a degenerate key with every other such spec. Resolving twice
+    /// costs two queries; sharing costs a credential.
+    fn new(run_id: &str, headers: &[dag::EnvVar]) -> Option<Self> {
+        serde_json::to_string(headers)
+            .ok()
+            .map(|block| Self { run_id: run_id.to_string(), block })
+    }
+}
+
+/// Poll one parked job over `defer.http` and return its verdict.
+///
+/// Every step that can fail returns `Err`, which the sweep treats as "no
+/// answer" and re-parks — never as a verdict about the job. A vendor that is
+/// rate-limiting us, or briefly 503ing, must not fail a six-hour run.
+///
+/// `secrets` is the caller's per-sweep cache: resolution is two DB queries plus
+/// an AES-GCM decrypt, and a batch of parked jobs sharing one header block
+/// shares one resolution.
+///
+/// **The key is the run AND the unresolved header block, never the run alone.**
+/// `headers` is a property of the *task*, so two deferred tasks in one run can
+/// name different credentials for different vendors. Keying on `run_id` would
+/// hand the second task the first one's resolved headers — sending vendor A's
+/// bearer token to vendor B, and authenticating as the wrong principal even
+/// where it did not leak. A cache that can answer with someone else's
+/// credential is not a cache.
+/// Everything one parked row needs to be polled off the reconcile thread.
+///
+/// Carries the *resolved* headers rather than the pool, which is what makes the
+/// poll safe to spawn: no datastore handle, no shared cache, nothing to
+/// contend on.
+struct PollPlan {
+    /// The `defer.http` spec and its resolved headers, when the task declares
+    /// one and they resolved. `None` means the built-in transport is not
+    /// available for this row — see `http_unresolved` for which of the two
+    /// reasons.
+    spec: Option<(dag::DeferHttpSpec, Vec<dag::EnvVar>)>,
+    /// The task DOES declare a `defer.http:` block, but its headers would not
+    /// resolve this sweep.
+    ///
+    /// Distinguished from "declares none" because the two deserve different
+    /// treatment: a missing block means nothing in this build can ever resolve
+    /// the row, which is worth saying once per kind; an unresolvable credential
+    /// is a transient the next sweep retries, and telling the operator to
+    /// register a poller would point them at the wrong problem entirely.
+    http_unresolved: bool,
+}
+
+/// One row's verdict, from whichever resolver owns it.
+///
+/// A registered [`hooks::ExternalPoller`] gets first refusal — it is installed
+/// for a kind, so it is the more specific thing — and the built-in `defer.http`
+/// transport is the fallback. `None` means nothing resolved it and the row
+/// stays parked, which is deliberately different from failing it.
+///
+/// Every error path here returns `None`, never a verdict. A 429, a reset
+/// connection, an expired timeout: none of them say anything about the remote
+/// job, and encoding one as `Failed` would kill a healthy six-hour run because
+/// its vendor rate-limited us.
+/// Returns the verdict and whether the row was left **unresolvable** — reached
+/// the end with no resolver claiming it, which is different from a resolver
+/// having tried and failed. Only the first deserves the once-per-kind warning;
+/// the second is a transient the next sweep retries.
+async fn poll_one(
+    poller: &Option<Arc<dyn hooks::ExternalPoller>>,
+    client: &reqwest::Client,
+    park: &dagron_core::models::ExternalPark,
+    plan: &PollPlan,
+) -> (Option<hooks::Verdict>, bool) {
+    let ctx = hooks::PollCtx {
+        kind: &park.external_kind,
+        handle: &park.external_handle,
+        endpoint: park.external_endpoint.as_deref(),
+        run_id: &park.run_id,
+        task_id: &park.id,
+        epoch: park.external_epoch,
+    };
+    if let Some(p) = poller {
+        // The trait carries no timeout contract, so this call site supplies
+        // one. Concurrency alone would not be enough: without a deadline a
+        // single blocked implementation holds a JoinSet slot forever, and the
+        // sweep that awaits the set never finishes its pass.
+        let registered = tokio::time::timeout(
+            std::time::Duration::from_secs(EXTERNAL_POLLER_TIMEOUT_SECS),
+            p.poll(&ctx),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "registered ExternalPoller for kind '{}' did not answer within {}s — \
+                 re-parking; a timeout is not a verdict about the job",
+                park.external_kind,
+                EXTERNAL_POLLER_TIMEOUT_SECS
+            ))
+        });
+        match registered {
+            Ok(Some(v)) => return (Some(v), false),
+            Err(e) => {
+                warn!(
+                    task_id = %park.id, handle = %park.external_handle,
+                    kind = %park.external_kind, error = %e,
+                    "deferred job poll failed — re-parking (not a verdict about the job)"
+                );
+                // It reached for this row and could not answer. Something owns
+                // the kind, so this is not the "nothing resolves it" case.
+                return (None, false);
+            }
+            // No registered poller claimed this kind — fall through to the
+            // built-in transport.
+            Ok(None) => {}
+        }
+    }
+    // No registered poller claimed the kind. Without a usable http block too,
+    // nothing resolved this row — but only a MISSING block means nothing in this
+    // build ever could. Headers that failed to resolve are a transient, already
+    // logged once with the actual cause.
+    let Some((spec, headers)) = plan.spec.as_ref() else {
+        return (None, !plan.http_unresolved);
+    };
+    match poll_defer_http(client, park, spec, headers).await {
+        Ok(v) => (Some(v), false),
+        Err(e) => {
+            warn!(
+                task_id = %park.id, handle = %park.external_handle, error = %e,
+                "defer.http poll failed — re-parking (not a verdict about the job)"
+            );
+            (None, false)
+        }
+    }
+}
+
+/// Resolve one spec's `value_from` header refs, through the sweep's cache.
+///
+/// Split from the poll itself because this is the only part that touches the
+/// **datastore**, and the poll is now run concurrently. Resolving here — in the
+/// parent, serially, before anything is spawned — is what lets the cache stay a
+/// plain `&mut HashMap` instead of becoming a shared mutex that every in-flight
+/// poll contends on. It also keeps the resolution order deterministic, so a
+/// batch sharing one credential still performs exactly one resolution.
+async fn resolve_defer_headers(
+    pool: &db::Pool,
+    run_id: &str,
+    spec: &dag::DeferHttpSpec,
+    secrets: &mut std::collections::HashMap<HeaderCacheKey, Vec<dag::EnvVar>>,
+) -> anyhow::Result<Vec<dag::EnvVar>> {
+    // Resolve the headers' `value_from` refs once per (run, header block) per
+    // sweep. A spec that will not serialise is not cached at all rather than
+    // sharing a degenerate key with every other such spec — resolving twice
+    // costs two queries, sharing costs a credential.
+    let cache_key = HeaderCacheKey::new(run_id, &spec.headers);
+    if let Some(h) = cache_key.as_ref().and_then(|k| secrets.get(k)) {
+        return Ok(h.clone());
+    }
+    let mut h = spec.headers.clone();
+    environments::resolve_secrets(pool, run_id, &mut h).await?;
+    if let Some(k) = cache_key {
+        secrets.insert(k, h.clone());
+    }
+    Ok(h)
+}
+
+/// Poll one parked job over `defer.http`, given headers already resolved.
+///
+/// Everything here is network or pure, which is what makes it safe to run
+/// concurrently with the rest of the batch: no pool, no cache, no shared state.
+async fn poll_defer_http(
+    client: &reqwest::Client,
+    park: &dagron_core::models::ExternalPark,
+    spec: &dag::DeferHttpSpec,
+    headers: &[dag::EnvVar],
+) -> anyhow::Result<hooks::Verdict> {
+    // The redactor is built from the RESOLVED headers, so it holds the actual
+    // credential and masks it out of anything this function writes back to the
+    // task — `value_from` marks a value secret whatever the header is called.
+    let redactor = dagron_executor::redact::Redactor::from_task_env(headers);
+    let pairs: Vec<(String, String)> =
+        headers.iter().map(|e| (e.name.clone(), e.value.clone())).collect();
+
+    // `{{ handle }}` is runtime state: expansion left it verbatim precisely so
+    // it could be bound here, against the handle on the row.
+    let url = spec.url.replace(dag::HANDLE_PLACEHOLDER, &park.external_handle);
+
+    let doc = defer_http::fetch(client, &url, &pairs)
+        .await
+        // Redact before the error text goes anywhere: a vendor's error envelope
+        // can echo the Authorization header straight back.
+        .map_err(|e| anyhow::anyhow!("{}", redactor.redact(&e.to_string()).into_owned()))?;
+
+    if defer_http::predicates_overlap(spec, &doc) {
+        warn!(
+            task_id = %park.id,
+            succeed_when = %spec.succeed_when,
+            fail_when = %spec.fail_when.as_deref().unwrap_or(""),
+            "defer.http succeed_when and fail_when BOTH matched — one of them is wrong. \
+             Treating the job as failed, because a false success advances dependents on a job \
+             that produced nothing while a false failure only costs a retry."
+        );
+    }
+    let verdict = defer_http::decide(spec, &doc)?;
+    Ok(match verdict {
+        hooks::Verdict::Failed { reason } => hooks::Verdict::Failed {
+            reason: redactor.redact(&reason).into_owned(),
+        },
+        other => other,
+    })
+}
+
 /// Record a task's `produces:` dataset updates after a **fenced** success.
 ///
+/// Count and meter one task's terminal transition — **the only place** either
+/// happens.
+///
+/// `Meter` is the quota seam: an alternate build accounts usage here and
+/// enforces limits like `max_tasks_per_day`. That only bounds anything if every
+/// path that lands a task in `succeeded` or `failed` calls it, and until this
+/// function existed only three did — all on the worker-result path. A task that
+/// parks holds no worker and resolves in a reconcile sweep, so it never
+/// traverses that path: wait sensors, `wait.url`, `wait.dataset`, sub-workflow
+/// triggers, approval gates, deferred `defer:` jobs and memoization cache hits
+/// were metered ZERO times, and `scheduler_tasks_{succeeded,failed}_total`
+/// under-reported by exactly the same set. A quota that silently stops bounding
+/// half the engine is worse than no quota, because it reads as enforced.
+///
+/// Call it **once per row this process actually transitioned** — inside the
+/// `if` on a guarded mutation's bool, or per element of a sweep's returned
+/// resolutions (those already contain only the rows that sweep landed). A
+/// stale-fence mutation changed nothing and must not be counted.
+///
+/// **Cancellation is deliberately not here.** `cancel_overdue_runs` and
+/// `cancel_gang_siblings` terminalize rows as `cancelled`, which is neither
+/// arm of this bool: a cancelled task did not succeed, and calling it a failure
+/// would inflate the failure rate and spend the very quota the seam exists to
+/// protect. Counting cancellations needs its own signal, not a coerced one.
+async fn task_finished(metrics: &Metrics, seams: &Seams, success: bool) {
+    if success {
+        metrics.inc_succeeded();
+    } else {
+        metrics.inc_failed();
+    }
+    seams.meter.on_task_completed(success).await;
+}
+
 /// Shared by the two paths that can succeed a producer task: the ordinary worker
 /// result and a memoization cache hit. A cache hit still records — `produces:` is
 /// a postcondition ("after this task succeeds, the dataset is current"), and
@@ -781,6 +1189,10 @@ pub async fn run(seams: Seams) -> Result<()> {
     // t+6 against an expiry of t+5.
     let heartbeat_every =
         std::time::Duration::from_secs((db::lease_secs() / 3).max(1) as u64);
+    // Cloned rather than moved: the fleet sweep calls the same executor from
+    // the reconcile loop, and it must be the SAME one — a second connection
+    // would be a second client to keep healthy for no gain.
+    let sweeper = Arc::clone(&executor);
     let workers = WorkerPool::with_lease_keeper(
         worker_count,
         executor,
@@ -828,6 +1240,14 @@ pub async fn run(seams: Seams) -> Result<()> {
         // spawns. If it's set but invalid the API is disabled, so it must not
         // count toward stay_resident — otherwise a one-shot run would hang with
         // no API to drain.
+        // Run-admission gate (`DAGRON_ADMISSION_FILE`). Read once here and cloned
+        // into each admission site; the gate itself holds only a path, and every
+        // read hits the file, so the clones cannot disagree about the verdict.
+        let admission_gate = pressure::AdmissionGate::from_env();
+        if let Some(p) = admission_gate.path() {
+            info!(path = %p.display(), "admission gate armed — new runs are refused while this file exists");
+        }
+
         let mut api_on = false;
         if let Ok(addr_raw) = std::env::var("API_ADDR") {
             match addr_raw.parse::<std::net::SocketAddr>() {
@@ -838,6 +1258,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                         metrics: Arc::clone(&metrics),
                         max_inflight_runs,
                         max_inflight_tasks,
+                        admission: admission_gate.clone(),
                     };
                     tokio::spawn(async move {
                         if let Err(e) = api::serve(addr, state).await {
@@ -878,7 +1299,8 @@ pub async fn run(seams: Seams) -> Result<()> {
             // DB-backed UI schedules — leadership-gated firing of first-class workflows.
             if db_schedules_on {
                 let (p, l, m) = (pool.clone(), Arc::clone(&is_leader), Arc::clone(&metrics));
-                tokio::spawn(async move { schedule::run(p, l, m).await });
+                let g = admission_gate.clone();
+                tokio::spawn(async move { schedule::run(p, l, m, g).await });
             }
 
             // First-class paced backfill jobs (#18) — leadership-gated, always on in
@@ -901,7 +1323,8 @@ pub async fn run(seams: Seams) -> Result<()> {
                 match cron::load(&path).await {
                     Ok(entries) => {
                         let (p, l, m) = (pool.clone(), Arc::clone(&is_leader), Arc::clone(&metrics));
-                        tokio::spawn(async move { cron::run(p, entries, l, m).await });
+                        let g = admission_gate.clone();
+                        tokio::spawn(async move { cron::run(p, entries, l, m, g).await });
                     }
                     Err(e) => tracing::error!(%path, error = %e, "cron config invalid — cron disabled"),
                 }
@@ -1025,8 +1448,51 @@ pub async fn run(seams: Seams) -> Result<()> {
         heartbeat_secs = heartbeat_every.as_secs(),
         "tick pacing configured"
     );
+    // Which dagron installation this engine is, for the fleet sweep. Unset
+    // means the sweep does not run — see `LABEL_INSTALLATION`: a sweep deletes
+    // workloads whose task is ABSENT from its datastore, and a foreign
+    // installation's live workload is indistinguishable from that. Off is the
+    // only safe default, and saying so at boot beats a metric that stays zero
+    // for a reason nobody can see.
+    let installation = std::env::var(dagron_executor::executor::DAGRON_INSTALLATION)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let orphan_sweep_interval = std::time::Duration::from_secs(
+        std::env::var("DAGRON_ORPHAN_SWEEP_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(ORPHAN_SWEEP_SECS_DEFAULT)
+            .max(30),
+    );
+    let orphan_min_age = std::time::Duration::from_secs(
+        std::env::var("DAGRON_ORPHAN_MIN_AGE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(ORPHAN_MIN_AGE_SECS_DEFAULT)
+            .max(60),
+    );
+    match installation.as_deref() {
+        Some(inst) => info!(
+            installation = %inst,
+            sweep_secs = orphan_sweep_interval.as_secs(),
+            min_age_secs = orphan_min_age.as_secs(),
+            "fleet sweep armed — leftover workloads carrying this installation's label whose \
+             task is no longer live will be deleted"
+        ),
+        None => info!(
+            "fleet sweep OFF ({} unset). Leftover pods/containers from a scheduler that died \
+             mid-task are not collected; each dispatch still reaps its own task's predecessors. \
+             Set it to a name unique to this installation to arm the sweep.",
+            dagron_executor::executor::DAGRON_INSTALLATION
+        ),
+    }
+
     // None → the first tick always sweeps (recovery must not wait a window).
     let mut last_sweep: Option<std::time::Instant> = None;
+    // Likewise, and it matters more here: a scheduler that has just restarted
+    // after a crash is exactly when leftovers exist.
+    let mut last_orphan_sweep: Option<std::time::Instant> = None;
 
     // Simple counter: how many tasks are currently in-flight inside the worker pool.
     let mut in_flight: usize = 0;
@@ -1078,6 +1544,16 @@ pub async fn run(seams: Seams) -> Result<()> {
         .and_then(|s| s.parse().ok())
         .filter(|&s| s > 0)
         .unwrap_or(15);
+    // Re-park interval for a deferred job whose poll did not resolve it. The
+    // authored `defer.poll_secs` sets the FIRST poll at park time; this is the
+    // cadence thereafter, and it is an operator knob rather than the author's
+    // number because the thing it protects — the vendor's rate limit — belongs
+    // to whoever runs the engine, not to whoever wrote the workflow.
+    let external_poll_secs: u64 = std::env::var("EXTERNAL_POLL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(dag::DEFAULT_DEFER_POLL_SECS);
     // Redirects are disabled: the sensor only needs the origin's own status, and
     // following redirects would let an innocuous-looking external `wait.url`
     // pivot the *scheduler's* network position to loopback / link-local / cloud
@@ -1102,6 +1578,11 @@ pub async fn run(seams: Seams) -> Result<()> {
             .no_proxy();
         info!("wait.url sensors restricted to globally-routable addresses, proxies bypassed (WAIT_URL_DENY_PRIVATE)");
     }
+    // The defer.http poller's own client. Separate from wait_http because the
+    // network policy inverts: that one issues an unauthenticated GET and
+    // permits private addresses by default; this one carries the task's
+    // headers, so it refuses them unless DEFER_HTTP_ALLOW_HOSTS names the host.
+    let defer_client = defer_http::client()?;
     let wait_http = wait_http_builder
         .build()
         // A failed build would silently hand back a *default* client — redirects
@@ -1122,9 +1603,10 @@ pub async fn run(seams: Seams) -> Result<()> {
     // later drops `on_datasets:` is cleared once instead of every sweep.
     let mut subscribed_workflows: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    // Workflows already signposted for feature-gated dataset composition —
-    // warn once each, not twelve times a minute forever.
-    let mut warned_dataset_composition: std::collections::HashSet<String> =
+    // One warning per unowned `defer.kind`, not one per tick: a build holding a
+    // job it cannot resolve is worth saying, and saying it twice a second is how
+    // an operator learns to filter it out.
+    let mut warned_defer_kinds: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
     // Cloud artifact location (DAGRON_ARTIFACT_URL — s3://, gs://, az://): the
@@ -1182,6 +1664,114 @@ pub async fn run(seams: Seams) -> Result<()> {
             last_sweep.is_none_or(|t: std::time::Instant| t.elapsed() >= sweep_interval);
         if run_sweeps {
             last_sweep = Some(std::time::Instant::now());
+            // ── Step 0: leftover workloads from schedulers that died ────────────
+            //
+            // The per-dispatch reap cannot see these. It runs when a task is
+            // dispatched and looks only at THAT task's predecessors, so a
+            // workload whose task never runs again — the run was cancelled, the
+            // task failed terminally, retention collected the row — is
+            // invisible to it forever. Those are the ones that keep costing.
+            //
+            // Ordered list-then-query on purpose. A workload observed in the
+            // listing already existed when the liveness question was asked, and
+            // a task row is always written before its workload is created, so
+            // "listed but not live" cannot mean "its row had not been written
+            // yet". `min_age` covers the clock skew and the replication lag
+            // that ordering alone does not.
+            if let Some(inst) = installation.as_deref() {
+                if last_orphan_sweep
+                    .is_none_or(|t: std::time::Instant| t.elapsed() >= orphan_sweep_interval)
+                {
+                    last_orphan_sweep = Some(std::time::Instant::now());
+                    let scope = dagron_executor::executor::OrphanScope {
+                        installation: inst,
+                        min_age: orphan_min_age,
+                    };
+                    match sweeper.list_orphan_candidates(&scope).await {
+                        Ok(found) => {
+                            // Every candidate is asked about, and the DELETES are
+                            // what is capped. Capping the candidate list instead
+                            // starves: an apiserver lists in a stable order, so a
+                            // namespace whose first N workloads are long-running
+                            // and live would be re-examined identically every
+                            // sweep and never reach the leftovers behind them.
+                            //
+                            // The liveness question is chunked rather than
+                            // truncated, so the `IN` stays bounded while the
+                            // coverage does not.
+                            //
+                            // A datastore failure here skips the pass, it does
+                            // not fail the tick. This sweep is best-effort
+                            // cleanup — its listing and its deletes already say
+                            // so — and `?` here would have made the opt-in
+                            // cleanup feature a NEW way for a transient
+                            // database blip to terminate the scheduler daemon:
+                            // `main` returns `run()`'s error straight out.
+                            //
+                            // The break is not tidiness. A PARTIAL live set is
+                            // worse than none: a task whose chunk never ran
+                            // looks dead, and the whole sweep acts on absence.
+                            // So one failed chunk abandons the deletes
+                            // entirely, and `last_orphan_sweep` is already
+                            // stamped, so the next attempt waits the normal
+                            // cadence rather than hot-looping.
+                            let mut live = std::collections::HashSet::new();
+                            let mut liveness_complete = true;
+                            for chunk in found.chunks(ORPHAN_QUERY_CHUNK) {
+                                let ids: Vec<String> =
+                                    chunk.iter().map(|w| w.task_id.clone()).collect();
+                                match db::live_task_ids(&pool, &ids).await {
+                                    Ok(ids) => live.extend(ids),
+                                    Err(e) => {
+                                        warn!(
+                                            error = %e,
+                                            "fleet sweep could not ask which tasks are live — \
+                                             skipping this pass's deletes rather than acting on \
+                                             a partial answer"
+                                        );
+                                        liveness_complete = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            for w in found
+                                .iter()
+                                .filter(|_| liveness_complete)
+                                .filter(|w| !live.contains(&w.task_id))
+                                .take(ORPHAN_DELETE_BATCH)
+                            {
+                                match sweeper.delete_workload(w).await {
+                                    Ok(()) => {
+                                        metrics.inc_orphan_workloads_reaped();
+                                        warn!(
+                                            handle = %w.handle,
+                                            task_id = %w.task_id,
+                                            run_id = w.run_id.as_deref().unwrap_or("<none>"),
+                                            attempt = w.attempt.as_deref().unwrap_or("<none>"),
+                                            "reaped a leftover workload — its task is no \
+                                             longer live, so whatever created this never \
+                                             finished cleaning up"
+                                        );
+                                    }
+                                    // One undeletable leftover must not stop
+                                    // the rest: the next sweep sees it again.
+                                    Err(e) => warn!(
+                                        handle = %w.handle, task_id = %w.task_id, error = %e,
+                                        "could not delete a leftover workload — will retry \
+                                         on the next fleet sweep"
+                                    ),
+                                }
+                            }
+                        }
+                        // Listing is the whole sweep's input, so a failure here
+                        // skips this pass rather than failing the tick. The
+                        // apiserver being briefly unreachable is not a reason to
+                        // stop scheduling.
+                        Err(e) => warn!(error = %e, "fleet sweep could not list workloads — skipping this pass"),
+                    }
+                }
+            }
+
             // ── Step 1: crash recovery ──────────────────────────────────────────
             let recovered = db::recover_expired_leases(&pool).await?;
             if recovered > 0 {
@@ -1220,6 +1810,10 @@ pub async fn run(seams: Seams) -> Result<()> {
             // every scheduler may sweep.
             for (task_id, approved) in db::resolve_expired_approvals(&pool).await? {
                 tracing::info!(%task_id, approved, "approval gate timed out — auto-resolved");
+                // Both arms are terminal: `resolve_approval` writes `succeeded`
+                // on approve and `failed` on reject. An approved gate is not
+                // handed on to a worker, so this is its only completion.
+                task_finished(&metrics, &seams, approved).await;
             }
 
             // Resolve any `type: workflow` trigger whose child run has finished (#23):
@@ -1230,12 +1824,44 @@ pub async fn run(seams: Seams) -> Result<()> {
             // during a long conversation is the loop working, not the loop stalled.
             for (task_id, succeeded) in db::reconcile_subworkflows(&pool).await? {
                 tracing::info!(%task_id, succeeded, "sub-workflow finished — resolved trigger task");
+                // A `repeat:` iteration that re-arms is not in this vec (the
+                // sweep `continue`s past it), so a conversation is metered once
+                // when it ends, not once per turn.
+                task_finished(&metrics, &seams, succeeded).await;
+            }
+
+            // Resolve any parked runtime fan-out (`with_output_of:`): read the
+            // producer's output, insert one task row per element, and — once
+            // those are all terminal — resolve the barrier they hang from.
+            // Idempotent (CAS on expand, parked-shape guard on resolve), so
+            // every scheduler may sweep.
+            //
+            // This is the one sweep that makes a run *bigger*. Everything else
+            // here resolves rows that already exist; an expansion is N tasks
+            // appearing after admission decided how many there would be, which
+            // is why it is logged at info with its count and why the sweep
+            // re-checks the run's task ceiling before inserting.
+            for (task_id, outcome) in db::reconcile_fanouts(&pool).await? {
+                match outcome {
+                    dagron_core::models::FanoutOutcome::Expanded { instances } => {
+                        tracing::info!(%task_id, instances, "runtime fan-out expanded");
+                    }
+                    dagron_core::models::FanoutOutcome::Joined { succeeded, instances } => {
+                        tracing::info!(%task_id, succeeded, instances, "runtime fan-out joined");
+                        task_finished(&metrics, &seams, succeeded).await;
+                    }
+                    dagron_core::models::FanoutOutcome::Failed { reason } => {
+                        tracing::warn!(%task_id, %reason, "runtime fan-out could not be resolved");
+                        task_finished(&metrics, &seams, false).await;
+                    }
+                }
             }
 
             // Resolve any deferred `type: wait` sensor whose deadline has passed (#27):
             // the task succeeds and its dependents advance. Idempotent, HA-safe.
             for task_id in db::reconcile_waits(&pool).await? {
                 tracing::info!(%task_id, "wait sensor elapsed — resolved");
+                task_finished(&metrics, &seams, true).await;
             }
 
             // Poll any parked `wait.url` HTTP sensor (#27 follow-on) that is due: a 2xx
@@ -1285,6 +1911,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                     if ready {
                         if db::resolve_url_wait(&pool, &task_id).await? {
                             tracing::info!(%task_id, %url, "http wait sensor endpoint ready (2xx) — resolved");
+                            task_finished(&metrics, &seams, true).await;
                         }
                     } else {
                         let next_poll = (chrono::Utc::now()
@@ -1295,11 +1922,400 @@ pub async fn run(seams: Seams) -> Result<()> {
                 }
             }
 
+            // Poll any parked `defer:` external job that is due. This is the
+            // sweep that makes the park worth having: the row is the whole
+            // contract, so whichever scheduler survives resolves a job that any
+            // other scheduler submitted.
+            //
+            // Concurrent, for the reason the url-sensor batch above is: polled
+            // serially, N parked jobs against a black-holed vendor would hold
+            // the tick for N × the request timeout, stalling claim, dispatch and
+            // run reaping behind them. `EXTERNAL_POLL_BATCH` caps it in SQL too,
+            // so the work one tick takes on is bounded from both ends; anything
+            // not polled this tick is picked up by the next.
+            //
+            // A poller that is absent leaves its rows parked rather than failing
+            // them — an engine rebuilt without the backend that owns a running
+            // job should not tear that job's task down on the next tick.
+            //
+            // Claimed, not listed: every scheduler sweeps, so an unclaimed read
+            // would have all of them call the vendor for the same job. The claim
+            // advances next_poll_at, which doubles as the crash bound — a
+            // scheduler that dies mid-request leaves the row due again then.
+            let due_external =
+                db::claim_due_external_polls(&pool, EXTERNAL_POLL_BATCH, external_poll_secs)
+                    .await?;
+            if !due_external.is_empty() {
+                // Secrets resolved for defer.http headers, cached for THIS sweep
+                // only. Resolution is two DB queries plus an AES-GCM decrypt, and
+                // a batch of parked jobs against one workspace shares one
+                // credential; per-sweep rather than process-wide so a rotated
+                // secret is picked up on the next tick rather than at the next
+                // restart.
+                let mut secrets: std::collections::HashMap<HeaderCacheKey, Vec<dag::EnvVar>> =
+                    std::collections::HashMap::new();
+                let now_rfc = chrono::Utc::now().to_rfc3339();
+
+                // ── Pass 1: the ceiling, and the datastore work ─────────────
+                //
+                // Serial on purpose, and both halves have to be. An elapsed
+                // `defer.max_wait_secs` is a failure regardless of what the
+                // remote system would say, so it is decided before anything is
+                // polled — a vendor we cannot reach must not keep a task parked
+                // past its budget. And header resolution is the one step that
+                // touches the pool and the shared cache, so doing it here keeps
+                // that cache a plain `&mut HashMap` rather than a mutex every
+                // in-flight poll contends on.
+                let mut plans: Vec<(dagron_core::models::ExternalPark, PollPlan)> =
+                    Vec::with_capacity(due_external.len());
+                for park in due_external {
+                    if park.external_deadline_at.as_deref().is_some_and(|d| d <= now_rfc.as_str()) {
+                        // With either cancel transport the row keeps its handle, so
+                        // the teardown sweep below stops the job; with neither nothing
+                        // here can, and the message says so.
+                        let via =
+                            cancel_transport(park.input.as_deref(), seams.external_poller.is_some());
+                        let outcome = match via {
+                            Some(t) => format!("cancelling it ({t})"),
+                            None => "the job was NOT cancelled by this engine".to_string(),
+                        };
+                        let reason = format!(
+                            "defer.max_wait_secs elapsed while remote job '{}' ({}) was still \
+                             running; {outcome}",
+                            park.external_handle, park.external_kind,
+                        );
+                        let failed = if via.is_some() {
+                            db::fail_external_keep_handle(&pool, &park.id, &park.external_handle, &reason)
+                                .await?
+                        } else {
+                            db::fail_external(&pool, &park.id, &park.external_handle, &reason).await?
+                        };
+                        if failed {
+                            warn!(
+                                task_id = %park.id, handle = %park.external_handle,
+                                kind = %park.external_kind, cancellable = via.is_some(),
+                                "deferred job exceeded defer.max_wait_secs — failed; the remote \
+                                 job is torn down only if a cancel transport is configured (a \
+                                 registered poller, or defer.http.cancel), else it may still be \
+                                 running"
+                            );
+                            task_finished(&metrics, &seams, false).await;
+                            newly_terminal = true;
+                        }
+                        continue;
+                    }
+
+                    // What the concurrent half will need, resolved now. The
+                    // registered poller is tried first at poll time (it is the
+                    // more specific thing), so a row carrying a `defer.http:`
+                    // block has its headers resolved even where a poller may
+                    // claim it — bounded by the cache, which performs exactly
+                    // one resolution per (run, header block) per sweep.
+                    let http = park
+                        .input
+                        .as_deref()
+                        .and_then(|j| serde_json::from_str::<dag::TaskSpec>(j).ok())
+                        .and_then(|t| t.defer)
+                        .and_then(|d| d.http);
+                    let plan = match http {
+                        Some(spec) => {
+                            match resolve_defer_headers(&pool, &park.run_id, &spec, &mut secrets).await {
+                                Ok(headers) => {
+                                    PollPlan { spec: Some((spec, headers)), http_unresolved: false }
+                                }
+                                // A credential we cannot resolve is not a verdict
+                                // either: the row is still POLLED, because a
+                                // registered poller may own this kind and needs
+                                // no header of ours, and only the built-in
+                                // fallback is unavailable. Dropping the row here
+                                // would silently stop resolving jobs a poller was
+                                // handling perfectly well.
+                                Err(e) => {
+                                    warn!(
+                                        task_id = %park.id, handle = %park.external_handle,
+                                        error = %e,
+                                        "could not resolve defer.http headers — re-parking \
+                                         (not a verdict about the job)"
+                                    );
+                                    PollPlan { spec: None, http_unresolved: true }
+                                }
+                            }
+                        }
+                        // No http block. Still a plan: a registered poller may
+                        // own this kind, and only calling it can tell us.
+                        None => PollPlan { spec: None, http_unresolved: false },
+                    };
+                    plans.push((park, plan));
+                }
+
+                // ── Pass 2: the network, concurrently ───────────────────────
+                //
+                // The reason this is not a `for` loop with an `.await` in it:
+                // polled serially, a batch against a black-holed vendor holds
+                // the tick for `EXTERNAL_POLL_BATCH` × the request timeout —
+                // 32 × 15 s of nothing happening — stalling claim, dispatch,
+                // log drain and run reaping behind it. The per-request timeout
+                // bounds one poll, never the tick. `EXTERNAL_POLL_BATCH` caps
+                // the batch in SQL, so the fan-out is bounded by the same
+                // constant that bounds the work, exactly as the `wait.url`
+                // probes above are.
+                let mut polls = tokio::task::JoinSet::new();
+                for (park, plan) in plans {
+                    let poller = seams.external_poller.clone();
+                    let client = defer_client.clone(); // Client is an Arc handle — cheap
+                    polls.spawn(async move {
+                        let (verdict, unresolvable) =
+                            poll_one(&poller, &client, &park, &plan).await;
+                        (park, verdict, unresolvable)
+                    });
+                }
+
+                // ── Pass 3: apply, serially ─────────────────────────────────
+                //
+                // Every datastore transition and every meter bump happens back
+                // here, one at a time, so the accounting is single-threaded and
+                // `newly_terminal` means what it says. The concurrency bought
+                // wall-clock on the network, and paid for none of it in the
+                // state machine.
+                while let Some(joined) = polls.join_next().await {
+                    let Ok((park, verdict, unresolvable)) = joined else { continue }; // task panicked
+                    // Nothing in this build can resolve this row. Leave it
+                    // PARKED rather than failing it — an engine rebuilt without
+                    // the backend that owns a running job should not tear that
+                    // job's task down on the next tick — and say so once per
+                    // kind, because repeating it twice a second is how a warning
+                    // stops being read.
+                    if unresolvable && warned_defer_kinds.insert(park.external_kind.clone()) {
+                        warn!(
+                            kind = %park.external_kind, task_id = %park.id,
+                            handle = %park.external_handle,
+                            "nothing in this build resolves this defer.kind: no registered \
+                             ExternalPoller claims it and the task declares no `defer.http:` \
+                             block, so the row stays parked. Any status endpoint that answers \
+                             with JSON runs on the built-in `defer.http` path today — a \
+                             Databricks, EMR Serverless, Dataproc, Livy, Kyuubi or YARN job \
+                             included, with the token in `value_from: {{ secret: NAME }}` \
+                             (docs/EXTERNAL_JOBS.md). Additional backends register through the \
+                             ExternalPoller seam (dagron_engine::Seams). Cancel the run to \
+                             release this task."
+                        );
+                    }
+
+                    // Apply it. One place, so every resolver produces the same
+                    // accounting — and `Running` / `None` both simply leave the
+                    // claim's next_poll_at standing.
+                    match verdict {
+                        Some(hooks::Verdict::Succeeded { output }) => {
+                            if db::resolve_external(
+                                &pool, &park.id, &park.external_handle, Some(&output),
+                            )
+                            .await?
+                            {
+                                info!(
+                                    task_id = %park.id, handle = %park.external_handle,
+                                    "deferred job succeeded — resolved"
+                                );
+                                task_finished(&metrics, &seams, true).await;
+                                newly_terminal = true;
+
+                                // The third path that can succeed a producer
+                                // task, after the worker result and the cache
+                                // hit. `produces:` is a postcondition — "after
+                                // this task succeeds, the dataset is current" —
+                                // and a deferred task succeeds HERE, in the
+                                // sweep, not on the worker result path. Without
+                                // this, `defer:` + `produces:` would validate,
+                                // run, and record nothing, leaving every
+                                // downstream sensor and `on_datasets:` consumer
+                                // parked forever.
+                                //
+                                // Guarded on the resolve having actually landed,
+                                // matching the `if marked` discipline on the
+                                // worker path: a re-sweep that lost the race
+                                // must not fabricate a second lineage row.
+                                let produces = park
+                                    .input
+                                    .as_deref()
+                                    .and_then(|j| serde_json::from_str::<dag::TaskSpec>(j).ok())
+                                    .map(|t| t.produces)
+                                    .unwrap_or_default();
+                                if !produces.is_empty() {
+                                    let wf = db::workflow_name_for_task(&pool, &park.id)
+                                        .await
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or_default();
+                                    record_produces(
+                                        &pool, &metrics, &wf, &park.id, &park.name, &produces,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                        Some(hooks::Verdict::Failed { reason }) => {
+                            if db::fail_external(&pool, &park.id, &park.external_handle, &reason)
+                                .await?
+                            {
+                                info!(
+                                    task_id = %park.id, handle = %park.external_handle,
+                                    "deferred job failed — resolved"
+                                );
+                                task_finished(&metrics, &seams, false).await;
+                                newly_terminal = true;
+                            }
+                        }
+                        Some(hooks::Verdict::Running) | None => {}
+                    }
+                }
+            }
+
+            // Tear down the remote jobs that terminated tasks left running.
+            //
+            // Cancelling a run is pure SQL — it flips rows terminal and clears
+            // leases — so before this sweep "we cancelled your run" meant "we
+            // stopped watching your cluster bill". The debt is row state rather
+            // than something the cancel stamps, and deliberately: the product's
+            // primary cancel path is inlined SQL in dagron-api, a binary that by
+            // design holds no Seams, so a teardown the cancel *performed* would
+            // be one the SDK and MCP server never triggered. A cancel that
+            // merely leaves evidence is one every caller performs for free.
+            let owing = db::claim_due_external_cancels(
+                &pool,
+                EXTERNAL_CANCEL_BATCH,
+                external_poll_secs.max(30),
+            )
+            .await?;
+            if !owing.is_empty() {
+                let now = chrono::Utc::now();
+                // Header secrets resolved here, serially, for the same reason the
+                // poll's are: the cache is a plain `&mut HashMap`, not a mutex.
+                let mut cancel_secrets: std::collections::HashMap<HeaderCacheKey, Vec<dag::EnvVar>> =
+                    std::collections::HashMap::new();
+                // Concurrently, bounded by the batch: a vendor that is timing
+                // out must not hold the reconcile tick, the same reason the
+                // wait.url probes are spawned.
+                let mut jobs = tokio::task::JoinSet::new();
+                for row in owing {
+                    // Give up on wall clock as well as attempts. Without this a
+                    // fleet where nothing owns the kind sweeps the row forever,
+                    // because the no-poller path deliberately does not consume
+                    // an attempt.
+                    let stale = row
+                        .finished_at
+                        .as_deref()
+                        .and_then(|f| chrono::DateTime::parse_from_rfc3339(f).ok())
+                        .is_some_and(|f| {
+                            (now - f.with_timezone(&chrono::Utc)).num_seconds()
+                                > EXTERNAL_CANCEL_GIVEUP_SECS
+                        });
+                    if stale {
+                        orphan(&pool, &metrics, &row, "teardown was owed for too long").await?;
+                        continue;
+                    }
+                    // The generic transport: a `defer.http.cancel` on the spec, tried
+                    // only when no registered poller claims the kind. Unresolvable
+                    // headers are a failed attempt, not a skipped one — the row is
+                    // given up on and logged by handle after three, rather than
+                    // sweeping forever on a credential that will not resolve.
+                    let http_cancel = match http_with_cancel(row.input.as_deref()) {
+                        Some(spec) => Some(
+                            resolve_defer_headers(&pool, &row.run_id, &spec, &mut cancel_secrets)
+                                .await
+                                .map(|headers| (spec, headers)),
+                        ),
+                        None => None,
+                    };
+                    let poller = seams.external_poller.clone();
+                    let client = defer_client.clone();
+                    let pool = pool.clone();
+                    let metrics = Arc::clone(&metrics);
+                    jobs.spawn(async move {
+                        let ctx = hooks::PollCtx {
+                            kind: &row.external_kind,
+                            handle: &row.external_handle,
+                            endpoint: row.external_endpoint.as_deref(),
+                            run_id: &row.run_id,
+                            task_id: &row.id,
+                            epoch: row.external_epoch,
+                        };
+                        let mut outcome = match &poller {
+                            Some(p) => p.cancel(&ctx).await,
+                            None => Ok(None),
+                        };
+                        if matches!(outcome, Ok(None)) {
+                            if let Some(plan) = http_cancel {
+                                outcome = match plan {
+                                    Ok((spec, headers)) => {
+                                        let cancel = spec.cancel.as_ref().expect("filtered on it");
+                                        defer_http::send_cancel(
+                                            &client, cancel, &row.external_handle, &headers,
+                                        )
+                                        .await
+                                        .map(Some)
+                                    }
+                                    Err(e) => Err(e),
+                                };
+                            }
+                        }
+                        let next = dag::delayed_retry_at(60);
+                        match outcome {
+                            // Torn down. The debt is settled.
+                            Ok(Some(())) => {
+                                if db::clear_external_handle(&pool, &row.id, &row.external_handle)
+                                    .await
+                                    .unwrap_or(false)
+                                {
+                                    info!(
+                                        task_id = %row.id, handle = %row.external_handle,
+                                        kind = %row.external_kind,
+                                        "remote job torn down after cancellation"
+                                    );
+                                }
+                            }
+                            // Nothing here owns this kind. Hand the row back
+                            // WITHOUT consuming an attempt: a RUNNER_CLASSES
+                            // pool runs the same binary with different seams, so
+                            // the replica that can do this work must not have
+                            // its budget spent by the ones that cannot.
+                            Ok(None) => {
+                                let _ = db::release_external_cancel_claim(
+                                    &pool, &row.id, &row.external_handle, &next,
+                                )
+                                .await;
+                            }
+                            // Tried and failed. This one is on the budget.
+                            Err(e) => {
+                                let attempts = db::record_external_cancel_failure(
+                                    &pool, &row.id, &row.external_handle, &next,
+                                )
+                                .await
+                                .unwrap_or(EXTERNAL_CANCEL_ATTEMPTS);
+                                warn!(
+                                    task_id = %row.id, handle = %row.external_handle,
+                                    kind = %row.external_kind, attempts, error = %e,
+                                    "could not tear down the remote job — will retry"
+                                );
+                                if attempts >= EXTERNAL_CANCEL_ATTEMPTS {
+                                    let _ = orphan(
+                                        &pool, &metrics, &row,
+                                        "the remote system could not be reached",
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    });
+                }
+                while jobs.join_next().await.is_some() {}
+            }
+
+
             // Resolve any parked `wait.dataset` sensor whose dataset recorded an
             // update after the park: the task succeeds and its dependents advance.
             // Idempotent, HA-safe (guarded UPDATE).
             for (task_id, uri) in db::reconcile_dataset_waits(&pool).await? {
                 tracing::info!(%task_id, dataset = %uri, "dataset sensor saw a new update — resolved");
+                task_finished(&metrics, &seams, true).await;
             }
 
             // Dataset-triggered scheduling: sync `on_datasets:` subscriptions from
@@ -1321,10 +2337,10 @@ pub async fn run(seams: Seams) -> Result<()> {
                 //    forever. `subscribed` remembers who we synced, so a workflow that
                 //    *drops* its `on_datasets:` still gets its rows cleared exactly
                 //    once (and the orphan prune below is the backstop for the rest).
-                //    Multi-dataset / all-of composition is the feature-gated data-aware
-                //    scheduler — an open build skips such specs with a signpost
-                //    instead of silently subscribing to a subset, warning once per
-                //    workflow rather than on every sweep.
+                //    Every subscription syncs, whatever its arity or mode:
+                //    multi-dataset and all-of composition are open, and
+                //    `claim_due_dataset_triggers` has handled `mode="all"` on
+                //    both backends all along.
                 match db::list_registered_workflows(&pool).await {
                     Ok(wfs) => {
                         let mut still_subscribed: std::collections::HashSet<String> =
@@ -1332,21 +2348,6 @@ pub async fn run(seams: Seams) -> Result<()> {
                         for (name, spec) in wfs {
                             match dag::dataset_subscriptions(&spec) {
                                 Some((uris, mode)) => {
-                                    if !cfg!(feature = "enterprise")
-                                        && (uris.len() > 1 || mode == "all")
-                                    {
-                                        if warned_dataset_composition.insert(name.clone()) {
-                                            tracing::warn!(
-                                                workflow = %name, datasets = uris.len(), mode = %mode,
-                                                "multi-dataset trigger composition is not in this build — subscription skipped (docs/DATASETS.md#limits-of-this-build)"
-                                            );
-                                        }
-                                        if subscribed_workflows.contains(&name) {
-                                            let _ = db::sync_dataset_triggers(&pool, &name, &[], "any").await;
-                                        }
-                                        continue;
-                                    }
-                                    warned_dataset_composition.remove(&name);
                                     still_subscribed.insert(name.clone());
                                     if let Err(e) =
                                         db::sync_dataset_triggers(&pool, &name, &uris, &mode).await
@@ -1361,7 +2362,6 @@ pub async fn run(seams: Seams) -> Result<()> {
                                     if subscribed_workflows.contains(&name) {
                                         let _ = db::sync_dataset_triggers(&pool, &name, &[], "any").await;
                                     }
-                                    warned_dataset_composition.remove(&name);
                                 }
                             }
                         }
@@ -1545,9 +2545,11 @@ pub async fn run(seams: Seams) -> Result<()> {
                             // (deep-merged `params`) visibly change task behavior
                             // without requiring the workflow author to thread each
                             // param through an explicit `env:` entry.
-                            #[cfg(not(feature = "enterprise"))]
-                            let env = spec.env;
-                            #[cfg(feature = "enterprise")]
+                            // One binding for both feature worlds now: the open
+                            // build also appends here (the `defer:` identity
+                            // pair below), so the split that existed only to
+                            // keep the non-enterprise build free of an unused
+                            // `mut` no longer buys anything.
                             let mut env = spec.env;
                             // Behind the `enterprise` feature: merge top-level string keys
                             // from `input` as env vars so parameterized reruns
@@ -1572,6 +2574,38 @@ pub async fn run(seams: Seams) -> Result<()> {
                                         env.push(dag::EnvVar { name, value: s.to_string(), value_from: None });
                                     }
                                 }
+                            }
+                            // A deferred submit needs a name for its remote
+                            // job that is the SAME on a post-crash resubmit and
+                            // DIFFERENT on a deliberate retry. These two are
+                            // that name: `dagron-<task_id>-<epoch>`.
+                            //
+                            // `task_runs.id` is stable across lease recovery, so
+                            // a resubmit after a crash reuses the name, the
+                            // remote system answers AlreadyExists, and the step
+                            // adopts the running job rather than starting a
+                            // second one. `attempt` is deliberately not used —
+                            // it increments on every claim *including* recovery,
+                            // so a name built from it changes at exactly the
+                            // moment adoption is needed.
+                            //
+                            // Pushed here, while the spec is still in scope and
+                            // before `resolve_secrets`, for the same ordering
+                            // reason the resume pointers are: substituting after
+                            // secret resolution would make any secret whose
+                            // plaintext contains `{{ … }}` a template-injection
+                            // surface.
+                            if spec.defer.is_some() {
+                                env.push(dag::EnvVar {
+                                    name: "DAGRON_TASK_ID".to_string(),
+                                    value: task.id.clone(),
+                                    value_from: None,
+                                });
+                                env.push(dag::EnvVar {
+                                    name: "DAGRON_EXTERNAL_EPOCH".to_string(),
+                                    value: task.external_epoch.to_string(),
+                                    value_from: None,
+                                });
                             }
                             // Raise the task's declared envelope to the
                             // operator's floor, then refuse it outright if this
@@ -1618,6 +2652,8 @@ pub async fn run(seams: Seams) -> Result<()> {
                                     isolation,
                                     // Wired per-attempt by the worker from `log_tx`.
                                     log_sink: None,
+                                    // Stamped below, once, for every arm.
+                                    identity: None,
                                 },
                                 spec.max_attempts,
                                 spec.retry_delay_secs,
@@ -1644,19 +2680,44 @@ pub async fn run(seams: Seams) -> Result<()> {
                                 task = %task.name, task_id = %task.id, error = %e,
                                 "unparseable task spec — marking task failed"
                             );
-                            db::mark_task_failed(
+                            if db::mark_task_failed(
                                 &pool,
                                 &task.id,
                                 &worker_id,
                                 task.version.saturating_add(1),
                                 Some(format!("unparseable task spec: {e}")),
                             )
-                            .await?;
+                            .await?
+                            {
+                                task_finished(&metrics, &seams, false).await;
+                            }
                             continue;
                         }
                     },
                     None => (ExecContext::new(vec!["true".to_string()], None, None), 1, 0, None, true, None, None, None, None, Vec::new(), None),
                 };
+
+                // Stamp who this execution belongs to, for every arm above.
+                //
+                // A backend that creates a remote workload labels it with this,
+                // which is what lets a workload be found by something other than
+                // the process that created it. Without it, `KubeExecutor` and
+                // `DockerExecutor` named their pod/container after a random UUID
+                // held only on the creating task's stack — so a lease expiry
+                // started a SECOND one while the first still ran, and a
+                // scheduler crash orphaned the first beyond any possibility of
+                // cleanup. `attempt` is the discriminator because it increments
+                // on every claim, recovery included: a workload carrying a
+                // different attempt for this task id is a predecessor.
+                ctx.identity = Some(dagron_executor::executor::TaskIdentity {
+                    task_id: task.id.clone(),
+                    run_id: task.run_id.clone(),
+                    attempt: task.attempt,
+                    // Stamped even when the sweep is off, so arming it later
+                    // finds the workloads already running rather than only
+                    // those dispatched after the restart.
+                    installation: installation.clone(),
+                });
 
                 // Refuse a trust envelope this executor cannot deliver — as a
                 // terminal failure of THIS task, never of the loop. Same
@@ -1671,14 +2732,17 @@ pub async fn run(seams: Seams) -> Result<()> {
                             task = %task.name, task_id = %task.id, error = %e,
                             "declared isolation cannot be enforced — marking task failed"
                         );
-                        db::mark_task_failed(
+                        if db::mark_task_failed(
                             &pool,
                             &task.id,
                             &worker_id,
                             task.version.saturating_add(1),
                             Some(e.to_string()),
                         )
-                        .await?;
+                        .await?
+                        {
+                            task_finished(&metrics, &seams, false).await;
+                        }
                         continue;
                     }
                 }
@@ -1725,12 +2789,20 @@ pub async fn run(seams: Seams) -> Result<()> {
                         Ok(dt) => dt,
                         Err(msg) => {
                             tracing::error!(task = %task.name, task_id = %task.id, %msg, "unreadable wait deadline — failing task");
-                            db::mark_task_failed(&pool, &task.id, &worker_id, fence, Some(msg)).await?;
+                            if db::mark_task_failed(&pool, &task.id, &worker_id, fence, Some(msg))
+                                .await?
+                            {
+                                task_finished(&metrics, &seams, false).await;
+                            }
                             continue;
                         }
                     };
                     if wake_dt <= now {
-                        db::mark_task_succeeded(&pool, &task.id, &worker_id, fence, Some("wait elapsed".into())).await?;
+                        // Already past: the sensor succeeds here and never parks,
+                        // so this is the one place it can be counted.
+                        if db::mark_task_succeeded(&pool, &task.id, &worker_id, fence, Some("wait elapsed".into())).await? {
+                            task_finished(&metrics, &seams, true).await;
+                        }
                     } else {
                         db::park_wait(&pool, &task.id, fence, &wake_dt.to_rfc3339()).await?;
                         info!(task = %task.name, task_id = %task.id, wake_at = %wake_dt.to_rfc3339(), "wait sensor deferred — parked with no worker until the deadline");
@@ -1760,7 +2832,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                             max = subworkflow_max_depth,
                             "sub-workflow nesting hit SUBWORKFLOW_MAX_DEPTH — refusing to trigger"
                         );
-                        db::mark_task_failed(
+                        if db::mark_task_failed(
                             &pool,
                             &task.id,
                             &worker_id,
@@ -1769,13 +2841,18 @@ pub async fn run(seams: Seams) -> Result<()> {
                                 "sub-workflow nesting depth {depth} reached SUBWORKFLOW_MAX_DEPTH ({subworkflow_max_depth}) — refusing to trigger '{child_name}' (recursive workflow?)"
                             )),
                         )
-                        .await?;
+                        .await?
+                        {
+                            task_finished(&metrics, &seams, false).await;
+                        }
                         continue;
                     }
                     match db::workflow_spec_by_name(&pool, child_name).await? {
                         None => {
                             tracing::error!(task = %task.name, workflow = %child_name, "type: workflow names an unknown workflow — failing task");
-                            db::mark_task_failed(&pool, &task.id, &worker_id, fence, Some(format!("unknown workflow '{child_name}'"))).await?;
+                            if db::mark_task_failed(&pool, &task.id, &worker_id, fence, Some(format!("unknown workflow '{child_name}'"))).await? {
+                                task_finished(&metrics, &seams, false).await;
+                            }
                         }
                         // Built *with* the trigger's arguments as parameters, the
                         // same call `POST /api/runs` makes for a caller-supplied
@@ -1789,7 +2866,9 @@ pub async fn run(seams: Seams) -> Result<()> {
                         ) {
                             Err(e) => {
                                 tracing::error!(task = %task.name, workflow = %child_name, error = %e, "child workflow spec no longer parses — failing task");
-                                db::mark_task_failed(&pool, &task.id, &worker_id, fence, Some(format!("child workflow '{child_name}' invalid: {e}"))).await?;
+                                if db::mark_task_failed(&pool, &task.id, &worker_id, fence, Some(format!("child workflow '{child_name}' invalid: {e}"))).await? {
+                                    task_finished(&metrics, &seams, false).await;
+                                }
                             }
                             Ok(child_dag) => match db::create_run(&pool, &child_dag, &child_yaml).await {
                                 Ok(child_run) => {
@@ -1807,7 +2886,9 @@ pub async fn run(seams: Seams) -> Result<()> {
                                     info!(task = %task.name, workflow = %child_name, reason = %e, "child workflow refused admission (capacity) — will retry");
                                 }
                                 Err(e) => {
-                                    db::mark_task_failed(&pool, &task.id, &worker_id, fence, Some(format!("failed to start child workflow '{child_name}': {e}"))).await?;
+                                    if db::mark_task_failed(&pool, &task.id, &worker_id, fence, Some(format!("failed to start child workflow '{child_name}': {e}"))).await? {
+                                        task_finished(&metrics, &seams, false).await;
+                                    }
                                 }
                             },
                         },
@@ -1849,6 +2930,10 @@ pub async fn run(seams: Seams) -> Result<()> {
                         // otherwise a downstream sensor or `on_datasets:` consumer
                         // would park forever whenever the producer hits its cache.
                         if marked {
+                            // A cache hit is a real success: it advances
+                            // dependents and records `produces:`, so it spends
+                            // quota exactly as an execution would.
+                            task_finished(&metrics, &seams, true).await;
                             newly_terminal = true;
                             record_produces(
                                 &pool,
@@ -1999,6 +3084,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                     }
                 }
 
+
                 // Resolve `value_from` secret refs into concrete env values just
                 // before dispatch (#9): the run's environment secret store
                 // first (DB, decrypted), then process env / secrets dir. A
@@ -2008,14 +3094,17 @@ pub async fn run(seams: Seams) -> Result<()> {
                     environments::resolve_secrets(&pool, &task.run_id, &mut ctx.env).await
                 {
                     tracing::error!(task = %task.name, task_id = %task.id, error = %e, "secret resolution failed — marking task failed");
-                    db::mark_task_failed(
+                    if db::mark_task_failed(
                         &pool,
                         &task.id,
                         &worker_id,
                         task.version.saturating_add(1),
                         Some(format!("secret resolution failed: {e}")),
                     )
-                    .await?;
+                    .await?
+                    {
+                        task_finished(&metrics, &seams, false).await;
+                    }
                     continue;
                 }
 
@@ -2192,14 +3281,18 @@ pub async fn run(seams: Seams) -> Result<()> {
                                 result.fence,
                                 result.output,
                                 retry_at,
+                                // This iteration's output is about to be
+                                // overwritten by the next one; `retry_task`
+                                // keeps a bounded tail of it so the log can
+                                // show the whole loop rather than its last
+                                // pass (dagron_core::attempt_log).
+                                dagron_core::attempt_log::AttemptEnd::Iteration,
                             )
                             .await?;
                             continue;
                         }
                         dag::RepeatDecision::Fail { reason } => {
                             info!(task_id = %result.task_id, iteration, %reason, "repeat loop failed");
-                            metrics.inc_failed();
-                            seams.meter.on_task_completed(false).await;
                             if db::mark_task_failed(
                                 &pool,
                                 &result.task_id,
@@ -2209,6 +3302,88 @@ pub async fn run(seams: Seams) -> Result<()> {
                             )
                             .await?
                             {
+                                task_finished(&metrics, &seams, false).await;
+                                newly_terminal = true;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                // `defer:` — the command that just succeeded was a *submit*, not
+                // the work. Park the row on the remote job it named instead of
+                // completing the task: claim dropped, lease NULLed, still
+                // `running`, handle on the row. A sweep resolves it later.
+                //
+                // Structurally a sibling of the `repeat:` branch above — same
+                // place, same `task_spec` off the dispatch payload, same
+                // `continue` past `mark_task_succeeded`.
+                //
+                // A submit that succeeded but named no handle is a **failure**,
+                // and deliberately so: succeeding the task would advance
+                // dependents on work that has not happened, which is the exact
+                // silent-success the `wait: { url: … }` sensor already gets
+                // wrong. Failing it is loud, costs one attempt, and retries.
+                if let Some(def) = task_spec.as_ref().and_then(|s| s.defer.clone()) {
+                    let output = result.output.clone().unwrap_or_default();
+                    match dag::parse_handle(&output) {
+                        Some(handle) => {
+                            let next_poll_at = dag::delayed_retry_at(def.poll_secs);
+                            let deadline_at = def.max_wait_secs.map(dag::delayed_retry_at);
+                            let endpoint = std::env::var("DAGRON_DEFER_ENDPOINT").ok();
+                            if db::park_external(
+                                &pool,
+                                &result.task_id,
+                                result.fence,
+                                &def.kind,
+                                &handle,
+                                endpoint.as_deref(),
+                                &next_poll_at,
+                                deadline_at.as_deref(),
+                            )
+                            .await?
+                            {
+                                info!(
+                                    task_id = %result.task_id,
+                                    kind = %def.kind,
+                                    %handle,
+                                    poll_secs = def.poll_secs,
+                                    "submitted — parked on the remote job (holding no worker)"
+                                );
+                            } else {
+                                // The fence did not hold: this attempt's lease
+                                // was reclaimed while the submit ran. The row
+                                // belongs to a newer attempt now, and the job
+                                // this one started is an orphan — say so, because
+                                // a cluster running work nobody is watching is
+                                // worth a line in the log.
+                                warn!(
+                                    task_id = %result.task_id, %handle,
+                                    "submit finished on a reclaimed lease — remote job is \
+                                     orphaned and will not be polled by this row"
+                                );
+                            }
+                            continue;
+                        }
+                        None => {
+                            let reason = format!(
+                                "defer.kind '{}': the submit exited 0 but printed no `{}<handle>` \
+                                 line, so there is no remote job to wait for. The command must \
+                                 print the handle its submission returned.",
+                                def.kind,
+                                dag::HANDLE_PREFIX
+                            );
+                            warn!(task_id = %result.task_id, "deferred submit named no handle");
+                            if db::mark_task_failed(
+                                &pool,
+                                &result.task_id,
+                                &result.worker_id,
+                                result.fence,
+                                Some(reason),
+                            )
+                            .await?
+                            {
+                                task_finished(&metrics, &seams, false).await;
                                 newly_terminal = true;
                             }
                             continue;
@@ -2217,8 +3392,6 @@ pub async fn run(seams: Seams) -> Result<()> {
                 }
 
                 info!(task_id = %result.task_id, "task succeeded");
-                metrics.inc_succeeded();
-                seams.meter.on_task_completed(true).await; // extension seam (usage accounting)
                 // Keep the output for the memo write below — `mark_task_succeeded`
                 // consumes `result.output`, and the memo must not be written until
                 // that fenced mutation has actually landed.
@@ -2241,6 +3414,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                 // lineage. Both are best-effort: a failure here never fails the
                 // run. Only tasks that use a feature pay for the name lookup.
                 if marked {
+                    task_finished(&metrics, &seams, true).await;
                     newly_terminal = true;
                     let needs_wf = task_spec
                         .as_ref()
@@ -2377,6 +3551,10 @@ pub async fn run(seams: Seams) -> Result<()> {
                         result.fence,
                         result.output,
                         retry_at,
+                        // Same overwrite, different reason: without a retained
+                        // tail the attempts that explain the failure are gone
+                        // and only the one that eventually passed is readable.
+                        dagron_core::attempt_log::AttemptEnd::Failed,
                     )
                     .await?;
                 } else {
@@ -2401,8 +3579,6 @@ pub async fn run(seams: Seams) -> Result<()> {
                         not_retried_due_to_timeout,
                         "task failed — not retrying"
                     );
-                    metrics.inc_failed();
-                    seams.meter.on_task_completed(false).await; // extension seam (usage accounting)
                     if db::mark_task_failed(
                         &pool,
                         &result.task_id,
@@ -2412,6 +3588,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                     )
                     .await?
                     {
+                        task_finished(&metrics, &seams, false).await;
                         newly_terminal = true;
                     }
                     // Die-together: a failed gang member takes its siblings
@@ -2529,7 +3706,174 @@ pub async fn run(seams: Seams) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dag, git_target, new_traceparent, parse_max_inflight_runs, run_images};
+    use super::{
+        dag, git_target, new_traceparent, parse_max_inflight_runs, run_images, HeaderCacheKey,
+    };
+
+    fn header(name: &str, secret: &str) -> dag::EnvVar {
+        dag::EnvVar {
+            name: name.to_string(),
+            value: String::new(),
+            value_from: Some(dag::SecretRef { secret: secret.to_string() }),
+        }
+    }
+
+    /// The bug this key replaced: the sweep cached resolved `defer.http` headers
+    /// under `run_id` alone, but `headers` is a property of the **task**. A run
+    /// with two deferred tasks aimed at two vendors handed the second task the
+    /// first one's resolved credential — vendor A's bearer token sent to vendor
+    /// B, and the wrong principal authenticated even where nothing leaked.
+    #[test]
+    fn two_header_blocks_in_one_run_never_share_a_cache_entry() {
+        let a = [header("Authorization", "VENDOR_A_TOKEN")];
+        let b = [header("X-Api-Key", "VENDOR_B_KEY")];
+        assert_ne!(
+            HeaderCacheKey::new("run-1", &a),
+            HeaderCacheKey::new("run-1", &b),
+            "same run, different credentials — these must not collide"
+        );
+    }
+
+    /// Two tasks naming the SAME secret still share one resolution, which is the
+    /// whole point of the cache: resolution is two queries plus a decrypt.
+    #[test]
+    fn an_identical_header_block_still_shares_one_resolution() {
+        let a = [header("Authorization", "VENDOR_A_TOKEN")];
+        let same = [header("Authorization", "VENDOR_A_TOKEN")];
+        assert_eq!(HeaderCacheKey::new("run-1", &a), HeaderCacheKey::new("run-1", &same));
+    }
+
+    /// The run half is load-bearing too: `environment:` is per-run, so the same
+    /// header block resolves to different secrets in different runs.
+    #[test]
+    fn the_same_block_in_two_runs_is_two_entries() {
+        let a = [header("Authorization", "VENDOR_A_TOKEN")];
+        assert_ne!(HeaderCacheKey::new("run-1", &a), HeaderCacheKey::new("run-2", &a));
+    }
+
+    /// A header order swap is a different block. Over-keying costs one extra
+    /// resolution; under-keying costs a credential, so the key errs that way.
+    #[test]
+    fn the_key_is_built_from_the_unresolved_spec() {
+        let k = HeaderCacheKey::new("run-1", &[header("Authorization", "TOK")]).expect("serialises");
+        assert!(k.block.contains("TOK"), "the SECRET NAME is in the key, not its value: {}", k.block);
+        assert!(!k.block.contains("value_from\":null"));
+    }
+
+    /// The helper every terminal transition funnels through actually does both
+    /// halves, in both directions.
+    ///
+    /// This test is the load-bearing half of the pair below it. A conformance
+    /// scan that says "nothing bumps the counters outside `task_finished`"
+    /// proves nothing on its own — an empty `task_finished` would satisfy it
+    /// while metering nothing at all. So assert the behaviour here and the
+    /// funnel there; neither is worth much alone.
+    #[tokio::test]
+    async fn task_finished_counts_and_meters_both_outcomes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct CountingMeter {
+            ok: AtomicUsize,
+            bad: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl super::hooks::Meter for CountingMeter {
+            async fn on_task_completed(&self, success: bool) {
+                if success {
+                    self.ok.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.bad.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let meter = std::sync::Arc::new(CountingMeter::default());
+        let seams = super::Seams {
+            meter: meter.clone(),
+            ..Default::default()
+        };
+        let metrics = dagron_core::metrics::Metrics::new();
+
+        super::task_finished(&metrics, &seams, true).await;
+        super::task_finished(&metrics, &seams, false).await;
+        super::task_finished(&metrics, &seams, false).await;
+
+        assert_eq!(meter.ok.load(Ordering::Relaxed), 1, "one success metered");
+        assert_eq!(meter.bad.load(Ordering::Relaxed), 2, "two failures metered");
+
+        // And the counters behind `scheduler_tasks_{succeeded,failed}_total`
+        // moved with it — the two must never be able to disagree, which is the
+        // whole reason they share a function.
+        assert_eq!(metrics.tasks_succeeded.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.tasks_failed.load(Ordering::Relaxed), 2);
+    }
+
+    /// Nothing in this crate may count or meter a task outside `task_finished`.
+    ///
+    /// The bug this exists to prevent has already happened twice. `Meter` is
+    /// the quota seam, and for most of this engine's life only the worker-result
+    /// path called it — so every park shape (wait, `wait.url`, `wait.dataset`,
+    /// sub-workflow, approval gate, `defer:`) and every memo cache hit resolved
+    /// without spending quota, and the task counters under-reported by the same
+    /// set. Adding a park shape is exactly the change that re-opens it, and
+    /// nothing about writing one makes you think about metering.
+    ///
+    /// So the check is not "did you remember" — it is that the symbols are
+    /// unreachable. A new terminal path cannot bump a counter without going
+    /// through the function that also meters, because a bare bump does not
+    /// compile past this test.
+    ///
+    /// The needles are assembled with `concat!` so this test's own source does
+    /// not contain them and cannot satisfy itself — the failure mode that made
+    /// the signpost conformance test in `dagron-core` vacuous three separate
+    /// ways before it bit.
+    #[test]
+    fn counting_and_metering_a_task_is_reachable_only_through_task_finished() {
+        // (needle, what it is, how many times the funnel itself uses it)
+        let needles: [(&str, &str, usize); 3] = [
+            (concat!("inc_", "succeeded()"), "the succeeded counter", 1),
+            (concat!("inc_", "failed()"), "the failed counter", 1),
+            (concat!("meter.on_task_", "completed("), "the quota seam", 1),
+        ];
+
+        let src_dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+        let mut totals = [0usize; 3];
+        let mut seen_any_file = false;
+
+        // Walked at runtime rather than listed as `include_str!`s: a module
+        // added next week must be covered without anyone remembering to add it
+        // here, which is the same failure this test is about.
+        let mut stack = vec![src_dir.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read dagron-engine/src") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                seen_any_file = true;
+                let text = std::fs::read_to_string(&path).expect("read source file");
+                for (i, (needle, _, _)) in needles.iter().enumerate() {
+                    totals[i] += text.matches(needle).count();
+                }
+            }
+        }
+        assert!(seen_any_file, "the source walk found no .rs files — it is not looking where it thinks");
+
+        for (i, (needle, what, allowed)) in needles.iter().enumerate() {
+            assert_eq!(
+                totals[i], *allowed,
+                "{what} ({needle}) is used {} times across dagron-engine/src, expected {allowed} \
+                 — all inside task_finished. A terminal transition that bumps it directly \
+                 desynchronises the counters from the Meter quota seam; call task_finished instead.",
+                totals[i]
+            );
+        }
+    }
 
     /// `{{ run.images }}` in a `notify.git` field: the distinct images the
     /// spec's tasks declare, in the order they first appear, with the workflow's
@@ -2744,4 +4088,185 @@ mod tests {
         // Two calls produce distinct traces.
         assert_ne!(new_traceparent().0, tp);
     }
+
+    use super::{poll_one, PollPlan};
+    use crate::hooks::{ExternalPoller, PollCtx, Verdict};
+    use std::sync::Arc;
+
+    fn park(kind: &str, handle: &str) -> dagron_core::models::ExternalPark {
+        dagron_core::models::ExternalPark {
+            id: "task-1".into(),
+            name: "rollup".into(),
+            run_id: "run-1".into(),
+            external_kind: kind.into(),
+            external_handle: handle.into(),
+            external_endpoint: None,
+            external_epoch: 1,
+            external_deadline_at: None,
+            input: None,
+        }
+    }
+
+    struct Fake;
+    #[async_trait::async_trait]
+    impl ExternalPoller for Fake {
+        async fn poll(&self, ctx: &PollCtx<'_>) -> anyhow::Result<Option<Verdict>> {
+            match (ctx.kind, ctx.handle) {
+                ("mine", "done") => Ok(Some(Verdict::Succeeded { output: "ok".into() })),
+                ("mine", "throttled") => Err(anyhow::anyhow!("429 Too Many Requests")),
+                _ => Ok(None), // not my kind
+            }
+        }
+    }
+
+    struct Hangs;
+    #[async_trait::async_trait]
+    impl ExternalPoller for Hangs {
+        async fn poll(&self, _ctx: &PollCtx<'_>) -> anyhow::Result<Option<Verdict>> {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    }
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::builder().build().expect("client")
+    }
+
+    #[tokio::test]
+    async fn a_registered_poller_that_claims_the_row_settles_it() {
+        let p: Option<Arc<dyn ExternalPoller>> = Some(Arc::new(Fake));
+        let plan = PollPlan { spec: None, http_unresolved: false };
+        let (v, unresolvable) = poll_one(&p, &client(), &park("mine", "done"), &plan).await;
+        assert!(matches!(v, Some(Verdict::Succeeded { .. })));
+        assert!(!unresolvable, "something owns this kind");
+    }
+
+    /// The once-per-kind warning's actual trigger: nothing owns the kind and the
+    /// task declares no `defer.http:` block, so no future sweep can resolve it
+    /// either. This is the only case that should say so.
+    #[tokio::test]
+    async fn a_row_no_transport_can_ever_resolve_is_reported_unresolvable() {
+        let p: Option<Arc<dyn ExternalPoller>> = Some(Arc::new(Fake));
+        let plan = PollPlan { spec: None, http_unresolved: false };
+        let (v, unresolvable) = poll_one(&p, &client(), &park("other", "x"), &plan).await;
+        assert!(v.is_none());
+        assert!(unresolvable, "no poller claimed it and it declares no http block");
+    }
+
+    /// The regression this pair exists to prevent. Headers that would not
+    /// resolve are a **transient** — the secret may appear, the environment may
+    /// be fixed — so the row must not be reported as something no build can
+    /// resolve. Telling an operator to register a poller when their credential
+    /// is simply missing points them at the wrong problem.
+    #[tokio::test]
+    async fn unresolvable_headers_are_not_reported_as_an_unresolvable_kind() {
+        let p: Option<Arc<dyn ExternalPoller>> = Some(Arc::new(Fake));
+        let plan = PollPlan { spec: None, http_unresolved: true };
+        let (v, unresolvable) = poll_one(&p, &client(), &park("other", "x"), &plan).await;
+        assert!(v.is_none(), "still no verdict this sweep");
+        assert!(!unresolvable, "a missing credential is transient, not a missing transport");
+    }
+
+    /// And the row still reaches the registered poller even when its headers
+    /// failed: a poller needs no header of ours, so dropping the row would
+    /// silently stop resolving jobs it was handling perfectly well.
+    #[tokio::test]
+    async fn a_row_with_unresolvable_headers_is_still_offered_to_the_poller() {
+        let p: Option<Arc<dyn ExternalPoller>> = Some(Arc::new(Fake));
+        let plan = PollPlan { spec: None, http_unresolved: true };
+        let (v, _) = poll_one(&p, &client(), &park("mine", "done"), &plan).await;
+        assert!(matches!(v, Some(Verdict::Succeeded { .. })), "the poller still got its chance");
+    }
+
+    /// A transport failure is never a verdict — a 429 says nothing about the
+    /// job, and failing on it would kill a healthy six-hour run.
+    #[tokio::test]
+    async fn a_poller_error_is_not_a_verdict() {
+        let p: Option<Arc<dyn ExternalPoller>> = Some(Arc::new(Fake));
+        let plan = PollPlan { spec: None, http_unresolved: false };
+        let (v, unresolvable) = poll_one(&p, &client(), &park("mine", "throttled"), &plan).await;
+        assert!(v.is_none());
+        assert!(!unresolvable, "it reached for the row; the kind is owned");
+    }
+
+    /// Concurrency alone does not bound a blocked implementation: without this
+    /// deadline one hung poller holds a JoinSet slot forever and the sweep that
+    /// awaits the set never finishes its pass. Expiry re-parks, never fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_poller_times_out_and_re_parks_rather_than_failing() {
+        let p: Option<Arc<dyn ExternalPoller>> = Some(Arc::new(Hangs));
+        let plan = PollPlan { spec: None, http_unresolved: false };
+        let (v, unresolvable) = poll_one(&p, &client(), &park("mine", "slow"), &plan).await;
+        assert!(v.is_none(), "a timeout is not a verdict about the job");
+        assert!(!unresolvable);
+    }
+
+    /// A registered poller is a cancel transport too, so the row keeps its handle
+    /// for it.
+    ///
+    /// Before this, `max_wait_secs` looked only at `defer.http.cancel`: a deployment
+    /// whose poller could have stopped the job had the handle cleared out from under
+    /// it and was never asked. Both are named in the reason, in the order the sweep
+    /// actually tries them.
+    #[test]
+    fn a_registered_poller_counts_as_a_cancel_transport() {
+        use super::{cancel_transport, http_with_cancel};
+        let spec_json = |defer: &str| {
+            let yaml = format!("name: p\ntasks:\n  - {{ name: a, command: [x], defer: {defer} }}\n");
+            let g = crate::dag::DagGraph::from_yaml(&yaml).unwrap();
+            serde_json::to_string(g.task_spec("a").unwrap()).unwrap()
+        };
+        let poll_only = spec_json(r#"{ kind: k, http: { url: "https://h/j", succeed_when: "s == D" } }"#);
+        let with_cancel = spec_json(
+            r#"{ kind: k, http: { url: "https://h/j", succeed_when: "s == D", cancel: { url: "https://h/j/{{ handle }}" } } }"#,
+        );
+
+        // The case this fixes: a poll-only spec IS cancellable when a poller is registered.
+        assert!(http_with_cancel(Some(&poll_only)).is_none(), "no http transport");
+        assert_eq!(
+            cancel_transport(Some(&poll_only), true),
+            Some("the registered poller"),
+            "the poller can stop it, so the handle must be kept"
+        );
+
+        // Neither transport: still nothing this engine can do, and the handle goes.
+        assert_eq!(cancel_transport(Some(&poll_only), false), None);
+        assert_eq!(cancel_transport(None, false), None);
+
+        // A spec without any defer block still rides the poller.
+        assert_eq!(cancel_transport(None, true), Some("the registered poller"));
+
+        // http alone, and both — named in the order the sweep tries them.
+        assert_eq!(cancel_transport(Some(&with_cancel), false), Some("defer.http.cancel"));
+        assert_eq!(
+            cancel_transport(Some(&with_cancel), true),
+            Some("the registered poller, else defer.http.cancel"),
+        );
+    }
+
+    /// The teardown decision: only a spec that declares `defer.http.cancel`
+    /// gives the engine anything generic to send, and a poll-only block, no
+    /// block, or a row without a spec all mean "nothing here can stop it".
+    #[test]
+    fn only_a_spec_with_a_cancel_block_is_cancellable() {
+        use super::http_with_cancel;
+        let spec_json = |defer: &str| {
+            let yaml = format!("name: p\ntasks:\n  - {{ name: a, command: [x], defer: {defer} }}\n");
+            let g = crate::dag::DagGraph::from_yaml(&yaml).unwrap();
+            serde_json::to_string(g.task_spec("a").unwrap()).unwrap()
+        };
+        let poll_only = spec_json(r#"{ kind: k, http: { url: "https://h/j", succeed_when: "s == D" } }"#);
+        let with_cancel = spec_json(
+            r#"{ kind: k, http: { url: "https://h/j", succeed_when: "s == D", cancel: { url: "https://h/j/{{ handle }}" } } }"#,
+        );
+        let no_http = spec_json("{ kind: k }");
+
+        assert!(http_with_cancel(Some(&poll_only)).is_none());
+        assert!(http_with_cancel(Some(&no_http)).is_none());
+        assert!(http_with_cancel(Some("not json")).is_none());
+        assert!(http_with_cancel(None).is_none());
+        let h = http_with_cancel(Some(&with_cancel)).expect("declares cancel");
+        assert_eq!(h.cancel.unwrap().method(), "DELETE");
+    }
+
 }
