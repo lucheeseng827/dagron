@@ -419,6 +419,7 @@ fn admission_refusal(e: &anyhow::Error) -> Option<(StatusCode, serde_json::Value
                 "workflow": m.name,
                 "active": m.active,
                 "max_active_runs": m.max,
+                "concurrency_key": m.key,
             }),
         ));
     }
@@ -655,7 +656,7 @@ async fn task_logs(
         ));
     };
 
-    let full = task.output.unwrap_or_default();
+    let full = db::task_log(&st.pool, &id, &task.id).await?.unwrap_or_default();
     let total = full.chars().count();
     let eof = task_is_terminal(&task.status.to_string());
     // Char-boundary slice — never splits a multibyte scalar.
@@ -806,6 +807,7 @@ async fn run_logs(
     let mut lines: Vec<serde_json::Value> = Vec::new();
     let (mut total, mut matched, mut truncated, mut eof) = (0usize, 0usize, false, true);
 
+    let logs = db::task_logs(&st.pool, &id).await?;
     for task in db::list_tasks(&st.pool, &id).await? {
         let status = task.status.to_string();
         let selected = (want_tasks.is_empty()
@@ -825,7 +827,7 @@ async fn run_logs(
         if !task_is_terminal(&status) {
             eof = false;
         }
-        let res = filter.apply(task.output.as_deref().unwrap_or_default());
+        let res = filter.apply(logs.get(&task.id).map(String::as_str).unwrap_or_default());
         total += res.total;
         matched += res.matched;
         truncated |= res.truncated;
@@ -983,8 +985,17 @@ async fn clear_task(
 async fn approve_task(
     State(st): State<ApiState>,
     Path((id, task_id)): Path<(String, String)>,
+    body: Option<Json<DecisionBody>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    resolve_approval_gate(&st, &id, &task_id, true).await
+    resolve_approval_gate(&st, &id, &task_id, true, body.map(|b| b.0)).await
+}
+
+/// Optional body of the approve / reject endpoints. A missing body is a
+/// decision with no comment, so every existing caller keeps working.
+#[derive(serde::Deserialize, Default)]
+struct DecisionBody {
+    #[serde(default)]
+    comment: Option<String>,
 }
 
 /// Body of `POST /runs/{id}/tasks/{task_id}/checkpoint`.
@@ -1042,23 +1053,89 @@ async fn checkpoint_task(
 async fn reject_task(
     State(st): State<ApiState>,
     Path((id, task_id)): Path<(String, String)>,
+    body: Option<Json<DecisionBody>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    resolve_approval_gate(&st, &id, &task_id, false).await
+    resolve_approval_gate(&st, &id, &task_id, false, body.map(|b| b.0)).await
 }
 
+/// The gate rules in a stored task spec that this unauthenticated API cannot
+/// honour, mirroring what the gateway checks: `approvers` limits approve and
+/// reject alike; `not_triggerer` and `binds` only limit approving.
+fn identity_bound_rules(input: Option<&str>, approve: bool) -> Vec<&'static str> {
+    #[derive(serde::Deserialize, Default)]
+    struct Gate {
+        #[serde(default)]
+        approvers: Vec<String>,
+        #[serde(default)]
+        not_triggerer: bool,
+        #[serde(default)]
+        binds: Vec<String>,
+    }
+    let g: Gate = match input.map(serde_json::from_str) {
+        None => Gate::default(),
+        Some(Ok(g)) => g,
+        // Fail closed: rules we cannot read may be rules we would skip.
+        Some(Err(_)) => return vec!["rules this API cannot read"],
+    };
+    let mut needs = Vec::new();
+    if !g.approvers.is_empty() {
+        needs.push("`approvers`");
+    }
+    if approve && g.not_triggerer {
+        needs.push("`not_triggerer`");
+    }
+    if approve && !g.binds.is_empty() {
+        needs.push("`binds`");
+    }
+    needs
+}
+
+/// This management API carries no caller identity (see the bind warning above),
+/// so the decision is recorded without a `decided_by`; the authenticated
+/// `dagron-api` gateway is the surface that names the approver.
 async fn resolve_approval_gate(
     st: &ApiState,
     id: &str,
     task_id: &str,
     approve: bool,
+    body: Option<DecisionBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let comment = body
+        .and_then(|b| b.comment)
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty());
+    if let Some(c) = &comment {
+        if c.chars().count() > dagron_core::dag::APPROVAL_TEXT_MAX {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("comment exceeds {} characters", dagron_core::dag::APPROVAL_TEXT_MAX),
+            ));
+        }
+    }
     if db::get_run(&st.pool, id).await?.is_none() {
         return Err(ApiError(StatusCode::NOT_FOUND, format!("run '{id}' not found")));
     }
-    if db::resolve_approval(&st.pool, id, task_id, approve).await? {
+    if let Some(task) = db::list_tasks(&st.pool, id).await?.into_iter().find(|t| t.id == task_id) {
+        let needs = identity_bound_rules(task.input.as_deref(), approve);
+        if !needs.is_empty() {
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                format!(
+                    "this gate sets {}, which need to know who is deciding; this API has no caller \
+                     identity, so decide it through the dagron-api gateway (the console's Approvals \
+                     page, or POST /api/runs/{{id}}/tasks/{{tid}}/{})",
+                    needs.join(" and "),
+                    if approve { "approve" } else { "reject" }
+                ),
+            ));
+        }
+    }
+    if db::resolve_approval(&st.pool, id, task_id, approve, None, comment.as_deref()).await? {
         let resolution = if approve { "approved" } else { "rejected" };
         info!(run_id = %id, task_id = %task_id, resolution, "approval gate resolved via API");
-        return Ok(Json(json!({ "run_id": id, "task_id": task_id, "resolution": resolution })));
+        return Ok(Json(json!({
+            "run_id": id, "task_id": task_id, "resolution": resolution, "comment": comment,
+        })));
     }
     // Disambiguate: unknown task → 404, existing-but-not-awaiting → 409.
     if db::task_exists(&st.pool, id, task_id).await? {
@@ -1148,6 +1225,9 @@ async fn post_dataset_event(
     dagron_core::dag::validate_dataset_uri(&body.uri)
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
     if !cfg!(feature = "enterprise") {
+        dagron_core::metrics::record_signpost_hit(
+            dagron_core::metrics::SignpostGate::ExternalDatasetEvents,
+        );
         return Err(ApiError(
             StatusCode::FORBIDDEN,
             "external dataset events are not in this build — \
@@ -1947,7 +2027,7 @@ mod tests {
 
         // Unknown run → 404.
         assert_eq!(
-            approve_task(State(state.clone()), Path(("nope".into(), gate_id.clone())))
+            approve_task(State(state.clone()), Path(("nope".into(), gate_id.clone())), None)
                 .await
                 .unwrap_err()
                 .0,
@@ -1955,7 +2035,7 @@ mod tests {
         );
         // Unknown task → 404.
         assert_eq!(
-            approve_task(State(state.clone()), Path((run_id.clone(), "nope".into())))
+            approve_task(State(state.clone()), Path((run_id.clone(), "nope".into())), None)
                 .await
                 .unwrap_err()
                 .0,
@@ -1963,7 +2043,7 @@ mod tests {
         );
         // The gate is still `pending` (build hasn't run) → not awaiting → 409.
         assert_eq!(
-            approve_task(State(state.clone()), Path((run_id.clone(), gate_id.clone())))
+            approve_task(State(state.clone()), Path((run_id.clone(), gate_id.clone())), None)
                 .await
                 .unwrap_err()
                 .0,
@@ -1978,19 +2058,94 @@ mod tests {
             .unwrap();
         db::advance_ready_tasks(&state.pool).await.unwrap();
 
-        // Approve → 200 with resolution "approved".
-        let ok = approve_task(State(state.clone()), Path((run_id.clone(), gate_id.clone())))
+        // Oversized comment → 400 before anything is written.
+        let long = Some(Json(DecisionBody { comment: Some("x".repeat(dagron_core::dag::APPROVAL_TEXT_MAX + 1)) }));
+        assert_eq!(
+            approve_task(State(state.clone()), Path((run_id.clone(), gate_id.clone())), long)
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+
+        // Approve with a comment → 200, and the reason is stored on the gate.
+        let with_comment = Some(Json(DecisionBody { comment: Some("  plan reviewed  ".into()) }));
+        let ok = approve_task(State(state.clone()), Path((run_id.clone(), gate_id.clone())), with_comment)
             .await
             .unwrap();
-        assert_eq!(ok.0["resolution"], "approved");
+        assert_eq!(ok.0["comment"], "plan reviewed");
+        let gate = db::list_tasks(&state.pool, &run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == gate_id)
+            .unwrap();
+        assert_eq!(gate.decision_comment.as_deref(), Some("plan reviewed"));
+        assert_eq!(gate.decided_by, None, "the unauthenticated engine API records no identity");
         // Re-approving is now 409 (already resolved).
         assert_eq!(
-            approve_task(State(state.clone()), Path((run_id.clone(), gate_id.clone())))
+            approve_task(State(state.clone()), Path((run_id.clone(), gate_id.clone())), None)
                 .await
                 .unwrap_err()
                 .0,
             StatusCode::CONFLICT
         );
+
+        state.pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A gate that names who may decide it cannot be decided here: this API has
+    /// no caller identity. `approvers` blocks both decisions, `not_triggerer`
+    /// and `binds` only approving; a plain gate is unaffected.
+    #[tokio::test]
+    async fn identity_bound_gates_are_refused_without_an_identity() {
+        let (state, path) = temp_state(0).await;
+        let yaml = "name: guarded\ntasks:\n  \
+            - { name: listed, type: approval, approvers: [\"ops@example.com\"] }\n  \
+            - { name: own, type: approval, not_triggerer: true }\n  \
+            - { name: pinned, type: approval, binds: [\"plan/tfplan\"] }\n  \
+            - { name: plain, type: approval }\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let run_id = db::create_run(&state.pool, &dag, yaml).await.unwrap();
+        db::advance_ready_tasks(&state.pool).await.unwrap();
+        let ids: std::collections::HashMap<String, String> = db::list_tasks(&state.pool, &run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.name, t.id))
+            .collect();
+        let decide = |name: &str, approve: bool| {
+            let p = Path((run_id.clone(), ids[name].clone()));
+            let st = State(state.clone());
+            async move {
+                if approve { approve_task(st, p, None).await } else { reject_task(st, p, None).await }
+            }
+        };
+
+        let e = decide("listed", true).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::FORBIDDEN);
+        assert!(e.1.contains("`approvers`") && e.1.contains("dagron-api gateway"), "{}", e.1);
+        assert_eq!(decide("listed", false).await.unwrap_err().0, StatusCode::FORBIDDEN);
+
+        let e = decide("own", true).await.unwrap_err();
+        assert!(e.1.contains("`not_triggerer`"), "{}", e.1);
+        let e = decide("pinned", true).await.unwrap_err();
+        assert!(e.1.contains("`binds`"), "{}", e.1);
+
+        // Refused gates stay parked for the gateway to decide.
+        let parked = db::list_tasks(&state.pool, &run_id).await.unwrap();
+        for name in ["listed", "own", "pinned"] {
+            let t = parked.iter().find(|t| t.name == name).unwrap();
+            assert_eq!(t.status, dagron_core::models::TaskStatus::AwaitingApproval, "{name}");
+        }
+
+        // Rejecting is not what `not_triggerer` or `binds` guard, and a plain gate is untouched.
+        assert!(decide("own", false).await.is_ok());
+        assert!(decide("pinned", false).await.is_ok());
+        assert!(decide("plain", true).await.is_ok());
+
+        assert_eq!(identity_bound_rules(Some("{not json"), false), vec!["rules this API cannot read"]);
 
         state.pool.close().await;
         let _ = std::fs::remove_file(&path);

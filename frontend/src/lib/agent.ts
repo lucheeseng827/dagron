@@ -9,7 +9,7 @@
 //  1. **There is no generator behind this API.** Natural-language → DAG ships
 //     outside this build and is reached there through an MCP tool;
 //     `dagron-api` exposes no route for it in any build
-//     (docs/MCP.md, "Roadmap to 1.0"). So the dock *probes* for one and adapts
+//     (docs/MCP.md, "Coverage — the agent-API gap"). So the dock *probes* for one and adapts
 //     rather than assuming: with a generator, a prompt is sent and answered
 //     here; without one, the prompt is composed and kept here and handed to
 //     whatever agent the operator drives dagron with.
@@ -30,7 +30,7 @@ import { probeAiGenerator } from "@/lib/dagron-api";
 /// button, the ⌘K action) reads this constant, and none of them render while it
 /// is false.
 ///
-/// Flip it when all of these are true (docs/MCP.md, "1.x — the console as an
+/// Flip it when all of these are true (docs/MCP.md, "Later — the console as an
 /// agent surface"):
 ///
 ///   1. `examples/ai/agent_turn.yaml` takes a `prompt` parameter.

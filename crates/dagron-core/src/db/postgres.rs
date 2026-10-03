@@ -112,7 +112,13 @@ pub async fn ping(pool: &Pool) -> Result<()> {
 /// in a single transaction, then NOTIFYs so any idle scheduler wakes to advance
 /// the root tasks. Returns the new run_id.
 pub async fn create_run(pool: &Pool, dag: &DagGraph, yaml_spec: &str) -> Result<String> {
-    create_run_inner(pool, dag, yaml_spec, None, None).await
+    create_run_inner(pool, dag, yaml_spec, None, None, None).await
+}
+
+/// [`create_run`] that records who submitted the run in the same insert, so the
+/// run is never visible without it: `not_triggerer` gates read `triggered_by`.
+pub async fn create_run_by(pool: &Pool, dag: &DagGraph, yaml_spec: &str, triggered_by: &str) -> Result<String> {
+    create_run_inner(pool, dag, yaml_spec, None, None, Some(triggered_by)).await
 }
 
 /// [`create_run`] that also commits a streaming source's cursor **in the same
@@ -127,7 +133,7 @@ pub async fn create_run_with_offset(
     source_name: &str,
     position: &str,
 ) -> Result<String> {
-    create_run_inner(pool, dag, yaml_spec, Some((source_name, position)), None).await
+    create_run_inner(pool, dag, yaml_spec, Some((source_name, position)), None, None).await
 }
 
 /// [`create_run`] that deletes the dead letter `dead_letter_id` **in the same
@@ -147,7 +153,7 @@ pub async fn create_run_from_dead_letter(
     yaml_spec: &str,
     dead_letter_id: &str,
 ) -> Result<Option<String>> {
-    match create_run_inner(pool, dag, yaml_spec, None, Some(dead_letter_id)).await {
+    match create_run_inner(pool, dag, yaml_spec, None, Some(dead_letter_id), None).await {
         Ok(run_id) => Ok(Some(run_id)),
         Err(e) if e.is::<super::DeadLetterGone>() => Ok(None),
         Err(e) => Err(e),
@@ -164,6 +170,7 @@ async fn create_run_inner(
     yaml_spec: &str,
     offset: Option<(&str, &str)>,
     dead_letter: Option<&str>,
+    triggered_by: Option<&str>,
 ) -> Result<String> {
     let def_id = Uuid::new_v4().to_string();
     let run_id = Uuid::new_v4().to_string();
@@ -215,17 +222,27 @@ async fn create_run_inner(
     // no equivalent: its single-writer transaction already serializes creators.)
     if let Some(max) = dag.spec.max_active_runs {
         if max > 0 {
+            // With a `concurrency_key` the cap is per (workflow, key): the lock
+            // narrows to that pair too, so two stacks admit in parallel.
+            // \u{1f} cannot appear in a workflow name (`[A-Za-z0-9_.-]`), so
+            // no name/key pair collides with another name.
+            let lock_scope = match &dag.spec.concurrency_key {
+                Some(key) => format!("{}\u{1f}{key}", dag.spec.name),
+                None => dag.spec.name.clone(),
+            };
             sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
                 .bind(RUN_ADMISSION_LOCK)
-                .bind(&dag.spec.name)
+                .bind(&lock_scope)
                 .execute(&mut *tx)
                 .await?;
             let active: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM workflow_runs wr
                  JOIN workflow_definitions d ON d.id = wr.definition_id
-                 WHERE wr.status = 'running' AND d.name = $1",
+                 WHERE wr.status = 'running' AND d.name = $1
+                   AND wr.concurrency_key IS NOT DISTINCT FROM $2",
             )
             .bind(&dag.spec.name)
+            .bind(&dag.spec.concurrency_key)
             .fetch_one(&mut *tx)
             .await?;
             if active >= max as i64 {
@@ -233,6 +250,7 @@ async fn create_run_inner(
                     name: dag.spec.name.clone(),
                     max,
                     active,
+                    key: dag.spec.concurrency_key.clone(),
                 }));
             }
         }
@@ -256,8 +274,8 @@ async fn create_run_inner(
     sqlx::query(
         "INSERT INTO workflow_runs
            (id, definition_id, status, created_at, deadline_at, alert_deadline_at, result_from, environment,
-            clock_confidence, clock_offset_ms, clock_source)
-         VALUES ($1, $2, 'running', $3, $4, $5, $6, $7, $8, $9, $10)",
+            clock_confidence, clock_offset_ms, clock_source, concurrency_key, triggered_by)
+         VALUES ($1, $2, 'running', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(&run_id)
     .bind(&def_id)
@@ -269,6 +287,8 @@ async fn create_run_inner(
     .bind(clock.confidence.as_str())
     .bind(clock.offset_ms)
     .bind(&clock.source)
+    .bind(&dag.spec.concurrency_key)
+    .bind(triggered_by)
     .execute(&mut *tx)
     .await?;
 
@@ -1081,6 +1101,7 @@ async fn claim_ready_filtered(
                  claimed_by = $1,
                  lease_expires_at = $2,
                  attempt = attempt + 1,
+                 log = NULL,
                  version = version + 1
              WHERE id IN (
                  SELECT id FROM task_runs
@@ -1188,7 +1209,7 @@ async fn claim_ready_filtered(
         let updated = sqlx::query(
             "UPDATE task_runs
              SET status = 'running', claimed_by = $1, lease_expires_at = $2,
-                 attempt = attempt + 1, version = version + 1
+                 attempt = attempt + 1, version = version + 1, log = NULL
              WHERE id = $3 AND status = 'ready' AND version = $4",
         )
         .bind(worker_id)
@@ -1298,6 +1319,7 @@ pub async fn claim_ready_gang(
              claimed_by = $1,
              lease_expires_at = $2,
              attempt = attempt + 1,
+             log = NULL,
              version = version + 1
          WHERE gang_id = $3 AND status = 'ready'
          RETURNING id, run_id, name, status,
@@ -1552,6 +1574,24 @@ pub async fn mark_task_failed(
     Ok(true)
 }
 
+/// Add a failure reason to a running task's streamed log, so a reason the
+/// engine writes to `output` is not hidden by the log the views prefer. Only
+/// when a log exists: a task with none already shows `output`, and starting a
+/// log with just the reason would hide the rest of it.
+pub async fn note_task_log(pool: &Pool, task_id: &str, fence: i64, note: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE task_runs SET log = log || $1
+         WHERE id = $2 AND version = $3 AND status = 'running' AND log IS NOT NULL",
+    )
+    .bind(format!("{}
+", note.trim_end()))
+    .bind(task_id)
+    .bind(fence)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Append a live-output chunk to a still-running task so the API/UI can tail it
 /// before the task exits (fast-win #17). Guarded by `version = fence AND status =
 /// 'running'`: only the current attempt writes, and a terminal row is immutable
@@ -1568,10 +1608,10 @@ pub async fn append_task_output(
     reset: bool,
 ) -> Result<()> {
     let sql = if reset {
-        "UPDATE task_runs SET output = $1
+        "UPDATE task_runs SET log = $1
          WHERE id = $2 AND version = $3 AND status = 'running' RETURNING run_id"
     } else {
-        "UPDATE task_runs SET output = COALESCE(output, '') || $1
+        "UPDATE task_runs SET log = COALESCE(log, '') || $1
          WHERE id = $2 AND version = $3 AND status = 'running' RETURNING run_id"
     };
     let mut tx = pool.begin().await?;
@@ -1957,18 +1997,24 @@ pub async fn resolve_approval(
     run_id: &str,
     task_id: &str,
     approve: bool,
+    decided_by: Option<&str>,
+    comment: Option<&str>,
 ) -> Result<bool> {
     let now = chrono::Utc::now().to_rfc3339();
     let (status, output) =
         if approve { ("succeeded", "approved") } else { ("failed", "rejected") };
     let mut tx = pool.begin().await?;
     let rows = sqlx::query(
-        "UPDATE task_runs SET status = $1, finished_at = $2, output = $3
-         WHERE id = $4 AND run_id = $5 AND status = 'awaiting_approval'",
+        "UPDATE task_runs SET status = $1, finished_at = $2, output = $3,
+                decided_by = $4, decision_comment = $5, log = $6
+         WHERE id = $7 AND run_id = $8 AND status = 'awaiting_approval'",
     )
     .bind(status)
     .bind(&now)
     .bind(output)
+    .bind(decided_by)
+    .bind(comment)
+    .bind(crate::dag::approval_log(approve, decided_by, comment, &now))
     .bind(task_id)
     .bind(run_id)
     .execute(&mut *tx)
@@ -2021,7 +2067,11 @@ pub async fn resolve_expired_approvals(pool: &Pool) -> Result<Vec<(String, bool)
             continue;
         }
         let approve = on_timeout.as_deref() == Some("approve");
-        if resolve_approval(pool, &run_id, &id, approve).await? {
+        let note = format!(
+            "approval_timeout_secs ({timeout}s) elapsed; defaulted to {}",
+            if approve { "approve" } else { "reject" }
+        );
+        if resolve_approval(pool, &run_id, &id, approve, Some("timeout"), Some(&note)).await? {
             resolved.push((id, approve));
         }
     }
@@ -3364,6 +3414,25 @@ pub async fn list_dataset_events(
     .await?)
 }
 
+/// The datasets one run read and wrote, for its OpenLineage event:
+/// `(waited_on, produced)`, each distinct and sorted. See the SQLite twin.
+pub async fn run_dataset_io(pool: &Pool, run_id: &str) -> Result<(Vec<String>, Vec<String>)> {
+    let waited_on: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT wait_dataset FROM task_runs
+         WHERE run_id = $1 AND wait_dataset IS NOT NULL ORDER BY wait_dataset",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    let produced: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT uri FROM dataset_events WHERE run_id = $1 ORDER BY uri",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    Ok((waited_on, produced))
+}
+
 /// Reset a failed task to `ready` for a later retry attempt.
 ///
 /// `scheduled_at = retry_at` keeps `claim_ready` from picking it up until the
@@ -3769,6 +3838,7 @@ pub async fn retry_task_from_ui(pool: &Pool, task_id: &str) -> Result<bool> {
              lease_expires_at = NULL,
              scheduled_at = NULL,
              output = NULL,
+             log = NULL,
              version = version + 1
          WHERE id = $1 AND status IN ('failed', 'cancelled')
          RETURNING run_id",
@@ -3841,6 +3911,7 @@ pub async fn rerun_from_failed(pool: &Pool, run_id: &str) -> Result<Option<u64>>
              claimed_by = NULL,
              lease_expires_at = NULL,
              output = NULL,
+             log = NULL,
              finished_at = NULL,
              -- The fault verdict describes why this row is *currently* failed.
              -- A row being reset to run again is not failed, so the previous
@@ -3947,7 +4018,7 @@ pub async fn clear_task_with_downstream(
          )
          UPDATE task_runs
          SET status = 'pending', attempt = 0, claimed_by = NULL, lease_expires_at = NULL,
-             output = NULL, finished_at = NULL, scheduled_at = $3, version = version + 1,
+             output = NULL, log = NULL, finished_at = NULL, scheduled_at = $3, version = version + 1,
              checkpoint_uri = NULL, checkpoint_marker = NULL,
              -- …and for the same reason a cleared deferred row drops its remote
              -- handle and takes a fresh epoch: the next submit must start a new
@@ -5274,6 +5345,8 @@ fn row_to_task(row: &sqlx::postgres::PgRow) -> Result<TaskRun> {
         fault_class: row.try_get("fault_class").ok().flatten(),
         fault_detail: row.try_get("fault_detail").ok().flatten(),
         fault_confidence: row.try_get("fault_confidence").ok().flatten(),
+        decided_by: row.try_get("decided_by").ok().flatten(),
+        decision_comment: row.try_get("decision_comment").ok().flatten(),
     })
 }
 
@@ -5395,6 +5468,31 @@ pub async fn latest_run_created_at(pool: &Pool) -> Result<Option<String>> {
     Ok(latest)
 }
 
+/// One task's log for the log views, scoped to its run: `task_runs.log`, else
+/// its `output`. `None` when no such task is in the run.
+#[cfg(feature = "ops")]
+pub async fn task_log(pool: &Pool, run_id: &str, task_id: &str) -> Result<Option<String>> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT COALESCE(log, output) FROM task_runs WHERE run_id = $1 AND id = $2")
+            .bind(run_id)
+            .bind(task_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(log,)| log.unwrap_or_default()))
+}
+
+/// Each task's log for the log views: stdout and stderr as streamed
+/// (`task_runs.log`), else its `output` for rows with no streamed log.
+#[cfg(feature = "ops")]
+pub async fn task_logs(pool: &Pool, run_id: &str) -> Result<std::collections::HashMap<String, String>> {
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT id, COALESCE(log, output) FROM task_runs WHERE run_id = $1")
+            .bind(run_id)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().map(|(id, log)| (id, log.unwrap_or_default())).collect())
+}
+
 /// All task rows of a run, ordered by name. Backs `GET /runs/:id`.
 #[cfg(feature = "ops")]
 pub async fn list_tasks(pool: &Pool, run_id: &str) -> Result<Vec<TaskRun>> {
@@ -5402,7 +5500,8 @@ pub async fn list_tasks(pool: &Pool, run_id: &str) -> Result<Vec<TaskRun>> {
         "SELECT id, run_id, name, status, attempt, remaining_deps,
                 input, output, claimed_by, lease_expires_at, version,
                 scheduled_at, finished_at, pool, priority, cache_hit,
-                wake_at, wait_url, wait_dataset, sub_run_id
+                wake_at, wait_url, wait_dataset, sub_run_id,
+                decided_by, decision_comment
          FROM task_runs WHERE run_id = $1 ORDER BY name",
     )
     .bind(run_id)
@@ -5546,12 +5645,76 @@ pub async fn status_counts(pool: &Pool) -> Result<crate::models::MetricsSnapshot
             .await?;
     let dead_letters: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM dead_letters").fetch_one(pool).await?;
+    // Per-workflow views. Each is bounded by something other than the size of
+    // the run history: a time window, the non-terminal task set, the parked
+    // dead letters.
+    let since = (chrono::Utc::now()
+        - chrono::TimeDelta::seconds(crate::models::RECENT_RUNS_WINDOW_SECS))
+    .to_rfc3339();
+    let recent: Vec<(String, Option<String>, String, i64)> = sqlx::query_as(
+        "SELECT wd.name, wr.environment, wr.status, COUNT(*)
+         FROM workflow_runs wr
+         JOIN workflow_definitions wd ON wd.id = wr.definition_id
+         WHERE wr.created_at >= $1
+         GROUP BY wd.name, wr.environment, wr.status",
+    )
+    .bind(&since)
+    .fetch_all(pool)
+    .await?;
+    let active_tasks: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT wd.name, tr.status, COUNT(*)
+         FROM task_runs tr
+         JOIN workflow_runs wr ON wr.id = tr.run_id
+         JOIN workflow_definitions wd ON wd.id = wr.definition_id
+         WHERE tr.status IN ('pending', 'ready', 'running', 'awaiting_approval')
+         GROUP BY wd.name, tr.status",
+    )
+    .fetch_all(pool)
+    .await?;
+    let by_source: Vec<(String, i64, Option<String>)> = sqlx::query_as(
+        "SELECT source, COUNT(*), MIN(first_seen_at) FROM dead_letters GROUP BY source",
+    )
+    .fetch_all(pool)
+    .await?;
     Ok(crate::models::MetricsSnapshot {
         runs_by_status: runs,
         tasks_by_status: tasks,
         dead_letters,
         ready_by_class: ready_backlog_by_class(pool).await?,
+        recent_runs: recent
+            .into_iter()
+            .map(|(workflow, environment, status, count)| crate::models::RecentRuns {
+                workflow,
+                environment,
+                status,
+                count,
+            })
+            .collect(),
+        active_tasks,
+        dead_letters_by_source: by_source
+            .into_iter()
+            .map(|(source, count, oldest_first_seen_at)| crate::models::DeadLetterSource {
+                source,
+                count,
+                oldest_first_seen_at,
+            })
+            .collect(),
     })
+}
+
+/// What the run-duration metrics need to know about a run that just finished:
+/// its workflow name and when it was created (RFC-3339).
+#[cfg(feature = "ops")]
+pub async fn run_metric_facts(pool: &Pool, run_id: &str) -> Result<Option<(String, String)>> {
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT wd.name, wr.created_at FROM workflow_runs wr
+         JOIN workflow_definitions wd ON wd.id = wr.definition_id
+         WHERE wr.id = $1",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
 }
 
 /// Ready backlog grouped by runner class: count + oldest `scheduled_at`. The

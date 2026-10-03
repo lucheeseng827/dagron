@@ -21,6 +21,10 @@ const SPLIT_KEY = "dagron.editor-split";
 const SPLIT_DEFAULT = 0.5;
 const SPLIT_MIN = 0.2;
 const SPLIT_MAX = 0.8;
+const WRAP_KEY = "dagron.editor-wrap";
+// What Tab can land on. Used to wrap focus inside the pane while it is in focus mode.
+const TABBABLE =
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
 /// A YAML DAG editor with a live DAG preview beside it. The preview re-renders as
 /// you type (debounced) so you can see the graph shape — Start/End markers, tasks,
@@ -61,6 +65,66 @@ export default function SpecEditorWithPreview({ value, onChange }: SpecEditorWit
       // Storage unavailable — keep the default.
     }
   }, []);
+  // Editor view toggles. Wrap is remembered across sessions (restored after
+  // mount like the split); focus is per-open and deliberately not persisted.
+  const [wrap, setWrap] = useState(false);
+  const [focus, setFocus] = useState(false);
+  useEffect(() => {
+    try {
+      setWrap(window.localStorage.getItem(WRAP_KEY) === "1");
+    } catch {
+      // Storage unavailable — keep the default.
+    }
+  }, []);
+  const toggleWrap = () => {
+    const next = !wrap;
+    setWrap(next);
+    try {
+      window.localStorage.setItem(WRAP_KEY, next ? "1" : "0");
+    } catch {
+      // Persistence is best-effort.
+    }
+  };
+  // Esc leaves focus mode first. Captured + immediate-stopped so a host modal's
+  // own Escape-to-close (RerunDialog) doesn't also fire and dismiss the dialog.
+  useEffect(() => {
+    if (!focus) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.stopImmediatePropagation();
+      setFocus(false);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [focus]);
+  // Focus mode lifts the pane over the window, but everything behind it stays mounted and
+  // tabbable — the host dialog's Cancel / Launch, the preview graph, the sidebar. Without a
+  // trap, Shift+Tab walks out onto controls nobody can see, and Enter on one of them can
+  // dismiss the dialog or start a run. So Tab and Shift+Tab wrap inside the pane while it is
+  // lifted; leaving focus mode removes the trap and ordinary navigation comes back.
+  const focusPaneRef = useRef<HTMLDivElement>(null);
+  const trapTab = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    // `defaultPrevented`: inside Monaco, Tab is an indent and Monaco has already claimed it.
+    // Hijacking that would make the editor unusable for indentation. With Monaco's own
+    // tab-focus mode on (Ctrl+M) it does not claim Tab, and the wrap below takes over.
+    if (e.key !== "Tab" || e.defaultPrevented) return;
+    const pane = focusPaneRef.current;
+    if (!pane) return;
+    const stops = Array.from(pane.querySelectorAll<HTMLElement>(TABBABLE)).filter(
+      (n) => n.getClientRects().length > 0,
+    );
+    if (stops.length === 0) return;
+    const first = stops[0];
+    const last = stops[stops.length - 1];
+    const active = document.activeElement;
+    if (e.shiftKey && active === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && active === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  };
   const persistSplit = (v: number) => {
     try {
       window.localStorage.setItem(SPLIT_KEY, String(v));
@@ -119,22 +183,83 @@ export default function SpecEditorWithPreview({ value, onChange }: SpecEditorWit
           userSelect: dragging ? "none" : undefined,
         }}
       >
-        <div style={{ width: `${split * 100}%`, minWidth: 0, flexShrink: 0 }}>
-          <Editor
-            height="100%"
-            defaultLanguage="yaml"
-            theme="vs-dark"
-            value={value}
-            onChange={(v) => onChange(v ?? "")}
-            options={{
-              minimap: { enabled: false },
-              fontSize: 13,
-              tabSize: 2,
-              scrollBeyondLastLine: false,
-              // The pane resizes as the divider drags; Monaco must follow.
-              automaticLayout: true,
+        <div
+          ref={focusPaneRef}
+          // Only while lifted does this behave as a modal: it covers the window and keeps Tab
+          // inside (see `trapTab`), so it says so to assistive tech as well.
+          role={focus ? "dialog" : undefined}
+          aria-modal={focus ? true : undefined}
+          aria-label={focus ? "Spec editor, focus mode" : undefined}
+          onKeyDown={focus ? trapTab : undefined}
+          // Focus mode lifts this same element over the whole window (no remount,
+          // so cursor/undo state survive); the preview stays mounted underneath.
+          style={
+            focus
+              ? {
+                  position: "fixed",
+                  inset: 0,
+                  zIndex: 100,
+                  display: "flex",
+                  flexDirection: "column",
+                  background: "var(--panel)",
+                }
+              : {
+                  width: `${split * 100}%`,
+                  minWidth: 0,
+                  flexShrink: 0,
+                  display: "flex",
+                  flexDirection: "column",
+                }
+          }
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "flex-end",
+              gap: 6,
+              padding: "4px 8px",
+              borderBottom: "1px solid var(--border)",
+              flexShrink: 0,
             }}
-          />
+          >
+            <button
+              type="button"
+              className="dy-btn"
+              aria-pressed={wrap}
+              onClick={toggleWrap}
+              title="Wrap long lines"
+            >
+              {wrap ? "✓ Wrap" : "Wrap"}
+            </button>
+            <button
+              type="button"
+              className="dy-btn"
+              aria-pressed={focus}
+              onClick={() => setFocus((f) => !f)}
+              title={focus ? "Back to split view (Esc)" : "Expand the editor to the full window"}
+            >
+              {focus ? "⤡ Exit focus" : "⤢ Focus"}
+            </button>
+          </div>
+          <div style={{ flex: 1, minHeight: 0 }}>
+            <Editor
+              height="100%"
+              defaultLanguage="yaml"
+              theme="vs-dark"
+              value={value}
+              onChange={(v) => onChange(v ?? "")}
+              options={{
+                minimap: { enabled: false },
+                fontSize: 13,
+                tabSize: 2,
+                scrollBeyondLastLine: false,
+                // The pane resizes as the divider drags; Monaco must follow.
+                automaticLayout: true,
+                wordWrap: wrap ? "on" : "off",
+              }}
+            />
+          </div>
         </div>
         <div
           role="separator"

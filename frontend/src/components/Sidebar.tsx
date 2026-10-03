@@ -7,6 +7,9 @@ import { getHealth, getMe, listWorkflows, logout, type Me } from "@/lib/dagron-a
 import { AGENT_DOCK_ENABLED } from "@/lib/agent";
 import { useAgentDock, useSidebarRail } from "@/lib/shell-prefs";
 import type { HealthResponse } from "@/types/dagron";
+// `@ee/cloud` is the hosted service's workspace switcher; the public build's stub
+// renders nothing and reports "not hosted".
+import { CloudWorkspaceSwitcher, useIsCloud } from "@ee/cloud";
 
 type IconName =
   | "overview"
@@ -159,6 +162,11 @@ export default function Sidebar() {
   // amber = DB ok but no live scheduler (schedules will not fire); red = API/DB
   // unreachable. Driven by GET /api/health — not hardcoded.
   const isAdmin = me?.groups?.includes("admin") ?? false;
+  // Hosted, people and tokens belong to the org and are managed there, not per
+  // engine: the engine's own screens for them are hidden.
+  const hosted = useIsCloud();
+  const orgManaged = (n: NavItem) =>
+    !(hosted && (n.href === "/settings/users" || n.href === "/settings/tokens"));
   const status = healthErr
     ? { color: "var(--red)", title: "API unreachable", sub: "health check failing" }
     : !health
@@ -266,18 +274,24 @@ export default function Sidebar() {
         </button>
       )}
 
+      <CloudWorkspaceSwitcher rail={rail} />
+
       {MAIN.map(renderItem)}
 
       <div className="dy-navsection">OPERATIONS</div>
       {OPS.map(renderItem)}
 
-      <div className="dy-navsection">ACCOUNT</div>
-      {ACCOUNT.map(renderItem)}
+      {ACCOUNT.filter(orgManaged).length > 0 && (
+        <>
+          <div className="dy-navsection">ACCOUNT</div>
+          {ACCOUNT.filter(orgManaged).map(renderItem)}
+        </>
+      )}
 
       {isAdmin && (
         <>
           <div className="dy-navsection">ADMIN</div>
-          {ADMIN.map(renderItem)}
+          {ADMIN.filter(orgManaged).map(renderItem)}
           {health?.edition === "enterprise" && ADMIN_EE.map(renderItem)}
         </>
       )}

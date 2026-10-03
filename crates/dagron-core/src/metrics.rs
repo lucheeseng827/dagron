@@ -22,6 +22,65 @@ use std::fmt::Write as _;
 #[cfg(feature = "ops")]
 use crate::models::MetricsSnapshot;
 
+/// A gate this build refuses with a signpost, counted when it is hit
+/// (`scheduler_signpost_hits_total{gate}`).
+///
+/// Only the gates that refuse a request while the engine keeps running are
+/// here. A gate met at startup (`SOURCE=fleet`, a managed connector kind, a KMS
+/// key provider) stops the process, so there is no `/metrics` left to read its
+/// count from; and dagron-api's gates run in a process that serves no
+/// Prometheus endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignpostGate {
+    /// `budget.external_cost_attribution` in a workflow spec.
+    ExternalCostAttribution,
+    /// `defer.connection:` on a task.
+    DeferConnection,
+    /// `POST /datasets/events` on the engine API.
+    ExternalDatasetEvents,
+}
+
+impl SignpostGate {
+    pub const ALL: [SignpostGate; 3] = [
+        SignpostGate::ExternalCostAttribution,
+        SignpostGate::DeferConnection,
+        SignpostGate::ExternalDatasetEvents,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SignpostGate::ExternalCostAttribution => "external_cost_attribution",
+            SignpostGate::DeferConnection => "defer_connection",
+            SignpostGate::ExternalDatasetEvents => "external_dataset_events",
+        }
+    }
+}
+
+/// Signpost hits, per [`SignpostGate`], for the whole process.
+///
+/// Process-wide rather than on [`Metrics`], because two of the three gates are
+/// spec validation in this crate: a pure function that has no `Metrics` handle
+/// and runs wherever a spec is parsed. Every process counts its own; only the
+/// engine renders them.
+static SIGNPOST_HITS: [AtomicU64; SignpostGate::ALL.len()] =
+    [const { AtomicU64::new(0) }; SignpostGate::ALL.len()];
+
+/// Count one hit of a signpost gate. Call it where the refusal is made, once
+/// per refusal.
+pub fn record_signpost_hit(gate: SignpostGate) {
+    if let Some(i) = SignpostGate::ALL.iter().position(|g| *g == gate) {
+        SIGNPOST_HITS[i].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Hits so far for one gate, in this process.
+pub fn signpost_hits(gate: SignpostGate) -> u64 {
+    SignpostGate::ALL
+        .iter()
+        .position(|g| *g == gate)
+        .map_or(0, |i| SIGNPOST_HITS[i].load(Ordering::Relaxed))
+}
+
 /// Upper bounds (seconds) for the latency histograms. Spans sub-millisecond
 /// scheduling latencies through minutes-long ETL tasks so one bucket set serves
 /// `reconcile_tick`, `task_duration`, and the dispatch-path histograms. A
@@ -36,6 +95,26 @@ const DURATION_BUCKETS: &[f64] = &[
 /// Bucket bounds for the claim batch-size histogram — counts, not seconds.
 /// Sized to worker-pool scales (`WORKER_COUNT` defaults 16, profiles run 64+).
 const BATCH_BUCKETS: &[f64] = &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0];
+
+/// Upper bounds (seconds) for whole-run durations. A run is a pipeline, not a
+/// task: a CI build or an ETL chain runs for minutes to hours, which
+/// [`DURATION_BUCKETS`]' 300 s ceiling would flatten into `+Inf`.
+const RUN_DURATION_BUCKETS: &[f64] = &[
+    1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0, 7200.0, 14400.0,
+];
+
+/// Max distinct `workflow` label values per series family. Workflow names come
+/// from submitted specs, so the cap is what stops a client that names every run
+/// differently from minting a series per run; the rest fold into
+/// `workflow="other"`.
+const WORKFLOW_SERIES_CAP: usize = 50;
+
+/// Max distinct `environment` and dead-letter `source` label values.
+#[cfg(feature = "ops")]
+const SMALL_SERIES_CAP: usize = 20;
+
+/// The label value the tail beyond a series cap is folded into.
+const OTHER: &str = "other";
 
 /// Max distinct `runner_class` label values exported per scrape. The class
 /// comes from workflow specs (only syntax-validated), so without a cap a
@@ -110,6 +189,21 @@ pub struct DbPoolStats {
     pub connections: u32,
     pub idle: u32,
     pub max: u32,
+}
+
+/// Finished-run totals for one workflow, split by outcome so a success ratio
+/// and a mean duration per outcome both fall out of the same two series.
+#[derive(Debug, Default, Clone)]
+struct WorkflowRunStats {
+    succeeded: u64,
+    succeeded_secs: f64,
+    failed: u64,
+    failed_secs: f64,
+    last_secs: f64,
+    // Fractional, so two engines finishing the same workflow within one second
+    // still order: dashboards pick the engine whose last run is newest.
+    last_finished_unix: f64,
+    last_succeeded: bool,
 }
 
 /// Monotonic process-lifetime counters. Cheap relaxed atomics — exactness across
@@ -216,6 +310,11 @@ pub struct Metrics {
     /// Tasks claimed per non-empty claim call — batch-shape signal for tuning
     /// `WORKER_COUNT` against the ready backlog. Unit: tasks, not seconds.
     pub claim_batch: Histogram,
+    /// Whole-run wall time (created→finished) for runs this engine finalized.
+    pub run_duration: Histogram,
+    /// Per-workflow finished-run totals and the last run's duration. A lock,
+    /// not atomics: it is taken once per finished *run*, never per task.
+    workflow_runs: std::sync::Mutex<std::collections::BTreeMap<String, WorkflowRunStats>>,
     // ── QW3 auto-catchup self-healing state gauges ──────────────────────────────────
     // Unlike the counters above (monotonic, bumped on the hot path) these are
     // *current state* re-published by the auto-backfill loop on every sweep: the
@@ -266,6 +365,8 @@ impl Default for Metrics {
             dispatch_latency: Histogram::new(DURATION_BUCKETS),
             result_wait: Histogram::new(DURATION_BUCKETS),
             claim_batch: Histogram::new(BATCH_BUCKETS),
+            run_duration: Histogram::new(RUN_DURATION_BUCKETS),
+            workflow_runs: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             #[cfg(feature = "enterprise")]
             overdue_schedules: AtomicU64::new(0),
             #[cfg(feature = "enterprise")]
@@ -412,6 +513,34 @@ impl Metrics {
         self.claim_batch.observe(claimed as f64);
     }
 
+    /// Record one run this engine finalized: its workflow, whether it
+    /// succeeded, and its wall time from creation to the terminal state.
+    ///
+    /// Only the first [`WORKFLOW_SERIES_CAP`] distinct workflow names get their
+    /// own entry; later ones are counted under `other`.
+    pub fn observe_run_finished(&self, workflow: &str, succeeded: bool, secs: f64) {
+        let secs = if secs.is_finite() && secs > 0.0 { secs } else { 0.0 };
+        self.run_duration.observe(secs);
+        // A panic while holding this lock leaves counts, not invariants.
+        let mut map = self.workflow_runs.lock().unwrap_or_else(|e| e.into_inner());
+        let key = if map.contains_key(workflow) || map.len() < WORKFLOW_SERIES_CAP {
+            workflow
+        } else {
+            OTHER
+        };
+        let w = map.entry(key.to_string()).or_default();
+        if succeeded {
+            w.succeeded += 1;
+            w.succeeded_secs += secs;
+        } else {
+            w.failed += 1;
+            w.failed_secs += secs;
+        }
+        w.last_secs = secs;
+        w.last_finished_unix = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        w.last_succeeded = succeeded;
+    }
+
     /// Render the Prometheus text exposition format (version 0.0.4) for the
     /// process counters plus the datastore gauges in `snap`. Gated to the `ops`
     /// feature — the only caller is the management API's `/metrics` endpoint.
@@ -512,6 +641,19 @@ impl Metrics {
             let _ = writeln!(
                 out,
                 "scheduler_task_faults_by_disposition_total{{disposition=\"{disposition}\"}} {v}"
+            );
+        }
+
+        // Requests refused with a signpost, by gate. Every gate is emitted, at
+        // zero too, for the same reason as the fault classes above.
+        let _ = writeln!(out, "# HELP scheduler_signpost_hits_total Requests this build refused with a signpost to what it does not include, by gate.");
+        let _ = writeln!(out, "# TYPE scheduler_signpost_hits_total counter");
+        for gate in SignpostGate::ALL {
+            let _ = writeln!(
+                out,
+                "scheduler_signpost_hits_total{{gate=\"{}\"}} {}",
+                gate.as_str(),
+                signpost_hits(gate)
             );
         }
 
@@ -639,6 +781,111 @@ impl Metrics {
             "Tasks claimed per non-empty claim call (unit: tasks).",
         );
 
+        self.run_duration.render_into(
+            &mut out,
+            "scheduler_run_duration_seconds",
+            "Run wall time from creation to a terminal state, for runs this engine finalized.",
+        );
+
+        // Per-workflow finished runs. A summary with no quantiles: the sum and
+        // the count are what a mean and a success ratio need, and a histogram
+        // per workflow would be buckets × workflows series.
+        {
+            let map = self.workflow_runs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let name = "scheduler_workflow_run_duration_seconds";
+            let _ = writeln!(out, "# HELP {name} Run wall time by workflow and outcome, for runs this engine finalized (sum and count only).");
+            let _ = writeln!(out, "# TYPE {name} summary");
+            for (workflow, w) in &map {
+                let wf = escape_label(workflow);
+                for (status, count, secs) in [
+                    ("succeeded", w.succeeded, w.succeeded_secs),
+                    ("failed", w.failed, w.failed_secs),
+                ] {
+                    let _ = writeln!(out, "{name}_sum{{workflow=\"{wf}\",status=\"{status}\"}} {secs}");
+                    let _ = writeln!(out, "{name}_count{{workflow=\"{wf}\",status=\"{status}\"}} {count}");
+                }
+            }
+            let _ = writeln!(out, "# HELP scheduler_workflow_last_run_duration_seconds Wall time of the workflow's most recently finished run.");
+            let _ = writeln!(out, "# TYPE scheduler_workflow_last_run_duration_seconds gauge");
+            for (workflow, w) in &map {
+                let _ = writeln!(out, "scheduler_workflow_last_run_duration_seconds{{workflow=\"{}\"}} {}", escape_label(workflow), w.last_secs);
+            }
+            let _ = writeln!(out, "# HELP scheduler_workflow_last_run_finished_timestamp_seconds Unix time the workflow's most recent run finished.");
+            let _ = writeln!(out, "# TYPE scheduler_workflow_last_run_finished_timestamp_seconds gauge");
+            for (workflow, w) in &map {
+                let _ = writeln!(out, "scheduler_workflow_last_run_finished_timestamp_seconds{{workflow=\"{}\"}} {}", escape_label(workflow), w.last_finished_unix);
+            }
+            let _ = writeln!(out, "# HELP scheduler_workflow_last_run_success 1 if the workflow's most recently finished run succeeded, 0 if it failed.");
+            let _ = writeln!(out, "# TYPE scheduler_workflow_last_run_success gauge");
+            for (workflow, w) in &map {
+                let _ = writeln!(out, "scheduler_workflow_last_run_success{{workflow=\"{}\"}} {}", escape_label(workflow), u8::from(w.last_succeeded));
+            }
+        }
+
+        // Datastore views by workflow and environment (whole-cluster truth).
+        {
+            use std::collections::BTreeMap;
+            let mut by_workflow: BTreeMap<(String, String), i64> = BTreeMap::new();
+            let mut by_env: BTreeMap<(String, String), i64> = BTreeMap::new();
+            for r in &snap.recent_runs {
+                *by_workflow.entry((r.workflow.clone(), r.status.clone())).or_default() += r.count;
+                // Parentheses cannot appear in an environment name, so the
+                // placeholder can never collide with a real one.
+                let env = r.environment.clone().unwrap_or_else(|| "(none)".to_string());
+                *by_env.entry((env, r.status.clone())).or_default() += r.count;
+            }
+            let _ = writeln!(out, "# HELP scheduler_workflow_recent_runs Runs created in the last 24 hours, by workflow and current status (busiest workflows; the rest summed as \"other\").");
+            let _ = writeln!(out, "# TYPE scheduler_workflow_recent_runs gauge");
+            for ((workflow, status), count) in fold_tail(by_workflow, WORKFLOW_SERIES_CAP) {
+                let _ = writeln!(out, "scheduler_workflow_recent_runs{{workflow=\"{}\",status=\"{}\"}} {count}", escape_label(&workflow), escape_label(&status));
+            }
+            let _ = writeln!(out, "# HELP scheduler_environment_recent_runs Runs created in the last 24 hours, by environment and current status.");
+            let _ = writeln!(out, "# TYPE scheduler_environment_recent_runs gauge");
+            for ((env, status), count) in fold_tail(by_env, SMALL_SERIES_CAP) {
+                let _ = writeln!(out, "scheduler_environment_recent_runs{{environment=\"{}\",status=\"{}\"}} {count}", escape_label(&env), escape_label(&status));
+            }
+
+            let mut tasks: BTreeMap<(String, String), i64> = BTreeMap::new();
+            for (workflow, status, count) in &snap.active_tasks {
+                *tasks.entry((workflow.clone(), status.clone())).or_default() += count;
+            }
+            let _ = writeln!(out, "# HELP scheduler_workflow_active_tasks Tasks that have not finished, by workflow and status (pending, ready, running, awaiting_approval).");
+            let _ = writeln!(out, "# TYPE scheduler_workflow_active_tasks gauge");
+            for ((workflow, status), count) in fold_tail(tasks, WORKFLOW_SERIES_CAP) {
+                let _ = writeln!(out, "scheduler_workflow_active_tasks{{workflow=\"{}\",status=\"{}\"}} {count}", escape_label(&workflow), escape_label(&status));
+            }
+
+            // Dead letters by source. The age is the tail's maximum, so a
+            // source folded into "other" still raises the alarm from there.
+            let now = chrono::Utc::now();
+            let mut sources: Vec<_> = snap.dead_letters_by_source.iter().collect();
+            sources.sort_by(|a, b| b.count.cmp(&a.count).then(a.source.cmp(&b.source)));
+            let (head, tail) = sources.split_at(sources.len().min(SMALL_SERIES_CAP));
+            let _ = writeln!(out, "# HELP scheduler_dead_letters_by_source Dead-letter rows currently parked, by the source that produced them.");
+            let _ = writeln!(out, "# TYPE scheduler_dead_letters_by_source gauge");
+            for d in head {
+                let _ = writeln!(out, "scheduler_dead_letters_by_source{{source=\"{}\"}} {}", escape_label(&d.source), d.count);
+            }
+            if !tail.is_empty() {
+                let _ = writeln!(out, "scheduler_dead_letters_by_source{{source=\"{OTHER}\"}} {}", tail.iter().map(|d| d.count).sum::<i64>());
+            }
+            let _ = writeln!(out, "# HELP scheduler_dead_letters_oldest_age_seconds Age of the oldest parked dead letter, by source.");
+            let _ = writeln!(out, "# TYPE scheduler_dead_letters_oldest_age_seconds gauge");
+            for d in head {
+                let _ = writeln!(out, "scheduler_dead_letters_oldest_age_seconds{{source=\"{}\"}} {}", escape_label(&d.source), d.oldest_age_secs(now));
+            }
+            if !tail.is_empty() {
+                let _ = writeln!(out, "scheduler_dead_letters_oldest_age_seconds{{source=\"{OTHER}\"}} {}", tail.iter().map(|d| d.oldest_age_secs(now)).max().unwrap_or(0));
+            }
+        }
+
+        // The process itself. `process_*` follows the names every
+        // Prometheus client library uses, so stock process dashboards and
+        // alerts work unchanged; it is read from /proc and so is Linux-only.
+        if let Some(p) = process::read() {
+            p.render_into(&mut out);
+        }
+
         // DB connection-pool saturation (in-use / idle / max).
         if let Some(p) = pool {
             let in_use = p.connections.saturating_sub(p.idle);
@@ -654,6 +901,141 @@ impl Metrics {
         }
 
         out
+    }
+}
+
+/// Escape a label value for the text exposition format: backslash, double
+/// quote and newline are the three characters it gives meaning to.
+#[cfg(feature = "ops")]
+fn escape_label(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Keep the `cap` keys with the largest totals and sum every other key's cells
+/// into [`OTHER`]. Cells are `(key, status) → count`; ties break by name so the
+/// set of series is stable from one scrape to the next.
+#[cfg(feature = "ops")]
+fn fold_tail(
+    cells: std::collections::BTreeMap<(String, String), i64>,
+    cap: usize,
+) -> std::collections::BTreeMap<(String, String), i64> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut totals: BTreeMap<&str, i64> = BTreeMap::new();
+    for ((key, _), count) in &cells {
+        *totals.entry(key.as_str()).or_default() += count;
+    }
+    if totals.len() <= cap {
+        return cells;
+    }
+    let mut ranked: Vec<(&str, i64)> = totals.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let keep: BTreeSet<String> = ranked.iter().take(cap).map(|(k, _)| k.to_string()).collect();
+    let mut out: BTreeMap<(String, String), i64> = BTreeMap::new();
+    for ((key, status), count) in cells {
+        let key = if keep.contains(&key) { key } else { OTHER.to_string() };
+        *out.entry((key, status)).or_default() += count;
+    }
+    out
+}
+
+/// The engine process's own resource use, in the standard `process_*` names.
+#[cfg(feature = "ops")]
+mod process {
+    use std::fmt::Write as _;
+
+    #[derive(Debug, PartialEq)]
+    pub(super) struct ProcessStats {
+        pub cpu_seconds: f64,
+        pub resident_bytes: u64,
+        pub virtual_bytes: u64,
+        pub threads: u64,
+        pub start_time_seconds: f64,
+        pub open_fds: Option<u64>,
+        pub max_fds: Option<u64>,
+    }
+
+    /// Parse `/proc/<pid>/stat`. The command name is the one field that may
+    /// contain spaces or parentheses, so fields are counted from the *last*
+    /// `)`; `ticks` is the kernel's clock ticks per second, `page` its page
+    /// size, and `boot_time` the Unix time the host booted.
+    #[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+    pub(super) fn parse_stat(stat: &str, ticks: f64, page: u64, boot_time: f64) -> Option<ProcessStats> {
+        let rest = &stat[stat.rfind(')')? + 1..];
+        // `rest` starts at field 3 (state), so field N is at index N - 3.
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        let num = |field: usize| f.get(field - 3)?.parse::<u64>().ok();
+        Some(ProcessStats {
+            cpu_seconds: (num(14)? + num(15)?) as f64 / ticks,
+            threads: num(20)?,
+            start_time_seconds: boot_time + num(22)? as f64 / ticks,
+            virtual_bytes: num(23)?,
+            resident_bytes: num(24)? * page,
+            open_fds: None,
+            max_fds: None,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn read() -> Option<ProcessStats> {
+        // SAFETY: sysconf takes no pointers and has no preconditions.
+        let (ticks, page) = unsafe { (libc::sysconf(libc::_SC_CLK_TCK), libc::sysconf(libc::_SC_PAGESIZE)) };
+        if ticks <= 0 || page <= 0 {
+            return None;
+        }
+        let boot_time = std::fs::read_to_string("/proc/stat")
+            .ok()?
+            .lines()
+            .find_map(|l| l.strip_prefix("btime "))?
+            .trim()
+            .parse::<f64>()
+            .ok()?;
+        let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+        let mut p = parse_stat(&stat, ticks as f64, page as u64, boot_time)?;
+        p.open_fds = std::fs::read_dir("/proc/self/fd").ok().map(|d| d.count() as u64);
+        p.max_fds = std::fs::read_to_string("/proc/self/limits").ok().and_then(|l| {
+            l.lines()
+                .find_map(|l| l.strip_prefix("Max open files"))?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        });
+        Some(p)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn read() -> Option<ProcessStats> {
+        None
+    }
+
+    impl ProcessStats {
+        pub(super) fn render_into(&self, out: &mut String) {
+            let mut one = |name: &str, kind: &str, help: &str, value: String| {
+                let _ = writeln!(out, "# HELP {name} {help}");
+                let _ = writeln!(out, "# TYPE {name} {kind}");
+                let _ = writeln!(out, "{name} {value}");
+            };
+            one("process_cpu_seconds_total", "counter", "Total user and system CPU time spent by the engine process, in seconds.", self.cpu_seconds.to_string());
+            one("process_resident_memory_bytes", "gauge", "Resident memory of the engine process, in bytes.", self.resident_bytes.to_string());
+            one("process_virtual_memory_bytes", "gauge", "Virtual memory of the engine process, in bytes.", self.virtual_bytes.to_string());
+            one("process_threads", "gauge", "Operating-system threads in the engine process.", self.threads.to_string());
+            one("process_start_time_seconds", "gauge", "Unix time the engine process started.", self.start_time_seconds.to_string());
+            if let Some(n) = self.open_fds {
+                one("process_open_fds", "gauge", "File descriptors the engine process has open.", n.to_string());
+            }
+            if let Some(n) = self.max_fds {
+                one("process_max_fds", "gauge", "The engine process's open file descriptor limit.", n.to_string());
+            }
+        }
     }
 }
 
@@ -684,6 +1066,7 @@ mod tests {
                     (chrono::Utc::now() - chrono::TimeDelta::seconds(120)).to_rfc3339(),
                 ),
             }],
+            ..Default::default()
         };
         let pool = DbPoolStats { connections: 5, idle: 2, max: 10 };
         let text = m.render(&snap, Some(&pool));
@@ -750,6 +1133,7 @@ mod tests {
             tasks_by_status: vec![],
             dead_letters: 0,
             ready_by_class,
+            ..Default::default()
         };
         let text = m.render(&snap, None);
 
@@ -813,6 +1197,94 @@ mod tests {
         assert_eq!(h.count.load(Ordering::Relaxed), 3);
     }
 
+    /// Finished runs feed the run histogram and the per-workflow summary and
+    /// last-run gauges; the datastore views render by workflow, environment
+    /// and dead-letter source, with hostile label values escaped.
+    #[test]
+    fn workflow_and_dead_letter_views_render() {
+        let m = Metrics::new();
+        m.observe_run_finished("ci/build", true, 90.0);
+        m.observe_run_finished("ci/build", false, 30.0);
+        m.observe_run_finished("ci/build", true, 120.0);
+        let now = chrono::Utc::now();
+        let snap = MetricsSnapshot {
+            recent_runs: vec![
+                crate::models::RecentRuns { workflow: "ci/build".into(), environment: Some("prod".into()), status: "succeeded".into(), count: 4 },
+                crate::models::RecentRuns { workflow: "ci/build".into(), environment: None, status: "succeeded".into(), count: 1 },
+                crate::models::RecentRuns { workflow: "a\"b\\c".into(), environment: None, status: "running".into(), count: 2 },
+            ],
+            active_tasks: vec![("ci/build".into(), "running".into(), 3)],
+            dead_letters_by_source: vec![crate::models::DeadLetterSource {
+                source: "kafka".into(),
+                count: 5,
+                oldest_first_seen_at: Some((now - chrono::TimeDelta::seconds(600)).to_rfc3339()),
+            }],
+            ..Default::default()
+        };
+        let text = m.render(&snap, None);
+        assert!(text.contains("scheduler_run_duration_seconds_count 3"), "{text}");
+        assert!(text.contains("scheduler_run_duration_seconds_bucket{le=\"120\"} 3"), "{text}");
+        assert!(text.contains("# TYPE scheduler_workflow_run_duration_seconds summary"));
+        assert!(text.contains("scheduler_workflow_run_duration_seconds_sum{workflow=\"ci/build\",status=\"succeeded\"} 210"), "{text}");
+        assert!(text.contains("scheduler_workflow_run_duration_seconds_count{workflow=\"ci/build\",status=\"succeeded\"} 2"));
+        assert!(text.contains("scheduler_workflow_run_duration_seconds_count{workflow=\"ci/build\",status=\"failed\"} 1"));
+        assert!(text.contains("scheduler_workflow_last_run_duration_seconds{workflow=\"ci/build\"} 120"));
+        assert!(text.contains("scheduler_workflow_last_run_success{workflow=\"ci/build\"} 1"));
+        // Two environments' cells for one workflow sum into one workflow series.
+        assert!(text.contains("scheduler_workflow_recent_runs{workflow=\"ci/build\",status=\"succeeded\"} 5"), "{text}");
+        assert!(text.contains("scheduler_workflow_recent_runs{workflow=\"a\\\"b\\\\c\",status=\"running\"} 2"), "{text}");
+        assert!(text.contains("scheduler_environment_recent_runs{environment=\"prod\",status=\"succeeded\"} 4"));
+        assert!(text.contains("scheduler_environment_recent_runs{environment=\"(none)\",status=\"succeeded\"} 1"));
+        assert!(text.contains("scheduler_workflow_active_tasks{workflow=\"ci/build\",status=\"running\"} 3"));
+        assert!(text.contains("scheduler_dead_letters_by_source{source=\"kafka\"} 5"));
+        let age_line = text
+            .lines()
+            .find(|l| l.starts_with("scheduler_dead_letters_oldest_age_seconds{source=\"kafka\"}"))
+            .expect("dead-letter age present");
+        let age: i64 = age_line.rsplit(' ').next().unwrap().parse().unwrap();
+        assert!((595..=610).contains(&age), "age ~600s, got {age}");
+    }
+
+    /// A client that names every run differently gets `other`, not a series
+    /// per run: in the process map and in the datastore views alike.
+    #[test]
+    fn workflow_series_are_capped() {
+        let m = Metrics::new();
+        for i in 0..WORKFLOW_SERIES_CAP + 5 {
+            m.observe_run_finished(&format!("wf-{i:03}"), true, 1.0);
+        }
+        let recent_runs = (0..WORKFLOW_SERIES_CAP + 5)
+            .map(|i| crate::models::RecentRuns {
+                workflow: format!("wf-{i:03}"),
+                environment: None,
+                status: "succeeded".into(),
+                // wf-000 is the busiest; the last five are the tail.
+                count: (WORKFLOW_SERIES_CAP + 5 - i) as i64,
+            })
+            .collect();
+        let text = m.render(&MetricsSnapshot { recent_runs, ..Default::default() }, None);
+        let series = |prefix: &str| text.lines().filter(|l| l.starts_with(prefix)).count();
+        assert_eq!(series("scheduler_workflow_last_run_duration_seconds{"), WORKFLOW_SERIES_CAP + 1);
+        assert!(text.contains("scheduler_workflow_run_duration_seconds_count{workflow=\"other\",status=\"succeeded\"} 5"), "{text}");
+        assert_eq!(series("scheduler_workflow_recent_runs{"), WORKFLOW_SERIES_CAP + 1);
+        // The five least-busy workflows (counts 5..1) fold into one cell.
+        assert!(text.contains("scheduler_workflow_recent_runs{workflow=\"other\",status=\"succeeded\"} 15"), "{text}");
+    }
+
+    /// `/proc/<pid>/stat` is parsed from the last `)`, so a command name with
+    /// spaces and parentheses cannot shift the fields.
+    #[test]
+    fn process_stat_parses_past_a_hostile_command_name() {
+        let stat = "42 (dag ron) x) S 1 42 42 0 -1 4194560 100 0 0 0 250 150 0 0 20 0 9 0 5000 104857600 2560 18446744073709551615";
+        let p = process::parse_stat(stat, 100.0, 4096, 1_000.0).expect("parses");
+        assert_eq!(p.cpu_seconds, 4.0);
+        assert_eq!(p.threads, 9);
+        assert_eq!(p.start_time_seconds, 1_050.0);
+        assert_eq!(p.virtual_bytes, 104_857_600);
+        assert_eq!(p.resident_bytes, 2560 * 4096);
+        assert!(process::parse_stat("garbage", 100.0, 4096, 0.0).is_none());
+    }
+
     #[test]
     fn fault_counters_render_both_series_and_never_grow_cardinality() {
         use crate::fault::FaultClass;
@@ -826,6 +1298,7 @@ mod tests {
             tasks_by_status: vec![],
             dead_letters: 0,
             ready_by_class: vec![],
+            ..Default::default()
         };
         let text = m.render(&snap, None);
 
@@ -835,6 +1308,13 @@ mod tests {
         // bucket — that bucket is what a fault-aware retry policy acts on.
         assert!(text.contains("scheduler_task_faults_total{class=\"nccl-timeout\",disposition=\"unknown\"} 1"));
         assert!(text.contains("scheduler_task_faults_by_disposition_total{disposition=\"infrastructure\"} 2"));
+        // Every signpost gate is a series from the first scrape, hit or not.
+        // The values are process-wide and other tests hit the gates, so this
+        // asserts the series and not a count.
+        for gate in SignpostGate::ALL {
+            let prefix = format!("scheduler_signpost_hits_total{{gate=\"{}\"}} ", gate.as_str());
+            assert!(text.lines().any(|l| l.starts_with(&prefix)), "missing {prefix}: {text}");
+        }
         assert!(text.contains("scheduler_task_faults_by_disposition_total{disposition=\"application\"} 1"));
         assert!(text.contains("scheduler_task_faults_by_disposition_total{disposition=\"unknown\"} 1"));
 

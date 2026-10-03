@@ -17,7 +17,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthUser;
-use crate::routes::control;
+use crate::routes::{artifacts, control};
 use crate::state::AppState;
 
 // ── Metrics (JSON gauges from the datastore) ────────────────────────────────
@@ -120,7 +120,20 @@ pub async fn metrics_timeseries(
 
 // ── Pending approval gates ──────────────────────────────────────────────────
 
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Serialize)]
+pub struct ApprovalArtifact {
+    /// The `<task>/<name>` artifact key the workflow asked to show.
+    pub path: String,
+    /// Download URL on this API (`GET /api/runs/{run}/artifacts/{task}/{name}`).
+    pub url: String,
+    /// The gate's approval is bound to this artifact's exact bytes (`binds`).
+    pub bound: bool,
+    /// sha256 (hex) of a bound artifact right now; send it back as
+    /// `digests[path]` to approve. `null` while the artifact is missing.
+    pub sha256: Option<String>,
+}
+
+#[derive(Serialize)]
 pub struct PendingApproval {
     pub run_id: String,
     pub task_id: String,
@@ -128,17 +141,123 @@ pub struct PendingApproval {
     pub workflow_name: Option<String>,
     /// When the gate parked (task scheduled_at), oldest first.
     pub since: Option<String>,
+    /// The workflow author's note to the approver (`approval_message`).
+    pub message: Option<String>,
+    /// Artifacts to review before deciding (`approval_show`), e.g. a plan.
+    pub show: Vec<ApprovalArtifact>,
+    /// Who may decide this gate (`approvers`); empty = any authenticated user.
+    pub approvers: Vec<String>,
+    /// Whether the run's triggerer is barred from approving (`not_triggerer`).
+    pub not_triggerer: bool,
+    /// Whether the caller may approve / reject it — so the console can disable
+    /// buttons the API would answer 403 to.
+    pub can_approve: bool,
+    pub can_reject: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct PendingApprovalRow {
+    run_id: String,
+    task_id: String,
+    task_name: String,
+    workflow_name: Option<String>,
+    since: Option<String>,
+    input: Option<String>,
+    triggered_by: Option<String>,
+}
+
+/// Percent-encode one URL path segment (everything but RFC 3986 unreserved).
+fn encode_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+impl PendingApprovalRow {
+    fn into_pending(self, me: &crate::auth::SessionClaims) -> PendingApproval {
+        let authz: control::GateAuthz = self
+            .input
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let listed = dagron_core::dag::approver_permits(&authz.approvers, &me.email, &me.sub, &me.groups);
+        let is_triggerer = self.triggered_by.as_deref().is_some_and(|t| {
+            [me.email.as_str(), me.sub.as_str()]
+                .iter()
+                .any(|id| !id.is_empty() && id.eq_ignore_ascii_case(t))
+        });
+        let spec: serde_json::Value = self
+            .input
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let message = spec
+            .get("approval_message")
+            .and_then(|m| m.as_str())
+            .map(str::to_owned);
+        // Re-validate on read: `input` is data, and a URL is built from it.
+        let listed_in = |field: &'static str| {
+            spec.get(field)
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.as_str())
+                .filter(|e| dagron_core::dag::validate_approval_show(e).is_ok())
+                .map(move |e| (e, field == "binds"))
+        };
+        let mut seen = std::collections::HashSet::new();
+        let show = listed_in("binds")
+            .chain(listed_in("approval_show"))
+            .filter(|(e, _)| seen.insert(*e))
+            .filter_map(|(e, bound)| {
+                let (task, name) = e.split_once('/')?;
+                Some(ApprovalArtifact {
+                    path: e.to_string(),
+                    url: format!(
+                        "/api/runs/{}/artifacts/{}/{}",
+                        encode_segment(&self.run_id),
+                        encode_segment(task),
+                        encode_segment(name)
+                    ),
+                    bound,
+                    sha256: None,
+                })
+            })
+            .collect();
+        PendingApproval {
+            run_id: self.run_id,
+            task_id: self.task_id,
+            task_name: self.task_name,
+            workflow_name: self.workflow_name,
+            since: self.since,
+            message,
+            show,
+            can_approve: listed && !(authz.not_triggerer && is_triggerer),
+            can_reject: listed,
+            approvers: authz.approvers,
+            not_triggerer: authz.not_triggerer,
+        }
+    }
 }
 
 /// `GET /api/approvals` — every task parked in `awaiting_approval`, oldest
-/// first: the human-in-the-loop worklist behind the sidebar badge.
+/// first: the human-in-the-loop worklist behind the sidebar badge. Each entry
+/// carries the gate's `approval_message` and `approval_show` artifact links so
+/// the approver can see what they are approving.
 pub async fn list_approvals(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<PendingApproval>>, StatusCode> {
-    let rows = sqlx::query_as::<_, PendingApproval>(
+    let rows = sqlx::query_as::<_, PendingApprovalRow>(
         "SELECT t.run_id, t.id AS task_id, t.name AS task_name,
-                d.name AS workflow_name, t.scheduled_at AS since
+                d.name AS workflow_name, t.scheduled_at AS since, t.input,
+                wr.triggered_by
          FROM task_runs t
          JOIN workflow_runs wr ON wr.id = t.run_id
          LEFT JOIN workflow_definitions d ON d.id = wr.definition_id
@@ -148,7 +267,18 @@ pub async fn list_approvals(
     .fetch_all(&state.read_pool)
     .await
     .map_err(internal)?;
-    Ok(Json(rows))
+    let mut pending: Vec<PendingApproval> = rows.into_iter().map(|r| r.into_pending(&auth.0)).collect();
+    // Digests are read fresh each time: they are what an approval is checked
+    // against, so a cached one could bless a plan that has since changed.
+    for p in &mut pending {
+        for a in p.show.iter_mut().filter(|a| a.bound) {
+            if let Some((task, name)) = a.path.split_once('/') {
+                let key = dagron_artifact::ArtifactKey::new(p.run_id.as_str(), task, name);
+                a.sha256 = artifacts::artifact_sha256(&state, &key).await.ok().flatten();
+            }
+        }
+    }
+    Ok(Json(pending))
 }
 
 // ── Dead letters ────────────────────────────────────────────────────────────
@@ -279,6 +409,419 @@ fn internal_msg(err: sqlx::Error) -> (StatusCode, String) {
 }
 
 #[cfg(test)]
+mod approval_authz_tests {
+    use super::*;
+    use crate::auth::SessionClaims;
+
+    fn me(email: &str, groups: &[&str]) -> SessionClaims {
+        SessionClaims {
+            sub: format!("sub-{email}"),
+            email: email.to_string(),
+            name: String::new(),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            exp: 0,
+        }
+    }
+
+    fn row(input: &str, triggered_by: Option<&str>) -> PendingApprovalRow {
+        PendingApprovalRow {
+            run_id: "r".into(),
+            task_id: "t".into(),
+            task_name: "gate".into(),
+            workflow_name: None,
+            since: None,
+            input: Some(input.to_string()),
+            triggered_by: triggered_by.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn worklist_reports_what_the_caller_may_do() {
+        let gate = r#"{"approvers":["ops@example.com","group:release"],"not_triggerer":true}"#;
+
+        let p = row(gate, Some("dev@example.com")).into_pending(&me("ops@example.com", &[]));
+        assert!(p.can_approve && p.can_reject);
+        assert_eq!(p.approvers.len(), 2);
+        assert!(p.not_triggerer);
+
+        // Listed but started the run: may reject, may not approve.
+        let p = row(gate, Some("ops@example.com")).into_pending(&me("ops@example.com", &[]));
+        assert!(!p.can_approve && p.can_reject);
+
+        // Reaches the list through a group.
+        let p = row(gate, None).into_pending(&me("x@example.com", &["release"]));
+        assert!(p.can_approve && p.can_reject);
+
+        // Not listed: neither.
+        let p = row(gate, None).into_pending(&me("mallory@example.com", &["dev"]));
+        assert!(!p.can_approve && !p.can_reject);
+
+        // An unrestricted gate admits anyone.
+        let p = row("{}", Some("dev@example.com")).into_pending(&me("dev@example.com", &[]));
+        assert!(p.can_approve && p.can_reject && p.approvers.is_empty());
+    }
+}
+
+/// The approval gate against a real datastore: who may decide, and what is
+/// recorded. Skipped without `TEST_DATABASE_URL`.
+#[cfg(test)]
+mod approval_live_tests {
+    use super::redrive_tests::test_state;
+    use super::*;
+    use crate::auth::SessionClaims;
+
+    fn user(email: &str, groups: &[&str]) -> AuthUser {
+        AuthUser(SessionClaims {
+            sub: format!("sub-{email}"),
+            email: email.to_string(),
+            name: String::new(),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            exp: 0,
+        })
+    }
+
+    /// A parked gate on a fresh run started by `dev@example.com`; returns
+    /// `(run_id, task_id)`.
+    async fn parked_gate(state: &AppState, name: &str) -> (String, String) {
+        let yaml = format!(
+            "name: {name}\ntasks:\n  - name: gate\n    type: approval\n    approvers: [\"ops@example.com\", \"group:release\"]\n    not_triggerer: true\n    approval_message: \"Apply?\"\n    approval_show: [\"plan/plan.txt\"]\n"
+        );
+        let run_id = control::submit_yaml_as(state, &yaml, &yaml, &BTreeMap::new(), Some("dev@example.com"))
+            .await
+            .unwrap();
+        let task_id: String =
+            sqlx::query_scalar("SELECT id FROM task_runs WHERE run_id = $1 AND name = 'gate'")
+                .bind(&run_id)
+                .fetch_one(&state.write_pool)
+                .await
+                .unwrap();
+        // The engine parks it; no engine runs here.
+        sqlx::query("UPDATE task_runs SET status = 'awaiting_approval' WHERE id = $1")
+            .bind(&task_id)
+            .execute(&state.write_pool)
+            .await
+            .unwrap();
+        (run_id, task_id)
+    }
+
+    async fn decide(
+        state: &AppState,
+        who: AuthUser,
+        run: &str,
+        task: &str,
+        approve: bool,
+        comment: Option<&str>,
+    ) -> Result<control::ApprovalResponse, (StatusCode, String)> {
+        decide_with(state, who, run, task, approve, comment, &[]).await
+    }
+
+    async fn decide_with(
+        state: &AppState,
+        who: AuthUser,
+        run: &str,
+        task: &str,
+        approve: bool,
+        comment: Option<&str>,
+        digests: &[(&str, &str)],
+    ) -> Result<control::ApprovalResponse, (StatusCode, String)> {
+        let body = Some(Json(control::DecisionBody {
+            comment: comment.map(str::to_string),
+            digests: digests.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        }));
+        let path = Path((run.to_string(), task.to_string()));
+        let r = if approve {
+            control::approve_task(who, State(state.clone()), path, body).await
+        } else {
+            control::reject_task(who, State(state.clone()), path, body).await
+        };
+        r.map(|Json(v)| v)
+    }
+
+    #[tokio::test]
+    async fn only_listed_non_triggerers_may_approve() {
+        let Some(state) = test_state("approval-live").await else { return };
+        let name = format!("appr-{}", uuid::Uuid::new_v4());
+        let (run, task) = parked_gate(&state, &name).await;
+
+        // Outsider: refused, and the gate stays parked.
+        let e = decide(&state, user("mallory@example.com", &["dev"]), &run, &task, true, None)
+            .await
+            .err()
+            .expect("outsider refused");
+        assert_eq!(e.0, StatusCode::FORBIDDEN, "{e:?}");
+        let e = decide(&state, user("mallory@example.com", &[]), &run, &task, false, None)
+            .await
+            .err()
+            .expect("outsider may not reject either");
+        assert_eq!(e.0, StatusCode::FORBIDDEN);
+
+        // The triggerer is on the list by group but may not approve their own run.
+        let e = decide(&state, user("dev@example.com", &["release"]), &run, &task, true, None)
+            .await
+            .err()
+            .expect("triggerer refused");
+        assert_eq!(e.0, StatusCode::FORBIDDEN, "{e:?}");
+        assert!(e.1.contains("not_triggerer"), "{}", e.1);
+
+        // The worklist tells each of them the same thing.
+        let list = list_approvals(user("dev@example.com", &["release"]), State(state.clone()))
+            .await
+            .unwrap()
+            .0;
+        let mine = list.iter().find(|p| p.task_id == task).expect("gate listed");
+        assert_eq!(mine.message.as_deref(), Some("Apply?"));
+        assert!(!mine.can_approve && mine.can_reject);
+        assert_eq!(mine.show[0].path, "plan/plan.txt");
+
+        // A listed approver who did not start the run decides it.
+        let ok = decide(&state, user("ops@example.com", &[]), &run, &task, true, Some("plan reviewed"))
+            .await
+            .unwrap();
+        assert_eq!(ok.resolution, "approved");
+        assert_eq!(ok.decided_by, "ops@example.com");
+        let (by, why, status): (Option<String>, Option<String>, String) = sqlx::query_as(
+            "SELECT decided_by, decision_comment, status FROM task_runs WHERE id = $1",
+        )
+        .bind(&task)
+        .fetch_one(&state.write_pool)
+        .await
+        .unwrap();
+        assert_eq!(by.as_deref(), Some("ops@example.com"));
+        assert_eq!(why.as_deref(), Some("plan reviewed"));
+        assert_eq!(status, "succeeded");
+
+        // A second decision does not overwrite the first.
+        let e = decide(&state, user("ops@example.com", &[]), &run, &task, false, Some("changed my mind"))
+            .await
+            .err()
+            .expect("already decided");
+        assert_eq!(e.0, StatusCode::CONFLICT);
+    }
+
+    /// The end the checks exist for: a plan whose approval was refused (outsider,
+    /// or the person who started the run) or rejected is never applied. The
+    /// scheduler runs between decisions, as the engine would.
+    #[tokio::test]
+    async fn a_refused_or_rejected_plan_is_never_applied() {
+        use dagron_core::db;
+        let Some(state) = test_state("approval-live-4").await else { return };
+        let yaml = format!(
+            "name: guarded-{}\ntasks:\n  - name: review\n    type: approval\n    approvers: [\"ops@example.com\", \"dev@example.com\"]\n    not_triggerer: true\n  - name: apply\n    command: [\"terraform\", \"apply\"]\n    depends_on: [review]\n",
+            uuid::Uuid::new_v4()
+        );
+        let run = control::submit_yaml_as(&state, &yaml, &yaml, &BTreeMap::new(), Some("dev@example.com"))
+            .await
+            .unwrap();
+        let pool = &state.write_pool;
+        let status = |name: &'static str| {
+            let run = run.clone();
+            async move {
+                sqlx::query_scalar::<_, String>("SELECT status FROM task_runs WHERE run_id = $1 AND name = $2")
+                    .bind(&run)
+                    .bind(name)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        db::advance_ready_tasks(pool).await.unwrap();
+        assert_eq!(status("review").await, "awaiting_approval");
+        let review: String =
+            sqlx::query_scalar("SELECT id FROM task_runs WHERE run_id = $1 AND name = 'review'")
+                .bind(&run)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+
+        // Refused approvals change nothing: the gate stays parked, apply never becomes ready.
+        // dev is a listed approver, so its refusal is `not_triggerer`'s, not the list's.
+        for (who, why) in [
+            (user("dev@example.com", &[]), "not_triggerer"),
+            (user("mallory@example.com", &[]), "not among this gate's approvers"),
+        ] {
+            let e = decide(&state, who, &run, &review, true, None).await.err().expect("refused");
+            assert_eq!(e.0, StatusCode::FORBIDDEN);
+            assert!(e.1.contains(why), "{}", e.1);
+            db::advance_ready_tasks(pool).await.unwrap();
+            assert_eq!(status("review").await, "awaiting_approval");
+            assert_eq!(status("apply").await, "pending");
+        }
+
+        // A listed approver rejects: the gate fails and apply is skipped, not run.
+        let r = decide(&state, user("ops@example.com", &[]), &run, &review, false, Some("drops the database"))
+            .await
+            .unwrap();
+        assert_eq!(r.resolution, "rejected");
+        db::advance_ready_tasks(pool).await.unwrap();
+        assert_eq!(status("review").await, "failed");
+        assert_eq!(status("apply").await, "skipped");
+    }
+
+    #[tokio::test]
+    async fn triggerer_may_still_reject_and_group_members_may_approve() {
+        let Some(state) = test_state("approval-live-2").await else { return };
+        let name = format!("appr-{}", uuid::Uuid::new_v4());
+        let (run, task) = parked_gate(&state, &name).await;
+        let r = decide(&state, user("dev@example.com", &["release"]), &run, &task, false, Some("wrong stack"))
+            .await
+            .unwrap();
+        assert_eq!(r.resolution, "rejected");
+        // The decision reads in the run log: who, when, and the comment.
+        let log = |task: String| {
+            let pool = state.read_pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>("SELECT log FROM task_runs WHERE id = $1")
+                    .bind(task)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+                    .expect("a decided gate carries a log")
+            }
+        };
+        let rejected = log(task.clone()).await;
+        assert!(
+            rejected.starts_with("rejected by dev@example.com at "),
+            "{rejected}"
+        );
+        assert!(rejected.ends_with("\ncomment: wrong stack"), "{rejected}");
+
+        let (run, task) = parked_gate(&state, &format!("appr-{}", uuid::Uuid::new_v4())).await;
+        let r = decide(&state, user("lead@example.com", &["Release"]), &run, &task, true, None)
+            .await
+            .unwrap();
+        assert_eq!(r.decided_by, "lead@example.com");
+        let approved = log(task.clone()).await;
+        assert!(
+            approved.starts_with("approved by lead@example.com at "),
+            "{approved}"
+        );
+        assert!(
+            !approved.contains('\n'),
+            "no comment, no comment line: {approved}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parameters_are_validated_and_runs_are_capped_per_key() {
+        let Some(state) = test_state("param-live-1").await else { return };
+        let yaml = format!(
+            "name: deploy-{}
+max_active_runs: 1
+concurrency_key: \"{{{{ stack }}}}\"
+parameters: {{ stack: \"\" }}
+param_schema:
+  stack: {{ required: true, pattern: \"[a-z]+\" }}
+tasks:
+  - name: gate
+    type: approval
+",
+            uuid::Uuid::new_v4()
+        );
+        let with = |stack: &str| -> BTreeMap<String, String> {
+            [("stack".to_string(), stack.to_string())].into_iter().collect()
+        };
+
+        // A refused value is a 400 that names the parameter, not "invalid DAG".
+        let e = control::submit_yaml_as(&state, &yaml, &yaml, &BTreeMap::new(), None).await.unwrap_err();
+        assert_eq!((e.0, e.1.as_str()), (StatusCode::BAD_REQUEST, "parameter 'stack' is required"));
+        let e = control::submit_yaml_as(&state, &yaml, &yaml, &with("Prod!"), None).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST);
+        assert!(e.1.starts_with("parameter 'stack' must match"), "{}", e.1);
+
+        // One run per stack: a second prod run is a 429 naming the key, staging is free.
+        control::submit_yaml_as(&state, &yaml, &yaml, &with("prod"), None).await.unwrap();
+        let e = control::submit_yaml_as(&state, &yaml, &yaml, &with("prod"), None).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::TOO_MANY_REQUESTS);
+        assert!(e.1.contains("concurrency_key 'prod'"), "{}", e.1);
+        control::submit_yaml_as(&state, &yaml, &yaml, &with("staging"), None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn approval_is_pinned_to_the_reviewed_bytes() {
+        use dagron_artifact::{ArtifactKey, ArtifactStore, LocalFsStore};
+        use sha2::{Digest, Sha256};
+
+        let Some(mut state) = test_state("approval-live-3").await else { return };
+        let dir = std::env::temp_dir().join(format!("dagron-binds-{}", uuid::Uuid::new_v4()));
+        let store = std::sync::Arc::new(LocalFsStore::new(&dir));
+        state.artifact_store = Some(store.clone());
+
+        let yaml = format!(
+            "name: binds-{}
+tasks:
+  - name: gate
+    type: approval
+    binds: [\"plan/plan.tfplan\"]
+",
+            uuid::Uuid::new_v4()
+        );
+        let run = control::submit_yaml_as(&state, &yaml, &yaml, &BTreeMap::new(), Some("dev@example.com"))
+            .await
+            .unwrap();
+        let task: String =
+            sqlx::query_scalar("SELECT id FROM task_runs WHERE run_id = $1 AND name = 'gate'")
+                .bind(&run)
+                .fetch_one(&state.write_pool)
+                .await
+                .unwrap();
+        sqlx::query("UPDATE task_runs SET status = 'awaiting_approval' WHERE id = $1")
+            .bind(&task)
+            .execute(&state.write_pool)
+            .await
+            .unwrap();
+        let sha = |b: &[u8]| format!("{:x}", Sha256::digest(b));
+        let key = ArtifactKey::new(run.as_str(), "plan", "plan.tfplan");
+        let me = || user("ops@example.com", &[]);
+
+        // No plan yet: listed, but nothing to pin, and approving is refused.
+        let list = list_approvals(me(), State(state.clone())).await.unwrap().0;
+        let g = list.iter().find(|p| p.task_id == task).expect("listed");
+        assert!(g.show[0].bound && g.show[0].sha256.is_none());
+        let e = decide_with(&state, me(), &run, &task, true, None, &[("plan/plan.tfplan", "00")])
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(e.0, StatusCode::CONFLICT, "{e:?}");
+
+        // The plan the approver reviews.
+        store.put(&key, b"create 3 resources").await.unwrap();
+        let list = list_approvals(me(), State(state.clone())).await.unwrap().0;
+        let seen = list.iter().find(|p| p.task_id == task).unwrap().show[0].sha256.clone().unwrap();
+        assert_eq!(seen, sha(b"create 3 resources"));
+
+        // Approving without saying what was reviewed is refused.
+        let e = decide_with(&state, me(), &run, &task, true, None, &[]).await.err().unwrap();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST, "{e:?}");
+
+        // The plan changes after review: the old digest no longer approves it.
+        store.put(&key, b"destroy everything").await.unwrap();
+        let e = decide_with(&state, me(), &run, &task, true, None, &[("plan/plan.tfplan", &seen)])
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(e.0, StatusCode::CONFLICT, "{e:?}");
+        assert!(e.1.contains(&sha(b"destroy everything")), "{}", e.1);
+        let status: String = sqlx::query_scalar("SELECT status FROM task_runs WHERE id = $1")
+            .bind(&task)
+            .fetch_one(&state.write_pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "awaiting_approval");
+
+        // Reviewing the current bytes approves, and records what was approved.
+        let now = sha(b"destroy everything");
+        let ok = decide_with(&state, me(), &run, &task, true, None, &[("plan/plan.tfplan", &now.to_uppercase())])
+            .await
+            .unwrap();
+        assert_eq!(ok.resolution, "approved");
+        let doc = store.get(&ArtifactKey::new(run.as_str(), "gate", "approved.sha256")).await.unwrap();
+        assert_eq!(String::from_utf8(doc).unwrap(), format!("{now}  plan/plan.tfplan
+"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
 mod redrive_tests {
     use std::str::FromStr;
     use std::sync::Arc;
@@ -301,7 +844,7 @@ mod redrive_tests {
     /// has to agree with. The pool's connections carry `app` as their
     /// `application_name`, so a test can find its own backends in
     /// `pg_stat_activity`.
-    async fn test_state(app: &str) -> Option<AppState> {
+    pub(super) async fn test_state(app: &str) -> Option<AppState> {
         let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
             eprintln!("TEST_DATABASE_URL unset - skipping a live-datastore test");
             return None;

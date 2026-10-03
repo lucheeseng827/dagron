@@ -1,0 +1,80 @@
+# Terraform pull-request check: everything up to a plan, nothing that changes infrastructure.
+#
+#   fmt ─────────────────────────────┐
+#   init ─┬─▶ validate ──────────────┤
+#         ├─▶ lint (tflint) ─────────┼─▶ speculative_plan ─▶ (summary)
+#         └─▶ compliance (checkov) ──┘
+#
+# Trigger it from CI on every pull request (POST /api/runs or the MCP trigger tool) with
+# the branch checked out at `tf_dir`. There is no approval gate and no apply: the plan is
+# saved to nothing, takes no state lock (`-lock=false`), and its full text is the run log,
+# so the reviewer reads what the change would do without being able to do it.
+#
+# Standard conditions:
+#   any check fails     the run fails and the plan step never starts (it depends on all four);
+#                       fmt/lint/compliance are independent of one another, so one run shows
+#                       every problem at once instead of the first.
+#   plan errors         terraform exits 1, the run fails. Exit 2 (changes) is a success here.
+#   several PRs         `concurrency_key` is the PR, so a new push to the same PR waits for
+#                       the earlier run and different PRs run side by side.
+#   full logs           `exec 2>&1` and `-no-color`, as in the other examples.
+name: terraform_pr_check
+tags: [terraform, iac, ci]
+max_active_runs: 1
+concurrency_key: "{{ pr }}"
+run_timeout_secs: 3600
+parameters:
+  tf_dir: "./infra"
+  environment: "staging"
+  pr: "local"
+
+param_schema:
+  tf_dir:      { required: true, pattern: "[A-Za-z0-9_./-]+", description: "Directory holding the Terraform root module" }
+  environment: { required: true, enum: [dev, staging, prod], description: "Environment to plan against" }
+  pr:          { required: true, pattern: "[A-Za-z0-9_.-]+", description: "Pull request number or branch, used to serialise runs" }
+
+tasks:
+  - name: fmt
+    command: ["sh", "-c", "exec 2>&1; terraform -chdir='{{ tf_dir }}' fmt -no-color -check -recursive -diff"]
+    timeout_secs: 120
+
+  - name: init
+    command: ["sh", "-c", "exec 2>&1; terraform -chdir='{{ tf_dir }}' init -input=false -no-color"]
+    max_attempts: 2
+    retry_delay_secs: 10
+    timeout_secs: 600
+
+  - name: validate
+    depends_on: [init]
+    command: ["sh", "-c", "exec 2>&1; terraform -chdir='{{ tf_dir }}' validate -no-color"]
+    timeout_secs: 120
+
+  - name: lint
+    depends_on: [init]
+    command: ["sh", "-c", "exec 2>&1; cd '{{ tf_dir }}' && tflint --recursive --no-color"]
+    timeout_secs: 300
+
+  - name: compliance
+    depends_on: [init]
+    command: ["sh", "-c", "exec 2>&1; checkov -d '{{ tf_dir }}' --quiet --compact"]
+    timeout_secs: 600
+
+  - name: speculative_plan
+    depends_on: [fmt, validate, lint, compliance]
+    command:
+      - sh
+      - -c
+      - |
+        exec 2>&1
+        set -e
+        terraform -chdir='{{ tf_dir }}' workspace select -or-create '{{ environment }}'
+        set +e
+        terraform -chdir='{{ tf_dir }}' plan -input=false -no-color -lock=false -detailed-exitcode -var environment='{{ environment }}'
+        rc=$?
+        set -e
+        case "$rc" in
+          0) echo "RESULT: no changes" ;;
+          2) echo "RESULT: this change modifies infrastructure (see the plan above)" ;;
+          *) exit "$rc" ;;
+        esac
+    timeout_secs: 1800

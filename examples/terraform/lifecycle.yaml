@@ -1,0 +1,233 @@
+# Terraform, the whole lifecycle in one run: plan -> approve -> apply -> approve -> destroy.
+#
+#   fmt ─┐
+#   init ┼▶ validate ─▶ lint ─▶ compliance ─┐
+#                                            ▼
+#   deploy    plan ▶ changed ▶ review (human) ▶ apply ▶ done
+#   teardown  plan -destroy ▶ changed ▶ review (human) ▶ destroy ▶ done    if destroy_after == true
+#   on_failure ▶ notify
+#
+# Two calls of one `stage` template, so the plan, the review and the execute step are
+# written once and differ only in `message` and `plan_flags`. Both calls are gated: the
+# run stops twice for a human, once to apply and once to destroy. A call's tasks are
+# named `<call>.<task>` (`deploy.review`, `teardown.execute`).
+#
+# Use it to stand an environment up, prove it, and take it down again: an ephemeral
+# preview or test environment, or a dry run of the pipeline itself. The teardown plans
+# against what the deploy actually left behind, so nothing is planned for destroy until
+# the apply finished.
+#
+# The standard conditions, and where they live:
+#
+#   approve to apply        `deploy.review`: the approver reads `plan_deploy/plan.txt`,
+#                           `binds` pins the approval to those exact bytes, and
+#                           `deploy.execute` re-checks them before it applies the saved plan.
+#   approve to destroy      `teardown.review`: same shape, reading `plan_teardown/plan.txt`,
+#                           the plan made with `-destroy`. Its message says DESTROY.
+#   reject stops the run    a rejected gate fails, so the stage's `execute` and `done` are
+#                           skipped, and the teardown plans only after the deploy's `done`
+#                           succeeded: rejecting the apply means no teardown is planned. A
+#                           failed check or plan stops it the same way.
+#   keep it up              `destroy_after: "false"` removes the teardown call when the
+#                           workflow expands, so this is also a plain plan/approve/apply.
+#   nothing to change       `changed` reads a marker the plan leaves; the review and execute
+#                           are skipped, `done` still succeeds, and the run carries on (a
+#                           deploy with nothing to change is still torn down).
+#   destructive plans       the deploy plan fails if it deletes or replaces anything unless
+#                           the caller passed `allow_destroy: "true"`. The teardown exists to
+#                           delete, so its call always allows it.
+#   who may approve         `approvers` / `not_triggerer` on each review (commented out:
+#                           they are enforced by the dagron-api gateway and need your login
+#                           to carry the group). Two different groups is the usual split.
+#   nobody answers          `approval_timeout_secs` with `approval_on_timeout: reject`.
+#   one run per stack       `concurrency_key`, so a second run of the same stack waits its turn.
+#   lock contention         `-lock-timeout=5m` on plan and execute; `init` retries.
+#   tell someone            `notify_failure` posts to $NOTIFY_WEBHOOK_URL when the run fails
+#                           (it only echoes if the variable is unset).
+#   full logs               `exec 2>&1` and `-no-color` keep terraform's own ordering.
+#
+# Assumes one workspace directory shared by every task (single worker or a shared
+# volume), state in a backend that supports workspaces, a variable named `environment`
+# in the root module, and `jq` on the worker's PATH (the destroy guard reads the plan's JSON).
+name: terraform_lifecycle
+tags: [terraform, iac, destroy]
+max_active_runs: 1
+concurrency_key: "{{ tf_dir }}:{{ environment }}"
+run_timeout_secs: 43200
+parameters:
+  tf_dir: "./infra"
+  environment: "dev"
+  allow_destroy: "false"
+  destroy_after: "true"
+
+param_schema:
+  tf_dir:        { required: true, pattern: "[A-Za-z0-9_./-]+", description: "Directory holding the Terraform root module" }
+  environment:   { required: true, enum: [dev, staging, prod], description: "Environment to apply, then destroy" }
+  allow_destroy: { required: true, enum: ["true", "false"], description: "Permit an apply plan that deletes or replaces resources" }
+  destroy_after: { required: true, enum: ["true", "false"], description: "Also plan and (after approval) destroy once the apply is done" }
+
+templates:
+  # One step of the lifecycle: plan, and if it changes anything, review and execute;
+  # then `done`, which the next call waits for.
+  # `message` is what the approver is told; `plan_flags` is what makes it a teardown
+  # (`-destroy`). Name the call after the step: the approval lands in
+  # `$DAGRON_ARTIFACTS/<call>.review/`, which `execute` reads as `{{ key }}.review`.
+  - name: stage
+    parameters:
+      key: ""
+      env: ""
+      plan_flags: ""
+      message: ""
+      tf_dir: ""
+      allow_destroy: "false"
+    tasks:
+      # The default trigger rule: a stage plans only once everything before it
+      # succeeded. For the teardown, that is the deploy's `done`.
+      - name: plan
+        command:
+          - sh
+          - -c
+          - |
+            exec 2>&1
+            set -e
+            A="${DAGRON_ARTIFACTS:-/tmp/dagron-${DAGRON_RUN_ID:-demo}}/plan_{{ key }}"; mkdir -p "$A"
+            rm -f "$A/changed"
+            terraform -chdir='{{ tf_dir }}' workspace select -or-create '{{ env }}'
+            set +e
+            terraform -chdir='{{ tf_dir }}' plan {{ plan_flags }} -input=false -no-color -lock-timeout=5m -detailed-exitcode -var environment='{{ env }}' -out="$A/tfplan"
+            rc=$?
+            set -e
+            case "$rc" in
+              0) ;;
+              2)
+                terraform -chdir='{{ tf_dir }}' show -no-color "$A/tfplan" > "$A/plan.txt"
+                # Resource deletions only. `actions` also appears under `output_changes` and
+                # `resource_drift`, so counting every `"actions"` refuses a deploy that merely drops
+                # an output, or re-creates something deleted outside Terraform. A replace is
+                # ["delete","create"], so it still counts. Fail closed: `show` is captured on its own
+                # because in `show | jq` the pipeline's status is jq's, so a failed `show` would hand
+                # jq an empty stream, leave n empty, and the `[ ... ]` below would only error inside
+                # an `&&` list, where set -e does not stop the step. Held in a variable, not a file:
+                # the JSON carries sensitive values in clear and everything under $A is an artifact.
+                # `jq -e` also fails on empty input, so a missing jq or a non-JSON plan stops here too.
+                plan_json=$(terraform -chdir='{{ tf_dir }}' show -json "$A/tfplan")
+                n=$(printf '%s' "$plan_json" | jq -e '[.resource_changes[]? | select(any(.change.actions[]; . == "delete"))] | length')
+                echo "resources this plan deletes or replaces: $n"
+                if [ "$n" -gt 0 ] && [ "{{ allow_destroy }}" != "true" ]; then
+                  echo "refusing: pass allow_destroy=true to permit deletions"; exit 3
+                fi
+                touch "$A/changed" ;;
+              *) exit "$rc" ;;
+            esac
+        timeout_secs: 1800
+
+      - name: changed
+        depends_on: [plan]
+        command: [sh, -c, 'A="${DAGRON_ARTIFACTS:-/tmp/dagron-${DAGRON_RUN_ID:-demo}}/plan_{{ key }}"; if [ -f "$A/changed" ]; then echo changes; else echo no_changes; fi']
+        timeout_secs: 60
+
+      - name: review
+        type: approval
+        depends_on: [changed]
+        when: "{{ tasks.changed.output }} == changes"
+        approval_message: "{{ message }}"
+        approval_show: ["plan_{{ key }}/plan.txt"]
+        binds: ["plan_{{ key }}/tfplan", "plan_{{ key }}/plan.txt"]
+        # approvers: ["group:release"]
+        # not_triggerer: true
+        approval_timeout_secs: 14400
+        approval_on_timeout: reject
+
+      # Applies the saved plan, never a fresh one. For the teardown that plan was made
+      # with -destroy, so this same command is what deletes.
+      - name: execute
+        depends_on: [changed, review]
+        when: "{{ tasks.changed.output }} == changes"
+        command:
+          - sh
+          - -c
+          - |
+            exec 2>&1
+            set -e
+            R="${DAGRON_ARTIFACTS:-/tmp/dagron-${DAGRON_RUN_ID:-demo}}"
+            (cd "$R" && sha256sum -c "{{ key }}.review/approved.sha256")
+            terraform -chdir='{{ tf_dir }}' workspace select '{{ env }}'
+            terraform -chdir='{{ tf_dir }}' apply -input=false -no-color -lock-timeout=5m "$R/plan_{{ key }}/tfplan"
+        timeout_secs: 3600
+
+      # The stage's exit, so the next call starts after it. It runs when the plan was
+      # applied or changed nothing. It is skipped when the review was rejected
+      # (`none_failed`), or when the plan failed or never ran (`changed` then has no
+      # output, so the `when` is false). `execute` alone cannot tell these apart: it is
+      # skipped both when nothing changed and when the review was rejected. `==`, not
+      # `in [..]`: with an empty left side, `in` currently evaluates true.
+      - name: done
+        depends_on: [changed, review, execute]
+        trigger_rule: none_failed
+        when: "{{ tasks.changed.output }} == changes or {{ tasks.changed.output }} == no_changes"
+        command: [sh, -c, "echo '{{ key }}: done'"]
+        timeout_secs: 60
+
+tasks:
+  # ---- checks -------------------------------------------------------------
+  - name: fmt
+    command: ["sh", "-c", "exec 2>&1; terraform -chdir='{{ tf_dir }}' fmt -no-color -check -recursive -diff"]
+    timeout_secs: 120
+
+  - name: init
+    command: ["sh", "-c", "exec 2>&1; terraform -chdir='{{ tf_dir }}' init -input=false -no-color"]
+    max_attempts: 2
+    retry_delay_secs: 10
+    timeout_secs: 600
+
+  - name: validate
+    depends_on: [init]
+    command: ["sh", "-c", "exec 2>&1; terraform -chdir='{{ tf_dir }}' validate -no-color"]
+    timeout_secs: 120
+
+  - name: lint
+    depends_on: [init]
+    command: ["sh", "-c", "exec 2>&1; cd '{{ tf_dir }}' && tflint --recursive --no-color"]
+    timeout_secs: 300
+
+  - name: compliance
+    depends_on: [init]
+    command: ["sh", "-c", "exec 2>&1; checkov -d '{{ tf_dir }}' --quiet --compact"]
+    timeout_secs: 600
+
+  # ---- the lifecycle ------------------------------------------------------
+  - name: deploy
+    template: stage
+    depends_on: [fmt, validate, lint, compliance]
+    arguments:
+      key: deploy
+      env: "{{ environment }}"
+      message: "Review the plan below, then apply it to {{ environment }}."
+      tf_dir: "{{ tf_dir }}"
+      allow_destroy: "{{ allow_destroy }}"
+
+  - name: teardown
+    template: stage
+    depends_on: [deploy]
+    when: "{{ destroy_after }} == true"
+    arguments:
+      key: teardown
+      env: "{{ environment }}"
+      plan_flags: "-destroy"
+      message: "DESTROY: review the teardown plan below. Approving deletes these resources in {{ environment }}."
+      tf_dir: "{{ tf_dir }}"
+      allow_destroy: "true"
+
+  - name: notify_failure
+    hook: on_failure
+    allow_failure: true
+    command:
+      - sh
+      - -c
+      - |
+        msg="dagron run ${DAGRON_RUN_ID} of terraform stack {{ tf_dir }} failed"
+        echo "$msg"
+        if [ -n "$NOTIFY_WEBHOOK_URL" ]; then
+          curl -fsS -X POST -H 'content-type: application/json' -d "{\"text\":\"$msg\"}" "$NOTIFY_WEBHOOK_URL"
+        fi
+    timeout_secs: 60

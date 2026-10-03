@@ -79,6 +79,14 @@ impl Expanded {
 
 /// Expand all template calls in `spec` into a flat, leaf-only [`DagSpec`].
 pub fn expand(mut spec: DagSpec) -> Result<DagSpec> {
+    if !spec.uses.is_empty() {
+        bail!(
+            "`use: [{}]` was not resolved — template libraries are imported by dagron-api when a \
+             workflow is saved or run; this path does not resolve them. Paste the templates into \
+             this spec, or submit it through the API",
+            spec.uses.join(", ")
+        );
+    }
     // task_defaults (the DRY block): fold into every task — top level and
     // inside each template — before anything expands, so per-task overrides
     // and template parameters behave identically with or without defaults.
@@ -104,10 +112,15 @@ pub fn expand(mut spec: DagSpec) -> Result<DagSpec> {
     Ok(DagSpec {
         name: spec.name,
         parameters: BTreeMap::new(),
+        // Enforced on the raw spec before expansion (`DagSpec::check_params`);
+        // the expanded spec has no parameters left for it to describe.
+        param_schema: BTreeMap::new(),
         templates: vec![],
+        uses: vec![],
         tags: spec.tags,
         run_timeout_secs: spec.run_timeout_secs,
         max_active_runs: spec.max_active_runs,
+        concurrency_key: spec.concurrency_key.as_deref().map(|k| substitute(k, &spec.parameters)),
         // Carried through, not consumed here. The local `budget` above is the
         // operator's global anti-blowup ceiling (DAGRON_MAX_TASKS_PER_RUN); this
         // is the *author's* declared ceiling for this workflow, and it is
@@ -203,6 +216,37 @@ fn wire_hooks(tasks: &mut [TaskSpec]) -> Result<()> {
     Ok(())
 }
 
+/// Rewrite `{{ tasks.<from>.output }}` to `{{ tasks.<to>.output }}` for each
+/// entry of `renamed`, leaving every other placeholder as written.
+fn rename_output_refs(cond: &str, renamed: &BTreeMap<String, String>) -> String {
+    let mut out = String::with_capacity(cond.len());
+    let mut rest = cond;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let key = after[..end].trim();
+        match key
+            .strip_prefix("tasks.")
+            .and_then(|k| k.strip_suffix(".output"))
+            .and_then(|name| renamed.get(name))
+        {
+            Some(to) => {
+                out.push_str("{{ tasks.");
+                out.push_str(to);
+                out.push_str(".output }}");
+            }
+            None => out.push_str(&rest[start..start + 2 + end + 2]),
+        }
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Expand a list of sibling tasks, wiring their inter-dependencies.
 fn expand_list(
     tasks: &[TaskSpec],
@@ -236,6 +280,19 @@ fn expand_list(
     let mut list_roots: Vec<String> = Vec::new();
     let mut list_exits: Vec<String> = Vec::new();
 
+    // A runtime `{{ tasks.X.output }}` names X as authored in this list. Inside
+    // a template X is renamed on expansion (`<call>.X`), so point the reference
+    // at the row X became. Only a sibling that expanded to exactly one row has
+    // a single answer; at the top level the name is unchanged and this is a
+    // no-op.
+    let renamed: BTreeMap<String, String> = per
+        .iter()
+        .filter_map(|(name, e)| match e.exits.as_slice() {
+            [only] if only != name => Some((name.clone(), only.clone())),
+            _ => None,
+        })
+        .collect();
+
     for t in tasks {
         // External deps for this task = the exit nodes of each sibling it depends on.
         let mut dep_exits: Vec<String> = Vec::new();
@@ -252,6 +309,13 @@ fn expand_list(
             let mut task = task.clone();
             if rootset.contains(task.name.as_str()) {
                 task.depends_on = dep_exits.clone();
+            }
+            // Leaves authored in this list only: a call's inner tasks were
+            // rewritten against their own list, and template scope is isolated.
+            if t.template.is_none() && !renamed.is_empty() {
+                if let Some(w) = &task.when {
+                    task.when = Some(rename_output_refs(w, &renamed));
+                }
             }
             out_tasks.push(task);
         }
@@ -432,7 +496,29 @@ fn expand_one(
         //    becomes ready, so an upstream's *result* can branch the DAG.
         let mut runtime_when: Option<String> = None;
         if let Some(cond) = &task.when {
-            let resolved = substitute(cond, &inst_ctx);
+            let mut resolved = substitute(cond, &inst_ctx);
+            // In an `and` chain, the parts that name no task output are known
+            // now: a false one drops the instance, true ones fall away, and only
+            // the runtime parts are left for the engine. (An `or` anywhere keeps
+            // the whole condition for runtime; splitting it would change it.)
+            if when_refs_task_outputs(&resolved) && split_word(&resolved, "or").len() == 1 {
+                let parts = split_word(&resolved, "and");
+                if parts.len() > 1 {
+                    let mut runtime_parts = Vec::new();
+                    let mut keep = true;
+                    for part in parts {
+                        if when_refs_task_outputs(part) {
+                            runtime_parts.push(part.to_string());
+                        } else if !eval_when(part)? {
+                            keep = false;
+                        }
+                    }
+                    if !keep {
+                        continue;
+                    }
+                    resolved = runtime_parts.join(" and ");
+                }
+            }
             if when_refs_task_outputs(&resolved) {
                 if is_call {
                     bail!(
@@ -712,6 +798,11 @@ fn build_leaf(
         }),
         approval_timeout_secs: task.approval_timeout_secs,
         approval_on_timeout: task.approval_on_timeout.clone(),
+        approval_message: task.approval_message.as_ref().map(|m| substitute(m, ctx)),
+        approval_show: task.approval_show.iter().map(|s| substitute(s, ctx)).collect(),
+        binds: task.binds.iter().map(|s| substitute(s, ctx)).collect(),
+        approvers: task.approvers.iter().map(|s| substitute(s, ctx)).collect(),
+        not_triggerer: task.not_triggerer,
         max_attempts: task.max_attempts,
         retry_delay_secs: task.retry_delay_secs,
         retry_max_delay_secs: task.retry_max_delay_secs,
@@ -999,12 +1090,44 @@ fn eval_arith(expr: &str, ctx: &BTreeMap<String, String>) -> Option<String> {
     })
 }
 
-/// Evaluate a `when:` expression: `LHS OP RHS` (ops `==,!=,<=,>=,<,>`) or a bare
-/// truthy value. Numeric comparison when both sides parse as numbers, else string.
-/// Public so the engine's schedule gates reuse the identical comparison semantics
-/// as task-level `when:`.
+/// Evaluate a `when:` expression. Grammar, loosest first:
+///
+/// - `A or B` — either side (whitespace-delimited word);
+/// - `A and B` — both sides;
+/// - `X in [a, b]` / `X not in [a, b]` — membership, items optionally quoted;
+/// - `LHS OP RHS` (`== != <= >= < >`), or a bare truthy value.
+///
+/// No parentheses. Comparisons are numeric when both sides parse as numbers,
+/// else string. Public so the engine's schedule gates and `repeat.until` reuse
+/// the identical semantics as task-level `when:`.
 pub fn eval_when(expr: &str) -> Result<bool> {
     let expr = expr.trim();
+    let ors = split_word(expr, "or");
+    if ors.len() > 1 {
+        for part in ors {
+            if eval_when(part)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    let ands = split_word(expr, "and");
+    if ands.len() > 1 {
+        for part in ands {
+            if !eval_when(part)? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    if let Some(r) = eval_membership(expr) {
+        return Ok(r);
+    }
+    // `in` as a word before a list, but not a well-formed membership test: an
+    // error, never the bare-value fallback (which would read it as true).
+    if split_word(expr, "in").len() > 1 && expr.contains('[') {
+        bail!("malformed membership test in when: '{expr}' (expected `X in [a, b]`)");
+    }
     for op in ["<=", ">=", "==", "!=", "<", ">"] {
         if let Some(idx) = expr.find(op) {
             let lhs = expr[..idx].trim();
@@ -1030,6 +1153,119 @@ pub fn eval_when(expr: &str) -> Result<bool> {
     }
     // Bare value: false-y set, else truthy.
     Ok(!matches!(expr, "" | "false" | "0" | "no"))
+}
+
+/// For each byte of `expr`: is it outside quotes and `[...]`? Operators only
+/// count there, so `x in ['foo or bar']` is one membership test. A quote with
+/// no closing partner is an ordinary character (an apostrophe in substituted
+/// output, like `don't`, must not swallow the rest of the condition).
+fn top_level(expr: &str) -> Vec<bool> {
+    let bytes = expr.as_bytes();
+    let mut out = vec![true; bytes.len()];
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // A quoted token starts at a token start and ends at a token end:
+        // `it's` / `don't` in substituted output are words, and pairing their
+        // apostrophes would hide the operator between them.
+        let opens = i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'[' | b',');
+        if (b == b'\'' || b == b'"') && opens {
+            let closes_at = |j: usize| {
+                bytes[j] == b
+                    && matches!(bytes.get(j + 1), None | Some(b' ' | b'\t' | b']' | b','))
+            };
+            if let Some(close) = (i + 1..bytes.len()).find(|&j| closes_at(j)).map(|j| j - i - 1) {
+                let end = i + 1 + close;
+                out[i..=end].iter_mut().for_each(|v| *v = false);
+                i = end + 1;
+                continue;
+            }
+        }
+        out[i] = depth == 0;
+        if b == b'[' {
+            depth += 1;
+        }
+        if b == b']' {
+            depth = depth.saturating_sub(1);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Split `expr` on `word` where it stands alone between whitespace, outside
+/// quotes and brackets, trimming each part. One element (the whole
+/// expression) when `word` does not occur there.
+pub(crate) fn split_word<'a>(expr: &'a str, word: &str) -> Vec<&'a str> {
+    let bytes = expr.as_bytes();
+    let top = top_level(expr);
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while let Some(pos) = expr[i..].find(word) {
+        let at = i + pos;
+        let end = at + word.len();
+        let before = at > 0 && bytes[at - 1].is_ascii_whitespace();
+        let after = end < bytes.len() && bytes[end].is_ascii_whitespace();
+        if before && after && top[at] {
+            parts.push(expr[start..at].trim());
+            start = end;
+        }
+        i = end;
+    }
+    parts.push(expr[start..].trim());
+    parts
+}
+
+/// `X in [a, b]` / `X not in [a, b]`, or `None` when `expr` is not that shape.
+/// Items are split on commas outside quotes, and quotes around an item are
+/// dropped. An item matches numerically when both parse as numbers, else as a
+/// string.
+fn eval_membership(expr: &str) -> Option<bool> {
+    if !expr.ends_with(']') {
+        return None;
+    }
+    let top = top_level(expr);
+    let open = expr.bytes().enumerate().find(|&(i, b)| b == b'[' && top[i])?.0;
+    let head = expr[..open].trim_end();
+    let (lhs, negate) = if let Some(l) = head.strip_suffix(" not in") {
+        (l, true)
+    } else if let Some(l) = head.strip_suffix(" in") {
+        (l, false)
+    } else {
+        return None;
+    };
+    let lhs = lhs.trim();
+    let body = &expr[open + 1..expr.len() - 1];
+    let body_top = top_level(body);
+    let mut items = Vec::new();
+    let mut start = 0;
+    for (i, b) in body.bytes().enumerate() {
+        if b == b',' && body_top[i] {
+            items.push(&body[start..i]);
+            start = i + 1;
+        }
+    }
+    items.push(&body[start..]);
+    let unquote = |s: &str| {
+        let s = s.trim();
+        for q in ['"', '\''] {
+            if s.len() >= 2 && s.starts_with(q) && s.ends_with(q) {
+                return s[1..s.len() - 1].to_string();
+            }
+        }
+        s.to_string()
+    };
+    let found = items
+        .into_iter()
+        .map(unquote)
+        .filter(|s| !s.trim().is_empty())
+        .any(|item| match (lhs.parse::<f64>(), item.parse::<f64>()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => lhs == item,
+        });
+    Some(found != negate)
 }
 
 #[cfg(test)]
@@ -1087,6 +1323,19 @@ mod tests {
     }
     fn expanded(yaml: &str) -> DagSpec {
         expand(serde_yaml::from_str(yaml).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn an_unresolved_use_is_refused_with_its_cause() {
+        let spec: DagSpec = serde_yaml::from_str(
+            "name: w\nuse: [iac-library, ci/build]\ntasks:\n  - { name: a, template: stage }\n",
+        )
+        .unwrap();
+        let err = expand(spec).unwrap_err().to_string();
+        assert!(
+            err.contains("was not resolved") && err.contains("iac-library, ci/build"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1504,6 +1753,97 @@ tasks:
         assert!(eval_when("true").unwrap());
         assert!(!eval_when("false").unwrap());
         assert!(!eval_when("0").unwrap());
+    }
+
+    /// Inside a template, `tasks.check.output` means this call's `check`, which
+    /// expansion renames `<call>.check`; and a parameter-only `and` part decides
+    /// at expansion whether the task exists at all.
+    #[test]
+    fn template_runtime_when_follows_its_renamed_sibling() {
+        let yaml = "name: w
+templates:
+  - name: stage
+    parameters: { gated: \"true\" }
+    tasks:
+      - { name: check, command: [\"decide\"] }
+      - name: gate
+        type: approval
+        depends_on: [check]
+        when: \"{{ gated }} == true and {{ tasks.check.output }} == go\"
+      - name: ship
+        command: [\"ship\"]
+        depends_on: [check, gate]
+        when: \"{{ tasks.check.output }} == go\"
+tasks:
+  - { name: dev, template: stage, arguments: { gated: \"false\" } }
+  - { name: prod, template: stage, depends_on: [dev], when: \"prod in [staging, prod]\" }
+";
+        let dag = crate::dag::DagGraph::from_yaml(yaml).expect("expands and validates");
+        let by = |n: &str| dag.spec.tasks.iter().find(|t| t.name == n).cloned();
+
+        assert!(by("dev.gate").is_none(), "gated=false drops the gate at expansion");
+        let dev_ship = by("dev.ship").unwrap();
+        assert_eq!(dev_ship.depends_on, vec!["dev.check".to_string()]);
+        assert_eq!(dev_ship.when.as_deref(), Some("{{ tasks.dev.check.output }} == go"));
+
+        let gate = by("prod.gate").expect("gated by default");
+        assert_eq!(
+            gate.when.as_deref(),
+            Some("{{ tasks.prod.check.output }} == go"),
+            "the decided part falls away and the reference follows the rename"
+        );
+        assert_eq!(by("prod.check").unwrap().depends_on, vec!["dev.ship".to_string()]);
+
+        let skipped = yaml.replace("prod in [staging, prod]", "dev in [staging, prod]");
+        let dag = crate::dag::DagGraph::from_yaml(&skipped).unwrap();
+        assert!(dag.spec.tasks.iter().all(|t| !t.name.starts_with("prod.")), "a false call guard drops the stage");
+    }
+
+    #[test]
+    fn when_logic_and_membership() {
+        assert!(eval_when("staging in [staging, prod]").unwrap());
+        assert!(!eval_when("dev in [staging, prod]").unwrap());
+        assert!(eval_when("dev not in [staging, prod]").unwrap());
+        assert!(eval_when("prod in ['staging', \"prod\"]").unwrap());
+        assert!(eval_when("3 in [1.0, 3.0]").unwrap(), "numeric membership");
+        assert!(!eval_when("x in []").unwrap());
+
+        assert!(eval_when("a == a and 2 > 1").unwrap());
+        assert!(!eval_when("a == a and 2 < 1").unwrap());
+        assert!(eval_when("a == b or 2 > 1").unwrap());
+        assert!(!eval_when("a == b or 2 < 1").unwrap());
+        // `and` binds tighter than `or`: false or (true and true).
+        assert!(eval_when("a == b or c == c and 1 == 1").unwrap());
+        // true or (false and …) — the right side never matters.
+        assert!(eval_when("a == a or c == d and 1 == 1").unwrap());
+
+        // Words only split when they stand alone: `brand` and `order` are values.
+        assert!(eval_when("brand == brand").unwrap());
+        assert!(eval_when("order != org").unwrap());
+        // Existing single comparisons keep their meaning.
+        assert!(eval_when("changes == changes").unwrap());
+        assert!(eval_when("prod in [staging, prod] and changes == changes").unwrap());
+        assert!(eval_when("1 < 2 and x").is_ok());
+        assert!(eval_when("a < b and 1 == 1").is_err(), "ordering on strings still errors");
+
+        // Operators and commas inside quotes belong to the value.
+        assert!(!eval_when("x in ['foo or bar']").unwrap(), "one quoted item, not two truthy halves");
+        assert!(!eval_when("x in ['a and x']").unwrap());
+        assert!(eval_when("foo or bar in ['foo or bar']").unwrap(), "split outside the list only");
+        assert!(eval_when("a, b in ['a, b', c]").unwrap(), "a quoted comma stays inside its item");
+        assert!(!eval_when("c, d in ['a, b', c]").unwrap());
+        assert!(eval_when("don't == don't and 1 == 1").unwrap(), "a lone apostrophe does not open a quote");
+        assert!(
+            eval_when("it's == ok or won't != ok").unwrap(),
+            "apostrophes inside words do not pair up and hide the `or`"
+        );
+        assert!(
+            eval_when("'tis == no or don't == don't").unwrap(),
+            "nor does a leading apostrophe close on one inside a later word"
+        );
+        assert!(eval_when("x in ['it''s', x]").unwrap(), "a list still splits after an odd quoted item");
+        assert!(eval_when("x in [a, b").is_err(), "an unclosed list is an error, not truthy");
+        assert!(eval_when("x in [a] extra").is_err());
     }
 
     #[test]

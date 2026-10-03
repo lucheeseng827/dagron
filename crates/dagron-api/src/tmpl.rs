@@ -5,9 +5,8 @@
 //! exclusivity trips under workspace feature unification, see control.rs), so
 //! the same semantics are replicated here. Keep in sync with core:
 //! * `{{ key }}` looks up the context; unknown keys stay verbatim;
-//! * `eval_when` is one binary comparison (`<= >= == != < >`; numeric when
-//!   both sides parse as f64, string equality otherwise) or a bare truthy
-//!   value (falsy = "", "false", "0", "no");
+//! * `eval_when` delegates to core's (`and` / `or` / `in [..]`, one
+//!   comparison, or a bare truthy value);
 //! * `tasks.<name>.output` references mark a condition as runtime-evaluated.
 //!
 //! (Core's 3-token arithmetic inside placeholders is intentionally not
@@ -45,28 +44,10 @@ pub fn substitute(s: &str, ctx: &BTreeMap<String, String>) -> String {
     out
 }
 
-/// Evaluate a (substituted) condition: one binary comparison or a bare truthy
-/// value. Mirrors core `eval_when`.
+/// Evaluate a (substituted) condition with core's grammar (`and`, `or`,
+/// `in [..]`, comparisons, a bare truthy value), so the two cannot drift.
 pub fn eval_when(cond: &str) -> Result<bool, String> {
-    let cond = cond.trim();
-    for op in ["<=", ">=", "==", "!=", "<", ">"] {
-        if let Some(pos) = cond.find(op) {
-            let (lhs, rhs) = (cond[..pos].trim(), cond[pos + op.len()..].trim());
-            let (ln, rn) = (lhs.parse::<f64>(), rhs.parse::<f64>());
-            return match (op, ln, rn) {
-                ("==", Ok(l), Ok(r)) => Ok(l == r),
-                ("!=", Ok(l), Ok(r)) => Ok(l != r),
-                ("<", Ok(l), Ok(r)) => Ok(l < r),
-                (">", Ok(l), Ok(r)) => Ok(l > r),
-                ("<=", Ok(l), Ok(r)) => Ok(l <= r),
-                (">=", Ok(l), Ok(r)) => Ok(l >= r),
-                ("==", _, _) => Ok(lhs == rhs),
-                ("!=", _, _) => Ok(lhs != rhs),
-                _ => Err(format!("ordering comparison on non-numeric values in '{cond}'")),
-            };
-        }
-    }
-    Ok(!matches!(cond, "" | "false" | "0" | "no"))
+    dagron_core::expand::eval_when(cond).map_err(|e| e.to_string())
 }
 
 /// Task names referenced as `{{ tasks.<name>.output }}` — the runtime-gate form.

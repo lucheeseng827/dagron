@@ -7,11 +7,10 @@
 import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { useRouteId } from "@/lib/route-id";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import TriggerBadge from "@/components/TriggerBadge";
 import RunSpecHistory from "@/components/RunSpecHistory";
-import { useToast } from "@/components/Toasts";
-import { getRunGraph, getWorkflow, listWorkflowRuns, runWorkflow } from "@/lib/dagron-api";
+import RunWorkflowDialog from "@/components/RunWorkflowDialog";
+import { getRunGraph, getWorkflow, listWorkflowRuns } from "@/lib/dagron-api";
 import { statusColor, statusLabel } from "@/lib/adapter";
 import { errMsg } from "@/lib/err";
 import { absTime, timeAgo, duration } from "@/lib/time";
@@ -40,13 +39,10 @@ export default function WorkflowHistoryPage() {
 
 function WorkflowHistoryPageInner() {
   const id = useRouteId();
-  const router = useRouter();
-  const toast = useToast();
   const [wf, setWf] = useState<Workflow | null>(null);
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [graphs, setGraphs] = useState<Map<string, GraphResponse>>(new Map());
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
   const [page, setPage] = useState(0);
   const [hasMore, setHasMore] = useState(false);
   // run id → which definition it ran (0 = the oldest on this page), filled in
@@ -113,17 +109,8 @@ function WorkflowHistoryPageInner() {
   // Duration trend: chronological (oldest → newest) bars for this page's runs.
   const trend = useMemo(() => [...runs].reverse(), [runs]);
 
-  const onRun = async () => {
-    setBusy(true);
-    try {
-      const { run_id } = await runWorkflow(id);
-      toast("Run started");
-      router.push(`/runs/detail/?id=${run_id}`);
-    } catch (e) {
-      toast(errMsg(e), "error");
-      setBusy(false);
-    }
-  };
+  const [running, setRunning] = useState(false);
+  const onRun = () => setRunning(true);
 
   // The Spec column appears only once the grouping is known, and only when
   // there is more than one definition — a column reading "#1" on every row is
@@ -133,6 +120,7 @@ function WorkflowHistoryPageInner() {
 
   return (
     <div className="dy-page" style={{ maxWidth: 1320 }}>
+      {running && <RunWorkflowDialog workflowId={id} onClose={() => setRunning(false)} />}
       <div className="dy-pagehead">
         <div>
           <h1 className="dy-h1" style={{ marginBottom: 0 }}>
@@ -141,7 +129,7 @@ function WorkflowHistoryPageInner() {
           <p className="dy-subtitle">{wf?.description || "Run history and per-task health."}</p>
         </div>
         <div style={{ display: "flex", gap: 10 }}>
-          <button onClick={onRun} disabled={busy} className="dy-btn dy-btn-primary">
+          <button onClick={onRun} disabled={running} className="dy-btn dy-btn-primary">
             ▶ Run now
           </button>
           <Link href={`/workflows/detail/?id=${id}`} className="dy-btn">

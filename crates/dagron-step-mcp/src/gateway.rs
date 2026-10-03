@@ -1,9 +1,9 @@
 //! Streamable-HTTP transport to an MCP gateway — a hand-rolled HTTP/1.1 client.
 //!
 //! **Why not an HTTP crate.** This binary ships inside every task image, and the
-//! crate docs defend having no HTTP stack for that reason. The sibling
-//! `dagron-step-llm` does take `reqwest` + rustls, but it must reach arbitrary
-//! TLS endpoints on the public internet. This one talks to a gateway that is, by
+//! crate docs defend having no HTTP stack for that reason. A step that must
+//! reach arbitrary TLS endpoints on the public internet needs `reqwest` +
+//! rustls; this one does not. It talks to a gateway that is, by
 //! design, loopback- or cluster-local plain HTTP (MCPdef binds `127.0.0.1` by
 //! default). One request, one response, a server we control, no redirects, no
 //! cookies, no content negotiation.

@@ -275,9 +275,11 @@ async fn create_run_inner_with_floor(
             let active: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM workflow_runs wr
                  JOIN workflow_definitions d ON d.id = wr.definition_id
-                 WHERE wr.status = 'running' AND d.name = ?",
+                 WHERE wr.status = 'running' AND d.name = ?
+                   AND wr.concurrency_key IS ?",
             )
             .bind(&dag.spec.name)
+            .bind(&dag.spec.concurrency_key)
             .fetch_one(&mut *tx)
             .await?;
             if active >= max as i64 {
@@ -285,6 +287,7 @@ async fn create_run_inner_with_floor(
                     name: dag.spec.name.clone(),
                     max,
                     active,
+                    key: dag.spec.concurrency_key.clone(),
                 }));
             }
         }
@@ -308,8 +311,8 @@ async fn create_run_inner_with_floor(
     sqlx::query(
         "INSERT INTO workflow_runs
            (id, definition_id, status, created_at, deadline_at, alert_deadline_at, result_from, environment,
-            clock_confidence, clock_offset_ms, clock_source)
-         VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)",
+            clock_confidence, clock_offset_ms, clock_source, concurrency_key)
+         VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&run_id)
     .bind(&def_id)
@@ -321,6 +324,7 @@ async fn create_run_inner_with_floor(
     .bind(clock.confidence.as_str())
     .bind(clock.offset_ms)
     .bind(&clock.source)
+    .bind(&dag.spec.concurrency_key)
     .execute(&mut *tx)
     .await?;
 
@@ -1203,6 +1207,7 @@ async fn claim_ready_filtered(
                  claimed_by = ?,
                  lease_expires_at = ?,
                  attempt = attempt + 1,
+                 log = NULL,
                  version = version + 1
              WHERE id = ? AND status = 'ready' AND version = ?",
         )
@@ -1312,6 +1317,7 @@ pub async fn claim_ready_gang(
              claimed_by = ?,
              lease_expires_at = ?,
              attempt = attempt + 1,
+             log = NULL,
              version = version + 1
          WHERE gang_id = ? AND status = 'ready'
          RETURNING id, run_id, name, status,
@@ -1557,6 +1563,24 @@ pub async fn mark_task_failed(
     Ok(true)
 }
 
+/// Add a failure reason to a running task's streamed log, so a reason the
+/// engine writes to `output` is not hidden by the log the views prefer. Only
+/// when a log exists: a task with none already shows `output`, and starting a
+/// log with just the reason would hide the rest of it.
+pub async fn note_task_log(pool: &Pool, task_id: &str, fence: i64, note: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE task_runs SET log = log || ?
+         WHERE id = ? AND version = ? AND status = 'running' AND log IS NOT NULL",
+    )
+    .bind(format!("{}
+", note.trim_end()))
+    .bind(task_id)
+    .bind(fence)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Append a live-output chunk to a still-running task so the API/UI can tail it
 /// before the task exits (fast-win #17). Guarded by `version = fence AND status =
 /// 'running'`: only the current attempt writes, and a terminal row is immutable
@@ -1572,10 +1596,10 @@ pub async fn append_task_output(
     reset: bool,
 ) -> Result<()> {
     let sql = if reset {
-        "UPDATE task_runs SET output = ?
+        "UPDATE task_runs SET log = ?
          WHERE id = ? AND version = ? AND status = 'running'"
     } else {
-        "UPDATE task_runs SET output = COALESCE(output, '') || ?
+        "UPDATE task_runs SET log = COALESCE(log, '') || ?
          WHERE id = ? AND version = ? AND status = 'running'"
     };
     sqlx::query(sql)
@@ -1951,18 +1975,24 @@ pub async fn resolve_approval(
     run_id: &str,
     task_id: &str,
     approve: bool,
+    decided_by: Option<&str>,
+    comment: Option<&str>,
 ) -> Result<bool> {
     let now = chrono::Utc::now().to_rfc3339();
     let (status, output) =
         if approve { ("succeeded", "approved") } else { ("failed", "rejected") };
     let mut tx = pool.begin().await?;
     let rows = sqlx::query(
-        "UPDATE task_runs SET status = ?, finished_at = ?, output = ?
+        "UPDATE task_runs SET status = ?, finished_at = ?, output = ?,
+                decided_by = ?, decision_comment = ?, log = ?
          WHERE id = ? AND run_id = ? AND status = 'awaiting_approval'",
     )
     .bind(status)
     .bind(&now)
     .bind(output)
+    .bind(decided_by)
+    .bind(comment)
+    .bind(crate::dag::approval_log(approve, decided_by, comment, &now))
     .bind(task_id)
     .bind(run_id)
     .execute(&mut *tx)
@@ -2016,7 +2046,11 @@ pub async fn resolve_expired_approvals(pool: &Pool) -> Result<Vec<(String, bool)
             continue;
         }
         let approve = on_timeout.as_deref() == Some("approve"); // default: reject
-        if resolve_approval(pool, &run_id, &id, approve).await? {
+        let note = format!(
+            "approval_timeout_secs ({timeout}s) elapsed; defaulted to {}",
+            if approve { "approve" } else { "reject" }
+        );
+        if resolve_approval(pool, &run_id, &id, approve, Some("timeout"), Some(&note)).await? {
             resolved.push((id, approve));
         }
     }
@@ -3429,6 +3463,30 @@ pub async fn list_dataset_events(
     .await?)
 }
 
+/// The datasets one run read and wrote, for its OpenLineage event:
+/// `(waited_on, produced)`, each distinct and sorted.
+///
+/// `waited_on` is every `wait: { dataset: … }` sensor in the run, as the URI it
+/// expanded to. `produced` is every ledger row the run appended — a `produces:`
+/// entry is recorded only when its task succeeded, so a failed run lists what it
+/// did write. A workflow's `on_datasets:` are not here: they live in its spec,
+/// not in any row of the run.
+pub async fn run_dataset_io(pool: &Pool, run_id: &str) -> Result<(Vec<String>, Vec<String>)> {
+    let waited_on: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT wait_dataset FROM task_runs
+         WHERE run_id = ? AND wait_dataset IS NOT NULL ORDER BY wait_dataset",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    let produced: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT uri FROM dataset_events WHERE run_id = ? ORDER BY uri")
+            .bind(run_id)
+            .fetch_all(pool)
+            .await?;
+    Ok((waited_on, produced))
+}
+
 /// Reset a failed task to `ready` for a later retry attempt.
 ///
 /// Sets `scheduled_at` to `retry_at` (a future RFC-3339 timestamp) so that
@@ -3828,6 +3886,7 @@ pub async fn retry_task_from_ui(pool: &Pool, task_id: &str) -> Result<bool> {
              lease_expires_at = NULL,
              scheduled_at = NULL,
              output = NULL,
+             log = NULL,
              version = version + 1
          WHERE id = ? AND status IN ('failed', 'cancelled')",
     )
@@ -3912,6 +3971,7 @@ pub async fn rerun_from_failed(pool: &Pool, run_id: &str) -> Result<Option<u64>>
              claimed_by = NULL,
              lease_expires_at = NULL,
              output = NULL,
+             log = NULL,
              finished_at = NULL,
              -- The fault verdict describes why this row is *currently* failed.
              -- A row being reset to run again is not failed, so the previous
@@ -4023,7 +4083,7 @@ pub async fn clear_task_with_downstream(
          )
          UPDATE task_runs
          SET status = 'pending', attempt = 0, claimed_by = NULL, lease_expires_at = NULL,
-             output = NULL, finished_at = NULL, scheduled_at = ?, version = version + 1,
+             output = NULL, log = NULL, finished_at = NULL, scheduled_at = ?, version = version + 1,
              checkpoint_uri = NULL, checkpoint_marker = NULL,
              -- …and for the same reason a cleared deferred row drops its remote
              -- handle and takes a fresh epoch: the next submit must start a new
@@ -5662,6 +5722,31 @@ pub async fn latest_run_created_at(pool: &Pool) -> Result<Option<String>> {
     Ok(latest)
 }
 
+/// One task's log for the log views, scoped to its run: `task_runs.log`, else
+/// its `output`. `None` when no such task is in the run.
+#[cfg(feature = "ops")]
+pub async fn task_log(pool: &Pool, run_id: &str, task_id: &str) -> Result<Option<String>> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT COALESCE(log, output) FROM task_runs WHERE run_id = ? AND id = ?")
+            .bind(run_id)
+            .bind(task_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(log,)| log.unwrap_or_default()))
+}
+
+/// Each task's log for the log views: stdout and stderr as streamed
+/// (`task_runs.log`), else its `output` for rows with no streamed log.
+#[cfg(feature = "ops")]
+pub async fn task_logs(pool: &Pool, run_id: &str) -> Result<std::collections::HashMap<String, String>> {
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT id, COALESCE(log, output) FROM task_runs WHERE run_id = ?")
+            .bind(run_id)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().map(|(id, log)| (id, log.unwrap_or_default())).collect())
+}
+
 /// All task rows of a run, ordered by name. Backs `GET /runs/:id`.
 #[cfg(feature = "ops")]
 pub async fn list_tasks(pool: &Pool, run_id: &str) -> Result<Vec<TaskRun>> {
@@ -5669,7 +5754,8 @@ pub async fn list_tasks(pool: &Pool, run_id: &str) -> Result<Vec<TaskRun>> {
         "SELECT id, run_id, name, status, attempt, remaining_deps,
                 input, output, claimed_by, lease_expires_at, version,
                 scheduled_at, finished_at, pool, priority, cache_hit,
-                wake_at, wait_url, wait_dataset, sub_run_id
+                wake_at, wait_url, wait_dataset, sub_run_id,
+                decided_by, decision_comment
          FROM task_runs WHERE run_id = ? ORDER BY name",
     )
     .bind(run_id)
@@ -5813,12 +5899,76 @@ pub async fn status_counts(pool: &Pool) -> Result<crate::models::MetricsSnapshot
             .await?;
     let dead_letters: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM dead_letters").fetch_one(pool).await?;
+    // Per-workflow views. Each is bounded by something other than the size of
+    // the run history: a time window, the non-terminal task set, the parked
+    // dead letters.
+    let since = (chrono::Utc::now()
+        - chrono::TimeDelta::seconds(crate::models::RECENT_RUNS_WINDOW_SECS))
+    .to_rfc3339();
+    let recent: Vec<(String, Option<String>, String, i64)> = sqlx::query_as(
+        "SELECT wd.name, wr.environment, wr.status, COUNT(*)
+         FROM workflow_runs wr
+         JOIN workflow_definitions wd ON wd.id = wr.definition_id
+         WHERE wr.created_at >= ?
+         GROUP BY wd.name, wr.environment, wr.status",
+    )
+    .bind(&since)
+    .fetch_all(pool)
+    .await?;
+    let active_tasks: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT wd.name, tr.status, COUNT(*)
+         FROM task_runs tr
+         JOIN workflow_runs wr ON wr.id = tr.run_id
+         JOIN workflow_definitions wd ON wd.id = wr.definition_id
+         WHERE tr.status IN ('pending', 'ready', 'running', 'awaiting_approval')
+         GROUP BY wd.name, tr.status",
+    )
+    .fetch_all(pool)
+    .await?;
+    let by_source: Vec<(String, i64, Option<String>)> = sqlx::query_as(
+        "SELECT source, COUNT(*), MIN(first_seen_at) FROM dead_letters GROUP BY source",
+    )
+    .fetch_all(pool)
+    .await?;
     Ok(crate::models::MetricsSnapshot {
         runs_by_status: runs,
         tasks_by_status: tasks,
         dead_letters,
         ready_by_class: ready_backlog_by_class(pool).await?,
+        recent_runs: recent
+            .into_iter()
+            .map(|(workflow, environment, status, count)| crate::models::RecentRuns {
+                workflow,
+                environment,
+                status,
+                count,
+            })
+            .collect(),
+        active_tasks,
+        dead_letters_by_source: by_source
+            .into_iter()
+            .map(|(source, count, oldest_first_seen_at)| crate::models::DeadLetterSource {
+                source,
+                count,
+                oldest_first_seen_at,
+            })
+            .collect(),
     })
+}
+
+/// What the run-duration metrics need to know about a run that just finished:
+/// its workflow name and when it was created (RFC-3339).
+#[cfg(feature = "ops")]
+pub async fn run_metric_facts(pool: &Pool, run_id: &str) -> Result<Option<(String, String)>> {
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT wd.name, wr.created_at FROM workflow_runs wr
+         JOIN workflow_definitions wd ON wd.id = wr.definition_id
+         WHERE wr.id = ?",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
 }
 
 /// Ready backlog grouped by runner class: count + oldest `scheduled_at`. The
@@ -7332,6 +7482,96 @@ tasks:
         let _ = std::fs::remove_file(&path);
     }
 
+    /// What a run's OpenLineage event names: that run's sensors and the ledger
+    /// rows it appended, each once, and nothing another run or an external event
+    /// wrote. The read is by run, so it must use the run index, not scan.
+    #[tokio::test]
+    async fn run_dataset_io_reads_one_runs_sensors_and_outputs() {
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: mart\ntasks:\n  - { name: sense, type: wait, wait: { dataset: \"s3://raw/events\" } }\n  - { name: build, command: [\"true\"], produces: [\"ch://a/marts/daily\", \"ch://a/marts/agg\"] }\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let run = create_run(&pool, &dag, yaml).await.unwrap();
+        let other = create_run(&pool, &dag, yaml).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+        let claimed = claim_ready(&pool, "w", 10).await.unwrap();
+        let mine = |name: &str| {
+            claimed
+                .iter()
+                .find(|t| t.run_id == run && t.name == name)
+                .unwrap_or_else(|| panic!("{name} claimed"))
+                .clone()
+        };
+        let (sense, build) = (mine("sense"), mine("build"));
+        assert!(
+            park_wait_dataset(&pool, &sense.id, sense.version + 1, "s3://raw/events")
+                .await
+                .unwrap()
+        );
+        assert!(
+            mark_task_succeeded(&pool, &build.id, "w", build.version + 1, None)
+                .await
+                .unwrap()
+        );
+        let both = [
+            "ch://a/marts/daily".to_string(),
+            "ch://a/marts/agg".to_string(),
+        ];
+        record_dataset_updates(&pool, "mart", &build.id, "build", &both)
+            .await
+            .unwrap();
+        // A second update of the same dataset is one output, not two.
+        record_dataset_updates(&pool, "mart", &build.id, "build", &both[..1])
+            .await
+            .unwrap();
+
+        // Noise the read must not pick up: another run's output, and an
+        // external event, which belongs to no run.
+        let (other_build,): (String,) =
+            sqlx::query_as("SELECT id FROM task_runs WHERE run_id = ? AND name = 'build'")
+                .bind(&other)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        record_dataset_updates(
+            &pool,
+            "mart",
+            &other_build,
+            "build",
+            &["ch://a/elsewhere".to_string()],
+        )
+        .await
+        .unwrap();
+        record_external_dataset_event(&pool, "ch://a/marts/daily")
+            .await
+            .unwrap();
+
+        let (waited_on, produced) = run_dataset_io(&pool, &run).await.unwrap();
+        assert_eq!(waited_on, vec!["s3://raw/events".to_string()]);
+        assert_eq!(
+            produced,
+            vec![
+                "ch://a/marts/agg".to_string(),
+                "ch://a/marts/daily".to_string()
+            ]
+        );
+
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+            "EXPLAIN QUERY PLAN SELECT DISTINCT uri FROM dataset_events WHERE run_id = ? ORDER BY uri",
+        )
+        .bind(&run)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            plan.iter()
+                .any(|(_, _, _, detail)| detail.contains("idx_dataset_events_run_id")),
+            "the by-run read must use its index: {plan:?}"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Datasets, part 2 — trigger subscriptions and firing: sync initializes
     /// cursors at the high-water mark (registering never fires on history), a new
     /// event claims exactly one fire (CAS coalesces racers), rollback re-arms a
@@ -7714,6 +7954,47 @@ tasks:
         let _ = std::fs::remove_file(&path);
     }
 
+    /// `concurrency_key` scopes the cap: one run per key at a time, but distinct
+    /// keys admit side by side, and the refusal names the key.
+    #[tokio::test]
+    async fn concurrency_key_caps_runs_per_key() {
+        let (pool, path) = temp_pool().await;
+
+        let yaml = "name: deploy\nmax_active_runs: 1\nconcurrency_key: \"{{ stack }}\"\nparameters: { stack: \"\" }\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let with = |stack: &str| {
+            let mut p = std::collections::BTreeMap::new();
+            p.insert("stack".to_string(), stack.to_string());
+            DagGraph::from_yaml_with_params(yaml, &p).unwrap()
+        };
+
+        let prod = create_run(&pool, &with("prod"), yaml).await.unwrap();
+        // A second prod run is refused, and the error carries the key.
+        let err = create_run(&pool, &with("prod"), yaml).await.expect_err("prod is busy");
+        let cap = err.downcast_ref::<crate::models::MaxActiveRunsReached>().expect("typed refusal");
+        assert_eq!(cap.key.as_deref(), Some("prod"));
+        assert_eq!(cap.active, 1);
+        // Another stack is unaffected.
+        create_run(&pool, &with("staging"), yaml).await.expect("staging is a different key");
+
+        // The key is stored on the run, and freeing prod's slot admits prod again.
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT concurrency_key FROM workflow_runs WHERE id = ?")
+                .bind(&prod)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored.as_deref(), Some("prod"));
+        sqlx::query("UPDATE workflow_runs SET status = 'succeeded' WHERE id = ?")
+            .bind(&prod)
+            .execute(&pool)
+            .await
+            .unwrap();
+        create_run(&pool, &with("prod"), yaml).await.expect("prod slot freed");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Run-level deadline: create_run persists `deadline_at` from the spec's
     /// `run_timeout_secs`, and the sweep fails an overdue run (tasks cancelled)
     /// while leaving on-time and deadline-free runs alone. Idempotent: a second
@@ -7887,6 +8168,220 @@ tasks:
         let _ = std::fs::remove_file(&path);
     }
 
+    // ---- the IaC library's promotion chain -------------------------------------
+    //
+    // A task whose dependency failed is *skipped*, never failed, and `none_failed`
+    // reads a skip as fine. So a stage whose plan failed, whose review was
+    // rejected or whose apply failed ends with its last task skipped, which a
+    // next stage waiting on that task with `none_failed` cannot tell from "nothing
+    // to change". These tests run the shipped examples through the real scheduler.
+
+    /// How a scripted task finishes in [`drive`].
+    #[cfg(feature = "ops")]
+    enum Step {
+        Done(&'static str),
+        Fail,
+        Approve,
+        Reject,
+    }
+
+    /// The shipped `iac-library`, merged into `workflow` the way `use:` does it
+    /// (the API resolves `use:`; the engine only ever sees the merged spec).
+    #[cfg(feature = "ops")]
+    fn merged_iac(workflow: &str, only: Option<&str>) -> String {
+        let lib: serde_yaml::Value =
+            serde_yaml::from_str(include_str!("../../../../examples/iac/iac-library.yaml")).unwrap();
+        let mut templates = lib["templates"].as_sequence().unwrap().clone();
+        if let Some(name) = only {
+            templates.retain(|t| t["name"].as_str() == Some(name));
+        }
+        let mut wf: serde_yaml::Value = serde_yaml::from_str(workflow).unwrap();
+        let m = wf.as_mapping_mut().unwrap();
+        m.remove("use");
+        m.insert("templates".into(), templates.into());
+        serde_yaml::to_string(&wf).unwrap()
+    }
+
+    /// Run a run to quiescence, finishing each task the way `script` says. A task
+    /// that becomes claimable without an entry is one that should not have run,
+    /// so it panics instead of being quietly completed.
+    #[cfg(feature = "ops")]
+    async fn drive(
+        pool: &Pool,
+        run_id: &str,
+        script: &[(&str, Step)],
+    ) -> std::collections::HashMap<String, crate::models::TaskStatus> {
+        use crate::models::TaskStatus;
+        let step_of = |name: &str| script.iter().find(|(n, _)| *n == name).map(|(_, s)| s);
+        loop {
+            advance_ready_tasks(pool).await.unwrap();
+            let mut progressed = false;
+            for t in claim_ready(pool, "w", 50).await.unwrap() {
+                let ok = match step_of(&t.name) {
+                    Some(Step::Done(out)) => {
+                        mark_task_succeeded(pool, &t.id, "w", t.version + 1, Some(out.to_string())).await.unwrap()
+                    }
+                    Some(Step::Fail) => {
+                        mark_task_failed(pool, &t.id, "w", t.version + 1, Some("boom".into())).await.unwrap()
+                    }
+                    _ => panic!("task '{}' ran, but an earlier stage had not completed", t.name),
+                };
+                assert!(ok, "could not finish '{}'", t.name);
+                progressed = true;
+            }
+            for t in list_tasks(pool, run_id).await.unwrap() {
+                if t.status == TaskStatus::AwaitingApproval {
+                    let approve = match step_of(&t.name) {
+                        Some(Step::Approve) => true,
+                        Some(Step::Reject) => false,
+                        _ => panic!("gate '{}' parked, but an earlier stage had not completed", t.name),
+                    };
+                    assert!(resolve_approval(pool, run_id, &t.id, approve, Some("alice"), None).await.unwrap());
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        list_tasks(pool, run_id).await.unwrap().into_iter().map(|t| (t.name, t.status)).collect()
+    }
+
+    #[cfg(feature = "ops")]
+    async fn iac_run(workflow: &str, only: Option<&str>, promote_through: &str) -> (Pool, std::path::PathBuf, String) {
+        let (pool, path) = temp_pool().await;
+        let yaml = merged_iac(workflow, only);
+        let overrides = std::collections::BTreeMap::from([("promote_through".to_string(), promote_through.to_string())]);
+        let dag = DagGraph::from_yaml_with_params(&yaml, &overrides).expect("the merged example must validate");
+        let run_id = create_run(&pool, &dag, &yaml).await.unwrap();
+        (pool, path, run_id)
+    }
+
+    #[cfg(feature = "ops")]
+    fn tf_checks_pass() -> Vec<(&'static str, Step)> {
+        ["checks.fmt", "checks.init", "checks.validate", "checks.lint", "checks.compliance"]
+            .into_iter()
+            .map(|n| (n, Step::Done("")))
+            .collect()
+    }
+
+    #[cfg(feature = "ops")]
+    const PROMOTE_TF: &str = include_str!("../../../../examples/iac/promote_terraform.yaml");
+    #[cfg(feature = "ops")]
+    const PROMOTE_PULUMI: &str = include_str!("../../../../examples/iac/promote_pulumi.yaml");
+
+    /// dev's plan fails: nothing after it may run, and no later stage may be
+    /// left looking finished.
+    #[cfg(feature = "ops")]
+    #[tokio::test]
+    async fn iac_a_failed_plan_does_not_promote() {
+        use crate::models::TaskStatus::*;
+        let (pool, path, run_id) = iac_run(PROMOTE_TF, None, "prod").await;
+        let mut script = tf_checks_pass();
+        script.extend([("dev.plan", Step::Fail), ("notify_failure", Step::Done(""))]);
+        let st = drive(&pool, &run_id, &script).await;
+        assert_eq!(st["dev.plan"], Failed);
+        for t in ["dev.done", "staging.plan", "staging.done", "prod.plan", "prod.done"] {
+            assert_eq!(st[t], Skipped, "{t}");
+        }
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An approver rejects staging: prod must not be planned, let alone offered.
+    #[cfg(feature = "ops")]
+    #[tokio::test]
+    async fn iac_a_rejected_review_does_not_promote() {
+        use crate::models::TaskStatus::*;
+        let (pool, path, run_id) = iac_run(PROMOTE_TF, None, "prod").await;
+        let mut script = tf_checks_pass();
+        script.extend([
+            ("dev.plan", Step::Done("")),
+            ("dev.changed", Step::Done("changes")),
+            ("dev.apply", Step::Done("")),
+            ("dev.done", Step::Done("")),
+            ("staging.plan", Step::Done("")),
+            ("staging.changed", Step::Done("changes")),
+            ("staging.review", Step::Reject),
+            ("notify_failure", Step::Done("")),
+        ]);
+        let st = drive(&pool, &run_id, &script).await;
+        assert_eq!(st["staging.review"], Failed);
+        for t in ["staging.apply", "staging.done", "prod.plan", "prod.done"] {
+            assert_eq!(st[t], Skipped, "{t}");
+        }
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An apply that fails is the same: the next stage waits for it.
+    #[cfg(feature = "ops")]
+    #[tokio::test]
+    async fn iac_a_failed_apply_does_not_promote() {
+        use crate::models::TaskStatus::*;
+        let (pool, path, run_id) = iac_run(PROMOTE_TF, None, "staging").await;
+        let mut script = tf_checks_pass();
+        script.extend([
+            ("dev.plan", Step::Done("")),
+            ("dev.changed", Step::Done("changes")),
+            ("dev.apply", Step::Fail),
+            ("notify_failure", Step::Done("")),
+        ]);
+        let st = drive(&pool, &run_id, &script).await;
+        assert_eq!(st["dev.apply"], Failed);
+        for t in ["dev.done", "staging.plan", "staging.done"] {
+            assert_eq!(st[t], Skipped, "{t}");
+        }
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The other direction: a stage with nothing to change is complete, and an
+    /// approved one is too, so promotion still reaches prod.
+    #[cfg(feature = "ops")]
+    #[tokio::test]
+    async fn iac_a_stage_that_changes_nothing_still_promotes() {
+        use crate::models::TaskStatus::*;
+        let (pool, path, run_id) = iac_run(PROMOTE_TF, None, "prod").await;
+        let mut script = tf_checks_pass();
+        script.extend([
+            ("dev.plan", Step::Done("")),
+            ("dev.changed", Step::Done("no_changes")),
+            ("dev.done", Step::Done("")),
+            ("staging.plan", Step::Done("")),
+            ("staging.changed", Step::Done("changes")),
+            ("staging.review", Step::Approve),
+            ("staging.apply", Step::Done("")),
+            ("staging.done", Step::Done("")),
+            ("prod.plan", Step::Done("")),
+            ("prod.changed", Step::Done("no_changes")),
+            ("prod.done", Step::Done("")),
+        ]);
+        let st = drive(&pool, &run_id, &script).await;
+        assert_eq!(st["dev.apply"], Skipped, "nothing to apply");
+        assert_eq!(st["staging.apply"], Succeeded);
+        for t in ["dev.done", "staging.done", "prod.done"] {
+            assert_eq!(st[t], Succeeded, "{t}");
+        }
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `pulumi_stage` has the same contract.
+    #[cfg(feature = "ops")]
+    #[tokio::test]
+    async fn iac_pulumi_a_failed_plan_does_not_promote() {
+        use crate::models::TaskStatus::*;
+        let (pool, path, run_id) = iac_run(PROMOTE_PULUMI, Some("pulumi_stage"), "prod").await;
+        let st = drive(&pool, &run_id, &[("dev.plan", Step::Fail)]).await;
+        assert_eq!(st["dev.plan"], Failed);
+        for t in ["dev.done", "staging.plan", "staging.done", "prod.plan", "prod.done"] {
+            assert_eq!(st[t], Skipped, "{t}");
+        }
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Deadline alerts (#20): a still-running run past its `alert_deadline_at`
     /// gets exactly one `run.deadline_exceeded` outbox event; the run is NOT
     /// cancelled, and a second sweep is a no-op.
@@ -7975,7 +8470,7 @@ tasks:
     }
 
     /// Live-log append (#17): reset then append chunks build the running task's
-    /// output; a stale fence and a terminal row are both refused.
+    /// log; a stale fence and a terminal row are both refused.
     #[tokio::test]
     async fn append_task_output_streams_then_guards() {
         let (pool, path) = temp_pool().await;
@@ -7990,7 +8485,7 @@ tasks:
         // First chunk resets, subsequent chunks append.
         append_task_output(&pool, &task.id, fence, "hello\n", true).await.unwrap();
         append_task_output(&pool, &task.id, fence, "world\n", false).await.unwrap();
-        let out: Option<String> = sqlx::query_scalar("SELECT output FROM task_runs WHERE id = ?")
+        let out: Option<String> = sqlx::query_scalar("SELECT log FROM task_runs WHERE id = ?")
             .bind(&task.id)
             .fetch_one(&pool)
             .await
@@ -7999,7 +8494,7 @@ tasks:
 
         // A stale fence (wrong version) writes nothing.
         append_task_output(&pool, &task.id, fence + 5, "STALE\n", false).await.unwrap();
-        let out: Option<String> = sqlx::query_scalar("SELECT output FROM task_runs WHERE id = ?")
+        let out: Option<String> = sqlx::query_scalar("SELECT log FROM task_runs WHERE id = ?")
             .bind(&task.id)
             .fetch_one(&pool)
             .await
@@ -8009,14 +8504,64 @@ tasks:
         // A terminal task refuses appends (guarded on status='running').
         assert!(mark_task_succeeded(&pool, &task.id, "w", fence, Some("final".into())).await.unwrap());
         append_task_output(&pool, &task.id, fence, "LATE\n", false).await.unwrap();
-        let out: Option<String> = sqlx::query_scalar("SELECT output FROM task_runs WHERE id = ?")
+        let out: Option<String> = sqlx::query_scalar("SELECT log FROM task_runs WHERE id = ?")
             .bind(&task.id)
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(out.as_deref(), Some("final"), "terminal row is immutable to appends");
+        assert_eq!(out.as_deref(), Some("hello
+world
+"), "terminal row is immutable to appends");
+        // The streamed log and the task's value are separate columns: completion
+        // sets `output` and leaves the log as streamed.
+        let value: Option<String> = sqlx::query_scalar("SELECT output FROM task_runs WHERE id = ?")
+            .bind(&task.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(value.as_deref(), Some("final"));
 
         let _ = run_id;
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A failure reason joins a streamed log (which the log views read first), and
+    /// never starts one: a task without a log already shows its `output`.
+    #[tokio::test]
+    async fn note_task_log_appends_only_to_an_existing_log() {
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: t
+tasks:
+  - name: a
+    command: [\"true\"]
+";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        create_run(&pool, &dag, yaml).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+        let task = claim_ready(&pool, "w", 10).await.unwrap().remove(0);
+        let fence = task.version + 1;
+        let log = |pool: Pool, id: String| async move {
+            sqlx::query_scalar::<_, Option<String>>("SELECT log FROM task_runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+
+        note_task_log(&pool, &task.id, fence, "reason").await.unwrap();
+        assert_eq!(log(pool.clone(), task.id.clone()).await, None, "no log, nothing started");
+
+        append_task_output(&pool, &task.id, fence, "partial
+", true).await.unwrap();
+        note_task_log(&pool, &task.id, fence, "task timed out after 5s").await.unwrap();
+        assert_eq!(
+            log(pool.clone(), task.id.clone()).await.as_deref(),
+            Some("partial
+task timed out after 5s
+")
+        );
+
         pool.close().await;
         let _ = std::fs::remove_file(&path);
     }
@@ -8311,13 +8856,29 @@ tasks:
         assert!(claim_ready(&pool, "w", 10).await.unwrap().is_empty());
 
         // Approve → gate succeeds, deploy becomes ready.
-        assert!(resolve_approval(&pool, &run_id, &tasks["gate"].id, true).await.unwrap());
+        assert!(resolve_approval(&pool, &run_id, &tasks["gate"].id, true, Some("alice"), Some("looks good")).await.unwrap());
         advance_ready_tasks(&pool).await.unwrap();
         let tasks = by_name(&list_tasks(&pool, &run_id).await.unwrap());
         assert_eq!(tasks["gate"].status, crate::models::TaskStatus::Succeeded);
         assert_eq!(tasks["deploy"].status, crate::models::TaskStatus::Ready);
         // Re-approving an already-resolved gate is a no-op (guarded).
-        assert!(!resolve_approval(&pool, &run_id, &tasks["gate"].id, true).await.unwrap());
+        assert_eq!(tasks["gate"].decided_by.as_deref(), Some("alice"));
+        assert_eq!(tasks["gate"].decision_comment.as_deref(), Some("looks good"));
+        // The decision also lands in the gate's log, so the run's merged log shows
+        // who decided and why; `output` stays the bare verdict `when:` reads.
+        let log: Option<String> = sqlx::query_scalar("SELECT log FROM task_runs WHERE id = ?")
+            .bind(&tasks["gate"].id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let log = log.expect("a decided gate carries a log");
+        assert!(log.starts_with("approved by alice at "), "{log}");
+        assert!(log.ends_with("\ncomment: looks good"), "{log}");
+        assert_eq!(tasks["gate"].output.as_deref(), Some("approved"));
+        assert!(!resolve_approval(&pool, &run_id, &tasks["gate"].id, true, Some("mallory"), None).await.unwrap());
+        // The losing second decision must not overwrite the first.
+        let tasks = by_name(&list_tasks(&pool, &run_id).await.unwrap());
+        assert_eq!(tasks["gate"].decided_by.as_deref(), Some("alice"));
 
         pool.close().await;
         let _ = std::fs::remove_file(&path);
@@ -8342,11 +8903,32 @@ tasks:
         advance_ready_tasks(&pool).await.unwrap(); // gate (no deps) → awaiting
         let tasks = by_name(&list_tasks(&pool, &run_id).await.unwrap());
         assert_eq!(tasks["gate"].status, crate::models::TaskStatus::AwaitingApproval);
-        assert!(resolve_approval(&pool, &run_id, &tasks["gate"].id, false).await.unwrap());
+        assert!(resolve_approval(&pool, &run_id, &tasks["gate"].id, false, None, None).await.unwrap());
         advance_ready_tasks(&pool).await.unwrap();
         let tasks = by_name(&list_tasks(&pool, &run_id).await.unwrap());
         assert_eq!(tasks["gate"].status, crate::models::TaskStatus::Failed);
         assert_eq!(tasks["deploy"].status, crate::models::TaskStatus::Skipped, "all_success dependent skipped");
+        let log = |id: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>("SELECT log FROM task_runs WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+                    .expect("a decided gate carries a log")
+            }
+        };
+        // No decider on this path (the engine API has no caller identity).
+        let rejected = log(tasks["gate"].id.clone()).await;
+        assert!(
+            rejected.starts_with("rejected by unknown at "),
+            "{rejected}"
+        );
+        assert!(
+            !rejected.contains('\n'),
+            "no comment, no comment line: {rejected}"
+        );
 
         // (2) Timeout auto-resolves to the default (reject) once expired.
         let yaml2 = "name: to\ntasks:\n  - { name: gate, type: approval, approval_timeout_secs: 60 }\n";
@@ -8367,6 +8949,19 @@ tasks:
             .unwrap();
         let resolved = resolve_expired_approvals(&pool).await.unwrap();
         assert_eq!(resolved, vec![(gate2.clone(), false)], "default reject");
+        let g2 = by_name(&list_tasks(&pool, &run2).await.unwrap());
+        assert_eq!(g2["gate"].decided_by.as_deref(), Some("timeout"));
+        assert!(g2["gate"].decision_comment.as_deref().unwrap_or("").contains("60s"));
+        let timed_out = log(gate2.clone()).await;
+        assert!(
+            timed_out.starts_with("rejected by timeout at "),
+            "{timed_out}"
+        );
+        assert!(
+            timed_out
+                .ends_with("\ncomment: approval_timeout_secs (60s) elapsed; defaulted to reject"),
+            "{timed_out}"
+        );
         let st: String = sqlx::query_scalar("SELECT status FROM task_runs WHERE id = ?")
             .bind(&gate2)
             .fetch_one(&pool)
@@ -8376,6 +8971,89 @@ tasks:
 
         pool.close().await;
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// `examples/terraform/lifecycle.yaml` through the scheduler: the teardown is
+    /// planned only after the deploy applied or had nothing to apply. A rejected
+    /// apply, a failed check and a failed plan all leave the deploy's apply
+    /// skipped, and none of them may reach the teardown's DESTROY gate.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn terraform_lifecycle_example_tears_down_only_after_the_deploy() {
+        /// Run the example to a standstill: every task succeeds except `fail`,
+        /// every `*.changed` prints `changed`, every gate is approved except
+        /// `reject`. Returns the tasks that ran and the gates that asked.
+        async fn drive(fail: &str, changed: &str, reject: &str) -> (Vec<String>, Vec<String>) {
+            let yaml = include_str!("../../../../examples/terraform/lifecycle.yaml");
+            let (pool, path) = temp_pool().await;
+            let dag = DagGraph::from_yaml_with_params(yaml, &Default::default()).unwrap();
+            let run_id = create_run(&pool, &dag, yaml).await.unwrap();
+            let (mut ran, mut asked) = (Vec::new(), Vec::new());
+            for _ in 0..100 {
+                let moved = advance_ready_tasks(&pool).await.unwrap();
+                let claimed = claim_ready(&pool, "w", 50).await.unwrap();
+                for t in &claimed {
+                    ran.push(t.name.clone());
+                    if t.name == fail {
+                        mark_task_failed(&pool, &t.id, "w", t.version + 1, None)
+                            .await
+                            .unwrap();
+                    } else {
+                        let out = t.name.ends_with(".changed").then(|| changed.to_string());
+                        mark_task_succeeded(&pool, &t.id, "w", t.version + 1, out)
+                            .await
+                            .unwrap();
+                    }
+                }
+                let parked: Vec<TaskRun> = list_tasks(&pool, &run_id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter(|t| t.status == crate::models::TaskStatus::AwaitingApproval)
+                    .collect();
+                for g in &parked {
+                    asked.push(g.name.clone());
+                    let approve = g.name != reject;
+                    assert!(
+                        resolve_approval(&pool, &run_id, &g.id, approve, Some("alice"), None)
+                            .await
+                            .unwrap()
+                    );
+                }
+                if moved == 0 && claimed.is_empty() && parked.is_empty() {
+                    break;
+                }
+            }
+            pool.close().await;
+            let _ = std::fs::remove_file(&path);
+            (ran, asked)
+        }
+        let ran_teardown = |ran: &[String]| ran.iter().any(|n| n.starts_with("teardown."));
+
+        // Both approved: apply, then plan the destroy and ask again.
+        let (ran, asked) = drive("", "changes", "").await;
+        assert_eq!(asked, ["deploy.review", "teardown.review"]);
+        assert!(ran.iter().any(|n| n == "teardown.execute"), "{ran:?}");
+        // Nothing to change on the deploy: no apply gate, and the teardown still follows.
+        let (ran, asked) = drive("", "no_changes", "").await;
+        assert!(asked.is_empty(), "{asked:?}");
+        assert!(ran.iter().any(|n| n == "teardown.plan"), "{ran:?}");
+        // A rejected apply ends it: no teardown plan, no DESTROY gate.
+        let (ran, asked) = drive("", "changes", "deploy.review").await;
+        assert_eq!(asked, ["deploy.review"]);
+        assert!(!ran_teardown(&ran), "{ran:?}");
+        // So do a failed check and a failed deploy plan.
+        for fail in ["fmt", "deploy.plan"] {
+            let (ran, asked) = drive(fail, "changes", "").await;
+            assert!(
+                asked.is_empty() && !ran_teardown(&ran),
+                "{fail}: ran {ran:?}, asked {asked:?}"
+            );
+        }
+        // A rejected teardown destroys nothing.
+        let (ran, asked) = drive("", "changes", "teardown.review").await;
+        assert_eq!(asked, ["deploy.review", "teardown.review"]);
+        assert!(!ran.iter().any(|n| n == "teardown.execute"), "{ran:?}");
     }
 
     /// list_runs carries the DAG name; status_counts reflects the seeded rows.
@@ -8402,6 +9080,39 @@ tasks:
             .map(|(_, n)| *n)
             .unwrap_or(0);
         assert_eq!(pending, 2, "two pending tasks seeded");
+
+        // The per-workflow views: the seeded run is recent and unfinished, and
+        // a dead letter is grouped under the source that produced it.
+        assert_eq!(snap.recent_runs.len(), 1);
+        assert_eq!(snap.recent_runs[0].workflow, "demo");
+        assert_eq!(snap.recent_runs[0].environment, None);
+        assert_eq!(snap.recent_runs[0].status, "running");
+        assert_eq!(snap.recent_runs[0].count, 1);
+        let active: i64 = snap
+            .active_tasks
+            .iter()
+            .filter(|(workflow, _, _)| workflow == "demo")
+            .map(|(_, _, n)| *n)
+            .sum();
+        let unfinished: i64 = snap
+            .tasks_by_status
+            .iter()
+            .filter(|(s, _)| matches!(s.as_str(), "pending" | "ready" | "running" | "awaiting_approval"))
+            .map(|(_, n)| *n)
+            .sum();
+        assert_eq!(active, unfinished, "one workflow owns every unfinished task");
+        assert!(active >= 2);
+        assert!(snap.dead_letters_by_source.is_empty());
+        record_dead_letter(&pool, "not yaml", "parse error", "kafka", 5).await.unwrap();
+        let snap = status_counts(&pool).await.unwrap();
+        assert_eq!(snap.dead_letters_by_source.len(), 1);
+        assert_eq!(snap.dead_letters_by_source[0].source, "kafka");
+        assert_eq!(snap.dead_letters_by_source[0].count, 1);
+        assert!(snap.dead_letters_by_source[0].oldest_age_secs(chrono::Utc::now()) < 60);
+        let (workflow, created_at) = run_metric_facts(&pool, &run_id).await.unwrap().expect("run exists");
+        assert_eq!(workflow, "demo");
+        assert!(chrono::DateTime::parse_from_rfc3339(&created_at).is_ok(), "{created_at}");
+        assert!(run_metric_facts(&pool, "no-such-run").await.unwrap().is_none());
 
         pool.close().await;
         let _ = std::fs::remove_file(&path);
@@ -10665,7 +11376,7 @@ tasks:
              the storage of the one attempt that is already stored whole"
         );
         let live: Option<String> =
-            sqlx::query_scalar("SELECT output FROM task_runs WHERE id = ?")
+            sqlx::query_scalar("SELECT log FROM task_runs WHERE id = ?")
                 .bind(&id).fetch_one(&pool).await.unwrap();
         assert_eq!(live.as_deref(), Some("pass 3 so far"), "and the live tail is untouched");
 

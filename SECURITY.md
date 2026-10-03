@@ -14,8 +14,7 @@ coordinated disclosure window, crediting reporters who wish to be named.
 
 ## Supported Versions
 
-Until 1.0, the latest published `0.x` minor is supported. From 1.0 onward we
-support the latest minor and the previous one.
+The latest published `0.x` minor is supported.
 
 | Version | Supported |
 |---------|-----------|

@@ -124,14 +124,25 @@ pub fn knobs() -> &'static [Knob] {
             K("DAGRON_SECRETS_DIR", "—"),
             K("DAGRON_SENSITIVE_ENV_PATTERNS", "built-in patterns"),
             K("DAGRON_TASK_ACTIVE_DEADLINE_SECS", "—"),
+            // The task ServiceAccounts a workflow may name. dagron Cloud's
+            // Workspace operator sets it to the workspace's task identity,
+            // `dagron-task`, and each such engine warned of a typo until it was
+            // listed here.
+            K("DAGRON_TASK_ALLOWED_SERVICE_ACCOUNTS", "— (a task that names one is refused)"),
             K("DAGRON_TASK_AUTOMOUNT_SA_TOKEN", "— (off)"),
             K("DAGRON_TASK_DROP_ALL_CAPABILITIES", "— (off)"),
             K("DAGRON_TASK_ISOLATION_FLOOR", "— (no floor)"),
             K("DAGRON_TASK_NODE_SELECTOR", "—"),
+            // A task pod's PriorityClass and tolerations: dagron Cloud's
+            // operator sets the class on every engine of a tiered workspace,
+            // and each such engine warned of a typo until it was listed here.
+            K("DAGRON_TASK_PRIORITY_CLASS", "— (none)"),
             K("DAGRON_TASK_READ_ONLY_ROOT_FS", "— (off)"),
             K("DAGRON_TASK_RUNTIME_CLASS", "—"),
             K("DAGRON_TASK_RUN_AS_USER", "—"),
             K("DAGRON_TASK_SECCOMP_RUNTIME_DEFAULT", "— (off)"),
+            K("DAGRON_TASK_SECRET_ENV", "secret"),
+            K("DAGRON_TASK_TOLERATIONS", "— (none)"),
             KR("DATABASE_LISTEN_URL", "— (share the pool DSN)"),
             KR("DATABASE_URL", "postgres://localhost/workflow (pg builds)"),
             K("DATASET_TRIGGERS", "true"),
@@ -461,25 +472,75 @@ pub fn warn_unknown_vars() {
     if std::env::var_os("DAGRON_CONFIG_NO_WARN").is_some() {
         return;
     }
+    // `vars_os`, not `vars`: the scan must never panic a boot over some
+    // unrelated non-UTF-8 variable in the environment. A non-UTF-8 *name*
+    // cannot be one of ours (every knob name is ASCII), so it is skipped.
+    let names: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .collect();
+    for name in unknown_vars(&names) {
+        tracing::warn!(
+            var = %name,
+            "environment variable looks like a dagron knob but is not one — typo? \
+             (see docs/CONFIG.md; DAGRON_CONFIG_NO_WARN=1 silences this check)"
+        );
+    }
+}
+
+/// The names in `names` the typo scan warns about: in one of our prefix
+/// families, and neither a registered knob, a known other-component var, nor
+/// one of Kubernetes' service links.
+fn unknown_vars(names: &[String]) -> Vec<&str> {
+    let services: Vec<&str> = names
+        .iter()
+        .filter_map(|name| name.strip_suffix("_SERVICE_HOST"))
+        .collect();
     let known = |name: &str| {
         name == "DAGRON_CONFIG"
             || name == "DAGRON_CONFIG_NO_WARN"
             || knobs().iter().any(|k| k.name == name)
             || FOREIGN_PREFIXES.iter().any(|p| name.starts_with(p))
+            || services.iter().any(|s| is_service_link(name, s))
     };
-    // `vars_os`, not `vars`: the scan must never panic a boot over some
-    // unrelated non-UTF-8 variable in the environment. A non-UTF-8 *name*
-    // cannot be one of ours (every knob name is ASCII), so it is skipped.
-    for (name, _) in std::env::vars_os() {
-        let Some(name) = name.to_str() else { continue };
-        if OUR_PREFIXES.iter().any(|p| name.starts_with(p)) && !known(name) {
-            tracing::warn!(
-                var = %name,
-                "environment variable looks like a dagron knob but is not one — typo? \
-                 (see docs/CONFIG.md; DAGRON_CONFIG_NO_WARN=1 silences this check)"
-            );
-        }
+    names
+        .iter()
+        .map(String::as_str)
+        .filter(|name| OUR_PREFIXES.iter().any(|p| name.starts_with(p)) && !known(name))
+        .collect()
+}
+
+/// Is `name` one of the variables the kubelet sets in every pod for a Service
+/// in its namespace? `service` is the Service's name upper-cased, dashes as
+/// underscores, and the variables are `<service>_SERVICE_HOST`,
+/// `_SERVICE_PORT`, `_SERVICE_PORT_<port name>`, `_PORT`, and
+/// `_PORT_<number>_<protocol>` with its `_PROTO`, `_PORT` and `_ADDR`. The
+/// chart's own `dagron-engine` Service gives its engine eight
+/// `DAGRON_ENGINE_*`. The caller takes `service` only from a
+/// `<service>_SERVICE_HOST` in the same environment, which nothing but the
+/// kubelet sets, so a typo keeps its warning.
+fn is_service_link(name: &str, service: &str) -> bool {
+    let Some(rest) = name.strip_prefix(service) else {
+        return false;
+    };
+    if matches!(rest, "_SERVICE_HOST" | "_SERVICE_PORT" | "_PORT")
+        || rest.starts_with("_SERVICE_PORT_")
+    {
+        return true;
     }
+    let Some(port) = rest.strip_prefix("_PORT_") else {
+        return false;
+    };
+    let mut parts = port.split('_');
+    let number = parts
+        .next()
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    let protocol = parts
+        .next()
+        .is_some_and(|p| matches!(p, "TCP" | "UDP" | "SCTP"));
+    let field = parts
+        .next()
+        .is_none_or(|f| matches!(f, "PROTO" | "PORT" | "ADDR"));
+    number && protocol && field && parts.next().is_none()
 }
 
 /// `dagron config [--json]` — print every knob's effective value and source.
@@ -545,6 +606,16 @@ mod tests {
             "DAGRON_MAX_TASK_TIMEOUT_SECS",
             "DAGRON_SENSITIVE_ENV_PATTERNS",
             "DAGRON_REDACT_ENV",
+            // The Kubernetes executor's task ServiceAccount allow-list, and how
+            // it hands a task its secret env.
+            "DAGRON_TASK_ALLOWED_SERVICE_ACCOUNTS",
+            "DAGRON_TASK_SECRET_ENV",
+            // Its task placement: the class a tier gives every task, and the
+            // tolerations a pool's taint asks for.
+            "DAGRON_TASK_PRIORITY_CLASS",
+            "DAGRON_TASK_TOLERATIONS",
+            // The isolation floor a sandbox mode gives every task.
+            "DAGRON_TASK_ISOLATION_FLOOR",
         ] {
             assert!(
                 registered(name),
@@ -662,6 +733,68 @@ mod build_pool_warning_tests {
         assert!(
             !FOREIGN_PREFIXES.iter().any(|p| "DAGRON_BUNDLE_PUBKEYS".starts_with(p)),
             "DAGRON_BUNDLE_PUBKEYS is the engine's own and must stay in the scan"
+        );
+    }
+}
+
+#[cfg(test)]
+mod service_link_warning_tests {
+    use super::*;
+
+    fn env(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// The kubelet gives every pod its namespace's Services as variables, and
+    /// the chart's own are named `dagron-*`: its engine read eight
+    /// `DAGRON_ENGINE_*`, and the chart's Postgres seven `DAGRON_POSTGRES_*`, as
+    /// typos at every boot. A real typo beside them still warns.
+    #[test]
+    fn a_services_links_are_not_reported_as_typos() {
+        let names = env(&[
+            "DAGRON_ENGINE_SERVICE_HOST",
+            "DAGRON_ENGINE_SERVICE_PORT",
+            "DAGRON_ENGINE_SERVICE_PORT_HTTP",
+            "DAGRON_ENGINE_PORT",
+            "DAGRON_ENGINE_PORT_8080_TCP",
+            "DAGRON_ENGINE_PORT_8080_TCP_PROTO",
+            "DAGRON_ENGINE_PORT_8080_TCP_PORT",
+            "DAGRON_ENGINE_PORT_8080_TCP_ADDR",
+            "DAGRON_POSTGRES_SERVICE_HOST",
+            "DAGRON_POSTGRES_PORT_5432_TCP_ADDR",
+            "DAGRON_MAX_TASK_TIMEOUT_SECS",
+            "DAGRON_MAX_TASK_TIMEOUT_SEC",
+        ]);
+        assert_eq!(unknown_vars(&names), ["DAGRON_MAX_TASK_TIMEOUT_SEC"]);
+    }
+
+    /// A link counts only beside its Service's `_SERVICE_HOST`, which nothing
+    /// but the kubelet sets, and only in the kubelet's shapes: anything else
+    /// under the same prefix is still a typo.
+    #[test]
+    fn only_the_kubelets_shapes_beside_their_host_are_links() {
+        let names = env(&["DAGRON_ENGINE_PORT", "DAGRON_ENGINE_SERVICE_PORT"]);
+        assert_eq!(
+            unknown_vars(&names),
+            ["DAGRON_ENGINE_PORT", "DAGRON_ENGINE_SERVICE_PORT"]
+        );
+        let names = env(&[
+            "DAGRON_ENGINE_SERVICE_HOST",
+            "DAGRON_ENGINE_PORTS",
+            "DAGRON_ENGINE_PORT_HTTP",
+            "DAGRON_ENGINE_PORT_8080_TLS",
+            "DAGRON_ENGINE_PORT_8080_TCP_HOST",
+            "DAGRON_ENGINE_PORT_8080_TCP_ADDR_2",
+        ]);
+        assert_eq!(
+            unknown_vars(&names),
+            [
+                "DAGRON_ENGINE_PORTS",
+                "DAGRON_ENGINE_PORT_HTTP",
+                "DAGRON_ENGINE_PORT_8080_TLS",
+                "DAGRON_ENGINE_PORT_8080_TCP_HOST",
+                "DAGRON_ENGINE_PORT_8080_TCP_ADDR_2",
+            ]
         );
     }
 }

@@ -12,7 +12,8 @@
     "check:recipe": "node --experimental-strip-types scripts/check-recipe-vectors.mjs",
     "check:errors": "node --experimental-strip-types --no-warnings scripts/check-error-envelope.mjs",
     "check:loops": "node --experimental-strip-types --no-warnings scripts/check-loops.mjs",
-    "check:diff": "node --experimental-strip-types --no-warnings scripts/check-diff.mjs"
+    "check:diff": "node --experimental-strip-types --no-warnings scripts/check-diff.mjs",
+    "check:params": "node --experimental-strip-types --no-warnings scripts/check-params.mjs"
   },
   "dependencies": {
     "@dagrejs/dagre": "^1.1.8",

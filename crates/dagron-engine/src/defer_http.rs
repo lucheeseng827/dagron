@@ -314,13 +314,22 @@ pub(crate) fn decide(spec: &DeferHttpSpec, doc: &Value) -> Result<Verdict> {
     Ok(Verdict::Running)
 }
 
-/// Whether both predicates matched — an authoring mistake worth one log line.
+/// Whether both predicates matched on the same field — an authoring mistake
+/// worth one log line.
+///
+/// Only the same field. Predicates on two fields matching together is how a
+/// spec says "finished, and not failed" in a grammar with no `and`: `fail_when`
+/// is checked first, so `succeed_when: status.state == TERMINATED` with
+/// `fail_when: status.termination_details.code != SUCCESS` succeeds only on a
+/// finished success. Both match on every finished failure, by design, and a
+/// warning there would fire on every failed job. Two predicates reading one
+/// field and both true are a contradiction: one of them is wrong.
 pub(crate) fn predicates_overlap(spec: &DeferHttpSpec, doc: &Value) -> bool {
     let Some(f) = &spec.fail_when else { return false };
     let (Ok(fp), Ok(sp)) = (Predicate::parse(f), Predicate::parse(&spec.succeed_when)) else {
         return false;
     };
-    fp.eval(doc) && sp.eval(doc)
+    fp.path() == sp.path() && fp.eval(doc) && sp.eval(doc)
 }
 
 /// A JSON value as human-readable text for a failure reason. An object or array
@@ -487,6 +496,53 @@ mod tests {
         assert!(matches!(decide(&s, &json!({})).unwrap(), Verdict::Running));
     }
 
+    /// The Databricks example in docs/EXTERNAL_JOBS.md, against response shapes
+    /// from the Jobs API 2.2 reference (`GET /api/2.2/jobs/runs/get`, the
+    /// `status` object).
+    ///
+    /// `termination_details` appears once a run is terminating *or* terminated,
+    /// and the reference does not say its code is final before `TERMINATED`. So
+    /// success waits for `status.state == TERMINATED`. Failure reads the code,
+    /// with `!= SUCCESS` because the code has some 25 values of which one is
+    /// success: a list of failure codes leaves the rest polling until
+    /// `max_wait_secs`, which is how the example was first written. Failing
+    /// during `TERMINATING` is the cheap direction: a retry, not a dependent
+    /// advanced early.
+    #[test]
+    fn the_documented_databricks_predicates_decide_every_terminal_code() {
+        let s = spec(
+            "status.state == TERMINATED",
+            Some("status.termination_details.code != SUCCESS"),
+            Some("status.termination_details.message"),
+        );
+        for running in [
+            json!({"status": {"state": "PENDING"}}),
+            json!({"status": {"state": "QUEUED", "queue_details": {"code": "ACTIVE_RUNS_LIMIT_REACHED"}}}),
+            json!({"status": {"state": "RUNNING"}}),
+            // A success code while still terminating is not yet a success.
+            json!({"status": {"state": "TERMINATING",
+                "termination_details": {"code": "SUCCESS", "type": "SUCCESS", "message": ""}}}),
+        ] {
+            assert!(matches!(decide(&s, &running).unwrap(), Verdict::Running), "{running}");
+        }
+        let ok = json!({"status": {"state": "TERMINATED",
+            "termination_details": {"code": "SUCCESS", "type": "SUCCESS", "message": ""}}});
+        assert!(matches!(decide(&s, &ok).unwrap(), Verdict::Succeeded { .. }));
+        for state in ["TERMINATING", "TERMINATED"] {
+            for code in ["CANCELED", "DRIVER_ERROR", "MAX_CONCURRENT_RUNS_EXCEEDED", "SKIPPED", "SUCCESS_WITH_FAILURES"] {
+                let doc = json!({"status": {"state": state,
+                    "termination_details": {"code": code, "type": "CLIENT_ERROR", "message": "the vendor's reason"}}});
+                let Verdict::Failed { reason } = decide(&s, &doc).unwrap() else {
+                    panic!("{state}/{code} must fail")
+                };
+                assert!(reason.contains("the vendor's reason"), "{code}: {reason}");
+                // Two fields composing "finished and not failed" is not an
+                // authoring mistake, so a failed run must not warn about it.
+                assert!(!predicates_overlap(&s, &doc), "{state}/{code}");
+            }
+        }
+    }
+
     #[test]
     fn the_vendors_own_error_text_becomes_the_failure_reason() {
         let s = spec("state == DONE", Some("state == FAILED"), Some("status.message"));
@@ -519,6 +575,13 @@ mod tests {
         let doc = json!({"state": "FAILED"});
         assert!(predicates_overlap(&s, &doc), "this spec's predicates do overlap");
         assert!(matches!(decide(&s, &doc).unwrap(), Verdict::Failed { .. }));
+
+        // On two different fields, both matching is a composition, not a
+        // contradiction: the verdict is the same, and nothing is flagged.
+        let composed = spec("done == true", Some("ok != true"), None);
+        let doc = json!({"done": true, "ok": false});
+        assert!(!predicates_overlap(&composed, &doc));
+        assert!(matches!(decide(&composed, &doc).unwrap(), Verdict::Failed { .. }));
     }
 
     #[test]

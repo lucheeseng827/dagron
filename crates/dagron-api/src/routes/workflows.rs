@@ -14,6 +14,8 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use dagron_core::dag::ParamRule;
+
 use crate::auth::AuthUser;
 use crate::routes::control;
 use crate::state::AppState;
@@ -38,6 +40,13 @@ pub struct Workflow {
     /// row query (which doesn't select a `tags` column) maps; set from the spec.
     #[sqlx(default)]
     pub tags: Vec<String>,
+    /// The spec's `parameters:` defaults, so a caller can offer a run form
+    /// without parsing YAML.
+    #[sqlx(skip)]
+    pub parameters: BTreeMap<String, String>,
+    /// The spec's `param_schema:` (required / enum / pattern / description).
+    #[sqlx(skip)]
+    pub param_schema: BTreeMap<String, ParamRule>,
 }
 
 #[derive(Deserialize)]
@@ -121,6 +130,25 @@ fn parse_tags(yaml: &str) -> Vec<String> {
         tags: Vec<String>,
     }
     serde_yaml::from_str::<TagsOnly>(yaml).map(|t| t.tags).unwrap_or_default()
+}
+
+/// A spec's `parameters` and `param_schema`, parsed as leniently as
+/// [`parse_tags`]: empty on error or when none are declared.
+fn parse_params(yaml: &str) -> (BTreeMap<String, String>, BTreeMap<String, ParamRule>) {
+    #[derive(Deserialize)]
+    struct ParametersOnly {
+        #[serde(default)]
+        parameters: BTreeMap<String, String>,
+    }
+    #[derive(Deserialize)]
+    struct SchemaOnly {
+        #[serde(default)]
+        param_schema: BTreeMap<String, ParamRule>,
+    }
+    // Separately, so one malformed map does not also blank the other.
+    let parameters = serde_yaml::from_str::<ParametersOnly>(yaml).map(|p| p.parameters).unwrap_or_default();
+    let schema = serde_yaml::from_str::<SchemaOnly>(yaml).map(|p| p.param_schema).unwrap_or_default();
+    (parameters, schema)
 }
 
 /// `GET /api/workflows` — enriched rows (definition + schedule + run digest).
@@ -232,7 +260,26 @@ pub async fn get_workflow(
     .map_err(internal)?
     .ok_or(StatusCode::NOT_FOUND)?;
     wf.tags = parse_tags(&wf.spec);
+    (wf.parameters, wf.param_schema) = parse_params(&wf.spec);
     Ok(Json(wf))
+}
+
+/// A spec with a `use:` block is only fully checkable once its libraries are
+/// merged in: resolve them and validate the result, so a missing library, a
+/// missing template or a name clash is a 400 on save rather than at the first run.
+async fn validate_imports(
+    state: &AppState,
+    spec: &control::DagSpecInput,
+    yaml: &str,
+) -> Result<(), (StatusCode, String)> {
+    if spec.uses.is_empty() {
+        return Ok(());
+    }
+    let root: serde_yaml::Value = serde_yaml::from_str(yaml)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid YAML: {e}")))?;
+    let (_, merged) = crate::expand::resolve_template_uses(state, root, yaml).await?;
+    control::parse_and_validate(&merged)?;
+    Ok(())
 }
 
 /// `POST /api/workflows` — create. Validates the DAG (cycle/dup/unknown-dep) and
@@ -243,6 +290,7 @@ pub async fn create_workflow(
     Json(body): Json<UpsertBody>,
 ) -> Result<(StatusCode, Json<Workflow>), (StatusCode, String)> {
     let spec = control::parse_and_validate(&body.spec)?;
+    validate_imports(&state, &spec, &body.spec).await?;
     let name = body.name.unwrap_or(spec.name);
     let description = body.description.filter(|d| !d.trim().is_empty());
     let now = chrono::Utc::now().to_rfc3339();
@@ -291,10 +339,13 @@ pub async fn create_workflow(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
+    let (parameters, param_schema) = parse_params(&body.spec);
     Ok((
         StatusCode::CREATED,
         Json(Workflow {
             tags: parse_tags(&body.spec),
+            parameters,
+            param_schema,
             id,
             name,
             spec: body.spec,
@@ -403,6 +454,7 @@ pub async fn update_workflow(
 ) -> Result<Json<Workflow>, ApiErr> {
     refuse_if_managed(&state.write_pool, &id, &auth.0, q.force).await?;
     let spec = control::parse_and_validate(&body.spec)?;
+    validate_imports(&state, &spec, &body.spec).await?;
     let name = body.name.unwrap_or(spec.name);
     let description = body.description.filter(|d| !d.trim().is_empty());
     let now = chrono::Utc::now().to_rfc3339();
@@ -480,8 +532,11 @@ pub async fn update_workflow(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
+    let (parameters, param_schema) = parse_params(&body.spec);
     Ok(Json(Workflow {
         tags: parse_tags(&body.spec),
+        parameters,
+        param_schema,
         id,
         name,
         spec: body.spec,
@@ -599,7 +654,7 @@ mod run_workflow_body_tests {
 /// which is a different and much broader operation than "run this workflow",
 /// both to reason about and to authorize.
 pub async fn run_workflow(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Path(id): Path<String>,
     body: Option<Json<RunWorkflowBody>>,
@@ -630,8 +685,9 @@ pub async fn run_workflow(
     // engine's own parser and run writer — now with the caller's arguments fed
     // in as parameter overrides, so substitution happens once, in the engine.
     let params = body.map(|Json(b)| b.parameters).unwrap_or_default();
+    let triggerer = control::caller_identity(&auth.0);
     let run_id =
-        control::submit_yaml_with_params(&state, &spec_yaml, &spec_yaml, &params).await?;
+        control::submit_yaml_as(&state, &spec_yaml, &spec_yaml, &params, Some(&triggerer)).await?;
     // `201`, not `200`. This route creates a run, and every other route that
     // creates one already says so — `POST /api/runs`, `/resubmit`. The odd one
     // out was not merely inconsistent: a layer in front that counts created
@@ -748,5 +804,34 @@ mod managed_tests {
         assert!(refuse_if_managed(&pool, &managed, &who(&["admin"]), true).await.is_ok());
         assert!(refuse_if_managed(&pool, &loose, &who(&[]), false).await.is_ok());
         assert!(refuse_if_managed(&pool, &orphan, &who(&[]), false).await.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_params;
+
+    #[test]
+    fn parameters_and_schema_are_returned_for_a_run_form() {
+        let (params, schema) = parse_params(
+            "name: w\nparameters: { env: staging, dir: ./infra }\nparam_schema:\n  env: { required: true, enum: [dev, staging, prod], description: Target }\ntasks: []\n",
+        );
+        assert_eq!(params.get("env").map(String::as_str), Some("staging"));
+        assert_eq!(params.len(), 2);
+        let env = &schema["env"];
+        assert!(env.required);
+        assert_eq!(env.choices, vec!["dev", "staging", "prod"]);
+        assert_eq!(env.description.as_deref(), Some("Target"));
+        assert!(!schema.contains_key("dir"));
+
+        let (p, s) = parse_params("not: [valid");
+        assert!(p.is_empty() && s.is_empty(), "a broken spec yields an empty form, not an error");
+
+        let (p, s) = parse_params("parameters: [not, a, map]
+param_schema:
+  env: { enum: [a, b] }
+");
+        assert!(p.is_empty());
+        assert_eq!(s["env"].choices, vec!["a", "b"], "a malformed parameters map keeps the schema");
     }
 }

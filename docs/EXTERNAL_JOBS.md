@@ -32,13 +32,29 @@ tasks:
       poll_secs: 30
       max_wait_secs: 21600     # 6h ceiling on the remote job itself
       http:
-        url: "https://dbc.example.com/api/2.1/jobs/runs/get?run_id={{ handle }}"
+        url: "https://dbc.example.com/api/2.2/jobs/runs/get?run_id={{ handle }}"
         headers:
           - { name: Authorization, value_from: { secret: DATABRICKS_TOKEN } }
-        succeed_when: "state.result_state == SUCCESS"
-        fail_when:    "state.result_state in [FAILED, TIMEDOUT, CANCELED]"
-        error_from:   "state.state_message"
+        succeed_when: "status.state == TERMINATED"
+        fail_when:    "status.termination_details.code != SUCCESS"
+        error_from:   "status.termination_details.message"
 ```
+
+The Jobs API 2.2 reports a run's outcome in `status` (the older `state` object
+is deprecated). Two fields, because success and failure are known at different
+times:
+
+- **Success waits for `TERMINATED`.** `termination_details` already appears
+  while the run is `TERMINATING`, and the API reference does not say its code is
+  final before then, so a success code alone could advance dependents early.
+- **Failure reads the code**, as `!= SUCCESS`: the code has some 25 values and one
+  of them is success, so a list of failure codes that misses one
+  (`MAX_CONCURRENT_RUNS_EXCEEDED`, `SKIPPED`, …) leaves that run polling until
+  `max_wait_secs`. Failing while `TERMINATING` is the cheap direction: a retry.
+
+`fail_when` is checked first, so a terminated failure matches both and fails;
+that is the composition working, not an overlap (see the rules below). Check the
+paths against your workspace's API version; they are configuration, not code.
 
 1. The command runs as any command task does — lease, retries, `timeout_secs`,
    fault classification.
@@ -222,10 +238,13 @@ discovers it cannot read the answer.
   not written `state.result_state` yet is not a vendor reporting failure, so an
   absent path means *undecided* and the job keeps polling. The next poll costs
   seconds; a wrong verdict costs the job.
-- **`fail_when` is checked first.** If your two predicates overlap, one is wrong
-  — and the mistakes are not equally expensive. A false failure costs a retry; a
-  false success advances every dependent on a job that produced nothing. The
-  overlap is logged.
+- **`fail_when` is checked first.** If your two predicates read the same field
+  and both match, one is wrong — and the mistakes are not equally expensive. A
+  false failure costs a retry; a false success advances every dependent on a job
+  that produced nothing. That overlap is logged. Predicates on two different
+  fields matching together are not an overlap: checked failure-first, they are how
+  you say "finished, and not failed" without an `and`, as the Databricks example
+  above does.
 - **Omitting `fail_when` is legal and usually wrong.** Without it a failed job is
   not noticed as failed — it is only *bounded*, and only if something bounds it.
   With `max_wait_secs` set, the task fails that many seconds late with a timeout
@@ -350,7 +369,7 @@ defer:
 
 ```yaml
     cancel:                     # a vendor that cancels with a POST
-      url: "https://dbc.example/api/2.1/jobs/runs/cancel"
+      url: "https://dbc.example/api/2.2/jobs/runs/cancel"
       method: POST
       body: '{"run_id": {{ handle }}}'
 ```
@@ -379,8 +398,10 @@ enough.
 A registered `ExternalPoller` gets first refusal: if its `cancel` claims the
 kind, the `cancel:` block is not sent. To stop remote work in a way a single
 HTTP request cannot express, register one whose `cancel` issues the vendor's own
-calls (`CancelJobRun`, `batches.delete`, a CR delete). The seam exists for
-exactly this.
+calls: EMR Serverless `CancelJobRun`; for a Dataproc batch, `operations.cancel` on
+the batch's long-running operation (what `gcloud dataproc batches cancel` does —
+`batches.delete` refuses a batch that has not finished); a CR delete. The seam
+exists for exactly this.
 
 ## The two step binaries
 

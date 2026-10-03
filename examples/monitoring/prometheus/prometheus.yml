@@ -16,3 +16,6 @@ scrape_configs:
       - targets: ["engine:8787"]
         labels:
           service: dagron-engine
+          # What a Kubernetes ServiceMonitor adds for you: the namespace the
+          # engine runs in. The dashboards group and filter by it.
+          namespace: dagron

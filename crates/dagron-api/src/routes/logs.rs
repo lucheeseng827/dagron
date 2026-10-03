@@ -1,6 +1,7 @@
 //! Workflow + task **log read** endpoints, with an explicit, adjustable filter.
 //!
-//! Two views over the same stored text (`task_runs.output`):
+//! Two views over the same stored text: each task's log (`task_runs.log`, stdout
+//! and stderr as streamed), else its `output` for rows with no streamed log:
 //!
 //! - `GET /api/runs/{id}/logs` — the **workflow** view: every task's output in
 //!   the run merged into one attributed stream. This is the view you want when
@@ -311,7 +312,7 @@ struct TaskAttemptRow {
 /// that never started, which must sort *after* the ones that did — otherwise a
 /// run's log view opens on the tasks that produced no output.
 const RUN_TASKS_SQL: &str = "SELECT id AS task_id, name, status, attempt,
-            scheduled_at, finished_at, output
+            scheduled_at, finished_at, COALESCE(log, output) AS output
      FROM task_runs WHERE run_id = $1
      ORDER BY scheduled_at IS NULL, scheduled_at, name";
 
@@ -455,7 +456,7 @@ pub async fn get_task_logs(
 
     let row = sqlx::query_as::<_, TaskLogRow>(
         "SELECT id AS task_id, name, status, attempt,
-                scheduled_at, finished_at, output
+                scheduled_at, finished_at, COALESCE(log, output) AS output
          FROM task_runs WHERE id = $1 AND run_id = $2",
     )
     .bind(&tid)

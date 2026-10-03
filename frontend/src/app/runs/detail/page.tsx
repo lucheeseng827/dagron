@@ -471,6 +471,8 @@ function RunPageInner() {
           pool={selectedTask?.pool}
           priority={selectedTask?.priority}
           cacheHit={selectedTask?.cache_hit}
+          decidedBy={selectedTask?.decided_by}
+          decisionComment={selectedTask?.decision_comment}
           filter={filter}
           onFilterChange={setFilter}
           actions={(logs) => (

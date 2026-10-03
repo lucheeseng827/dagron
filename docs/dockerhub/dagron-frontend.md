@@ -11,7 +11,7 @@
 > since the proxy this image ran buffered `text/event-stream` and never opened it.
 >
 > **This image is no longer published.** The plan was to keep publishing it
-> until 1.0.0 so a pinned tag would not vanish underneath anyone, but the same
+> until its removal so a pinned tag would not vanish underneath anyone, but the same
 > change that moved the console made the image unbuildable: the console now
 > builds with `output: "export"`, which emits `out/` and never the
 > `.next/standalone` this image ran. Nor would repointing it help — the console

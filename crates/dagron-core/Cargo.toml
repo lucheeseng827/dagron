@@ -62,3 +62,5 @@ uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 # statvfs for the SQLite free-disk admission floor (DAGRON_MIN_FREE_BYTES).
 libc = "0.2"
+# Whole-value matching for `param_schema` patterns (linear-time engine).
+regex = "1"

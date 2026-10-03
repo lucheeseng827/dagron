@@ -62,6 +62,22 @@ GET  /datasets/events?uri=...   → the update trail: who updated what, when
 That trail is the cross-workflow update tracking: producer runs on one
 workflow, consumers on others, one ledger connecting them.
 
+**The same edges reach an OpenLineage backend** (Marquez and the like) when
+`OPENLINEAGE_URL` is set. Each finished run's `COMPLETE` / `FAIL` event lists
+its datasets:
+
+- `inputs`: the workflow's `on_datasets:` and the run's `wait: { dataset: … }`
+  sensors, as the URIs they expanded to;
+- `outputs`: the `produces:` entries the ledger recorded for the run. A
+  failed run lists what its succeeded tasks did write.
+
+A URI is named the way OpenLineage expects: `scheme://authority` is the dataset
+namespace and the path is its name, so `clickhouse://analytics/marts/daily` is
+`marts/daily` in `clickhouse://analytics`. A URI with no path is named whole,
+and a name with no scheme sits in `OPENLINEAGE_NAMESPACE`. The edges attach to
+the job, which is the workflow, so the graph is workflow to dataset to workflow,
+not task-level.
+
 ### 2. `wait: { dataset: … }` — the dataset sensor
 
 ```yaml
@@ -139,6 +155,7 @@ job finishes.
 | Capability | This build |
 |---|---|
 | `produces:` recording, registry + lineage ledger and their read APIs | full |
+| Run inputs and outputs on OpenLineage events (`OPENLINEAGE_URL`) | full, at workflow granularity |
 | `wait: { dataset: … }` sensor | full |
 | Dataset-triggered workflows | full — any number of datasets |
 | Multi-dataset composition (`on_datasets: [a, b, …]` + `datasets_mode: any\|all`) | full (open since 0.10.0) |

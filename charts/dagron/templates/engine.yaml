@@ -61,10 +61,12 @@ spec:
         app.kubernetes.io/component: engine
     spec:
       serviceAccountName: {{ include "dagron.fullname" . }}-engine
+      # The image's user (Dockerfile: USER 65532:65532, distroless's nonroot),
+      # who owns the /workflows the engine seeds on first start.
       securityContext:
         runAsNonRoot: true
-        runAsUser: 10001
-        fsGroup: 10001
+        runAsUser: 65532
+        fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       {{- with .Values.imagePullSecrets }}
@@ -82,6 +84,9 @@ spec:
       {{- with .Values.engine.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.engine.priorityClassName }}
+      priorityClassName: {{ . | quote }}
       {{- end }}
       containers:
         - name: engine
@@ -143,6 +148,10 @@ spec:
               value: {{ .Values.engine.maxInflightRuns | quote }}
             - name: RUST_LOG
               value: {{ .Values.engine.rustLog | quote }}
+            {{- with .Values.engine.taskPriorityClassName }}
+            - name: DAGRON_TASK_PRIORITY_CLASS
+              value: {{ . | quote }}
+            {{- end }}
             {{- if eq (include "dagron.envSecretsEnabled" .) "true" }}
             # Decrypts environment secrets at task dispatch (dagron-api holds
             # the same key to encrypt them on write).

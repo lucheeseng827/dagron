@@ -81,13 +81,15 @@ Ready-made scripts and a restore rehearsal you can run in minutes:
 - **Liveness:** `GET /healthz` on both the engine ops API and `dagron-api`
   (no auth, no DB on the latter).
 - **Metrics:** Prometheus text on the **engine** at `GET <API_ADDR>/metrics`
-  — task counters (dispatched/succeeded/failed/retried), the reconcile-tick
-  latency histogram, and live DB gauges (all `scheduler_*`). `dagron-api`
-  re-surfaces JSON counts at `GET /api/metrics` for the UI.
-- **Dashboard:** a ready-to-run Prometheus + Grafana stack with a bundled
-  dashboard is in [`examples/monitoring/`](../examples/monitoring/) — scrapes the
-  engine and renders throughput, run/task state, latency percentiles, backlog,
-  and DB-pool saturation.
+  — task counters (dispatched/succeeded/failed/retried), latency histograms,
+  per-workflow run counts and run time, live DB gauges (all `scheduler_*`) and
+  the engine's own CPU and memory (`process_*`). `dagron-api` re-surfaces JSON
+  counts at `GET /api/metrics` for the UI. Every series is documented in the
+  [metrics guide](METRICS.md).
+- **Dashboards:** a ready-to-run Prometheus + Grafana stack with eight bundled
+  dashboards is in [`examples/monitoring/`](../examples/monitoring/): overview,
+  workflows by namespace, workflow statistics, run time, jobs, dead letters,
+  instance metrics, and health and latency.
 - **Alert on:** failed runs trending up; `dead_letters` count > 0 and growing
   (submissions being rejected — redrive or fix them); reconcile-tick histogram
   upper buckets filling (a pegged tick shows up under load); Postgres

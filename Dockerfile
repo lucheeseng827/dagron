@@ -46,9 +46,14 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then \
         cp /app/target/release/dagron /dagron; \
     fi
 
-# An empty, non-root-owned /workflows to COPY into the shell-less runtime (we
-# can't `mkdir`/`chown` there). The binary seeds it from the examples on start.
-RUN mkdir -p /seed/workflows && chown -R 65532:65532 /seed
+# Empty, non-root-owned /workflows and /artifacts to COPY into the shell-less runtime
+# (we can't `mkdir`/`chown` there). The binary seeds /workflows from the examples on
+# start. /artifacts is the run artifact store (DAGRON_ARTIFACT_DIR): a named volume
+# mounted over a path the image lacks is created root-owned, the engine runs as 65532,
+# and it then silently skips DAGRON_ARTIFACTS ("could not prepare artifact dir"), which
+# an approval gate's `binds` needs. A volume first mounted over a directory the image
+# ships inherits that directory's owner.
+RUN mkdir -p /seed/workflows /seed/artifacts && chown -R 65532:65532 /seed
 
 # ── Local-dev runtime: debian-slim. Has coreutils + /bin/sh, so example tasks
 # whose command is `echo`/`sh -c ...` actually resolve (the distroless prod image
@@ -58,7 +63,7 @@ RUN apt-get update -q && apt-get install -y -q --no-install-recommends ca-certif
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /dagron /usr/local/bin/dagron
 COPY examples/ /etc/dagron/examples/
-RUN mkdir -p /workflows && chown -R 65532:65532 /workflows
+RUN mkdir -p /workflows /artifacts && chown -R 65532:65532 /workflows /artifacts
 VOLUME /workflows
 # Run as the same nonroot uid as the distroless prod image — good habit even in dev.
 USER 65532:65532
@@ -77,6 +82,8 @@ COPY --from=builder /dagron /usr/local/bin/dagron
 COPY examples/ /etc/dagron/examples/
 # Pre-created, nonroot-owned GitOps volume mount point (distroless can't mkdir).
 COPY --from=builder --chown=65532:65532 /seed/workflows /workflows
+# Same for the artifact store, so a volume mounted at /artifacts is writable.
+COPY --from=builder --chown=65532:65532 /seed/artifacts /artifacts
 
 # /workflows is the GitOps-managed volume mount point. Override the path with the
 # WORKFLOW_DIR env var (the binary seeds it from /etc/dagron/examples when empty).

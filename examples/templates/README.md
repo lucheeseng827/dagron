@@ -16,6 +16,11 @@ patterns that change the *shape* of the graph (fan-out, recursion, conditionals)
 are YAML-only there: the canvas draws one node per task and cannot honestly draw
 a task that becomes N.
 
+Templates declared in a spec are reused *within* that spec. To share them across
+workflows, save a workflow that declares `templates:` as a **library** and import
+it with `use: [library]` — see [`../iac/`](../iac/README.md), which does this for
+Terraform, OpenTofu and Pulumi.
+
 Templates are **DAG** reuse, not **code** reuse: they dedupe steps and
 parameterize them with `arguments:`. If what you actually want is to stop
 inlining a long shell script, that is a different question —
@@ -54,7 +59,15 @@ A task is **either** a leaf (`command:`) **or** a call (`template:`) — exactly
 - `{{ item }}`, `{{ item.key }}`, `{{ index }}` — fan-out bindings.
 - `{{ a OP b }}` — minimal arithmetic (`+ - * / %`, whitespace-separated), e.g.
   `{{ n - 1 }}`. This is what lets a recursive template decrement and terminate.
-- `when:` — `LHS OP RHS` (`== != < > <= >=`) or a bare truthy value.
+- `when:` — `LHS OP RHS` (`== != < > <= >=`), `X in [a, b]` / `X not in [a, b]`,
+  combined with `and` / `or` (`and` binds tighter; no parentheses), or a bare
+  truthy value. `and` / `or` / `in` are operators only as whole words, so a value
+  like `brand` or `order` is unaffected.
+- Inside a template, a runtime `{{ tasks.X.output }}` means this call's own `X`
+  (renamed `<call>.X` on expansion; the reference follows it). In an `and` chain,
+  parts that use only parameters are decided at expansion: a false one removes the
+  task, and only the `tasks.*.output` parts are left for runtime. A condition with
+  `or` stays whole.
 
 ### Scope
 Template scope is **isolated**: inside a template only its own `parameters`

@@ -585,6 +585,80 @@ async fn task_finished(metrics: &Metrics, seams: &Seams, success: bool) {
     seams.meter.on_task_completed(success).await;
 }
 
+/// The datasets a finished run read and wrote, for its OpenLineage event.
+///
+/// Inputs are the workflow's `on_datasets:` (from its spec) and the run's
+/// `wait: { dataset: … }` sensors; outputs are the `produces:` entries the
+/// ledger recorded for the run. Best-effort, like the emit it feeds: a failed
+/// read leaves that side empty and logs, and never holds up finalization.
+async fn run_lineage_datasets(pool: &db::Pool, run_id: &str) -> dagron_lineage::RunDatasets {
+    let mut inputs = match db::spec_for_run(pool, run_id).await {
+        Ok(Some(spec)) => dag::dataset_subscriptions(&spec)
+            .map(|(uris, _)| uris)
+            .unwrap_or_default(),
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            warn!(error = %e, %run_id, "OpenLineage: could not read the run's spec");
+            Vec::new()
+        }
+    };
+    let outputs = match db::run_dataset_io(pool, run_id).await {
+        Ok((waited_on, produced)) => {
+            inputs.extend(waited_on);
+            produced
+        }
+        Err(e) => {
+            warn!(error = %e, %run_id, "OpenLineage: could not read the run's datasets");
+            Vec::new()
+        }
+    };
+    inputs.sort();
+    inputs.dedup();
+    dagron_lineage::RunDatasets { inputs, outputs }
+}
+
+/// Feed the run-duration metrics for a run this engine just finalized.
+///
+/// Best-effort: the run is already terminal, so a failed lookup costs one
+/// observation and nothing else. Runs cancelled through the API or the gateway
+/// never pass through here, so they are in neither the histogram nor the
+/// per-workflow totals.
+#[cfg(feature = "ops")]
+async fn run_finished(pool: &db::Pool, metrics: &Metrics, run_id: &str, succeeded: bool) {
+    let Ok(Some((workflow, created_at))) = db::run_metric_facts(pool, run_id).await else {
+        return;
+    };
+    let Ok(created) = chrono::DateTime::parse_from_rfc3339(&created_at) else {
+        return;
+    };
+    let elapsed = chrono::Utc::now() - created.with_timezone(&chrono::Utc);
+    metrics.observe_run_finished(&workflow, succeeded, elapsed.num_milliseconds() as f64 / 1000.0);
+}
+
+/// Append queued live-log chunks (#17). Fence-guarded, so a stale attempt's late
+/// chunk can't corrupt a re-run; the first chunk of an attempt resets any
+/// prior-attempt log. Best-effort: a failed append is logged, not fatal.
+async fn drain_log_chunks(
+    pool: &db::Pool,
+    log_rx: &mut mpsc::UnboundedReceiver<dagron_executor::executor::LogChunk>,
+) {
+    while let Ok(chunk) = log_rx.try_recv() {
+        if let Err(e) =
+            db::append_task_output(pool, &chunk.task_id, chunk.fence, &chunk.chunk, chunk.first).await
+        {
+            tracing::warn!(task_id = %chunk.task_id, error = %e, "live-log append failed");
+        }
+    }
+}
+
+/// Put an engine-side failure reason in the task's streamed log too, before the
+/// task goes terminal: the log views prefer the log, which would otherwise hide it.
+async fn note_failure(pool: &db::Pool, task_id: &str, fence: i64, reason: &str) {
+    if let Err(e) = db::note_task_log(pool, task_id, fence, reason).await {
+        tracing::warn!(task_id, error = %e, "could not add failure reason to the task log");
+    }
+}
+
 /// Shared by the two paths that can succeed a producer task: the ordinary worker
 /// result and a memoization cache hit. A cache hit still records — `produces:` is
 /// a postcondition ("after this task succeeds, the dataset is current"), and
@@ -664,6 +738,24 @@ fn parse_max_inflight_runs(raw: Option<String>) -> i64 {
     raw.and_then(|v| v.trim().parse::<i64>().ok())
         .unwrap_or(64)
         .max(0)
+}
+
+/// Does the engine start with no initial run, rather than a file source that
+/// can only fail? In `dagron dev` when its DAG file is missing, and in a
+/// resident server (its API, cron, DB schedules or GC keep it up) given no DAG
+/// file at all, when the default `examples/simple_dag.yaml` is not there
+/// either: a checkout has it, an image does not. The workspace chart runs its
+/// engine that way, and each one warned at start of a file it never asked for.
+/// A DAG file that was asked for and is missing is still the file source's
+/// error, and a one-shot run with nothing to run still says so.
+fn starts_without_a_run(
+    source_kind: &str,
+    dag_exists: bool,
+    dev_mode: bool,
+    resident: bool,
+    dag_given: bool,
+) -> bool {
+    source_kind == "file" && !dag_exists && (dev_mode || (resident && !dag_given))
 }
 
 /// Seed the GitOps workflow directory with the image's bundled examples on first
@@ -921,6 +1013,8 @@ pub async fn run(seams: Seams) -> Result<()> {
         .get(pos_offset)
         .map(String::as_str)
         .unwrap_or("examples/simple_dag.yaml");
+    // Whether a DAG file was asked for, rather than the default taken.
+    let dag_given = args.get(pos_offset).is_some();
 
     // Datastore target. SQLite takes a file path (defaulting to a local file);
     // Postgres takes a connection string (else $DATABASE_URL).
@@ -1015,6 +1109,20 @@ pub async fn run(seams: Seams) -> Result<()> {
             Some(floor)
         }
         _ => None,
+    };
+
+    // Task-pod tolerations: which tainted nodes task pods may land on. Checked
+    // at startup for the floor's reason. A malformed value found at dispatch
+    // would leave every task Pending, short of the pool it was meant to reach.
+    #[cfg(feature = "kubernetes")]
+    let _task_tolerations = {
+        let raw = std::env::var("DAGRON_TASK_TOLERATIONS").unwrap_or_default();
+        let tolerations = kube_executor::parse_tolerations(&raw)
+            .map_err(|e| anyhow::anyhow!("invalid DAGRON_TASK_TOLERATIONS: {e}"))?;
+        if !tolerations.is_empty() {
+            info!(tolerations = %raw.trim(), "task pod tolerations in force");
+        }
+        tolerations
     };
 
     // Named concurrency pools (#21): POOLS=etl:4,db:2 caps how many tasks in each
@@ -1375,15 +1483,24 @@ pub async fn run(seams: Seams) -> Result<()> {
     // emits one DAG then drains; for queue sources it streams indefinitely.
     // In `dagron dev` with no DAG file present, start with no initial run — just
     // serve the API/UI — instead of letting the file source error-loop on a
-    // missing path. Submit work via the API once the server is up.
-    let wf_source: Box<dyn source::WorkflowSource> = if dev_mode
-        && source_kind == "file"
-        && !std::path::Path::new(dag_path).exists()
-    {
-        info!(
-            dag = %dag_path,
-            "dagron dev — no DAG file found; starting with no initial run (submit via POST /runs)"
-        );
+    // missing path. Submit work via the API once the server is up. The same for
+    // a resident server given no DAG file at all, as the workspace chart runs
+    // one (`starts_without_a_run`).
+    let wf_source: Box<dyn source::WorkflowSource> = if starts_without_a_run(
+        &source_kind,
+        std::path::Path::new(dag_path).exists(),
+        dev_mode,
+        stay_resident,
+        dag_given,
+    ) {
+        if dev_mode {
+            info!(
+                dag = %dag_path,
+                "dagron dev — no DAG file found; starting with no initial run (submit via POST /runs)"
+            );
+        } else {
+            info!("no DAG file given: starting with no initial run, the API and schedules bringing the work");
+        }
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(1);
         drop(tx); // immediately drained → no initial run; the API keeps the daemon resident
         Box::new(source::ChannelSource::new(rx))
@@ -1785,6 +1902,8 @@ pub async fn run(seams: Seams) -> Result<()> {
             for run_id in db::cancel_overdue_runs(&pool).await? {
                 tracing::warn!(%run_id, "run deadline exceeded (run_timeout_secs) — run failed, tasks cancelled");
                 metrics.inc_runs_deadline_exceeded();
+                #[cfg(feature = "ops")]
+                run_finished(&pool, &metrics, &run_id, false).await;
             }
 
             // ── Step 1c: soft SLA deadline alerts ───────────────────────────────
@@ -3216,19 +3335,19 @@ pub async fn run(seams: Seams) -> Result<()> {
         // tail it before the task exits. Fence-guarded, so a stale attempt's late
         // chunk can't corrupt a re-run; the first chunk of an attempt resets any
         // prior-attempt output. Best-effort: a failed append is logged, not fatal.
-        while let Ok(chunk) = log_rx.try_recv() {
-            if let Err(e) =
-                db::append_task_output(&pool, &chunk.task_id, chunk.fence, &chunk.chunk, chunk.first)
-                    .await
-            {
-                tracing::warn!(task_id = %chunk.task_id, error = %e, "live-log append failed");
-            }
-        }
+        drain_log_chunks(&pool, &mut log_rx).await;
 
         // ── Step 4: collect finished tasks ──────────────────────────────────
         let mut results = std::mem::take(&mut pending_results);
         while let Ok(result) = rx.try_recv() {
             results.push(result);
+        }
+        // An executor sends its last chunks (and the sealed, whole-redacted
+        // log) before its result, so anything for these results is queued by
+        // now. Drain it while the tasks are still `running`: once terminal, the
+        // status guard refuses the append.
+        if !results.is_empty() {
+            drain_log_chunks(&pool, &mut log_rx).await;
         }
         for mut result in results {
             // Executor finished → drained here (A-5). Before the completion
@@ -3293,6 +3412,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                         }
                         dag::RepeatDecision::Fail { reason } => {
                             info!(task_id = %result.task_id, iteration, %reason, "repeat loop failed");
+                            note_failure(&pool, &result.task_id, result.fence, &reason).await;
                             if db::mark_task_failed(
                                 &pool,
                                 &result.task_id,
@@ -3374,6 +3494,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                                 dag::HANDLE_PREFIX
                             );
                             warn!(task_id = %result.task_id, "deferred submit named no handle");
+                            note_failure(&pool, &result.task_id, result.fence, &reason).await;
                             if db::mark_task_failed(
                                 &pool,
                                 &result.task_id,
@@ -3608,6 +3729,8 @@ pub async fn run(seams: Seams) -> Result<()> {
         // ── Step 5: finalize any runs whose tasks are all terminal ──────────
         for (run_id, status) in db::reap_completed_runs(&pool).await? {
             info!(%run_id, %status, "run complete");
+            #[cfg(feature = "ops")]
+            run_finished(&pool, &metrics, &run_id, status == models::RunStatus::Succeeded).await;
             // Extension seam: no-op by default; an alternate build may emit the run event.
             seams.run_sink.on_run_completed(&run_id, &status.to_string()).await;
             // OpenLineage: emit the terminal RunEvent (best-effort — a lineage
@@ -3619,7 +3742,11 @@ pub async fn run(seams: Seams) -> Result<()> {
                     .flatten()
                     .unwrap_or_else(|| run_id.clone());
                 let failed = status.to_string() == "failed";
-                if let Err(e) = ol.emit_run_completed(&run_id, &job, failed).await {
+                let datasets = run_lineage_datasets(&pool, &run_id).await;
+                if let Err(e) = ol
+                    .emit_run_completed(&run_id, &job, failed, &datasets)
+                    .await
+                {
                     tracing::warn!(error = %e, %run_id, "OpenLineage emit failed");
                 }
             }
@@ -3707,7 +3834,8 @@ pub async fn run(seams: Seams) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        dag, git_target, new_traceparent, parse_max_inflight_runs, run_images, HeaderCacheKey,
+        dag, git_target, new_traceparent, parse_max_inflight_runs, run_images,
+        starts_without_a_run, HeaderCacheKey,
     };
 
     fn header(name: &str, secret: &str) -> dag::EnvVar {
@@ -3875,14 +4003,6 @@ mod tests {
         }
     }
 
-    /// `{{ run.images }}` in a `notify.git` field: the distinct images the
-    /// spec's tasks declare, in the order they first appear, with the workflow's
-    /// `task_defaults` filling in for a task that names none.
-    ///
-    /// This is what puts the built image in the check on a pull request that
-    /// changed its recipe — the reference is content-addressed, so it is in the
-    /// spec rather than something the run has to report back.
-    #[test]
     /// The README's `notify.git` example, verbatim: it advertises
     /// `{{ run.images }}`, so its task must actually name an image or the
     /// rendered description is the word "built" and a space.
@@ -3898,6 +4018,14 @@ mod tests {
         assert_eq!(run_images(&spec), "golang:1.23");
     }
 
+    /// `{{ run.images }}` in a `notify.git` field: the distinct images the
+    /// spec's tasks declare, in the order they first appear, with the workflow's
+    /// `task_defaults` filling in for a task that names none.
+    ///
+    /// This is what puts the built image in the check on a pull request that
+    /// changed its recipe — the reference is content-addressed, so it is in the
+    /// spec rather than something the run has to report back.
+    #[test]
     fn run_images_lists_the_distinct_task_images() {
         let spec = |yaml: &str| -> dag::DagSpec { serde_yaml::from_str(yaml).unwrap() };
 
@@ -4057,6 +4185,21 @@ mod tests {
     /// `MAX_INFLIGHT_RUNS` contract, as the Helm chart and `values.yaml`
     /// document it: default 64, an explicit number is honoured verbatim, and
     /// `0` **disables** the cap rather than clamping to a cap of one.
+    /// A resident server given no DAG file starts with no initial run, as
+    /// `dagron dev` does, instead of warning of the default file it never asked
+    /// for. A file that was asked for and is missing, a one-shot run, a default
+    /// file that is there, and every other source keep their behaviour.
+    #[test]
+    fn a_resident_server_given_no_dag_starts_without_a_run() {
+        // (source, the DAG file exists, dev, resident, a DAG file was given)
+        assert!(starts_without_a_run("file", false, false, true, false));
+        assert!(starts_without_a_run("file", false, true, true, true));
+        assert!(!starts_without_a_run("file", false, false, true, true));
+        assert!(!starts_without_a_run("file", false, false, false, false));
+        assert!(!starts_without_a_run("file", true, false, true, false));
+        assert!(!starts_without_a_run("dir", false, false, true, false));
+    }
+
     #[test]
     fn max_inflight_runs_zero_disables_the_cap() {
         let cap = |s: &str| parse_max_inflight_runs(Some(s.to_string()));

@@ -15,19 +15,51 @@ pub struct MaxActiveRunsReached {
     pub max: u32,
     /// How many runs of the workflow were active when admission was refused.
     pub active: i64,
+    /// The run's `concurrency_key` when the cap is per key rather than per
+    /// workflow; `active` then counts only runs sharing this key.
+    pub key: Option<String>,
 }
 
 impl std::fmt::Display for MaxActiveRunsReached {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "max_active_runs ({}) reached for workflow '{}' ({} active)",
-            self.max, self.name, self.active
-        )
+        match &self.key {
+            None => write!(
+                f,
+                "max_active_runs ({}) reached for workflow '{}' ({} active)",
+                self.max, self.name, self.active
+            ),
+            Some(key) => write!(
+                f,
+                "max_active_runs ({}) reached for workflow '{}' and concurrency_key '{}' ({} active)",
+                self.max, self.name, key, self.active
+            ),
+        }
     }
 }
 
 impl std::error::Error for MaxActiveRunsReached {}
+
+/// A trigger-time parameter value broke the workflow's `param_schema` (missing
+/// `required`, outside the `enum`, not matching the `pattern`).
+///
+/// Typed for the same reason as [`TaskBudgetExceeded`]: it is the caller's input
+/// being refused, not a malformed spec, so the API says so plainly (400 with the
+/// reason) instead of wrapping it in "invalid DAG:".
+#[derive(Debug, Clone)]
+pub struct ParameterInvalid {
+    /// The parameter that was refused.
+    pub name: String,
+    /// Why, in a sentence a caller can act on.
+    pub reason: String,
+}
+
+impl std::fmt::Display for ParameterInvalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "parameter '{}' {}", self.name, self.reason)
+    }
+}
+
+impl std::error::Error for ParameterInvalid {}
 
 /// A run was refused because the spec's declared `budget.tasks` is smaller than
 /// the number of tasks the run would create (G-AG3).
@@ -540,6 +572,13 @@ pub struct TaskRun {
     pub fault_detail: Option<String>,
     #[sqlx(default)]
     pub fault_confidence: Option<String>,
+    /// Who resolved an approval gate and why (migration 047/061). `decided_by` is
+    /// the approver, or `timeout` when the sweep resolved it; both `None` until
+    /// resolved and on every non-approval row.
+    #[sqlx(default)]
+    pub decided_by: Option<String>,
+    #[sqlx(default)]
+    pub decision_comment: Option<String>,
 }
 
 /// What one sweep tick did to a parked runtime fan-out barrier.
@@ -640,6 +679,52 @@ pub struct MetricsSnapshot {
     /// Ready backlog per runner class (count + oldest wait) — the signal that a
     /// class no live scheduler serves is silently aging (runner segmentation).
     pub ready_by_class: Vec<ReadyClassBacklog>,
+    /// Runs created in the last [`RECENT_RUNS_WINDOW_SECS`], grouped by
+    /// workflow, environment and status. Bounded by the window rather than the
+    /// whole table: a run carries its own definition row, so an unbounded
+    /// per-workflow count is a join of two tables that only ever grow.
+    pub recent_runs: Vec<RecentRuns>,
+    /// Tasks that are not finished yet, as `(workflow, status, count)`.
+    pub active_tasks: Vec<(String, String, i64)>,
+    /// Dead letters grouped by the source that produced them.
+    pub dead_letters_by_source: Vec<DeadLetterSource>,
+}
+
+/// How far back the per-workflow run gauges look, in seconds (24 hours).
+#[cfg(feature = "ops")]
+pub const RECENT_RUNS_WINDOW_SECS: i64 = 86_400;
+
+/// One `(workflow, environment, status)` cell of the recent-run counts.
+#[cfg(feature = "ops")]
+#[derive(Debug, Clone, Default)]
+pub struct RecentRuns {
+    pub workflow: String,
+    /// The run's named `environment:`, or `None` when it declared none.
+    pub environment: Option<String>,
+    pub status: String,
+    pub count: i64,
+}
+
+/// Dead letters from one source: how many are parked and when the oldest
+/// arrived (`first_seen_at`, RFC-3339).
+#[cfg(feature = "ops")]
+#[derive(Debug, Clone, Default)]
+pub struct DeadLetterSource {
+    pub source: String,
+    pub count: i64,
+    pub oldest_first_seen_at: Option<String>,
+}
+
+#[cfg(feature = "ops")]
+impl DeadLetterSource {
+    /// Seconds the oldest dead letter from this source has been parked.
+    pub fn oldest_age_secs(&self, now: chrono::DateTime<chrono::Utc>) -> i64 {
+        self.oldest_first_seen_at
+            .as_deref()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| (now - t.with_timezone(&chrono::Utc)).num_seconds().max(0))
+            .unwrap_or(0)
+    }
 }
 
 /// Per-runner-class dispatch backlog: how many `ready` tasks are waiting and

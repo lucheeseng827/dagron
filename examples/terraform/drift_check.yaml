@@ -1,0 +1,73 @@
+# Terraform drift detection: has anything changed outside Terraform since the last apply?
+#
+#   init ─▶ detect_drift ─▶ (fails on drift) ─▶ notify_failure (on_failure)
+#
+# Run it on a schedule (Schedules drawer or API, cron `sec min hour dom mon dow`, e.g.
+# `0 0 6 * * *` for 06:00 daily). `terraform plan -refresh-only` compares the state with
+# the real infrastructure and proposes only to update the state; it never edits resources.
+#
+# Standard conditions:
+#   drift found         exit code 2 from `-detailed-exitcode` fails the run on purpose, so
+#                       the failed run in the list is the alert; the log is the drift report.
+#   nothing found       exit 0, the run succeeds.
+#   tell someone        `notify_failure` posts to $NOTIFY_WEBHOOK_URL (echo only if unset).
+#                       It also fires for a real error (exit 1), which the log tells apart.
+#   no overlap          `max_active_runs: 1` per stack; a slow check is not started twice.
+#   read-only           `-lock=false`: a check must not block a deploy that is in flight.
+#   full logs           `exec 2>&1` and `-no-color`.
+#
+# To fix drift, run plan_review_apply.yaml: it plans the difference between the code and the
+# real world and gates the apply on a human.
+name: terraform_drift_check
+tags: [terraform, iac, drift, scheduled]
+max_active_runs: 1
+concurrency_key: "{{ tf_dir }}:{{ environment }}"
+run_timeout_secs: 3600
+parameters:
+  tf_dir: "./infra"
+  environment: "prod"
+
+param_schema:
+  tf_dir:      { required: true, pattern: "[A-Za-z0-9_./-]+", description: "Directory holding the Terraform root module" }
+  environment: { required: true, enum: [dev, staging, prod], description: "Environment to check" }
+
+tasks:
+  - name: init
+    command: ["sh", "-c", "exec 2>&1; terraform -chdir='{{ tf_dir }}' init -input=false -no-color"]
+    max_attempts: 2
+    retry_delay_secs: 30
+    timeout_secs: 600
+
+  - name: detect_drift
+    depends_on: [init]
+    command:
+      - sh
+      - -c
+      - |
+        exec 2>&1
+        set -e
+        terraform -chdir='{{ tf_dir }}' workspace select -or-create '{{ environment }}'
+        set +e
+        terraform -chdir='{{ tf_dir }}' plan -refresh-only -input=false -no-color -lock=false -detailed-exitcode -var environment='{{ environment }}'
+        rc=$?
+        set -e
+        case "$rc" in
+          0) echo "RESULT: no drift in {{ environment }}" ;;
+          2) echo "RESULT: DRIFT in {{ environment }}: the real infrastructure differs from state (see above)"; exit 2 ;;
+          *) exit "$rc" ;;
+        esac
+    timeout_secs: 1800
+
+  - name: notify_failure
+    hook: on_failure
+    allow_failure: true
+    command:
+      - sh
+      - -c
+      - |
+        msg="dagron run ${DAGRON_RUN_ID}: terraform drift check of {{ tf_dir }} ({{ environment }}) did not pass, see the detect_drift log"
+        echo "$msg"
+        if [ -n "$NOTIFY_WEBHOOK_URL" ]; then
+          curl -fsS -X POST -H 'content-type: application/json' -d "{\"text\":\"$msg\"}" "$NOTIFY_WEBHOOK_URL"
+        fi
+    timeout_secs: 60

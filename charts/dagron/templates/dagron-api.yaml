@@ -43,6 +43,9 @@ spec:
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.dagronApi.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       containers:
         - name: dagron-api
           image: {{ include "dagron.image" (dict "image" $.Values.dagronApi.image "root" $) | quote }}

@@ -1,0 +1,74 @@
+# Terraform or OpenTofu, promoted dev -> staging -> prod, in one screen.
+#
+# Compare examples/terraform/promote_environments.yaml: the same workflow with the
+# `stage` template and the five checks written out in the spec (199 lines). Here
+# they come from the `iac-library` workflow (examples/iac/iac-library.yaml), so
+# this file holds only what is particular to the stack: which tool, which
+# environments, who approves.
+#
+#   checks ─▶ dev ─▶ staging (review) ─▶ prod (review)
+#
+# Save iac-library first, then this workflow. Pass `tool=tofu` to run OpenTofu.
+name: promote_terraform
+tags: [iac, promotion]
+use: [iac-library]
+max_active_runs: 1
+concurrency_key: "{{ tf_dir }}"
+run_timeout_secs: 43200
+parameters:
+  tool: terraform
+  tf_dir: "./infra"
+  promote_through: "staging"
+  allow_destroy: "false"
+
+param_schema:
+  tool:            { required: true, enum: [terraform, tofu], description: "IaC binary to run" }
+  tf_dir:          { required: true, pattern: "[A-Za-z0-9_./-]+", description: "Directory holding the root module" }
+  promote_through: { required: true, enum: [dev, staging, prod], description: "Last environment to apply to" }
+  allow_destroy:   { required: true, enum: ["true", "false"], description: "Permit plans that delete or replace resources" }
+
+tasks:
+  - name: checks
+    template: tf_checks
+    arguments: { tool: "{{ tool }}", tf_dir: "{{ tf_dir }}" }
+
+  - name: dev
+    template: tf_stage
+    depends_on: [checks]
+    arguments: { tool: "{{ tool }}", env: dev, gated: "false", tf_dir: "{{ tf_dir }}", allow_destroy: "{{ allow_destroy }}" }
+
+  - name: staging
+    template: tf_stage
+    depends_on: [dev]
+    when: "{{ promote_through }} in [staging, prod]"
+    arguments:
+      tool: "{{ tool }}"
+      env: staging
+      message: "Review the staging plan below, then apply it."
+      tf_dir: "{{ tf_dir }}"
+      allow_destroy: "{{ allow_destroy }}"
+
+  - name: prod
+    template: tf_stage
+    depends_on: [staging]
+    when: "{{ promote_through }} == prod"
+    arguments:
+      tool: "{{ tool }}"
+      env: prod
+      message: "PRODUCTION: review the plan below. Approving applies it."
+      tf_dir: "{{ tf_dir }}"
+      allow_destroy: "{{ allow_destroy }}"
+
+  - name: notify_failure
+    hook: on_failure
+    allow_failure: true
+    command:
+      - sh
+      - -c
+      - |
+        msg="dagron run ${DAGRON_RUN_ID} of {{ tool }} stack {{ tf_dir }} failed"
+        echo "$msg"
+        if [ -n "$NOTIFY_WEBHOOK_URL" ]; then
+          curl -fsS -X POST -H 'content-type: application/json' -d "{\"text\":\"$msg\"}" "$NOTIFY_WEBHOOK_URL"
+        fi
+    timeout_secs: 60

@@ -1,0 +1,49 @@
+# Pulumi, promoted dev -> staging -> prod, from the shared `iac-library`.
+#
+#   dev (no gate) ─▶ staging (review) ─▶ prod (review)
+#
+# Each environment is a Pulumi stack of the same name. Read the Pulumi caveat at
+# the top of examples/iac/iac-library.yaml: the approval pins the reviewed
+# preview and `apply` re-previews and refuses if it moved, which is weaker than
+# Terraform's saved plan. Needs `jq`, a logged-in backend and a secrets
+# passphrase or KMS provider in the task environment.
+name: promote_pulumi
+tags: [iac, promotion, pulumi]
+use: [iac-library/pulumi_stage]
+max_active_runs: 1
+concurrency_key: "{{ pulumi_dir }}"
+run_timeout_secs: 43200
+parameters:
+  pulumi_dir: "./infra"
+  promote_through: "staging"
+  allow_destroy: "false"
+
+param_schema:
+  pulumi_dir:      { required: true, pattern: "[A-Za-z0-9_./-]+", description: "Directory holding Pulumi.yaml" }
+  promote_through: { required: true, enum: [dev, staging, prod], description: "Last stack to apply to" }
+  allow_destroy:   { required: true, enum: ["true", "false"], description: "Permit previews that delete or replace resources" }
+
+tasks:
+  - name: dev
+    template: pulumi_stage
+    arguments: { env: dev, gated: "false", pulumi_dir: "{{ pulumi_dir }}", allow_destroy: "{{ allow_destroy }}" }
+
+  - name: staging
+    template: pulumi_stage
+    depends_on: [dev]
+    when: "{{ promote_through }} in [staging, prod]"
+    arguments:
+      env: staging
+      message: "Review the staging preview below, then apply it."
+      pulumi_dir: "{{ pulumi_dir }}"
+      allow_destroy: "{{ allow_destroy }}"
+
+  - name: prod
+    template: pulumi_stage
+    depends_on: [staging]
+    when: "{{ promote_through }} == prod"
+    arguments:
+      env: prod
+      message: "PRODUCTION: review the preview below. Approving applies it."
+      pulumi_dir: "{{ pulumi_dir }}"
+      allow_destroy: "{{ allow_destroy }}"

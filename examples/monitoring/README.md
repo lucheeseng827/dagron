@@ -1,14 +1,30 @@
 # Monitoring dagron with Prometheus + Grafana
 
 A ready-to-run monitoring stack: **Prometheus** scrapes the dagron engine's
-built-in metrics and **Grafana** renders the bundled **dagron — overview**
-dashboard.
+built-in metrics and **Grafana** renders eight bundled dashboards.
+
+Every metric, what it means, how to query it and what to alert on is in the
+[metrics guide](../../docs/METRICS.md).
 
 ![dagron — overview Grafana dashboard](grafana-dashboard.png)
 
-## What it shows
+## Dashboards
 
-All panels use the engine's `scheduler_*` metrics (OSS build):
+| Dashboard | The question it answers |
+| --- | --- |
+| dagron — overview | Is anything obviously wrong? |
+| dagron — workflows by namespace | Which namespace and environment is running what? |
+| dagron — workflow statistics | How is each workflow doing? |
+| dagron — run time | How long do runs take, and is it drifting? |
+| dagron — workflow jobs | Which tasks are running, waiting or failing, and why? |
+| dagron — dead letter queue | What could not become a run? |
+| dagron — instance metrics | Is each engine process healthy as a process? |
+| dagron — health and latency | Is dagron itself up and fast? |
+
+Screenshots of each are in the [metrics guide](../../docs/METRICS.md#dashboards).
+They are tested on Grafana 13.2.3, use only built-in panels, and need no plugins.
+
+The overview, pictured above, uses the engine's `scheduler_*` metrics:
 
 - **Throughput** — runs created/s, tasks dispatched/succeeded/failed/retried per second.
 - **State** — runs and tasks by status (`scheduler_runs`, `scheduler_tasks`), queue depth, dead-letters parked.
@@ -37,8 +53,8 @@ docker compose up -d            # or: podman compose up -d
 docker compose -f examples/monitoring/compose.yaml up -d
 ```
 
-- **Grafana** → <http://localhost:3001> — the *dagron / dagron — overview*
-  dashboard is auto-provisioned. Anonymous viewing is on; admin is
+- **Grafana** → <http://localhost:3001> — the dashboards are auto-provisioned
+  into the *dagron* folder. Anonymous viewing is on; admin is
   `admin` / `admin` (override with `GRAFANA_USER` / `GRAFANA_PASSWORD`).
 - **Prometheus** → <http://localhost:9090> — check
   *Status → Targets* shows `dagron-engine` **UP**.
@@ -62,9 +78,15 @@ Edit [`prometheus/prometheus.yml`](prometheus/prometheus.yml) `targets`:
 | `compose.yaml` | Prometheus + Grafana, wired to the dagron network |
 | `prometheus/prometheus.yml` | scrape config (engine `:8787/metrics`) |
 | `grafana/provisioning/` | datasource + dashboard auto-provisioning |
-| `grafana/dashboards/dagron-overview.json` | the dashboard model |
+| `grafana/dashboards/*.json` | the dashboard models |
+| `grafana/generate-dashboards.mjs` | writes every dashboard except the overview; edit it and re-run `node generate-dashboards.mjs` rather than editing that JSON |
 
-> The dashboard uses only metrics this build emits. Feature-on builds also expose
+The scrape config sets a `namespace` label on the engine target. A Kubernetes
+`ServiceMonitor` sets the same label to the pod's namespace; the dashboards
+group and filter by it.
+
+> The dashboards use only metrics this build emits. Feature-on builds also expose
 > `scheduler_catchup_runs_total`, `scheduler_auto_reruns_total`,
 > `scheduler_overdue_schedules`, `scheduler_schedule_lag_seconds`, and
-> `scheduler_incomplete_runs` — add panels for those if you run that build.
+> `scheduler_incomplete_runs`; the workflow statistics dashboard has a collapsed
+> row for them.

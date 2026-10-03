@@ -2,11 +2,241 @@
 
 All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
-[Semantic Versioning](https://semver.org/) (pre-1.0: minor = breaking).
+[Semantic Versioning](https://semver.org/) (while dagron is 0.x: a minor bump may be breaking).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-03
+
 ### Added
+- **OpenLineage events name the run's datasets.** The terminal `RunEvent` carried
+  only the run and the job, so a lineage backend saw runs and no data. It now
+  lists `inputs` (the workflow's `on_datasets:` and the run's `wait: { dataset: … }`
+  sensors) and `outputs` (the `produces:` entries the ledger recorded for the run),
+  each split the way OpenLineage names a dataset: `scheme://authority` as its
+  namespace, the path as its name. Edges attach to the workflow, which is what
+  `job.name` is. Reading a run's outputs is a by-run read of `dataset_events`,
+  which was indexed only by dataset, so migrations 050 (SQLite) and 065
+  (Postgres, `CONCURRENTLY`) add `idx_dataset_events_run_id`; without it every
+  finalization with lineage on would scan the ledger. See
+  [`docs/DATASETS.md`](docs/DATASETS.md).
+- **`scheduler_signpost_hits_total{gate}` counts what this build refused.** The
+  gates that answer with a pointer to what this build does include had no count,
+  so there was no telling whether anyone met them. Three refuse a request while
+  the engine keeps running, and those are counted: `external_cost_attribution`,
+  `defer_connection` and `external_dataset_events`, each emitted at zero from
+  the first scrape. A gate met at startup stops the engine, leaving nothing to
+  scrape, and dagron-api serves no Prometheus endpoint, so neither is in it. See
+  [`docs/METRICS.md`](docs/METRICS.md).
+- **`dagron_wait_run` reports progress while it blocks.** The tool long-polls for
+  up to 600 s and answered only at the end, and many MCP clients drop a request
+  after 60 s without progress on it, so the tool failed for exactly the long runs
+  it exists for. When a call carries `params._meta.progressToken`, the stdio
+  server now sends `notifications/progress` with how many of the run's tasks
+  have finished (`progress`) out of how many it has (`total`), read every 5 s and
+  sent only when the count rose. A call without a token is answered exactly as
+  before. Stdout now has one writer, fed by a queue that both replies and
+  notifications go through, so a notification cannot split a reply or arrive
+  after it. `handle` and `call_tool` keep their signatures;
+  `handle_with_progress` and `call_tool_with_progress` take a `ProgressSink`.
+  See [`docs/MCP.md`](docs/MCP.md).
+- **Metrics guide, seven new Grafana dashboards, and the metrics they needed.**
+  [`docs/METRICS.md`](docs/METRICS.md) documents every series the engine exports: what
+  it measures, how to aggregate it across engines, query recipes and alerts.
+  `examples/monitoring/` now ships eight dashboards, tested on Grafana 13.2.3: the
+  overview, workflows by namespace, workflow statistics, run time, workflow jobs, dead
+  letter queue, instance metrics, and health and latency. To make the per-workflow views
+  possible the engine's `/metrics` gained: `scheduler_run_duration_seconds` (histogram,
+  1 s to 4 h), `scheduler_workflow_run_duration_seconds` (sum and count by workflow and
+  outcome), `scheduler_workflow_last_run_duration_seconds`,
+  `scheduler_workflow_last_run_finished_timestamp_seconds`,
+  `scheduler_workflow_last_run_success`, `scheduler_workflow_recent_runs` and
+  `scheduler_environment_recent_runs` (runs created in the last 24 hours),
+  `scheduler_workflow_active_tasks`, `scheduler_dead_letters_by_source`,
+  `scheduler_dead_letters_oldest_age_seconds`, and on Linux the standard `process_*`
+  series (CPU, memory, threads, file descriptors, start time). Workflow, environment and
+  source labels are capped (50, 20, 20) with the rest summed as `other`. Each scrape
+  runs three more datastore queries, all bounded by a time window or by unfinished work.
+- **Template libraries: `use:` imports templates from another saved workflow.** A
+  `templates:` block used to live in the spec that called it, so every Terraform
+  workflow carried its own copy of the same 100-line `stage` template. A saved
+  workflow that declares `templates:` is now a library, and `use: [iac-library]` (all
+  its templates) or `use: [iac-library/tf_stage]` (one, plus the templates it calls)
+  brings them in; `template:` calls and `arguments:` then work as before. Resolved by
+  `dagron-api` when the workflow is saved or run, by name and as saved at that time. A
+  name defined twice (in the spec and a library, or in two libraries) is refused rather
+  than overridden, a library may not import another, and a missing library or template
+  is a `400` on save. Paths that never reach the gateway refuse an unresolved `use:`
+  with the cause instead of dropping it.
+- **`examples/iac/`: Terraform, OpenTofu and Pulumi from one library.** `iac-library`
+  holds `tf_checks`, `tf_stage` and `pulumi_stage`; `promote_terraform.yaml` (74 lines;
+  `tool=tofu` runs OpenTofu, which needs 1.6 or newer) and `promote_pulumi.yaml` (49
+  lines) are the same dev, staging, prod promotion as `examples/terraform/` with the
+  repeated part gone. Pulumi has no reviewed plan file to apply, so its approval pins the
+  reviewed preview and `apply` re-previews and refuses if the change summary moved: weaker
+  than Terraform's saved plan, and not yet exercised against a live Pulumi stack. Each
+  stage ends in a `done` task that succeeds only when the plan was applied or changed
+  nothing, so a failed plan or a rejected review does not let the next stage run.
+- **`examples/terraform/lifecycle.yaml`: plan, approve, apply, then approve, destroy, in
+  one run.** One `stage` template called twice: `deploy` plans and applies behind a
+  human gate, `teardown` plans with `-destroy` against what the deploy left and destroys
+  behind a second gate. Each gate pins its plan with `binds`, and `destroy_after:
+  "false"` leaves the environment up. Each stage ends in a `done` task that runs only when
+  the stage applied or had nothing to apply, and the teardown waits for the deploy's: so
+  rejecting the apply, or a failed check or plan, plans no teardown.
+- **An approval decision now shows in the run log.** Approving or rejecting a
+  `type: approval` gate writes `approved by <who> at <time>` (or `rejected`), then
+  `comment: <text>` when the approver left one, to the gate's log, so it reads in the
+  merged run log beside the tasks around it. Before, who decided and why lived only in
+  `decided_by` / `decision_comment` on the row, and the gate's log was empty. A timeout
+  decision logs the same way (`by timeout`). `output` is unchanged (`approved` /
+  `rejected`), so `when:` conditions and trigger rules behave as before; gates decided
+  before the upgrade keep an empty log.
+- **The engine API no longer decides gates it cannot check.** Its approve/reject
+  endpoints carry no caller identity, so they used to resolve a gate whatever its
+  `approvers`, `not_triggerer` or `binds` said. They now answer 403 and name the rules
+  and the gateway: `approvers` blocks both decisions; `not_triggerer` and `binds` block
+  approving. A spec the engine cannot read is refused too. Plain gates are unchanged.
+- **The gateway's live approval tests run in CI.** They (and the redrive and repo-sync
+  live tests) skip without `TEST_DATABASE_URL`, and no CI job set it, so none of them
+  had ever run there. `scripts/ci-test.sh` now starts a disposable Postgres for the
+  `dagron-api` leg when run in CI. A new live test covers the end those checks exist
+  for: a refused (outsider, or the run's own triggerer) or rejected plan is never
+  applied, with the scheduler advancing between decisions.
+- **`when:` gains `and`, `or`, `in [..]` and `not in [..]`.** `and` binds tighter than
+  `or`, there are no parentheses, and the words are operators only when they stand
+  alone, so existing conditions keep their meaning. The same grammar applies to task
+  `when:`, `repeat.until` and schedule `when` gates (the gateway's copy now calls core's).
+- **Templates can branch on their own tasks' output.** A runtime `{{ tasks.X.output }}`
+  inside a template now follows `X` to its expanded name (`<call>.X`); before, the
+  reference pointed at a task that did not exist and the spec was refused. In an `and`
+  chain, the parts that use only parameters are decided at expansion: a false one
+  removes the task, so one template can have an optional gate.
+- **`promote_environments.yaml` is one `stage` template called three times.** Plan,
+  destroy guard, review and apply are written once; `promote_through` becomes
+  `when: "{{ promote_through }} in [staging, prod]"` on the staging call and
+  `when: "{{ promote_through }} == prod"` on the prod call (dev always runs), so a
+  stage beyond it is never created (the `level` helper task is gone), and dev's review is removed at
+  expansion by `gated: "false"`. Tasks are now named `<env>.<step>`
+  (`staging.review`, `prod.apply`).
+- **Run a stored workflow with its parameters from the console.** The Run buttons
+  (workflow list, editor, history) open a dialog built from the spec: `enum` becomes a
+  dropdown, `required` is marked, `description` and `pattern` are shown, and values are
+  checked against the same rules the engine applies before the request goes out (the
+  engine stays authoritative). Only changed values are sent, so the spec's defaults
+  still apply; a workflow with no parameters starts immediately, as before.
+  `GET /api/workflows/{id}` (and the create/update responses) now return `parameters`
+  and `param_schema`, and the MCP `dagron_get_workflow` / `dagron_run_workflow`
+  descriptions point agents at them. `npm run check:params` covers the form rules.
+- **A task's log keeps stderr, whether it succeeds or fails.** Migrations 049 (SQLite) /
+  064 (Postgres) add `task_runs.log`: stdout and stderr lines in arrival order, streamed
+  live by the local executor (and by the Docker executor, which already interleaved
+  both but only streamed stdout). The log views (`/api/runs/{id}/logs`,
+  `/api/runs/{id}/tasks/{tid}/logs`, and the engine's equivalents) read it, falling back
+  to `output` for older rows and non-streaming executors. `output` is unchanged: still
+  stdout (plus the stderr tail on failure), so `when:`, `repeat.until`, fan-out,
+  `result_from` and the cache never see a stderr warning. The log resets when an
+  attempt is claimed, and when the task has secrets it is rewritten once at exit,
+  redacted as a whole, so a secret split across chunks cannot persist.
+- **Terraform reference workflows and a conditions guide.** `examples/terraform/`
+  gains `pr_check.yaml` (checks and a lock-free speculative plan for pull requests),
+  `promote_environments.yaml` (dev, staging, prod with a reviewed gate per stage after
+  dev, a `promote_through` cut-off, a destroy guard and a failure notification),
+  `drift_check.yaml` (scheduled `plan -refresh-only` that fails the run on drift) and a
+  README mapping each standard condition to the Dagron feature that expresses it.
+  All parse in tests; the promotion, PR and drift flows were also run end to end.
+- **Approval gates record who decided and why, and show the approver what they
+  are approving.** A `type: approval` gate used to be a bare yes/no: the run
+  history could not say who approved, and the approver saw only a task name.
+  Two new task fields fix the second half: `approval_message` (free text,
+  workflow parameters substituted, max 2000 chars) and `approval_show: ["<task>/<name>"]`
+  (up to 16 artifact keys, same layout as `$DAGRON_ARTIFACTS/<task>/<name>`), both
+  valid only on `type: approval` and included in the plan diff. `GET /api/approvals`
+  returns them as `message` and `show: [{path, url}]`. The first half: migrations
+  047 (SQLite) / 061 (Postgres) add `task_runs.decided_by` and `decision_comment`.
+  Approve/reject accept an optional `{"comment": "..."}` body; the dagron-api
+  gateway records the authenticated user as `decided_by`, the unauthenticated
+  engine API records the comment only, and the timeout sweep records
+  `decided_by = 'timeout'`. Both appear on the task rows of the run detail, and
+  `dagron_approve_task` / `dagron_reject_task` take an optional `comment`. A
+  second decision on an already-resolved gate is still a 409 and cannot
+  overwrite the first record.
+- **Approval gates can restrict who may decide.** Two new fields, valid only on
+  `type: approval`: `approvers: [...]` (up to 64 entries; each is an email, an
+  OIDC subject, or `group:<name>`, matched case-insensitively; empty means any
+  signed-in user, as before) and `not_triggerer: true` (the person who started
+  the run may not approve it, though they may still reject). The dagron-api
+  gateway enforces them on approve/reject with a 403 that says why; the
+  unauthenticated engine API cannot know who is calling and does not.
+  `GET /api/approvals` gains `approvers`, `not_triggerer`, `can_approve` and
+  `can_reject` for the caller, and the Approvals page disables the buttons
+  accordingly. To know who started a run, migration 062 (Postgres) adds
+  `workflow_runs.triggered_by`, set by the gateway on trigger, resubmit and
+  run-now; runs started before it have no triggerer, so `not_triggerer` does not
+  block them. **Behaviour change:** `dagron_approve_task` in `dagron-mcp` is now
+  hidden and refused unless `DAGRON_MCP_ALLOW_APPROVE=1`, so an agent cannot
+  approve a gate by default; `dagron_reject_task` stays available and
+  `DAGRON_MCP_READONLY` still overrides both.
+- **An approval can be pinned to the exact plan the approver read (`binds:`).**
+  A `type: approval` gate may list `binds: ["<task>/<name>", ...]` (up to 16; shown
+  like `approval_show`, and diffed in the plan). The worklist gives each bound
+  artifact's current sha256; approving through the gateway must send those back as
+  `digests` in the body (`400` without them, `409` when the artifact is missing or
+  has changed since, `503` with no artifact store) -- so a plan re-planned after
+  review cannot be approved unseen. On success the reviewed digests are written to
+  `<gate>/approved.sha256` in `sha256sum -c` format, before the approval commits
+  (a failed write aborts it), so a downstream `apply` can verify it is running what was
+  approved (`cd "$DAGRON_ARTIFACTS" && sha256sum -c review/approved.sha256`). The
+  Approvals page does this itself; `dagron_approve_task` takes an optional
+  `digests` object. Enforced by the gateway only: the engine API neither checks nor
+  writes them, so an apply that verifies `approved.sha256` fails closed if the gate
+  was decided there. `examples/terraform/plan_review_apply.yaml` now uses it.
+- **Workflow parameters can be constrained (`param_schema:`), and `max_active_runs`
+  can be scoped per key (`concurrency_key:`).** `parameters: { name: default }` is
+  unchanged. A new top-level `param_schema:` block adds rules keyed by parameter
+  name: `required: true` (non-empty), `enum: [...]`, `pattern: "<regex>"` (must
+  match the *whole* value) and a free-text `description`. They are enforced when a
+  run is triggered, on the merged caller/schedule/environment values and before
+  `{{ }}` is substituted into any task, and a refusal is a `400` that names the
+  parameter (`parameter 'environment' must be one of: dev, staging, prod`). Saving
+  a workflow does not demand `required` values, but a malformed rule, a key with
+  no matching `parameters:` entry, or a default that breaks its own rule is an
+  error; an empty value skips `enum`/`pattern`. Workflows without `param_schema`
+  behave exactly as before. `concurrency_key: "{{ stack }}"` (templated, needs
+  `max_active_runs`) makes the cap count only running runs of the workflow that
+  share the resolved key, so `max_active_runs: 1` means one run per stack; the
+  `429` names the key. Migrations 048 (SQLite) / 063 (Postgres) add
+  `workflow_runs.concurrency_key`; on Postgres the admission lock narrows to
+  (workflow, key). `dagron-core` gains a `regex` dependency.
+  `examples/terraform/plan_review_apply.yaml` uses both.
+- **Terraform examples keep the whole plan/apply output in the run log, and gain a destroy flow.**
+  On the local executor the stderr of a task that succeeds is not stored, and terraform
+  writes much of its output there, so every step in `examples/terraform/` now starts
+  `exec 2>&1` and passes `-no-color`; `plan` no longer prints a marker word (a
+  `plan_result` task reads a marker file instead), so `plan`'s log is the plan.
+  New `plan_destroy_review.yaml`: `plan -destroy`, a bound approval, then apply of
+  exactly that saved plan. Exercised end to end against a Postgres-backed engine,
+  dagron-api and the built console: approve from the Approvals page, a stale digest
+  refused with 409, `decided_by`/`decision_comment` recorded.
+- **Task pods can tolerate taints, and take a priority class.**
+  - `DAGRON_TASK_TOLERATIONS` (`key[=value][:effect]`, comma-separated) puts
+    tolerations on every task pod the Kubernetes executor creates. A
+    `DAGRON_TASK_NODE_SELECTOR` that points at a tainted pool no longer leaves
+    them Pending.
+  - An empty key is refused, since it would tolerate every taint, and so is a
+    key or value the apiserver would refuse in a toleration: a key is a label
+    key and a value a label value. A malformed value stops the engine at
+    startup, rather than every task pod being refused.
+  - `DAGRON_TASK_PRIORITY_CLASS` sets the pods' `priorityClassName`, and
+    labels them `dagron.dev/priority-class` with it where the name fits a
+    label (at most 63 characters), so the pods one class admitted can be
+    selected by label.
+  - Both are unset by default, and task pods are shaped as before.
+  - The chart takes the priority classes: `engine.priorityClassName` and
+    `dagronApi.priorityClassName` for their pods, and
+    `engine.taskPriorityClassName` for every task pod the engine starts
+    (`DAGRON_TASK_PRIORITY_CLASS`). Each class must exist in the cluster. All
+    three are empty by default, and render nothing.
 - **Every `dagron-mcp` tool now declares MCP tool annotations.** Before this, a
   tool definition carried only `name`, `description` and `inputSchema`, so a client
   that runs a tool unasked only when it says `readOnlyHint: true` asked a person
@@ -987,6 +1217,24 @@ All notable changes to this project are documented here. The format is based on
   task while the job runs — roll schedulers before publishing `defer:` specs.
 
 ### Security
+- **A task may run only as a ServiceAccount an operator allow-listed
+  (`DAGRON_TASK_ALLOWED_SERVICE_ACCOUNTS`).** A task pod is created in the
+  KubeExecutor's namespace, beside the engine, whose own ServiceAccount can
+  create pods and read Secrets (the chart's engine Role). Nothing stopped a
+  workflow-authored task from setting `service_account:` to that account — or any
+  other in the namespace — and running its command with those rights: an
+  escalation from "run a container" to "create pods and read Secrets here". The
+  executor now checks a requested ServiceAccount against an allow-list, where the
+  pod is built, so a disallowed one fails the task instead of running as it. The
+  check is a pure function with unit tests: unset denies every request, an
+  allow-list permits only its exact names (listing an IRSA task identity does not
+  admit the engine's), and a task naming none is unaffected.
+  - **Behaviour change:** the allow-list is **empty by default**, so a task that
+    declares `service_account:` is now refused until an operator lists that name.
+    An install that uses `service_account:` for IRSA sets
+    `DAGRON_TASK_ALLOWED_SERVICE_ACCOUNTS` to the task identities it created for
+    it — never the engine's own ServiceAccount. Tasks that declare no
+    `service_account:` are unchanged. `docs/CONFIG.md` has the setting.
 - **The read-only `viewer` role is enforced in every build, not just enterprise.** A viewer is
   refused every mutation — `403 {"error": "viewer role is read-only"}` — by middleware, before
   the request reaches a handler. `GET` is untouched, and so are `POST /api/login` / `/logout`:
@@ -1046,6 +1294,99 @@ All notable changes to this project are documented here. The format is based on
   above, which gates it too, so nothing in this release leaves it open.
 
 ### Fixed
+- **The Databricks example in `docs/EXTERNAL_JOBS.md` missed most ways a run can fail.**
+  Its `fail_when` listed three result states, and the Jobs API has some 25
+  terminal codes, so a run ending in, say, `MAX_CONCURRENT_RUNS_EXCEEDED` or
+  `SKIPPED` matched neither predicate and polled until `max_wait_secs`. It now
+  reads the Jobs API 2.2 `status` object (the older `state` object is
+  deprecated): success waits for `status.state == TERMINATED`, because
+  `termination_details` already appears while the run is `TERMINATING`, and
+  failure is `status.termination_details.code != SUCCESS`. Checked against
+  Databricks' API reference, and a test pins it. The engine's "both predicates
+  matched" warning now fires only when both read the same field, since two fields
+  matching together is how such a spec says "finished, and not failed". The same
+  page named Dataproc's `batches.delete` as a way to stop a remote job; it refuses
+  a batch that has not finished, so the page now names `operations.cancel` on the
+  batch's operation.
+- **The public mirror linked to guides it did not carry.** `docs/METRICS.md`,
+  `docs/LOOPS.md` and `docs/ITERATION-LOGS.md` are linked from the README,
+  `API.md`, `CONFIG.md`, `OPERATIONS.md` and `examples/monitoring`, and were
+  never in the mirror's allowlist. They are now.
+- **`dagron-api` no longer exits when its schema bootstrap deadlocks with the engine's
+  migrations.** Started together on a fresh database, as compose and a Helm install start
+  them, `dagron-api`'s `ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS environment`
+  could queue behind the engine's `CREATE INDEX CONCURRENTLY` on the same table
+  (`migrations_pg` 047 and 048). The index build in turn waits out every older snapshot,
+  that queued ALTER's included. Postgres broke the cycle by failing `dagron-api` with
+  `deadlock detected`, and the bootstrap retried only duplicate-object errors, so it exited
+  before it listened ("ensuring environments schema ... deadlock detected"). With the 0.9.3
+  images that happened in 4 of 40 starts. The bootstrap now replays on `deadlock_detected`
+  (40P01) too: every step is idempotent, and only two index builds touch that table, so the
+  existing four attempts cover it. A live test (`TEST_DATABASE_URL`) builds the same cycle
+  from an open write, an index build and the bootstrap, and fails without the fix.
+- **The Terraform examples' compliance step runs, and their destroy guard fails closed.**
+  `checkov` has no `--no-color` flag (it exits 2 on an unknown argument), so the compliance
+  task in `pr_check.yaml`, `plan_review_apply.yaml`, `promote_environments.yaml` and
+  `iac/iac-library.yaml` failed before scanning anything; the flag is gone, and piped output
+  carries no colour codes anyway. The destroy guard in `promote_environments.yaml` and
+  `tf_stage` counted every `"actions"` entry in `terraform show -json`, so a plan that only
+  dropped an output was refused, and `show | grep ... || true` read a failed or empty `show`
+  as "0 deletions" and let the plan through to approval. It now counts only
+  `resource_changes`, captures `show` on its own so a failure stops the step, and reads the
+  count with `jq -e`; `jq` is a new prerequisite, as it already was for `lifecycle.yaml`.
+- **A fresh `compose.yaml` stack can publish approval `binds` digests.** `/artifacts` was a
+  named volume over a path neither image has, so Docker created it root-owned while the
+  engine and `dagron-api` run as uid 65532. The engine logged "could not prepare artifact
+  dir", never set `DAGRON_ARTIFACTS`, and a gate with `binds` listed `sha256: null`, so it
+  could not be approved from the Approvals page. Both images now ship `/artifacts` owned by
+  65532, which a new volume inherits. A volume created before this stays root-owned: remove
+  it (`docker compose down -v`) or `chown 65532:65532` it once.
+- **The test of `notify.git`'s `{{ run.images }}` never ran.** Its `#[test]`
+  sat on the README example's test instead, which ran twice. So nothing
+  checked that each image is listed once, in the order it first appears, that
+  `task_defaults` stands in for a task that names none, or that a workflow
+  with no images renders empty. It runs again, and fails against a
+  `run_images` that lists an image twice or ignores `task_defaults`.
+- **A workspace engine started with nine false warnings.**
+  - The typo scan took Kubernetes' service links for dagron knobs. The
+    kubelet gives every pod its namespace's Services as variables, and the
+    chart's Services are named `dagron-*`, so each engine warned of eight
+    `DAGRON_ENGINE_*`, and seven `DAGRON_POSTGRES_*` beside the chart's
+    Postgres. A name in the kubelet's exact shapes, beside its Service's
+    `_SERVICE_HOST`, which nothing else sets, is no longer a typo. A real
+    typo beside them still warns.
+  - A resident server given no DAG file warned that it could not read the
+    default `examples/simple_dag.yaml`. That file is in a checkout, not in
+    an image, and the chart runs its engine with no DAG. Such a server (the
+    management API, cron, DB schedules or GC on) now starts with no initial
+    run, as `dagron dev` does without its file. A DAG file that was asked
+    for and is missing still warns, and so does a one-shot run with nothing
+    to run.
+  - Unit tests cover both, each red against a broken variant. The built
+    engine, started as the chart starts it, with the kubelet's variables for
+    two Services and one real typo, warns of the typo alone.
+- **The chart's engine could not seed `/workflows`.** The chart ran the
+  engine as uid 10001, but the image runs as 65532, distroless's `nonroot`,
+  which owns `/workflows` and the working directory, `/home/nonroot`.
+  Kubernetes ignores the image's `VOLUME`, so the first-start copy of the
+  bundled examples into `/workflows` failed, a `seed copy failed … Permission
+  denied` warning for each, and a path the engine resolved from its working
+  directory failed the same way. The chart now runs the engine as the image's
+  user, 65532, as it already ran `dagron-api`. Engines roll once on upgrade.
+- **Two knobs dagron Cloud sets on its engines were reported as typos at
+  every boot:** `DAGRON_TASK_PRIORITY_CLASS` and `DAGRON_TASK_TOLERATIONS`,
+  both read by the Kubernetes executor, were missing from the engine's
+  registry. dagron Cloud's Workspace operator sets the first on every engine
+  of a tiered workspace, and each logged a "looks like a dagron knob but is
+  not one" warning. Both are registered now, and the registry test holds
+  them, and `DAGRON_TASK_ISOLATION_FLOOR`, which the operator now sets too.
+- **Two more real knobs were reported as typos at every boot:**
+  `DAGRON_TASK_ALLOWED_SERVICE_ACCOUNTS` and `DAGRON_TASK_SECRET_ENV`, both
+  read by the Kubernetes executor and documented in `docs/CONFIG.md`, were
+  missing from the engine's registry. dagron Cloud's Workspace operator now
+  sets the first on every workspace engine with a task identity (the
+  workspace's `dagron-task`), so each would have warned. The test that pins
+  the registry against the knobs other crates read now names both.
 - **A failed dead-letter redrive no longer loses the dead letter.** Both redrive routes
   deleted the row as their claim and committed that before creating the run.
   `dagron-api`'s `POST /api/dead-letters/{id}/redrive` then lost the payload, with its
@@ -1731,7 +2072,7 @@ digests and the Helm chart never went out.
 
 ### Fixed
 - **`mancube/dagron-frontend` is discontinued; 0.8.1 was its last tag.** It was
-  announced for removal at 1.0.0, and that promise cannot be kept: the change
+  announced for removal in a later breaking release, and that promise cannot be kept: the change
   that moved the console into `dagron-api` also made this image unbuildable.
 
   `frontend/next.config.js` sets `output: "export"` so `dagron-api` can embed
@@ -2133,10 +2474,10 @@ The one thing to read before you upgrade is **Deprecated** below: if you deploy
   learns to route around.
 
 ### Deprecated
-- **`mancube/dagron-frontend` is deprecated and will be removed in 1.0.0.** The
+- **`mancube/dagron-frontend` is deprecated and will be removed in a future breaking release.** The
   console it carried now ships inside `dagron-api` (see *Changed* below), so the
   image is a 281 MB Node runtime with nothing left to do. The intent was to keep
-  building and publishing it until 1.0.0 so anyone pinned to it had a release
+  building and publishing it until that removal so anyone pinned to it had a release
   boundary to migrate across rather than a tag that vanished underneath them. That
   did not survive contact with the build — see 0.9.1 above; **0.8.1 is the last
   tag.**
@@ -2147,7 +2488,7 @@ The one thing to read before you upgrade is **Deprecated** below: if you deploy
   with an ingress routing `/` to the frontend Service and `/api` to the API Service,
   both now point at the API.
 
-  0.9.1 does what 1.0.0 was going to: drops the image from
+  0.9.1 does that removal early: drops the image from
   `.github/workflows/docker.yml` and removes `frontend/Dockerfile`. The Docker Hub
   overview at `docs/dockerhub/dagron-frontend.md` stays as a tombstone pointing at
   `dagron-api`. The `frontend/` sources stay — they are what `dagron-api` builds
@@ -2158,7 +2499,7 @@ The one thing to read before you upgrade is **Deprecated** below: if you deploy
   there — instead of to a frontend Service. A default install goes from three pods to
   two and stops running a 281 MB pod to serve a page the API already has.
 
-  Waiting for 1.0.0 would have shipped the console **twice** on every chart install
+  Waiting for the removal release would have shipped the console **twice** on every chart install
   for a whole minor line: once from the deprecated frontend pod that the ingress still
   pointed at, once from the API. That overlap is worth avoiding now; removing the
   block entirely still waits for the breaking release.
@@ -2709,7 +3050,7 @@ backend should skip 0.8.0 entirely; SQLite deployments are unaffected.
 
 Minor, not patch: task pods created by the Kubernetes executor no longer receive
 a ServiceAccount token unless they asked for one. That is a changed default, and
-pre-1.0 this project treats a breaking change as a minor bump (see the header
+while dagron is 0.x this project treats a breaking change as a minor bump (see the header
 above). Everything else here is additive or a fix.
 
 ### Fixed
@@ -2780,7 +3121,7 @@ above). Everything else here is additive or a fix.
 ## [0.6.0] - 2026-08-09
 
 Minor, not patch: `DagronClient::from_env` now returns `Result<Self>`, and
-pre-1.0 this project treats a breaking change as a minor bump (see the header
+while dagron is 0.x this project treats a breaking change as a minor bump (see the header
 above).
 
 ### Added
@@ -3442,7 +3783,7 @@ above).
   alone, needing no new status. A non-2xx / errored poll re-parks it for the next
   window; the per-request timeout keeps a hung endpoint from stalling the tick.
   Bounded by the run's own `run_timeout_secs`. `for` / `until` / `url` are
-  mutually exclusive (exactly one). The `url` may template (`{{ params.* }}`).
+  mutually exclusive (exactly one). The `url` may template (`workflow parameters`).
   (A fourth form, `wait: { dataset: … }`, ships in the datasets entry above, so
   the exactly-one-of rule is over four fields, not three.)
 - **OpenTelemetry OTLP span exporter** (parity fast-win #28 follow-on) — with an
@@ -3511,7 +3852,7 @@ above).
   later task whose key matches reuses that output and **skips execution
   entirely** — no worker, no secrets, no artifacts — then its dependents advance
   as for a normal success. The `key` is a template resolved at expansion, so
-  `{{ scheduled_time }}` / `{{ params.* }}` make repeated and backfilled runs hit
+  `{{ scheduled_time }}` / `workflow parameters` make repeated and backfilled runs hit
   the cache (reproducible backfills). `max_age_secs` expires stale entries so the
   task re-runs and refreshes. New `task_memo` table (SQLite 028, Postgres 035);
   the memo write reuses the per-success spec parse the `repeat` operator already

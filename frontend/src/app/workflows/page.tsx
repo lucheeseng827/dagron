@@ -2,13 +2,12 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import LiveToggle from "@/components/LiveToggle";
+import RunWorkflowDialog from "@/components/RunWorkflowDialog";
 import {
   deleteWorkflow,
   getMe,
   listWorkflows,
-  runWorkflow,
   updateSchedule,
   type Me,
 } from "@/lib/dagron-api";
@@ -23,7 +22,6 @@ type ViewMode = "table" | "board";
 const GRID = "2.4fr 1.5fr 1.2fr 1.3fr 0.7fr 92px";
 
 export default function WorkflowsPage() {
-  const router = useRouter();
   const [me, setMe] = useState<Me | null>(null);
   const [rows, setRows] = useState<WorkflowRow[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -77,16 +75,8 @@ export default function WorkflowsPage() {
     });
   }, [rows, q, filter, tagFilter]);
 
-  const onRun = async (id: string) => {
-    setBusy(id);
-    try {
-      const { run_id } = await runWorkflow(id);
-      router.push(`/runs/detail/?id=${run_id}`);
-    } catch (e) {
-      setError(errMsg(e));
-      setBusy(null);
-    }
-  };
+  const [runTarget, setRunTarget] = useState<string | null>(null);
+  const onRun = (id: string) => setRunTarget(id);
   const onTogglePause = async (r: WorkflowRow) => {
     if (!r.schedule_id) return;
     setBusy(r.id);
@@ -114,6 +104,7 @@ export default function WorkflowsPage() {
 
   return (
     <div className="dy-page" style={{ maxWidth: 1320 }}>
+      {runTarget && <RunWorkflowDialog workflowId={runTarget} onClose={() => setRunTarget(null)} />}
       <div className="dy-pagehead">
         <div>
           <h1 className="dy-h1" style={{ marginBottom: 0 }}>

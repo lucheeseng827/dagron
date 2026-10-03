@@ -23,9 +23,11 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
-use crate::{ApiResponse, DagronClient, Method};
+use crate::{ApiResponse, DagronClient, Method, Progress};
 
 /// Whether a tool only reads dagron state or changes it — and, for a write,
 /// what kind of change.
@@ -523,9 +525,22 @@ first. A run sitting here is waiting on a decision, not on the engine.",
         Access::Write(Effect { destructive: false, idempotent: true, open_world: true }),
         "dagron_approve_task",
         "Approve a parked `type: approval` gate: the task succeeds and its dependents advance. \
-409 when the task is not awaiting approval.",
+409 when the task is not awaiting approval. `comment` records why; the approver's identity is \
+recorded automatically. Read the gate's `message` and `show` links from dagron_list_approvals \
+before deciding. A gate with `bound` artifacts in `show` approves only the exact bytes you reviewed: \
+pass their `sha256` from dagron_list_approvals as `digests` (400 without them, 409 if the artifact \
+changed since).",
         obj(
-            json!({ "run_id": sstr("the run id"), "task_id": sstr("the gate's task id") }),
+            json!({
+                "run_id": sstr("the run id"),
+                "task_id": sstr("the gate's task id"),
+                "comment": sstr("optional: why you approved (max 2000 chars)"),
+                "digests": json!({
+                    "type": "object",
+                    "description": "for a gate with bound artifacts: `<task>/<name>` -> the sha256 (hex) of that artifact as you reviewed it",
+                    "additionalProperties": { "type": "string" }
+                }),
+            }),
             &["run_id", "task_id"],
         ),
     ));
@@ -535,9 +550,13 @@ first. A run sitting here is waiting on a decision, not on the engine.",
         Access::Write(Effect { destructive: true, idempotent: true, open_world: true }),
         "dagron_reject_task",
         "Reject a parked `type: approval` gate: the task fails and its `all_success` dependents \
-skip. 409 when the task is not awaiting approval.",
+skip. 409 when the task is not awaiting approval. `comment` records why.",
         obj(
-            json!({ "run_id": sstr("the run id"), "task_id": sstr("the gate's task id") }),
+            json!({
+                "run_id": sstr("the run id"),
+                "task_id": sstr("the gate's task id"),
+                "comment": sstr("optional: why you rejected (max 2000 chars)"),
+            }),
             &["run_id", "task_id"],
         ),
     ));
@@ -643,7 +662,9 @@ paging on this route.",
     t.push(tool(
         Access::Read,
         "dagron_get_workflow",
-        "Get one registered workflow: its spec, description, state and current version.",
+        "Get one registered workflow: its spec, description, state and current version, plus \
+`parameters` (defaults) and `param_schema` (per parameter: `required`, `enum`, `pattern` \
+matching the whole value, `description`) — read these before `dagron_run_workflow`.",
         obj(json!({ "workflow_id": sstr("the workflow id") }), &["workflow_id"]),
     ));
     t.push(tool(
@@ -713,7 +734,9 @@ schedules intact; 'retired' is a soft delete that keeps the history; 'active' re
         "dagron_run_workflow",
         "Run a registered workflow by id, with optional arguments for its declared \
 `parameters:`. This is how a stored workflow is called as a function — no need to fetch its \
-spec and resubmit YAML. 409 when the workflow is paused or retired.",
+spec and resubmit YAML. Values must satisfy the workflow's `param_schema` (see \
+`dagron_get_workflow`); a violation is a 400 naming the parameter. 409 when the workflow is \
+paused or retired.",
         obj(
             json!({
                 "workflow_id": sstr("the workflow id"),
@@ -908,9 +931,21 @@ pub fn tool_defs() -> Vec<Value> {
 /// not merely refusing it on call, because a tool an agent can see is a tool it
 /// will plan around.
 pub fn tool_defs_for(readonly: bool) -> Vec<Value> {
+    tool_defs_for_policy(readonly, true)
+}
+
+/// The one tool that is off unless asked for: approving a gate.
+const APPROVE_TOOL: &str = "dagron_approve_task";
+
+/// [`tool_defs_for`], plus whether `dagron_approve_task` is offered
+/// (`DAGRON_MCP_ALLOW_APPROVE`). Rejecting stays available either way: it is
+/// the fail-safe direction, and an agent that can only refuse cannot push a
+/// change through.
+pub fn tool_defs_for_policy(readonly: bool, allow_approve: bool) -> Vec<Value> {
     catalogue()
         .into_iter()
         .filter(|(access, _)| !readonly || *access == Access::Read)
+        .filter(|(_, def)| allow_approve || def["name"] != APPROVE_TOOL)
         .map(|(_, def)| def)
         .collect()
 }
@@ -991,12 +1026,29 @@ fn body(v: Value) -> Option<(String, &'static str)> {
 
 /// Execute a tool against dagron-api, returning the response text.
 pub async fn call_tool(client: &DagronClient, name: &str, args: &Value) -> Result<String> {
+    call_tool_with_progress(client, name, args, None).await
+}
+
+/// [`call_tool`], reporting progress while the tool blocks when the request
+/// asked for it. Only `dagron_wait_run` blocks long enough to report any.
+pub async fn call_tool_with_progress(
+    client: &DagronClient,
+    name: &str,
+    args: &Value,
+    progress: Option<Progress<'_>>,
+) -> Result<String> {
     // Fail closed: a write tool stays refused in read-only mode even if some
     // composing server advertised it anyway.
     if client.readonly() && tool_access(name).is_some_and(Access::is_write) {
         anyhow::bail!(
             "`{name}` changes cluster state and this server is running read-only \
              (DAGRON_MCP_READONLY); unset it to enable the write tools"
+        );
+    }
+    if name == APPROVE_TOOL && !client.allow_approve() {
+        anyhow::bail!(
+            "`{name}` is disabled: approving a gate is a human decision. Ask a person to approve \
+             it in the console, or set DAGRON_MCP_ALLOW_APPROVE=1 on this server to let an agent do it"
         );
     }
     let a = Args::new(args);
@@ -1040,7 +1092,12 @@ pub async fn call_tool(client: &DagronClient, name: &str, args: &Value) -> Resul
         "dagron_wait_run" => {
             let run_id = a.id("run_id")?;
             let timeout = a.int("timeout_secs", 1, 600, 30)?;
-            get(client, &format!("/api/runs/{run_id}/wait?timeout_secs={timeout}")).await
+            let path = format!("/api/runs/{run_id}/wait?timeout_secs={timeout}");
+            let wait = get(client, &path);
+            match progress {
+                None => wait.await,
+                Some(p) => wait_reporting_progress(client, &run_id, wait, p).await,
+            }
         }
 
         // ── Runs: recover ────────────────────────────────────────────────────
@@ -1068,13 +1125,20 @@ pub async fn call_tool(client: &DagronClient, name: &str, args: &Value) -> Resul
 
         // ── Approval gates ───────────────────────────────────────────────────
         "dagron_list_approvals" => get(client, "/api/approvals").await,
-        "dagron_approve_task" => {
+        "dagron_approve_task" | "dagron_reject_task" => {
+            let verb = if name == "dagron_approve_task" { "approve" } else { "reject" };
             let (run, task) = (a.id("run_id")?, a.id("task_id")?);
-            post(client, &format!("/api/runs/{run}/tasks/{task}/approve"), None).await
-        }
-        "dagron_reject_task" => {
-            let (run, task) = (a.id("run_id")?, a.id("task_id")?);
-            post(client, &format!("/api/runs/{run}/tasks/{task}/reject"), None).await
+            let mut payload = json!({});
+            if let Some(c) = a.opt_str("comment")? {
+                payload["comment"] = json!(c);
+            }
+            if verb == "approve" {
+                if let Some(d) = a.str_map("digests")? {
+                    payload["digests"] = json!(d);
+                }
+            }
+            let payload = if payload.as_object().is_some_and(|o| !o.is_empty()) { body(payload) } else { None };
+            post(client, &format!("/api/runs/{run}/tasks/{task}/{verb}"), payload).await
         }
 
         // ── Triage ───────────────────────────────────────────────────────────
@@ -1280,6 +1344,83 @@ pub async fn call_tool(client: &DagronClient, name: &str, args: &Value) -> Resul
 /// `GET path`, rendered.
 async fn get(client: &DagronClient, path: &str) -> Result<String> {
     render(client.request(Method::Get, path, None, &[]).await?)
+}
+
+/// Task statuses a task does not leave. Progress counts these.
+const TERMINAL_TASK_STATUSES: [&str; 4] = ["succeeded", "failed", "skipped", "cancelled"];
+
+/// Drive a blocking `/wait`, and every [`DagronClient::progress_poll`] read the
+/// run and report how many of its tasks have finished.
+///
+/// A report goes out only when the count rose, because progress is meant to
+/// increase with each notification. So a run whose one long task is still
+/// running sends nothing while it runs. `total` is the run's task rows and can
+/// grow mid-run when a fan-out inserts tasks; `progress` never exceeds it. A
+/// failed read is logged and skipped: progress is best-effort, and must never
+/// fail the wait it decorates.
+async fn wait_reporting_progress(
+    client: &DagronClient,
+    run_id: &str,
+    wait: impl Future<Output = Result<String>>,
+    p: Progress<'_>,
+) -> Result<String> {
+    tokio::pin!(wait);
+    let every = client.progress_poll();
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut sent: Option<u64> = None;
+    // The read in flight, if any. It is a branch of the select below rather
+    // than awaited inside a handler, because a handler that awaits stops the
+    // select polling `wait`: a read that stalled would hold back an answer the
+    // wait already had. Each read is also bounded by one interval, so one
+    // stall cannot end the reports for the rest of the wait.
+    // `Send`, because a composing server's handler future must be: axum
+    // refuses one that is not, and this future is part of `handle`'s.
+    type Read<'a> = Pin<Box<dyn Future<Output = Result<(u64, u64)>> + Send + 'a>>;
+    let mut read: Option<Read<'_>> = None;
+    loop {
+        tokio::select! {
+            // The answer wins a tie, so no report is sent once it is in.
+            biased;
+            done = &mut wait => return done,
+            got = async { read.as_mut().expect("guarded by the precondition").await }, if read.is_some() => {
+                read = None;
+                match got {
+                    Ok((finished, total)) if sent.is_none_or(|s| finished > s) => {
+                        p.sink.send(p.token, finished, total);
+                        sent = Some(finished);
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(run_id, error = %e, "progress read failed; the wait continues"),
+                }
+            }
+            _ = tick.tick(), if read.is_none() => {
+                read = Some(Box::pin(async move {
+                    tokio::time::timeout(every, run_progress(client, run_id))
+                        .await
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("progress read timed out after {every:?}")))
+                }));
+            }
+        }
+    }
+}
+
+/// `(finished, total)` task counts for a run, from `GET /api/runs/{id}`.
+async fn run_progress(client: &DagronClient, run_id: &str) -> Result<(u64, u64)> {
+    let body = client.get(&format!("/api/runs/{run_id}")).await?;
+    let run: Value = serde_json::from_str(&body).context("run detail is not JSON")?;
+    let tasks = run["tasks"]
+        .as_array()
+        .context("run detail has no `tasks`")?;
+    let finished = tasks
+        .iter()
+        .filter(|t| {
+            t["status"]
+                .as_str()
+                .is_some_and(|s| TERMINAL_TASK_STATUSES.contains(&s))
+        })
+        .count();
+    Ok((finished as u64, tasks.len() as u64))
 }
 
 /// `POST path`, rendered.
@@ -1952,6 +2093,24 @@ mod tests {
         assert!(head.to_lowercase().contains("idempotency-key: retry-42"), "head: {head}");
         let sent: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(sent["parameters"]["region"], "ap-southeast-1");
+    }
+
+    #[tokio::test]
+    async fn approve_carries_the_digests_the_agent_reviewed() {
+        let (base, server) = capture_one_request(CREATED_RUN).await;
+        let client = DagronClient::new(base, None).with_allow_approve(true);
+        call_tool(
+            &client,
+            "dagron_approve_task",
+            &json!({ "run_id": "r1", "task_id": "t1", "digests": { "plan/plan.tfplan": "ab12" } }),
+        )
+        .await
+        .unwrap();
+
+        let (head, body) = server.await.unwrap();
+        assert!(head.contains("/api/runs/r1/tasks/t1/approve"), "head: {head}");
+        let sent: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(sent["digests"]["plan/plan.tfplan"], "ab12");
     }
 
     #[tokio::test]

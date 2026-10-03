@@ -7,6 +7,7 @@ import { useRouter } from "next/navigation";
 import Editor from "@monaco-editor/react";
 import "@/lib/monaco"; // self-host the Monaco runtime (air-gap; no CDN)
 import ScheduleDrawer from "@/components/ScheduleDrawer";
+import RunWorkflowDialog from "@/components/RunWorkflowDialog";
 import EditableDag from "@/components/dag/EditableDag";
 import WorkflowLoopBar from "@/components/dag/WorkflowLoopBar";
 import { applyLoopBody, loopBodyModel, readWorkflowLoop } from "@/lib/workflow-loop";
@@ -22,7 +23,6 @@ import {
   deleteWorkflow,
   getMe,
   getWorkflow,
-  runWorkflow,
   syncWorkflowToGit,
   updateWorkflow,
   type Me,
@@ -122,17 +122,8 @@ export default function WorkflowEditor({ id }: { id?: string }) {
     }
   };
 
-  const onRun = async () => {
-    if (!id) return;
-    setBusy(true);
-    try {
-      const { run_id } = await runWorkflow(id);
-      router.push(`/runs/detail/?id=${run_id}`);
-    } catch (e) {
-      setError(errMsg(e));
-      setBusy(false);
-    }
-  };
+  const [running, setRunning] = useState(false);
+  const onRun = () => id && setRunning(true);
 
   const onDelete = async () => {
     if (!id || !confirm("Delete this workflow?")) return;
@@ -168,6 +159,7 @@ export default function WorkflowEditor({ id }: { id?: string }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", padding: "20px 24px" }}>
+      {running && id && <RunWorkflowDialog workflowId={id} onClose={() => setRunning(false)} />}
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
         <h1 className="dy-h1" style={{ margin: 0 }}>
           {isNew ? "New workflow" : "Edit workflow"}

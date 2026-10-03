@@ -26,7 +26,7 @@ services:
       - default
 
   grafana:
-    image: docker.io/grafana/grafana:13.1.1
+    image: docker.io/grafana/grafana:13.2.3
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}

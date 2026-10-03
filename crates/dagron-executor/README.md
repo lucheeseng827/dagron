@@ -14,7 +14,14 @@ knowledge of scheduling or ingestion.
 - **`docker_executor`** — `DockerExecutor`, running each task in a container over a
   Docker / podman socket (`bollard`).
 - **`kube_executor`** — `KubeExecutor`, running each task as a Kubernetes pod. Behind
-  the `kubernetes` feature (pure-Rust client; compiles without a cluster).
+  the `kubernetes` feature (pure-Rust client; compiles without a cluster). A task may
+  name its own `service_account` (the IRSA seam, so a pod can assume an IAM role), so
+  which accounts a task may run under is gated by `DAGRON_TASK_ALLOWED_SERVICE_ACCOUNTS`
+  — a comma-separated allow-list, empty by default: a task that names an unlisted
+  account is refused rather than run with it, and one that names none runs as the
+  namespace `default` (whose token the pod hardening withholds). Never list the
+  engine's own ServiceAccount there — it can create pods and read Secrets, so running a
+  task under it is a privilege-escalation path. See the module doc for the checks.
 - **`worker`** — the ractor `WorkerPool` that dispatches `DispatchPayload`s to the
   executor, records per-task durations into the core `Metrics` registry, and returns
   each `TaskResult` to the reconcile loop.

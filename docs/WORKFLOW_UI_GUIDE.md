@@ -102,7 +102,7 @@ Open **http://localhost:8080**.
 | Runs workflow | `workflow_ref` | **chain another saved workflow** — see §5. |
 | Calls template | `template` | **call a `templates:` sub-DAG declared in this spec** — see §5.5. |
 | Arguments | `arguments` | values passed to the called template, filling its `parameters`. |
-| (task kind) | `type: approval` | human approval gate: no command/ref; optional `approval_timeout_secs` + `approval_on_timeout: reject` (default) \| `approve`. |
+| (task kind) | `type: approval` | human approval gate: no command/ref; optional `approval_timeout_secs` + `approval_on_timeout` (`reject` by default, or `approve`); `approval_message` (text shown to the approver); `approval_show: ["<task>/<name>"]` (artifacts to review, e.g. `plan/plan.txt`); `binds: ["<task>/<name>"]` (pin the approval to those artifacts' exact bytes: approving needs their sha256, and the digests are written to `<gate>/approved.sha256` for `sha256sum -c` downstream); `approvers: [email or group:<name>]` (who may decide; the gateway answers 403 to anyone else); `not_triggerer: true` (whoever started the run may not approve it). |
 
 Run-level fields (top of the spec, beside `name`):
 
@@ -292,8 +292,10 @@ the pipeline), since a call is only valid alongside the template it names.
 **Rules.** Except for `type: approval` tasks (a human gate that runs no command),
 a task is exactly one of `command` (leaf), `template` (call), or
 `workflow_ref` (chain). A `template:` must name a template declared in the same
-spec — an unknown name is rejected on **Save**, not at run time. Templates may
-call other templates. A `workflow_ref` may not appear *inside* a template (the
+spec, or one a `use:` block imports from a template library (a saved workflow
+that declares `templates:`; see [`examples/iac/`](../examples/iac/README.md)) —
+an unknown name is rejected on **Save**, not at run time. Templates may call
+other templates. A `workflow_ref` may not appear *inside* a template (the
 chain expander only walks top-level tasks, so it would be silently dropped), and
 a chained workflow may not declare its own `templates:` (inlining copies its
 tasks, not its templates) — both are refused with a message saying so.
@@ -302,6 +304,96 @@ Parameters, fan-out (`with_items`), conditionals and recursion build on the same
 mechanism; see [`../examples/templates/`](../examples/templates/README.md).
 Those specs run fine, but they lock the Visual tab (§2) — the canvas cannot
 honestly draw a task that becomes N tasks.
+
+### 5.6 Keeping a long spec short
+
+A spec grows long because the same group of steps is written out once per
+environment, stack or region. Work through these in order; each removes a
+different kind of repetition.
+
+**1. Move the repeated block into a template.** Find a group of tasks that appears
+more than once, or appears with a few values changed. Put it under `templates:`
+and call it with `template:`.
+
+```yaml
+templates:
+  - name: stage
+    parameters: { env: "", gated: "true" }    # everything the block varies on, with defaults
+    tasks:
+      - { name: plan,  command: [sh, -c, "plan {{ env }}"] }
+      - { name: apply, depends_on: [plan], command: [sh, -c, "apply {{ env }}"] }
+
+tasks:
+  - { name: dev,  template: stage, arguments: { env: dev, gated: "false" } }
+  - { name: prod, template: stage, depends_on: [dev], arguments: { env: prod } }
+```
+
+- Whatever differs between calls becomes a `{{ name }}` parameter with a default.
+- A template sees only its own parameters. Pass anything from the outer spec through
+  `arguments:`, for example `tf_dir: "{{ tf_dir }}"`.
+- After expansion a call's tasks are named `<call>.<task>` (`prod.apply`), so name
+  the call after what it represents.
+
+**2. Put the variations on the call, not in the template.**
+
+| You want | Write it on the call |
+|---|---|
+| A different environment or value | `arguments: { env: prod }` |
+| Run only if a condition holds | `when: "{{ promote_through }} in [staging, prod]"` |
+| Run only if an earlier step changed something | `when: "{{ tasks.changed.output }} == changes"` |
+| Combine conditions | `and` / `or`, and `in [..]` / `not in [..]` (no parentheses; `and` binds tighter) |
+| Run once per item | `with_items: [a, b]`, or `with_param: "{{ list }}"` |
+| Run once per item an earlier step printed | `with_output_of: <task>` (that task prints a JSON array) |
+| Order the calls | `depends_on: [dev]` |
+
+A false `when:` removes the call and everything inside it.
+
+**3. Remove per-task boilerplate.**
+
+- `task_defaults:` sets shared values once (`max_attempts`, `retry_delay_secs`,
+  `timeout_secs`, `docker_image`, `runner_class`, `priority`, `pool`, `env`). A task
+  wins by setting its own value.
+- Top-level `parameters:` with `param_schema:` gives the workflow one place for its
+  inputs, checked (`required`, `enum`, `pattern`) before any task exists. A `pattern`
+  on a value that is spliced into a shell command is also what stops a caller
+  injecting shell.
+- `environment:` names a stored variable set, available as `{{ env.NAME }}`, so
+  values and secrets stay out of the spec.
+
+**4. Share a template across workflows with `use:`.** When a template is useful in
+more than one workflow, move it out of the spec. Save a workflow that declares
+`templates:` and `tasks: []` (tag it `library`), then import it:
+
+```yaml
+use:
+  - iac-library               # every template the library declares
+  - ci-library/build          # one template, plus the templates it calls
+```
+
+- The import is by name and resolves to the library as saved *now*, so editing the
+  library changes every workflow that imports it on its next run. To pin a workflow
+  to a fixed copy, save the library under a new name and import that.
+- A name defined both in the spec and in a library, or in two libraries, is refused
+  rather than overridden; import `library/template` to take only what you need.
+- A library may not itself `use:` another. A missing library or template, or a clash,
+  is rejected on **Save**.
+- `use:` is resolved by `dagron-api`. A bare engine or a file ingest refuses it with
+  a message saying so.
+
+A worked example, with Terraform, OpenTofu and Pulumi promotion workflows of 74 and
+49 lines, is in [`../examples/iac/`](../examples/iac/README.md).
+
+**Pick the right kind of reuse.**
+
+- `template:` / `use:` — the same group of steps with different values. The main tool.
+- `workflow_ref:` — run a whole saved workflow as one step (§5.1–5.3). It carries no
+  arguments and cannot appear inside a template.
+- A script file — for one task whose `command` is itself long. Templates reuse the
+  DAG, not the code.
+
+A good target is a spec that reads as a short `parameters` and `param_schema` block
+followed by a list of calls, each saying what it is (`name`), what it needs
+(`depends_on`), when it runs (`when`) and what differs (`arguments`).
 
 ---
 
@@ -330,10 +422,18 @@ configured” error.
 name: <workflow-name>           # required
 run_timeout_secs: 3600          # optional: auto-terminate the whole run (wall clock)
 result_from: <task-name>        # optional: that task's output becomes the run result
+parameters: { stack: "", action: plan }   # optional defaults, overridable per run
+param_schema:                   # optional: rules checked when a run is triggered (400 if broken)
+  stack:  { required: true, pattern: "[a-z][a-z0-9-]+" }   # pattern must match the whole value
+  action: { enum: [plan, apply], description: "shown to whoever triggers it" }
+max_active_runs: 1              # optional: cap on concurrently running runs of this workflow
+concurrency_key: "{{ stack }}"  # optional: make that cap per key (one run per stack); needs max_active_runs
 templates:                      # optional: reusable sub-DAGs (§5.5)
   - name: <template-name>
     parameters: { key: default }  # optional defaults, overridable per call
     tasks: [ … ]                  # the sub-DAG, same task shape as below
+use: [<library>, <library>/<template>]   # optional: import templates from a saved library workflow (§5.6)
+task_defaults: { max_attempts: 2, timeout_secs: 600 }   # optional: shared task values, a task's own wins (§5.6)
 tasks:
   - name: <task-name>           # required, unique
     # exactly one of:
@@ -352,6 +452,11 @@ tasks:
     type: approval
     approval_timeout_secs: 3600 # optional deadline…
     approval_on_timeout: reject # …and what it does: reject (default) | approve
+    approval_message: "Apply the plan to prod?" # shown to the approver
+    approval_show: ["plan/plan.txt"]            # artifacts they should read first
+    binds: ["plan/tfplan"]                       # approval covers these exact bytes; apply verifies <gate>/approved.sha256
+    approvers: ["group:release"]                # who may decide (email or group:<name>); omit = anyone signed in
+    not_triggerer: true                         # whoever started the run may not approve it
 ```
 
 Ready-to-load specs live in [`../examples/ui/`](../examples/ui/) and are the same

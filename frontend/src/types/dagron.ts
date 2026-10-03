@@ -118,6 +118,9 @@ export interface TaskRow {
   pool: string | null;
   priority: number;
   cache_hit: boolean;
+  /// Approval gate decision: who resolved it (`timeout` when the sweep did) and why.
+  decided_by?: string | null;
+  decision_comment?: string | null;
 }
 
 /// A dataset in the registry: current state plus who consumes it.
@@ -366,6 +369,19 @@ export interface Workflow extends WorkflowSummary {
   state?: WorkflowState;
   /// Current definition version; the history is /workflows/{id}/versions.
   version?: number;
+  tags?: string[];
+  /// The spec's `parameters:` defaults.
+  parameters?: Record<string, string>;
+  /// The spec's `param_schema:`, enforced when a run is triggered.
+  param_schema?: Record<string, ParamRule>;
+}
+
+export interface ParamRule {
+  required?: boolean;
+  enum?: string[];
+  /// Must match the whole value.
+  pattern?: string;
+  description?: string;
 }
 
 /// One entry in a workflow's definition history. Append-only: an edit adds a
@@ -462,6 +478,18 @@ export interface PendingApproval {
   task_name: string;
   workflow_name: string | null;
   since: string | null;
+  /// The workflow author's note to the approver (`approval_message`).
+  message: string | null;
+  /// Artifacts to review before deciding (`approval_show`); `url` is an API path.
+  /// `bound` ones are pinned by `binds`: approving sends back their `sha256`.
+  show: { path: string; url: string; bound: boolean; sha256: string | null }[];
+  /// Who may decide (`approvers`); empty means anyone signed in.
+  approvers: string[];
+  /// Whoever started the run may not approve it (`not_triggerer`).
+  not_triggerer: boolean;
+  /// Whether the caller may approve / reject this gate (server-computed).
+  can_approve: boolean;
+  can_reject: boolean;
 }
 
 export type BackfillStatus = "running" | "completed" | "cancelled";

@@ -80,7 +80,7 @@ jobs:
             file: "./crates/dagron-api/Dockerfile"
             build_args: ""
           # `dagron-frontend` used to be built here. It is gone as of 0.9.1, one
-          # minor earlier than the 1.0.0 removal that was announced, because the
+          # minor earlier than the removal that was announced, because the
           # image cannot be built at all any more — let alone usefully:
           #
           #   * `frontend/next.config.js` sets `output: "export"` so dagron-api can

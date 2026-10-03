@@ -578,10 +578,25 @@ async fn main() -> Result<()> {
 /// migrator but knows nothing about these statements — so on a clean volume the
 /// two collide and dagron-api exits before it ever listens.
 ///
+/// The other collision is a deadlock. `ALTER TABLE workflow_runs` here queues
+/// for an exclusive lock behind the migrator's `CREATE INDEX CONCURRENTLY` on the
+/// same table (migrations_pg 047, 048), and the index build in turn waits out
+/// every transaction with an older snapshot — including that queued ALTER.
+/// Postgres breaks the cycle by failing one side with `deadlock_detected`, and
+/// it is usually this one, which started waiting first:
+///
+/// ```text
+/// Error: ensuring environments schema
+/// Caused by: deadlock detected
+/// ```
+///
 /// Every step below is idempotent, so the whole sequence is simply replayed: by
 /// the retry the other side has committed, `IF NOT EXISTS` sees the object and
-/// the no-op path is taken. Retries are bounded — a race resolves on the first
-/// one, and anything still failing after that is a real error worth dying on.
+/// the no-op path is taken. Retries are bounded. A duplicate or a deadlock
+/// clears once the migration behind it commits, which the next attempt finds
+/// done; two index builds touch `workflow_runs`, so four attempts cover a
+/// duplicate and both. Anything still failing after that is a real error worth
+/// dying on.
 async fn ensure_schemas(pool: &sqlx::postgres::PgPool) -> Result<()> {
     const MAX_ATTEMPTS: u32 = 4;
     let mut attempt = 1;
@@ -636,13 +651,14 @@ async fn ensure_schemas_once(pool: &sqlx::postgres::PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Does this error mean "another session created the object first"?
+/// Does this error mean "the migrator got there first", so a replay succeeds?
 ///
 /// Scoped deliberately to the schema bootstrap. `23505` is an ordinary
 /// application error elsewhere (a duplicate email on signup); what makes it a
 /// race *here* is that the only inserts in that path are Postgres' own catalog
-/// writes. The rest are the DDL-specific codes Postgres raises when an object
-/// appears between the existence check and the create.
+/// writes. Next are the DDL-specific codes Postgres raises when an object
+/// appears between the existence check and the create. Last is the deadlock
+/// with a concurrent index build described on [`ensure_schemas`].
 fn is_concurrent_ddl_race(err: &anyhow::Error) -> bool {
     err.chain()
         .filter_map(|cause| cause.downcast_ref::<sqlx::Error>())
@@ -656,6 +672,9 @@ fn is_concurrent_ddl_race(err: &anyhow::Error) -> bool {
                     | Some("42P07")
                     | Some("42710")
                     | Some("42701")
+                // deadlock_detected: an ALTER TABLE here against the migrator's
+                // CREATE INDEX CONCURRENTLY on the same table
+                    | Some("40P01")
             )
         })
 }
@@ -750,4 +769,112 @@ async fn readyz(
 /// contract works end-to-end. Gated by the `AuthUser` extractor.
 async fn me(AuthUser(claims): AuthUser) -> Json<auth::SessionClaims> {
     Json(claims)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The server `TEST_DATABASE_URL` names, or `None` (with a note) so a live test skips.
+    fn test_database_url() -> Option<String> {
+        let url = std::env::var("TEST_DATABASE_URL").ok();
+        if url.is_none() {
+            eprintln!("TEST_DATABASE_URL unset - skipping a live-datastore test");
+        }
+        url
+    }
+
+    /// Wait until `workflow_runs` in `schema` has a lock in `mode`, granted or queued.
+    async fn wait_for_lock(pool: &sqlx::PgPool, schema: &str, mode: &str, granted: bool) {
+        for _ in 0..500 {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks l
+                   JOIN pg_class c ON c.oid = l.relation
+                   JOIN pg_namespace n ON n.oid = c.relnamespace
+                  WHERE n.nspname = $1 AND c.relname = 'workflow_runs'
+                    AND l.mode = $2 AND l.granted = $3",
+            )
+            .bind(schema)
+            .bind(mode)
+            .bind(granted)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if n > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("no {mode} (granted: {granted}) on {schema}.workflow_runs after 5 s");
+    }
+
+    /// The lock cycle a fresh install hits when the engine migrates while dagron-api boots. The
+    /// migrator's `CREATE INDEX CONCURRENTLY` on `workflow_runs` (migrations_pg 047, 048) waits out
+    /// every transaction with an older snapshot, and that includes this bootstrap's
+    /// `ALTER TABLE workflow_runs`, which is itself queued behind the index build's lock. Postgres
+    /// fails one side with deadlock_detected; the bootstrap waited first, so it is the one. It must
+    /// replay and succeed, and the index build must still finish.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_bootstrap_replays_past_a_deadlock_with_a_concurrent_index_build() {
+        let Some(url) = test_database_url() else {
+            return;
+        };
+        // A private schema: the bootstrap's tables land here and shadow nothing another test uses.
+        let schema = format!("bootstrap_deadlock_{}", uuid::Uuid::new_v4().simple());
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect_with(options.options([("search_path", schema.as_str())]))
+            .await
+            .unwrap();
+        // The engine-owned table, as much of it as this needs.
+        sqlx::query("CREATE TABLE workflow_runs (id TEXT PRIMARY KEY, created_at TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // An open write holds the index build at its first wait, so the ALTER queues behind it.
+        let mut writer = pool.begin().await.unwrap();
+        sqlx::query("INSERT INTO workflow_runs VALUES ('r1', 'now')")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        let index = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "CREATE INDEX CONCURRENTLY idx_runs_created ON workflow_runs (created_at)",
+                )
+                .execute(&pool)
+                .await
+            }
+        });
+        wait_for_lock(&pool, &schema, "ShareUpdateExclusiveLock", true).await;
+        let bootstrap = tokio::spawn({
+            let pool = pool.clone();
+            async move { ensure_schemas(&pool).await }
+        });
+        wait_for_lock(&pool, &schema, "AccessExclusiveLock", false).await;
+        // Released, the index build reaches its snapshot wait, which closes the cycle.
+        writer.commit().await.unwrap();
+
+        let bootstrapped = bootstrap.await.unwrap();
+        let indexed = index.await.unwrap();
+        pool.close().await;
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        bootstrapped.expect("the bootstrap replays past the deadlock");
+        indexed.expect("the index build finishes");
+    }
 }

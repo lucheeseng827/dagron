@@ -25,7 +25,49 @@ use std::time::Duration;
 
 mod tools;
 
-pub use tools::{call_tool, tool_access, tool_defs, tool_defs_for, Access, Effect};
+pub use tools::{
+    call_tool, call_tool_with_progress, tool_access, tool_defs, tool_defs_for,
+    tool_defs_for_policy, Access, Effect,
+};
+
+/// How often a blocked `dagron_wait_run` re-reads the run to report progress.
+/// The API re-checks a waited-on run at the same interval, so a progress poll
+/// costs a waiter about what the server already pays for it.
+const PROGRESS_POLL: Duration = Duration::from_secs(5);
+
+/// Where `notifications/progress` go while a tool call blocks.
+///
+/// A trait rather than a channel so the stdio binary can write to its output
+/// queue and a test can collect what was sent.
+pub trait ProgressSink: Send + Sync {
+    /// One notification: `progress` of `total`, for the request that carried
+    /// `token`.
+    fn send(&self, token: &Value, progress: u64, total: u64);
+}
+
+/// A sink that drops everything: what [`handle`] and [`call_tool`] use.
+pub struct NoProgress;
+
+impl ProgressSink for NoProgress {
+    fn send(&self, _token: &Value, _progress: u64, _total: u64) {}
+}
+
+/// A request's progress token and where its notifications go. Only built when
+/// the request carried a token: the token is the client's opt-in.
+#[derive(Clone, Copy)]
+pub struct Progress<'a> {
+    pub token: &'a Value,
+    pub sink: &'a dyn ProgressSink,
+}
+
+/// The `notifications/progress` message for one report.
+pub fn progress_notification(token: &Value, progress: u64, total: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": { "progressToken": token, "progress": progress, "total": total }
+    })
+}
 
 /// MCP protocol revision this server implements, and answers every `initialize`
 /// with.
@@ -111,7 +153,9 @@ pub struct DagronClient {
     base: String,
     token: Option<String>,
     readonly: bool,
+    allow_approve: bool,
     max_artifact_bytes: usize,
+    progress_poll: Duration,
 }
 
 impl DagronClient {
@@ -137,7 +181,9 @@ impl DagronClient {
             base,
             token,
             readonly: env_flag("DAGRON_MCP_READONLY"),
+            allow_approve: env_flag("DAGRON_MCP_ALLOW_APPROVE"),
             max_artifact_bytes,
+            progress_poll: PROGRESS_POLL,
         })
     }
 
@@ -149,8 +195,34 @@ impl DagronClient {
             base: base.into(),
             token,
             readonly: false,
+            allow_approve: false,
             max_artifact_bytes: DEFAULT_MAX_ARTIFACT_BYTES,
+            progress_poll: PROGRESS_POLL,
         }
+    }
+
+    /// Re-read a waited-on run this often, so a test need not wait 5 s a tick.
+    #[cfg(test)]
+    pub(crate) fn with_progress_poll(mut self, every: Duration) -> Self {
+        self.progress_poll = every;
+        self
+    }
+
+    pub(crate) fn progress_poll(&self) -> Duration {
+        self.progress_poll
+    }
+
+    /// Let this server approve gates (`DAGRON_MCP_ALLOW_APPROVE`). Off by
+    /// default: approving is the one decision that should be a person's, and an
+    /// agent that reads untrusted text (a plan, a log line) can be talked into it.
+    pub fn with_allow_approve(mut self, allow: bool) -> Self {
+        self.allow_approve = allow;
+        self
+    }
+
+    /// Whether `dagron_approve_task` is advertised and honoured.
+    pub fn allow_approve(&self) -> bool {
+        self.allow_approve
     }
 
     /// Hide and refuse every mutating tool.
@@ -384,6 +456,23 @@ fn plaintext_remote_host(base: &str) -> Option<String> {
 /// Handle one JSON-RPC message. Returns `Some(response)` for a request, `None` for
 /// a notification (no `id`) that needs no reply.
 pub async fn handle(client: &DagronClient, msg: &Value) -> Option<Value> {
+    handle_with_progress(client, msg, &NoProgress).await
+}
+
+/// [`handle`], sending `notifications/progress` to `sink` while a tool call
+/// blocks.
+///
+/// Only a `tools/call` whose `params._meta.progressToken` is a string or a
+/// number gets any: the token is the client's opt-in, and it is echoed as
+/// given. Today only `dagron_wait_run` reports progress; every other tool
+/// ignores the token, which the protocol allows. Nothing is sent after the
+/// response: the caller writes the returned response after every
+/// notification this call made.
+pub async fn handle_with_progress(
+    client: &DagronClient,
+    msg: &Value,
+    sink: &dyn ProgressSink,
+) -> Option<Value> {
     // A JSON-RPC message without an `id` is a notification: it must never get a
     // reply, regardless of method. Bail out before producing any response.
     let id = match msg.get("id").cloned() {
@@ -402,15 +491,20 @@ pub async fn handle(client: &DagronClient, msg: &Value) -> Option<Value> {
             }),
         )),
         "ping" => Some(ok(id, json!({}))),
-        "tools/list" => Some(ok(id, json!({ "tools": tool_defs_for(client.readonly()) }))),
+        "tools/list" => Some(ok(id, json!({ "tools": tool_defs_for_policy(client.readonly(), client.allow_approve()) }))),
         "tools/call" => {
             let params = msg.get("params").cloned().unwrap_or(Value::Null);
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let (text, is_error) = match call_tool(client, name, &args).await {
-                Ok(t) => (t, false),
-                Err(e) => (e.to_string(), true),
-            };
+            let token = params
+                .pointer("/_meta/progressToken")
+                .filter(|t| t.is_string() || t.is_number());
+            let progress = token.map(|token| Progress { token, sink });
+            let (text, is_error) =
+                match call_tool_with_progress(client, name, &args, progress).await {
+                    Ok(t) => (t, false),
+                    Err(e) => (e.to_string(), true),
+                };
             Some(ok(
                 id,
                 json!({ "content": [{ "type": "text", "text": text }], "isError": is_error }),
@@ -536,6 +630,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approving_is_off_until_asked_for_but_rejecting_is_not() {
+        async fn listed(c: &DagronClient) -> Vec<String> {
+            let resp = handle(c, &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).await.unwrap();
+            resp["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        }
+        let default = client();
+        let names = listed(&default).await;
+        assert!(!names.contains(&"dagron_approve_task".to_string()));
+        assert!(names.contains(&"dagron_reject_task".to_string()), "refusing stays available");
+        assert!(names.contains(&"dagron_list_approvals".to_string()));
+
+        // Advertised or not, a call is refused: the switch fails closed.
+        let resp = handle(
+            &default,
+            &json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+                    "params":{"name":"dagron_approve_task","arguments":{"run_id":"r","task_id":"t"}}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("DAGRON_MCP_ALLOW_APPROVE"), "got {text:?}");
+
+        let allowed = client().with_allow_approve(true);
+        assert!(listed(&allowed).await.contains(&"dagron_approve_task".to_string()));
+        // Read-only still wins over the opt-in.
+        let ro = client().with_allow_approve(true).with_readonly(true);
+        assert!(!listed(&ro).await.contains(&"dagron_approve_task".to_string()));
+    }
+
+    #[tokio::test]
     async fn notification_gets_no_response() {
         let resp = handle(
             &client(),
@@ -569,6 +699,248 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp["result"]["isError"], true);
+    }
+
+    // ── Progress ─────────────────────────────────────────────────────────────
+
+    /// Records every notification it is handed.
+    #[derive(Default)]
+    struct Collect(std::sync::Mutex<Vec<(Value, u64, u64)>>);
+
+    impl ProgressSink for Collect {
+        fn send(&self, token: &Value, progress: u64, total: u64) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((token.clone(), progress, total));
+        }
+    }
+
+    impl Collect {
+        fn sent(&self) -> Vec<(Value, u64, u64)> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    const WAIT_BODY: &str = r#"{"run_id":"r1","status":"succeeded","finished":true}"#;
+
+    /// What the stub answers one `GET /api/runs/r1` with.
+    #[derive(Clone, Copy)]
+    enum Detail {
+        /// `(finished, total)` task counts.
+        Counts(usize, usize),
+        /// A 500.
+        Fails,
+        /// Nothing, ever: the connection stays open.
+        Hangs,
+    }
+    use Detail::{Counts, Fails, Hangs};
+
+    /// A stub dagron-api. `/wait` answers after `wait_for`. Each
+    /// `GET /api/runs/r1` answers the next entry of `details`, the last one
+    /// repeating.
+    async fn stub_api(wait_for: Duration, details: Vec<Detail>) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let details = Arc::new(details);
+        let next = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let (details, next) = (details.clone(), next.clone());
+                tokio::spawn(async move {
+                    let mut raw = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => raw.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&raw).into_owned();
+                    let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let (status, body) = if path.contains("/wait") {
+                        tokio::time::sleep(wait_for).await;
+                        ("200 OK", WAIT_BODY.to_string())
+                    } else {
+                        let i = next.fetch_add(1, Ordering::SeqCst).min(details.len() - 1);
+                        match details[i] {
+                            Counts(finished, total) => {
+                                let tasks: Vec<Value> = (0..total)
+                                    .map(|n| json!({ "status": if n < finished { "succeeded" } else { "running" } }))
+                                    .collect();
+                                ("200 OK", json!({ "id": "r1", "tasks": tasks }).to_string())
+                            }
+                            Fails => ("500 Internal Server Error", "boom".to_string()),
+                            Hangs => {
+                                tokio::time::sleep(Duration::from_secs(3600)).await;
+                                return;
+                            }
+                        }
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        base
+    }
+
+    fn wait_call(token: Option<Value>) -> Value {
+        let mut msg = json!({"jsonrpc":"2.0","id":5,"method":"tools/call",
+            "params":{"name":"dagron_wait_run","arguments":{"run_id":"r1","timeout_secs":5}}});
+        if let Some(t) = token {
+            msg["params"]["_meta"] = json!({ "progressToken": t });
+        }
+        msg
+    }
+
+    fn fast(base: String) -> DagronClient {
+        DagronClient::new(base, None).with_progress_poll(Duration::from_millis(50))
+    }
+
+    #[tokio::test]
+    async fn a_blocked_wait_reports_rising_progress_under_the_callers_token() {
+        let base = stub_api(
+            Duration::from_millis(600),
+            vec![Counts(1, 4), Counts(1, 4), Counts(2, 4), Counts(3, 5)],
+        )
+        .await;
+        let sink = Collect::default();
+        let resp = handle_with_progress(&fast(base.clone()), &wait_call(Some(json!("tok"))), &sink)
+            .await
+            .unwrap();
+        let sent = sink.sent();
+        // An unchanged count sends nothing, and `total` grows with the run.
+        let counts: Vec<(u64, u64)> = sent.iter().map(|(_, p, t)| (*p, *t)).collect();
+        assert_eq!(counts, vec![(1, 4), (2, 4), (3, 5)]);
+        assert!(
+            sent.iter().all(|(token, _, _)| token == "tok"),
+            "token echoed as given: {sent:?}"
+        );
+
+        // The answer itself is the one a call without a token gets.
+        let plain = handle(&fast(base), &wait_call(None)).await.unwrap();
+        assert_eq!(resp, plain);
+        assert_eq!(resp["result"]["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn without_a_token_nothing_is_sent() {
+        let base = stub_api(Duration::from_millis(300), vec![Counts(1, 2)]).await;
+        let sink = Collect::default();
+        let resp = handle_with_progress(&fast(base), &wait_call(None), &sink)
+            .await
+            .unwrap();
+        assert!(
+            sink.sent().is_empty(),
+            "no token, no notifications: {:?}",
+            sink.sent()
+        );
+        assert_eq!(resp["result"]["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn a_token_that_is_neither_string_nor_number_is_not_an_opt_in() {
+        let base = stub_api(Duration::from_millis(300), vec![Counts(1, 2)]).await;
+        let sink = Collect::default();
+        handle_with_progress(&fast(base), &wait_call(Some(json!({ "x": 1 }))), &sink)
+            .await
+            .unwrap();
+        assert!(sink.sent().is_empty(), "{:?}", sink.sent());
+    }
+
+    #[tokio::test]
+    async fn a_numeric_token_round_trips_as_a_number() {
+        let base = stub_api(Duration::from_millis(300), vec![Counts(1, 2)]).await;
+        let sink = Collect::default();
+        handle_with_progress(&fast(base), &wait_call(Some(json!(7))), &sink)
+            .await
+            .unwrap();
+        let sent = sink.sent();
+        assert!(!sent.is_empty());
+        assert!(
+            sent.iter().all(|(token, _, _)| *token == json!(7)),
+            "{sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_progress_read_does_not_fail_the_wait() {
+        let base = stub_api(Duration::from_millis(300), vec![Fails]).await;
+        let sink = Collect::default();
+        let resp = handle_with_progress(&fast(base), &wait_call(Some(json!("tok"))), &sink)
+            .await
+            .unwrap();
+        assert!(sink.sent().is_empty());
+        assert_eq!(resp["result"]["isError"], false, "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("succeeded"),
+            "the wait's own answer comes back: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_progress_read_that_never_answers_does_not_hold_back_the_wait() {
+        // Every read hangs. The wait answers at 300 ms, and that answer must
+        // come back then: a read in flight is not something the wait waits on.
+        let base = stub_api(Duration::from_millis(300), vec![Hangs]).await;
+        let sink = Collect::default();
+        let started = std::time::Instant::now();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            handle_with_progress(&fast(base), &wait_call(Some(json!("tok"))), &sink),
+        )
+        .await
+        .expect("a hung progress read held back the wait's answer")
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "answered after {:?}",
+            started.elapsed()
+        );
+        assert_eq!(resp["result"]["isError"], false, "{resp}");
+        assert!(sink.sent().is_empty());
+    }
+
+    /// A composing server runs `handle` inside its own handlers, and axum
+    /// takes only `Send` futures. This fails to compile if one stops being.
+    #[test]
+    fn the_handler_futures_are_send() {
+        fn assert_send<T: Send>(_: T) {}
+        let c = client();
+        let msg = wait_call(Some(json!("tok")));
+        let args = json!({ "run_id": "r1" });
+        assert_send(handle(&c, &msg));
+        assert_send(handle_with_progress(&c, &msg, &NoProgress));
+        assert_send(call_tool(&c, "dagron_wait_run", &args));
+        assert_send(call_tool_with_progress(
+            &c,
+            "dagron_wait_run",
+            &args,
+            Some(Progress { token: &msg, sink: &NoProgress }),
+        ));
+    }
+
+    #[test]
+    fn the_notification_has_the_progress_shape() {
+        let n = progress_notification(&json!("abc"), 7, 12);
+        assert_eq!(
+            n,
+            json!({"jsonrpc":"2.0","method":"notifications/progress",
+                   "params":{"progressToken":"abc","progress":7,"total":12}})
+        );
+        assert!(n.get("id").is_none(), "a notification carries no id");
     }
 
     #[test]

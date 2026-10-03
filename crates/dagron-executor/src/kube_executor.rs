@@ -58,6 +58,9 @@ pub struct KubeExecutor {
     /// spec as literals (the pre-Secret behaviour). Default off: they are handed
     /// to the pod by `secretKeyRef` — see [`env_secret_object`].
     inline_secrets: bool,
+    /// Which ServiceAccounts a task's `service_account:` may name. Read once at
+    /// connect, denies everything by default — see [`ServiceAccountPolicy`].
+    sa_policy: ServiceAccountPolicy,
 }
 
 /// Parse `DAGRON_TASK_SECRET_ENV`: `secret` (default) or `inline`. A typo is an
@@ -90,7 +93,13 @@ impl KubeExecutor {
 
         let inline_secrets =
             parse_secret_env_mode(std::env::var("DAGRON_TASK_SECRET_ENV").ok().as_deref())?;
-        Ok(Self { default_image: default_image.into(), namespace, client, inline_secrets })
+        Ok(Self {
+            default_image: default_image.into(),
+            namespace,
+            client,
+            inline_secrets,
+            sa_policy: ServiceAccountPolicy::from_env(),
+        })
     }
 
     /// Best-effort pod deletion (cleanup); errors and a stalled request are
@@ -310,6 +319,15 @@ impl Executor for KubeExecutor {
         // left running. Without this the lease bounds the row, not the work.
         Self::reap_predecessors(&pods, ctx).await;
 
+        // Reject a disallowed ServiceAccount before creating anything — but after
+        // reaping, so a retry whose ServiceAccount was removed from the allow-list
+        // mid-flight still cleans up its predecessor rather than leaving it running
+        // under the now-disallowed account. The build below checks it too (so every
+        // pod-construction path is covered); doing it here as well keeps a task with
+        // secret-sourced env from having its Secret created and then only
+        // best-effort cleaned up, which a failed cleanup would leave stored.
+        self.sa_policy.check(ctx.service_account.as_deref())?;
+
         // Secret-sourced env vars (`value_from`, resolved by the engine just
         // before dispatch) go to the pod by reference, so the plaintext is never
         // in the Pod spec that `get pods` / `describe` / audit logs show. The
@@ -329,7 +347,14 @@ impl Executor for KubeExecutor {
             })?;
         }
 
-        let pod = match build_pod_with_secrets(&name, image, &ctx.command, ctx, secret_name.as_deref()) {
+        let pod = match build_pod_with_secrets(
+            &name,
+            image,
+            &ctx.command,
+            ctx,
+            secret_name.as_deref(),
+            &self.sa_policy,
+        ) {
             Ok(p) => p,
             Err(e) => {
                 self.cleanup_task(&pods, &name, secret_name.as_deref()).await;
@@ -456,6 +481,12 @@ pub struct PodHardening {
     pub runtime_class: Option<String>,
     /// `DAGRON_TASK_NODE_SELECTOR` — `k=v,k=v`.
     pub node_selector: Vec<(String, String)>,
+    /// `DAGRON_TASK_TOLERATIONS` — `key[=value][:effect]`, comma-separated
+    /// ([`parse_tolerations`]). A node selector pins task pods to nodes; a
+    /// tainted pool also needs its taint tolerated, or the pods stay Pending.
+    pub tolerations: Vec<TaskToleration>,
+    /// `DAGRON_TASK_PRIORITY_CLASS` — `priorityClassName` on task pods.
+    pub priority_class: Option<String>,
     /// Mount a ServiceAccount token into task pods that did NOT ask for one.
     ///
     /// This is the single default that CHANGES: it is `false`, so a task with no
@@ -496,9 +527,101 @@ impl PodHardening {
                         .collect()
                 })
                 .unwrap_or_default(),
+            // The engine refuses to start on a value that does not parse
+            // (dagron-engine's startup checks), so the fallback below is for
+            // other embedders of this executor: they get no tolerations and a
+            // log line, not a task that fails at dispatch.
+            tolerations: match std::env::var("DAGRON_TASK_TOLERATIONS") {
+                Ok(raw) => parse_tolerations(&raw).unwrap_or_else(|e| {
+                    tracing::error!(error = %e, "ignoring DAGRON_TASK_TOLERATIONS");
+                    Vec::new()
+                }),
+                Err(_) => Vec::new(),
+            },
+            priority_class: std::env::var("DAGRON_TASK_PRIORITY_CLASS")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
             automount_sa_token: flag("DAGRON_TASK_AUTOMOUNT_SA_TOKEN"),
         }
     }
+}
+
+/// One toleration a task pod carries, from `DAGRON_TASK_TOLERATIONS`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskToleration {
+    pub key: String,
+    /// `Some` tolerates the taint with this value (`operator: Equal`); `None`
+    /// tolerates the key whatever its value (`operator: Exists`).
+    pub value: Option<String>,
+    /// `None` tolerates every effect.
+    pub effect: Option<String>,
+}
+
+impl TaskToleration {
+    fn manifest(&self) -> serde_json::Value {
+        let mut t = serde_json::json!({ "key": self.key });
+        match &self.value {
+            Some(v) => {
+                t["operator"] = serde_json::json!("Equal");
+                t["value"] = serde_json::json!(v);
+            }
+            None => t["operator"] = serde_json::json!("Exists"),
+        }
+        if let Some(effect) = &self.effect {
+            t["effect"] = serde_json::json!(effect);
+        }
+        t
+    }
+}
+
+/// Parse `DAGRON_TASK_TOLERATIONS`: comma-separated `key[=value][:effect]`.
+///
+/// - `key=value` tolerates a taint with that value (`operator: Equal`).
+/// - A bare `key` tolerates the key whatever its value (`operator: Exists`).
+/// - `:effect` is `NoSchedule`, `PreferNoSchedule` or `NoExecute`. Without it,
+///   every effect is tolerated.
+///
+/// An empty key is refused. With `Exists` it would tolerate every taint on
+/// every node, which undoes the taints a tainted pool exists for. An empty
+/// value (`key=`) is refused too: a pool's taint carries a value, and a
+/// half-typed entry should fail here rather than leave tasks Pending.
+///
+/// Otherwise a key is what Kubernetes admits as a toleration's key, a label
+/// key (`is_label_key`), and a value what it admits with `Equal`, a label
+/// value (`is_label_value`). Anything else would pass here only for the
+/// apiserver to refuse every task pod that carries it.
+pub fn parse_tolerations(raw: &str) -> Result<Vec<TaskToleration>> {
+    let mut out = Vec::new();
+    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let (kv, effect) = match entry.split_once(':') {
+            Some((kv, effect)) => {
+                if !matches!(effect, "NoSchedule" | "PreferNoSchedule" | "NoExecute") {
+                    bail!("toleration {entry:?}: effect must be NoSchedule, PreferNoSchedule or NoExecute");
+                }
+                (kv, Some(effect.to_string()))
+            }
+            None => (entry, None),
+        };
+        let (key, value) = match kv.split_once('=') {
+            Some((k, v)) => (k.trim(), Some(v.trim())),
+            None => (kv.trim(), None),
+        };
+        if !is_label_key(key) {
+            bail!("toleration {entry:?}: the key must be a label key: an optional DNS subdomain and '/', then 1 to 63 letters, digits, '-', '_' or '.', a letter or digit at each end");
+        }
+        if let Some(v) = value {
+            if !is_label_value(v) {
+                bail!("toleration {entry:?}: the value after '=' must be a label value: 1 to 63 letters, digits, '-', '_' or '.', a letter or digit at each end");
+            }
+        }
+        out.push(TaskToleration {
+            key: key.to_string(),
+            value: value.map(str::to_string),
+            effect,
+        });
+    }
+    Ok(out)
 }
 
 impl PodHardening {
@@ -546,12 +669,64 @@ impl PodHardening {
     }
 }
 
+/// The label that carries a task pod's priority class
+/// (`DAGRON_TASK_PRIORITY_CLASS`), so whatever manages the classes can select
+/// the pods one admitted by label, without reading every pod: dagron Cloud's
+/// Workspace operator stops a subscription tier's leftover work this way when
+/// the workspace moves down a tier.
+pub const PRIORITY_CLASS_LABEL: &str = "dagron.dev/priority-class";
+
+/// Can `s` be a label value? At most 63 characters, alphanumeric at each end,
+/// and `-`, `_` or `.` between. A PriorityClass name may be up to 253, so a
+/// long one gets the class and no label.
+fn is_label_value(s: &str) -> bool {
+    let alnum = |c: char| c.is_ascii_alphanumeric();
+    !s.is_empty()
+        && s.len() <= 63
+        && s.starts_with(alnum)
+        && s.ends_with(alnum)
+        && s.chars().all(|c| alnum(c) || matches!(c, '-' | '_' | '.'))
+}
+
+/// Can `s` be a label key, Kubernetes' "qualified name"? A name that could be
+/// a label value, after an optional prefix and `/`: a DNS subdomain of at most
+/// 253 characters, dot-separated parts of lowercase letters, digits and `-`,
+/// each a letter or digit at both ends (`cloud.dagron.dev/tenant`).
+fn is_label_key(s: &str) -> bool {
+    let subdomain = |p: &str| {
+        let alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+        p.len() <= 253
+            && p.split('.').all(|part| {
+                part.starts_with(alnum)
+                    && part.ends_with(alnum)
+                    && part.chars().all(|c| alnum(c) || c == '-')
+            })
+    };
+    match s.split_once('/') {
+        Some((prefix, name)) => subdomain(prefix) && is_label_value(name),
+        None => is_label_value(s),
+    }
+}
+
 /// Apply hardening to a built Pod manifest.
 ///
 /// Pure and `Value`-shaped, mirroring `ee/dagron-executor-ee`'s confidential
 /// path so both shape the same manifest through the same kind of seam rather
 /// than two divergent ones.
 pub fn apply_hardening(pod: &mut serde_json::Value, h: &PodHardening, wants_sa: bool) {
+    if let Some(pc) = h.priority_class.as_deref().filter(|pc| is_label_value(pc)) {
+        if let Some(labels) = pod
+            .get_mut("metadata")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|m| {
+                m.entry("labels")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+            })
+        {
+            labels.insert(PRIORITY_CLASS_LABEL.to_string(), serde_json::json!(pc));
+        }
+    }
     let Some(spec) = pod.get_mut("spec").and_then(serde_json::Value::as_object_mut) else {
         return;
     };
@@ -593,6 +768,13 @@ pub fn apply_hardening(pod: &mut serde_json::Value, h: &PodHardening, wants_sa: 
             .collect();
         spec.insert("nodeSelector".to_string(), serde_json::Value::Object(m));
     }
+    if !h.tolerations.is_empty() {
+        let t = h.tolerations.iter().map(TaskToleration::manifest).collect();
+        spec.insert("tolerations".to_string(), serde_json::Value::Array(t));
+    }
+    if let Some(pc) = &h.priority_class {
+        spec.insert("priorityClassName".to_string(), serde_json::json!(pc));
+    }
     // Only withhold the token from tasks that never asked for an identity;
     // a task with `service_account:` wants IRSA and must keep its token.
     if !h.automount_sa_token && !wants_sa {
@@ -623,6 +805,75 @@ pub fn apply_hardening(pod: &mut serde_json::Value, h: &PodHardening, wants_sa: 
     }
 }
 
+/// Which ServiceAccounts a task may ask for through `service_account:`.
+///
+/// A task pod is created in this executor's namespace, beside the engine — whose
+/// own ServiceAccount can create pods and Secrets (the chart's `<release>-engine`
+/// Role). Nothing stopped a workflow-authored task from naming that ServiceAccount
+/// (or any other in the namespace) and running as it: the task's command would
+/// then hold the engine's rights, which is a privilege escalation from "run a
+/// container" to "create pods and read Secrets in this namespace".
+///
+/// So a requested ServiceAccount is now allow-listed. The list is an operator
+/// setting, and **unset denies every request** — the same default-off posture the
+/// rest of this module takes. `service_account:` is the IRSA seam, so an install
+/// that uses it lists the task identities it created for that purpose, and never
+/// the engine's own ServiceAccount.
+#[derive(Debug, Clone, Default)]
+pub struct ServiceAccountPolicy {
+    allowed: std::collections::BTreeSet<String>,
+    /// Tests only (`allow_all`): skip the check entirely. `from_env` never sets
+    /// it, so no environment can turn the gate off — only an explicit list opens
+    /// specific names.
+    allow_any: bool,
+}
+
+impl ServiceAccountPolicy {
+    /// `DAGRON_TASK_ALLOWED_SERVICE_ACCOUNTS` — comma-separated ServiceAccount
+    /// names a task may request. Empty or unset denies every request, so a task
+    /// that names one is refused rather than run with it. Never list the engine's
+    /// own ServiceAccount, or any with pod-create / Secret RBAC: list only the
+    /// purpose-built task identities the IRSA seam exists for.
+    pub fn from_env() -> Self {
+        Self::from_env_value(std::env::var("DAGRON_TASK_ALLOWED_SERVICE_ACCOUNTS").ok().as_deref())
+    }
+
+    /// [`from_env`](Self::from_env) split off its one variable, so the parse is
+    /// pure and testable without racing other tests on the process environment.
+    fn from_env_value(value: Option<&str>) -> Self {
+        let allowed = value
+            .map(|v| {
+                v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect()
+            })
+            .unwrap_or_default();
+        Self { allowed, allow_any: false }
+    }
+
+    /// A policy that permits any ServiceAccount. Test-only: production always
+    /// goes through `from_env`, whose default denies.
+    #[cfg(test)]
+    fn allow_all() -> Self {
+        Self { allowed: std::collections::BTreeSet::new(), allow_any: true }
+    }
+
+    /// Refuse a task that asks for a ServiceAccount it may not use. `None` (the
+    /// task named none) is always allowed — it runs as the namespace `default`,
+    /// whose token `apply_hardening` withholds anyway.
+    pub fn check(&self, requested: Option<&str>) -> Result<()> {
+        let Some(sa) = requested else { return Ok(()) };
+        if self.allow_any || self.allowed.contains(sa) {
+            return Ok(());
+        }
+        bail!(
+            "task requests serviceAccount '{sa}', which is not permitted. A task pod runs beside \
+             the engine in its namespace, so running as an arbitrary ServiceAccount is a \
+             privilege-escalation path (the engine's own ServiceAccount can create pods and read \
+             Secrets). List the task identities you created for IRSA in \
+             DAGRON_TASK_ALLOWED_SERVICE_ACCOUNTS — never the engine's ServiceAccount."
+        )
+    }
+}
+
 /// Build the one-shot task Pod manifest. Split out (and free of any client) so it
 /// is unit-testable without a cluster.
 ///
@@ -630,10 +881,11 @@ pub fn apply_hardening(pod: &mut serde_json::Value, h: &PodHardening, wants_sa: 
 /// * `env` → container env vars (the parameterised ETL image reads these);
 /// * `resources` → container `resources.requests/limits` so the k8s scheduler
 ///   packs/evicts/OOMKills pods like production;
-/// * `service_account` → the IRSA seam, so the pod assumes an IAM role for S3.
+/// * `service_account` → the IRSA seam, so the pod assumes an IAM role for S3,
+///   gated by [`ServiceAccountPolicy`].
 #[cfg(test)]
 fn build_pod(name: &str, image: &str, command: &[String], ctx: &ExecContext) -> Result<Pod> {
-    build_pod_with_secrets(name, image, command, ctx, None)
+    build_pod_with_secrets(name, image, command, ctx, None, &ServiceAccountPolicy::allow_all())
 }
 
 /// Whether the task carries any secret-sourced env var. `value_from` stays set
@@ -677,7 +929,13 @@ fn build_pod_with_secrets(
     command: &[String],
     ctx: &ExecContext,
     secret_name: Option<&str>,
+    sa_policy: &ServiceAccountPolicy,
 ) -> Result<Pod> {
+    // Before anything is built: a task may not run as a ServiceAccount it was not
+    // granted. Checked here so every path that produces a task pod is covered, and
+    // so the refusal is a build error the caller already cleans up after.
+    sa_policy.check(ctx.service_account.as_deref())?;
+
     let env: Vec<serde_json::Value> = ctx
         .env
         .iter()
@@ -774,6 +1032,8 @@ mod tests {
         assert!(spec.get("securityContext").is_none(), "no securityContext by default");
         assert!(spec.get("runtimeClassName").is_none());
         assert!(spec.get("activeDeadlineSeconds").is_none());
+        assert!(spec.get("tolerations").is_none());
+        assert!(spec.get("priorityClassName").is_none());
         // The one changed default: a task that declared no service_account is
         // not handed a token, because on an IRSA cluster that token is an IAM
         // credential given to arbitrary customer code.
@@ -818,6 +1078,163 @@ mod tests {
         assert_eq!(csc["allowPrivilegeEscalation"], false);
         assert_eq!(csc["readOnlyRootFilesystem"], true);
         assert_eq!(csc["capabilities"]["drop"][0], "ALL");
+    }
+
+    #[test]
+    fn tolerations_parse_in_each_form() {
+        let t = parse_tolerations(
+            " cloud.dagron.dev/tenant=org-9:NoSchedule, dagron.io/untrusted:NoExecute,gpu=true, spot ",
+        )
+        .unwrap();
+        assert_eq!(
+            t,
+            vec![
+                TaskToleration {
+                    key: "cloud.dagron.dev/tenant".into(),
+                    value: Some("org-9".into()),
+                    effect: Some("NoSchedule".into()),
+                },
+                TaskToleration {
+                    key: "dagron.io/untrusted".into(),
+                    value: None,
+                    effect: Some("NoExecute".into())
+                },
+                TaskToleration {
+                    key: "gpu".into(),
+                    value: Some("true".into()),
+                    effect: None
+                },
+                TaskToleration {
+                    key: "spot".into(),
+                    value: None,
+                    effect: None
+                },
+            ]
+        );
+        assert!(parse_tolerations("").unwrap().is_empty());
+        assert!(parse_tolerations(" , ").unwrap().is_empty());
+    }
+
+    /// A toleration that matches every taint would undo every tainted pool,
+    /// and a half-typed one would leave tasks Pending: both are refused.
+    #[test]
+    fn tolerations_refuse_what_would_match_everything_or_nothing() {
+        for bad in [
+            // an empty key with an effect tolerates every taint with that effect
+            ":NoSchedule",
+            // an empty key
+            "=org-9",
+            // an empty value
+            "cloud.dagron.dev/tenant=",
+            // not an effect
+            "k=v:NoSchedul",
+            // an empty effect
+            "k=v:",
+            // a space is not part of a key, nor of a value
+            "k y=v",
+            "k=v w",
+        ] {
+            assert!(parse_tolerations(bad).is_err(), "{bad:?} should be refused");
+        }
+    }
+
+    /// What passes here, the apiserver admits: a key is a label key and a
+    /// value a label value, as Kubernetes validates a toleration. Otherwise
+    /// the engine would start, and every task pod be refused.
+    #[test]
+    fn tolerations_are_held_to_kubernetes_rules() {
+        let n = |c: &str, len: usize| c.repeat(len);
+        // A prefix of 253, and one of 254.
+        let prefix = |last: usize| [n("a", 63), n("b", 63), n("c", 63), n("d", last)].join(".");
+        for good in [
+            "example.com/MyName=v1.0_rc-2".to_string(),
+            "a/b".to_string(),
+            "node-role.kubernetes.io/control-plane:NoSchedule".to_string(),
+            format!("{}={}", n("k", 63), n("v", 63)),
+            format!("{}/k", prefix(61)),
+        ] {
+            assert!(parse_tolerations(&good).is_ok(), "{good:?} should pass");
+        }
+        for bad in [
+            // an empty name after the prefix, or an empty prefix
+            "gpu/".to_string(),
+            "/gpu".to_string(),
+            // a prefix is a DNS subdomain: lowercase, no empty part, no edge dash
+            "Example.com/gpu".to_string(),
+            "a..b/gpu".to_string(),
+            "-a.com/gpu".to_string(),
+            "a-.com/gpu".to_string(),
+            "a_b.com/gpu".to_string(),
+            // one '/' at most
+            "a/b/c".to_string(),
+            // a name, and a value, is a letter or digit at each end
+            "-gpu".to_string(),
+            "gpu.".to_string(),
+            "k=-reserved".to_string(),
+            "k=reserved_".to_string(),
+            // a name, or a value, of 64
+            n("k", 64),
+            format!("k={}", n("v", 64)),
+            format!("{}/k", prefix(62)),
+        ] {
+            assert!(parse_tolerations(&bad).is_err(), "{bad:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn tolerations_and_priority_class_reach_the_pod() {
+        let h = PodHardening {
+            tolerations: parse_tolerations("cloud.dagron.dev/tenant=org-9:NoSchedule,spot")
+                .unwrap(),
+            priority_class: Some("dagron-task".into()),
+            ..PodHardening::default()
+        };
+        let mut pod = serde_json::json!({
+            "metadata": {"labels": {"app": "module-54-scheduler"}},
+            "spec": {"containers": [{"name": "task"}]},
+        });
+        apply_hardening(&mut pod, &h, false);
+        let spec = &pod["spec"];
+        assert_eq!(
+            spec["tolerations"],
+            serde_json::json!([
+                {"key": "cloud.dagron.dev/tenant", "operator": "Equal", "value": "org-9", "effect": "NoSchedule"},
+                {"key": "spot", "operator": "Exists"},
+            ])
+        );
+        assert_eq!(spec["priorityClassName"], "dagron-task");
+        // The class labels the pod too, beside the labels it already had.
+        assert_eq!(
+            pod["metadata"]["labels"],
+            serde_json::json!({"app": "module-54-scheduler", "dagron.dev/priority-class": "dagron-task"})
+        );
+    }
+
+    /// A class name no label can hold still reaches the pod, unlabelled; with
+    /// no class, no label.
+    #[test]
+    fn the_priority_class_labels_the_pod_only_where_a_label_can_hold_it() {
+        let long = "a".repeat(64);
+        for (class, labelled) in [
+            (Some("dagron-task-pro"), true),
+            (Some(long.as_str()), false),
+            (Some("dagron.task"), true),
+            (None, false),
+        ] {
+            let h = PodHardening {
+                priority_class: class.map(String::from),
+                ..PodHardening::default()
+            };
+            let mut pod = serde_json::json!({"metadata": {"name": "t"}, "spec": {"containers": []}});
+            apply_hardening(&mut pod, &h, false);
+            assert_eq!(
+                pod["metadata"]["labels"].get(PRIORITY_CLASS_LABEL).is_some(),
+                labelled,
+                "{class:?}"
+            );
+            assert_eq!(pod["spec"]["priorityClassName"].as_str(), class, "{class:?}");
+        }
+        assert!(!is_label_value("-x") && !is_label_value("x-") && !is_label_value("a b"));
     }
 
     // ── Per-task trust envelope (family 3) ────────────────────────────────
@@ -1155,6 +1572,50 @@ mod tests {
         assert_eq!(lims["memory"].0, "512Mi");
     }
 
+    // ── A task may run only as a ServiceAccount it was granted ────────────
+
+    /// Unset denies every request: a task that names a ServiceAccount is refused,
+    /// so a workflow cannot run as the engine's ServiceAccount (or any other in
+    /// the namespace) by naming it. The error names the account and the setting.
+    #[test]
+    fn a_service_account_is_refused_unless_allow_listed() {
+        let policy = ServiceAccountPolicy::from_env_value(None);
+        assert!(policy.check(None).is_ok(), "a task that names none runs as default");
+
+        let err = policy.check(Some("dagron-engine")).unwrap_err().to_string();
+        assert!(err.contains("dagron-engine"), "{err}");
+        assert!(err.contains("DAGRON_TASK_ALLOWED_SERVICE_ACCOUNTS"), "{err}");
+    }
+
+    /// An operator's allow-list permits exactly the names on it, and nothing else —
+    /// so listing the purpose-built IRSA identity does not also admit the engine's.
+    #[test]
+    fn the_allow_list_permits_only_its_names() {
+        let policy = ServiceAccountPolicy::from_env_value(Some(" dagron-etl , dagron-loader "));
+        assert!(policy.check(Some("dagron-etl")).is_ok());
+        assert!(policy.check(Some("dagron-loader")).is_ok());
+        assert!(policy.check(Some("dagron-engine")).is_err(), "the engine's SA is not on the list");
+        assert!(policy.check(None).is_ok());
+    }
+
+    /// The gate is enforced where the pod is built, so a disallowed ServiceAccount
+    /// is a build error and no pod is produced — not a pod that quietly runs as it.
+    #[test]
+    fn build_refuses_a_disallowed_service_account() {
+        let mut ctx = ExecContext::new(vec!["true".into()], None, None);
+        ctx.service_account = Some("dagron-engine".to_string());
+        let denied = ServiceAccountPolicy::from_env_value(None);
+        let err = build_pod_with_secrets("sched-x", "alpine", &ctx.command, &ctx, None, &denied)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dagron-engine"), "{err}");
+
+        let allowed = ServiceAccountPolicy::from_env_value(Some("dagron-engine"));
+        let pod = build_pod_with_secrets("sched-x", "alpine", &ctx.command, &ctx, None, &allowed)
+            .unwrap();
+        assert_eq!(pod.spec.unwrap().service_account_name.as_deref(), Some("dagron-engine"));
+    }
+
     // ── Secret-sourced env vars reach the pod by reference ────────────────
     fn ctx_with_secret() -> ExecContext {
         use dagron_core::dag::{EnvVar, SecretRef};
@@ -1176,7 +1637,15 @@ mod tests {
     fn a_secret_env_var_is_a_secret_key_ref_and_its_plaintext_is_not_in_the_pod() {
         let ctx = ctx_with_secret();
         assert!(has_secret_env(&ctx));
-        let pod = build_pod_with_secrets("sched-x", "alpine", &ctx.command, &ctx, Some("sched-x-env")).unwrap();
+        let pod = build_pod_with_secrets(
+            "sched-x",
+            "alpine",
+            &ctx.command,
+            &ctx,
+            Some("sched-x-env"),
+            &ServiceAccountPolicy::allow_all(),
+        )
+        .unwrap();
 
         let wire = serde_json::to_string(&pod).unwrap();
         assert!(!wire.contains("s3cr3t-plaintext"), "plaintext must not be in the Pod spec: {wire}");

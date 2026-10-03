@@ -74,6 +74,7 @@ MCP client (`mcpServers`) entry:
 | `DAGRON_API_URL` | `dagron-api` base URL (default `http://localhost:8080`) |
 | `DAGRON_MCP_TOKEN` | session JWT sent as `Authorization: Bearer …` |
 | `DAGRON_MCP_READONLY` | `1` hides **and** refuses every write tool |
+| `DAGRON_MCP_ALLOW_APPROVE` | `1` offers `dagron_approve_task` (off by default; rejecting is always available) |
 | `DAGRON_MCP_MAX_ARTIFACT_BYTES` | largest artifact returned inline (default `262144`) |
 | `DAGRON_MCP_ALLOW_PLAINTEXT_TOKEN` | `1` permits the token over plaintext `http://` to a remote host (refused otherwise) |
 

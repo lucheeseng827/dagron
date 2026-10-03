@@ -1,0 +1,210 @@
+# Terraform, promoted through environments: dev -> staging -> prod.
+#
+#   fmt ─┐
+#   init ┼▶ validate ─▶ lint ─▶ compliance ─┐
+#                                            ▼
+#   dev      plan ▶ changed ▶ apply                    (no gate)
+#   staging  plan ▶ changed ▶ review (human) ▶ apply   if promote_through in [staging, prod]
+#   prod     plan ▶ changed ▶ review (human) ▶ apply   if promote_through == prod
+#   on_failure ▶ notify
+#
+# Every stage is one call of the `stage` template, so the plan, the destroy guard,
+# the review and the apply are written once. A call's tasks are named `<call>.<task>`
+# (`staging.review`, `prod.apply`, ...). Each stage plans against what the previous
+# one actually left behind, so nothing is planned for staging until dev applied.
+#
+# The standard conditions, and where they live:
+#
+#   nothing to change       `changed` reads a marker the plan leaves; the review and
+#                           apply are skipped, and the next stage still runs
+#                           (`trigger_rule: none_failed` on `plan`: a skip is not a failure).
+#   stop part-way           each call's `when:` names the `promote_through` values that
+#                           include it; a stage outside them is never created.
+#   no gate on dev          `gated: "false"` makes the review's
+#                           `{{ gated }} == true and ...` false when the workflow expands,
+#                           so dev has no review task at all.
+#   destructive plans       a plan that deletes or replaces anything fails its plan step
+#                           unless the caller passed `allow_destroy: "true"`.
+#   human approval          staging and prod gate on `<env>.review`: the approver reads
+#                           `plan_<env>/plan.txt`, `binds` pins the approval to those exact
+#                           bytes, the apply re-checks them, and the timeout rejects.
+#   who may approve         `approvers` / `not_triggerer` on the review (commented out:
+#                           they are enforced by the dagron-api gateway and need your login
+#                           to carry the group).
+#   one run per stack       `concurrency_key`, so a second run of the same stack waits its turn.
+#   lock contention         `-lock-timeout=5m` on plan and apply; `init` retries.
+#   tell someone            `notify_failure` posts to $NOTIFY_WEBHOOK_URL when the run fails
+#                           (it only echoes if the variable is unset).
+#   full logs               `exec 2>&1` and `-no-color` keep terraform's own ordering.
+#
+# Assumes one workspace directory shared by every task (single worker or a shared
+# volume), state in a backend that supports workspaces, a variable named
+# `environment` in the root module, and `jq` on the worker's PATH (the destroy guard
+# reads the plan's JSON).
+name: terraform_promote_environments
+tags: [terraform, iac, promotion]
+max_active_runs: 1
+concurrency_key: "{{ tf_dir }}"
+run_timeout_secs: 43200
+parameters:
+  tf_dir: "./infra"
+  promote_through: "staging"
+  allow_destroy: "false"
+
+param_schema:
+  tf_dir:          { required: true, pattern: "[A-Za-z0-9_./-]+", description: "Directory holding the Terraform root module" }
+  promote_through: { required: true, enum: [dev, staging, prod], description: "Last environment to apply to" }
+  allow_destroy:   { required: true, enum: ["true", "false"], description: "Permit plans that delete or replace resources" }
+
+templates:
+  # One environment: plan, and if it changes anything, (review and) apply.
+  # Name the call after the environment (`- name: staging` with `env: staging`):
+  # the approval lands in `$DAGRON_ARTIFACTS/<call>.review/`, which `apply` reads
+  # as `{{ env }}.review`.
+  - name: stage
+    parameters:
+      env: ""
+      gated: "true"
+      message: ""
+      tf_dir: ""
+      allow_destroy: "false"
+    tasks:
+      - name: plan
+        trigger_rule: none_failed
+        command:
+          - sh
+          - -c
+          - |
+            exec 2>&1
+            set -e
+            A="${DAGRON_ARTIFACTS:-/tmp/dagron-${DAGRON_RUN_ID:-demo}}/plan_{{ env }}"; mkdir -p "$A"
+            rm -f "$A/changed"
+            terraform -chdir='{{ tf_dir }}' workspace select -or-create '{{ env }}'
+            set +e
+            terraform -chdir='{{ tf_dir }}' plan -input=false -no-color -lock-timeout=5m -detailed-exitcode -var environment='{{ env }}' -out="$A/tfplan"
+            rc=$?
+            set -e
+            case "$rc" in
+              0) ;;
+              2)
+                terraform -chdir='{{ tf_dir }}' show -no-color "$A/tfplan" > "$A/plan.txt"
+                # Resource deletions only. `actions` also appears under `output_changes` and
+                # `resource_drift`, so counting every `"actions"` refuses a deploy that merely drops
+                # an output, or re-creates something deleted outside Terraform. A replace is
+                # ["delete","create"], so it still counts. Fail closed: `show` is captured on its own
+                # because in `show | jq` the pipeline's status is jq's, so a failed `show` would hand
+                # jq an empty stream, leave n empty, and the `[ ... ]` below would only error inside
+                # an `&&` list, where set -e does not stop the step. Held in a variable, not a file:
+                # the JSON carries sensitive values in clear and everything under $A is an artifact.
+                # `jq -e` also fails on empty input, so a missing jq or a non-JSON plan stops here too.
+                plan_json=$(terraform -chdir='{{ tf_dir }}' show -json "$A/tfplan")
+                n=$(printf '%s' "$plan_json" | jq -e '[.resource_changes[]? | select(any(.change.actions[]; . == "delete"))] | length')
+                echo "resources this plan deletes or replaces: $n"
+                if [ "$n" -gt 0 ] && [ "{{ allow_destroy }}" != "true" ]; then
+                  echo "refusing: pass allow_destroy=true to permit deletions"; exit 3
+                fi
+                touch "$A/changed" ;;
+              *) exit "$rc" ;;
+            esac
+        timeout_secs: 1800
+
+      - name: changed
+        depends_on: [plan]
+        command: [sh, -c, 'A="${DAGRON_ARTIFACTS:-/tmp/dagron-${DAGRON_RUN_ID:-demo}}/plan_{{ env }}"; if [ -f "$A/changed" ]; then echo changes; else echo no_changes; fi']
+        timeout_secs: 60
+
+      - name: review
+        type: approval
+        depends_on: [changed]
+        when: "{{ gated }} == true and {{ tasks.changed.output }} == changes"
+        approval_message: "{{ message }}"
+        approval_show: ["plan_{{ env }}/plan.txt"]
+        binds: ["plan_{{ env }}/tfplan", "plan_{{ env }}/plan.txt"]
+        # approvers: ["group:release"]
+        # not_triggerer: true
+        approval_timeout_secs: 14400
+        approval_on_timeout: reject
+
+      - name: apply
+        depends_on: [changed, review]
+        when: "{{ tasks.changed.output }} == changes"
+        command:
+          - sh
+          - -c
+          - |
+            exec 2>&1
+            set -e
+            R="${DAGRON_ARTIFACTS:-/tmp/dagron-${DAGRON_RUN_ID:-demo}}"
+            if [ "{{ gated }}" = "true" ]; then
+              (cd "$R" && sha256sum -c "{{ env }}.review/approved.sha256")
+            fi
+            terraform -chdir='{{ tf_dir }}' workspace select '{{ env }}'
+            terraform -chdir='{{ tf_dir }}' apply -input=false -no-color -lock-timeout=5m "$R/plan_{{ env }}/tfplan"
+        timeout_secs: 3600
+
+tasks:
+  # ---- checks -------------------------------------------------------------
+  - name: fmt
+    command: ["sh", "-c", "exec 2>&1; terraform -chdir='{{ tf_dir }}' fmt -no-color -check -recursive -diff"]
+    timeout_secs: 120
+
+  - name: init
+    command: ["sh", "-c", "exec 2>&1; terraform -chdir='{{ tf_dir }}' init -input=false -no-color"]
+    max_attempts: 2
+    retry_delay_secs: 10
+    timeout_secs: 600
+
+  - name: validate
+    depends_on: [init]
+    command: ["sh", "-c", "exec 2>&1; terraform -chdir='{{ tf_dir }}' validate -no-color"]
+    timeout_secs: 120
+
+  - name: lint
+    depends_on: [init]
+    command: ["sh", "-c", "exec 2>&1; cd '{{ tf_dir }}' && tflint --recursive --no-color"]
+    timeout_secs: 300
+
+  - name: compliance
+    depends_on: [init]
+    command: ["sh", "-c", "exec 2>&1; checkov -d '{{ tf_dir }}' --quiet --compact"]
+    timeout_secs: 600
+
+  # ---- stages -------------------------------------------------------------
+  - name: dev
+    template: stage
+    depends_on: [fmt, validate, lint, compliance]
+    arguments: { env: dev, gated: "false", tf_dir: "{{ tf_dir }}", allow_destroy: "{{ allow_destroy }}" }
+
+  - name: staging
+    template: stage
+    depends_on: [dev]
+    when: "{{ promote_through }} in [staging, prod]"
+    arguments:
+      env: staging
+      message: "Review the staging plan below, then apply it."
+      tf_dir: "{{ tf_dir }}"
+      allow_destroy: "{{ allow_destroy }}"
+
+  - name: prod
+    template: stage
+    depends_on: [staging]
+    when: "{{ promote_through }} == prod"
+    arguments:
+      env: prod
+      message: "PRODUCTION: review the plan below. Approving applies it."
+      tf_dir: "{{ tf_dir }}"
+      allow_destroy: "{{ allow_destroy }}"
+
+  - name: notify_failure
+    hook: on_failure
+    allow_failure: true
+    command:
+      - sh
+      - -c
+      - |
+        msg="dagron run ${DAGRON_RUN_ID} of terraform stack {{ tf_dir }} failed"
+        echo "$msg"
+        if [ -n "$NOTIFY_WEBHOOK_URL" ]; then
+          curl -fsS -X POST -H 'content-type: application/json' -d "{\"text\":\"$msg\"}" "$NOTIFY_WEBHOOK_URL"
+        fi
+    timeout_secs: 60

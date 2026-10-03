@@ -256,6 +256,9 @@ impl Executor for DockerExecutor {
                             stderr = %stderr_line.trim(),
                             "container stderr"
                         );
+                        if let Some(sink) = &ctx.log_sink {
+                            sink.append(&stderr_line);
+                        }
                         log_output.push_str(&stderr_line);
                     }
                     _ => {}
@@ -265,6 +268,9 @@ impl Executor for DockerExecutor {
         .await;
         if collected.is_err() {
             tracing::warn!(container = %name, secs, "log collection timed out; output may be truncated");
+        }
+        if let Some(sink) = &ctx.log_sink {
+            sink.seal(&log_output);
         }
 
         self.force_remove(&name).await;

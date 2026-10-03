@@ -5,6 +5,8 @@ import AgentPanel from "@/components/AgentPanel";
 import CommandPalette from "@/components/CommandPalette";
 import Sidebar from "@/components/Sidebar";
 import { checkSession, login } from "@/lib/dagron-api";
+// The hosted service's single sign-on button; the public build's stub renders nothing.
+import { CloudSignInExtras } from "@ee/cloud";
 
 // Gate the app on a valid session. The token lives in an HttpOnly cookie that JS
 // can't read, so we probe `/api/me` (the cookie rides along automatically) to
@@ -154,6 +156,7 @@ function SignInGate({ onSet }: { onSet: () => void }) {
           {busy ? "Signing in…" : "Sign in"}
         </button>
       </form>
+      <CloudSignInExtras />
     </div>
   );
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{timeout, Duration};
@@ -88,6 +88,23 @@ impl LogSink {
             fence: self.fence,
             chunk: redacted,
             first,
+        });
+    }
+
+    /// Replace the streamed log with `full` redacted as a whole. Chunk-wise
+    /// redaction can miss a secret split across chunks, and the log (unlike
+    /// `output`) is not rewritten at completion, so an executor calls this once
+    /// with everything it streamed. A no-op when the task has no secrets.
+    pub fn seal(&self, full: &str) {
+        if self.redactor.is_empty() || full.is_empty() {
+            return;
+        }
+        self.started.store(true, Ordering::SeqCst);
+        let _ = self.tx.send(LogChunk {
+            task_id: self.task_id.clone(),
+            fence: self.fence,
+            chunk: self.redactor.redact(full).into_owned(),
+            first: true,
         });
     }
 }
@@ -682,32 +699,44 @@ async fn run_command_streaming(
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
 
+    // Both streams go to the live log in arrival order; `output` stays stdout.
+    let log = std::sync::Mutex::new(String::new());
+    let emit = |line: &str| {
+        let chunk = format!("{line}\n");
+        log.lock().expect("log lock").push_str(&chunk);
+        sink.append(&chunk);
+    };
     let combined = async {
-        let mut lines = BufReader::new(stdout).lines();
-        // Read stdout (streaming to the sink) and stderr concurrently so neither
-        // pipe backpressures the child into a deadlock.
+        // Read both pipes concurrently so neither backpressures the child into
+        // a deadlock.
         let stdout_fut = async {
+            let mut lines = BufReader::new(stdout).lines();
             let mut acc = String::new();
             while let Some(line) = lines.next_line().await? {
                 acc.push_str(&line);
                 acc.push('\n');
-                sink.append(&format!("{line}\n"));
+                emit(&line);
             }
             Ok::<String, anyhow::Error>(acc)
         };
         let stderr_fut = async {
-            let mut s = String::new();
-            BufReader::new(stderr).read_to_string(&mut s).await?;
-            Ok::<String, anyhow::Error>(s)
+            let mut lines = BufReader::new(stderr).lines();
+            let mut acc = String::new();
+            while let Some(line) = lines.next_line().await? {
+                acc.push_str(&line);
+                acc.push('\n');
+                emit(&line);
+            }
+            Ok::<String, anyhow::Error>(acc)
         };
         let (out, err) = tokio::try_join!(stdout_fut, stderr_fut)?;
         let status = child.wait().await?;
         Ok::<_, anyhow::Error>((status, out, err))
     };
 
-    let (status, stdout_s, stderr_s) = timeout(Duration::from_secs(secs), combined)
-        .await
-        .map_err(|_| anyhow::Error::new(TimeoutError { secs }))??;
+    let finished = timeout(Duration::from_secs(secs), combined).await;
+    sink.seal(&log.lock().expect("log lock"));
+    let (status, stdout_s, stderr_s) = finished.map_err(|_| anyhow::Error::new(TimeoutError { secs }))??;
 
     if !stderr_s.is_empty() {
         let redactor = crate::redact::Redactor::from_task_env(env);
@@ -982,6 +1011,57 @@ mod tests {
         let out = LocalExecutor.execute(&ctx).await.unwrap();
         assert!(out.success);
         assert_eq!(out.output.trim(), "out", "stderr must not leak into a success");
+    }
+
+    /// With a live log, stderr reaches the log even when the task succeeds, while
+    /// `output` (what `when:` and the cache read) stays stdout alone.
+    #[tokio::test]
+    async fn a_successful_streamed_command_logs_stderr_but_keeps_output_stdout() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<LogChunk>();
+        let sink = LogSink::new(tx, "t".to_string(), 1, crate::redact::Redactor::default());
+        let ctx = ExecContext {
+            command: vec!["sh".into(), "-c".into(), "echo out; echo warn >&2".into()],
+            timeout_secs: Some(10),
+            docker_image: None,
+            env: vec![],
+            resources: None,
+            service_account: None,
+            isolation: None,
+            log_sink: Some(sink),
+            identity: None,
+        };
+        let out = LocalExecutor.execute(&ctx).await.unwrap();
+        assert!(out.success);
+        assert_eq!(out.output, "out\n", "the value is stdout only");
+        let mut log = String::new();
+        while let Ok(c) = rx.try_recv() {
+            log.push_str(&c.chunk);
+        }
+        assert!(log.contains("out\n") && log.contains("warn\n"), "both streams logged: {log:?}");
+    }
+
+    /// `seal` rewrites the whole log redacted as one piece (so a secret split
+    /// across chunks is still masked), and does nothing when there is no secret.
+    #[test]
+    fn seal_replaces_the_log_redacted_whole() {
+        let secret = dagron_core::dag::EnvVar {
+            name: "DEPLOY_KEY".to_string(),
+            value: "s3cr3t-token-value".to_string(),
+            value_from: Some(dagron_core::dag::SecretRef { secret: "deploy-key".to_string() }),
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<LogChunk>();
+        let sink = LogSink::new(tx, "t".to_string(), 1, crate::redact::Redactor::from_task_env(&[secret]));
+        sink.append("key=s3cr3t-");
+        sink.append("token-value\n");
+        sink.seal("key=s3cr3t-token-value\n");
+        let chunks: Vec<LogChunk> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let last = chunks.last().unwrap();
+        assert!(last.first, "a seal replaces rather than appends");
+        assert_eq!(last.chunk, "key=***\n");
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<LogChunk>();
+        LogSink::new(tx, "t".to_string(), 1, crate::redact::Redactor::default()).seal("plain\n");
+        assert!(rx.try_recv().is_err(), "no secrets, nothing to rewrite");
     }
 
     /// A failing task's stderr is the half that says what went wrong — and on a

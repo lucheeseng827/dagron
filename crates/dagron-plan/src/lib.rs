@@ -36,6 +36,11 @@ pub struct TaskView {
     pub task_type: Option<String>,
     pub approval_timeout_secs: Option<u64>,
     pub approval_on_timeout: Option<String>,
+    pub approval_message: Option<String>,
+    pub approval_show: Vec<String>,
+    pub binds: Vec<String>,
+    pub approvers: Vec<String>,
+    pub not_triggerer: bool,
 }
 
 impl TaskView {
@@ -66,6 +71,11 @@ impl TaskView {
             task_type: t.task_type.clone(),
             approval_timeout_secs: t.approval_timeout_secs,
             approval_on_timeout: t.approval_on_timeout.clone(),
+            approval_message: t.approval_message.clone(),
+            approval_show: t.approval_show.clone(),
+            binds: t.binds.clone(),
+            approvers: t.approvers.clone(),
+            not_triggerer: t.not_triggerer,
         }
     }
 
@@ -155,6 +165,28 @@ impl TaskView {
                 opt(&self.approval_on_timeout),
                 opt(&head.approval_on_timeout)
             ));
+        }
+        if self.approval_message != head.approval_message {
+            out.push(format!(
+                "approval_message: {} → {}",
+                opt(&self.approval_message),
+                opt(&head.approval_message)
+            ));
+        }
+        if self.approval_show != head.approval_show {
+            out.push(format!(
+                "approval_show: {:?} → {:?}",
+                self.approval_show, head.approval_show
+            ));
+        }
+        if self.binds != head.binds {
+            out.push(format!("binds: {:?} → {:?}", self.binds, head.binds));
+        }
+        if self.approvers != head.approvers {
+            out.push(format!("approvers: {:?} → {:?}", self.approvers, head.approvers));
+        }
+        if self.not_triggerer != head.not_triggerer {
+            out.push(format!("not_triggerer: {} → {}", self.not_triggerer, head.not_triggerer));
         }
         // Per-key env diff (added / removed / changed), so a one-var change reads
         // as one line rather than "env changed".

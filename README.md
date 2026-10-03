@@ -51,6 +51,15 @@ by default), and a run list groups its runs by the definition each one actually
 ran — so "these four failures started with Tuesday's edit" is one screen rather
 than a manual comparison of two YAML dumps.
 
+The engine also exports Prometheus metrics, and
+[`examples/monitoring/`](examples/monitoring/README.md) ships eight Grafana
+dashboards built on them. [`docs/METRICS.md`](docs/METRICS.md) covers every
+series and shows each dashboard.
+
+| Workflow statistics — runs, outcomes and success ratio per workflow | Workflow jobs — tasks running, waiting and failing, and why |
+|---|---|
+| [![Grafana workflow statistics dashboard](docs/images/metrics/dagron-workflow-statistics.png)](docs/images/metrics/dagron-workflow-statistics.png) | [![Grafana workflow jobs dashboard](docs/images/metrics/dagron-jobs.png)](docs/images/metrics/dagron-jobs.png) |
+
 ## Why dagron
 
 - **Lightweight** — a Rust binary, no Python/Celery/etc. to operate.
@@ -628,7 +637,7 @@ to run a workflow except the first five rows.
 | `dagron-artifact` | artifact-store seam — local filesystem by default, S3 / GCS / Azure behind features |
 | `dagron-crypto` | secret-value encryption (AES-256-GCM, env-derived key), shared by the engine and the API |
 | `dagron-logging` | the shared `tracing` bootstrap every binary calls first |
-| `dagron-lineage` | OpenLineage emitter — best-effort `RunEvent`s on run finalization |
+| `dagron-lineage` | OpenLineage emitter — best-effort `RunEvent`s on run finalization, with the run's input and output datasets |
 | `dagron-import` | importers — Argo Workflows specs → dagron YAML |
 | `dagron-plan` | spec diff for a pull request: what a workflow change does before it merges |
 | `dagron-forge` | commit statuses / PR checks on GitHub or GitLab when a run finishes |
@@ -644,6 +653,8 @@ positional arg, Cargo feature and config file in one table.
 [`docs/API.md`](docs/API.md) — both HTTP surfaces, endpoint by endpoint.
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — deploy, upgrade, backup per
 backend, monitoring, security posture, symptom-first troubleshooting.
+[`docs/METRICS.md`](docs/METRICS.md) — every Prometheus series, how to query and
+alert on it, and the Grafana dashboards built from it.
 [`docs/EDGE_PROFILE.md`](docs/EDGE_PROFILE.md) — what `profile: edge` sets, the
 constrained-host gates, SQLite on flash, clock confidence.
 [`docs/RASPBERRY_PI.md`](docs/RASPBERRY_PI.md) — the whole stack measured on a

@@ -1,7 +1,7 @@
 # dagron Python SDK — coverage & roadmap
 
 > Status of this document: **living plan.** It tracks what the SDK covers today
-> (`0.9.0`) and the planned path to `1.0`. Update the coverage matrix in the same
+> (`0.9.0`) and the planned path beyond it. Update the coverage matrix in the same
 > PR as any endpoint change so the SDK never silently drifts from `dagron-api`.
 
 ## Goal
@@ -233,7 +233,7 @@ documented protocol before the SDK can wrap it.
 | **State plans** | `crates/dagron-state` | compile a backfill plan into runs from Python |
 | **SSO / OIDC login** | the identity seam | pluggable auth provider on `Client` |
 
-### M6 — Stabilise to `1.0`
+### M6 — Stabilise the public surface
 SemVer guarantees on the public surface, a published changelog, generated API
 reference, and a conformance test that runs the SDK against a live `dagron-api`
 (beyond the unit-level fake gateway) in CI.

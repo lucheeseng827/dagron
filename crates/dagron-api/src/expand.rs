@@ -132,6 +132,15 @@ async fn collect_referenced_specs(
             })?;
             let child: Value = serde_yaml::from_str(&yaml)
                 .map_err(|e| bad(format!("referenced workflow '{name}' has an invalid spec: {e}")))?;
+            // Same reasoning as `templates:` below: a child's imports would not
+            // come with its tasks.
+            if !direct_uses(&child).is_empty() {
+                return Err(bad(format!(
+                    "referenced workflow '{name}' declares `use:` — a chained workflow is inlined \
+                     task-by-task, so its imported templates would not come with it. Add the same \
+                     `use:` to this workflow, or drop the `workflow_ref` and inline the steps directly."
+                )));
+            }
         // Inlining copies a child's `tasks:` into the root but not its
         // `templates:` block, so a child that calls its own templates would land
         // in the root with nothing to resolve against — the engine would then
@@ -345,6 +354,190 @@ fn set_depends_on(task: &mut Value, deps: Vec<String>) -> Result<(), ApiError> {
     Ok(())
 }
 
+
+// ── Template libraries: `use:` ────────────────────────────────────────────────
+//
+// A saved workflow can serve as a **template library**: it declares `templates:`
+// (and, because `tasks:` is required, `tasks: []`) and other workflows import
+// from it instead of pasting the same sub-DAG into every spec:
+//
+// ```yaml
+// use:
+//   - iac-library              # every template the library declares
+//   - ci-library/build         # one template, plus the templates it calls
+// tasks:
+//   - { name: prod, template: tf_stage, arguments: { env: prod } }
+// ```
+//
+// Imports are resolved here, in YAML space, before the engine's parser runs: the
+// library's templates are appended to the spec's own `templates:` block and `use:`
+// is removed, so the engine never sees an import. As with `workflow_ref`, the
+// reference is by name and resolves to the library as saved *now* — save the
+// library under a new name to pin a spec to a fixed copy.
+
+/// The libraries a spec imports (the raw `use:` entries).
+pub(crate) fn direct_uses(spec: &Value) -> Vec<String> {
+    spec.get("use")
+        .and_then(Value::as_sequence)
+        .map(|s| s.iter().filter_map(|v| v.as_str().map(str::trim).map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+/// Split a `use:` entry into `(library, template)`.
+fn split_use(entry: &str) -> Result<(&str, Option<&str>), ApiError> {
+    let (lib, tpl) = match entry.split_once('/') {
+        Some((l, t)) => (l.trim(), Some(t.trim())),
+        None => (entry.trim(), None),
+    };
+    if lib.is_empty() || tpl.is_some_and(str::is_empty) || tpl.is_some_and(|t| t.contains('/')) {
+        return Err(bad(format!(
+            "`use:` entry '{entry}' is not valid — write `<library>` or `<library>/<template>`"
+        )));
+    }
+    Ok((lib, tpl))
+}
+
+fn template_name(t: &Value) -> Option<String> {
+    str_field(t, "name")
+}
+
+/// The templates `name` needs from `lib`: itself and, transitively, every sibling
+/// its tasks call with `template:`.
+fn template_closure(lib: &str, templates: &[Value], name: &str) -> Result<Vec<String>, ApiError> {
+    let find = |n: &str| templates.iter().find(|t| template_name(t).as_deref() == Some(n));
+    if find(name).is_none() {
+        let have: Vec<String> = templates.iter().filter_map(template_name).collect();
+        return Err(bad(format!(
+            "library '{lib}' has no template '{name}' (it declares: {})",
+            if have.is_empty() { "none".to_string() } else { have.join(", ") }
+        )));
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut stack = vec![name.to_string()];
+    while let Some(n) = stack.pop() {
+        if out.contains(&n) {
+            continue;
+        }
+        // A callee the library does not declare is left for the engine to report
+        // as an unknown template, with the task that calls it.
+        if let Some(t) = find(&n) {
+            for task in tasks_of(t) {
+                if let Some(callee) = str_field(task, "template") {
+                    stack.push(callee);
+                }
+            }
+            out.push(n);
+        }
+    }
+    Ok(out)
+}
+
+/// Append the templates named by `root`'s `use:` to its `templates:` block and
+/// drop `use:`. Pure: `libs` is every library the spec names, already loaded.
+fn merge_uses(mut root: Value, libs: &HashMap<String, Value>) -> Result<Value, ApiError> {
+    let entries = direct_uses(&root);
+    // template name -> the library it came from ("" for the spec's own).
+    let mut owner: HashMap<String, String> = HashMap::new();
+    if let Some(local) = root.get("templates").and_then(Value::as_sequence) {
+        for t in local {
+            if let Some(n) = template_name(t) {
+                owner.insert(n, String::new());
+            }
+        }
+    }
+    let mut imported: Vec<Value> = Vec::new();
+    for entry in &entries {
+        let (lib, only) = split_use(entry)?;
+        let spec = libs.get(lib).ok_or_else(|| {
+            bad(format!("`use:` names unknown workflow '{lib}' — save that library first"))
+        })?;
+        let templates: &[Value] =
+            spec.get("templates").and_then(Value::as_sequence).map(|s| s.as_slice()).unwrap_or(&[]);
+        if templates.is_empty() {
+            return Err(bad(format!("`use:` names '{lib}', which declares no `templates:`")));
+        }
+        let wanted: Vec<String> = match only {
+            Some(t) => template_closure(lib, templates, t)?,
+            None => templates.iter().filter_map(template_name).collect(),
+        };
+        for name in wanted {
+            match owner.get(&name) {
+                Some(o) if o == lib => continue, // the same template imported twice
+                Some(o) => {
+                    let from =
+                        if o.is_empty() { "this spec".to_string() } else { format!("library '{o}'") };
+                    return Err(bad(format!(
+                        "template '{name}' is defined by {from} and imported from library '{lib}' — \
+                         rename one, or import only the templates you need with `use: {lib}/<template>`"
+                    )));
+                }
+                None => {}
+            }
+            if let Some(t) =
+                templates.iter().find(|t| template_name(t).as_deref() == Some(name.as_str()))
+            {
+                imported.push(t.clone());
+                owner.insert(name, lib.to_string());
+            }
+        }
+    }
+    let map = root.as_mapping_mut().ok_or_else(|| bad("spec must be a mapping"))?;
+    map.remove(Value::from("use"));
+    let slot = map.entry(Value::from("templates")).or_insert_with(|| Value::Sequence(Vec::new()));
+    match slot {
+        Value::Sequence(seq) => seq.extend(imported),
+        Value::Null => *slot = Value::Sequence(imported),
+        _ => return Err(bad("`templates:` must be a list")),
+    }
+    Ok(root)
+}
+
+/// Resolve `root`'s `use:` imports. Borrows `yaml` untouched when the spec
+/// imports nothing, so the common path pays no parse and no database work.
+pub(crate) async fn resolve_template_uses<'y>(
+    state: &AppState,
+    root: Value,
+    yaml: &'y str,
+) -> Result<(Value, Cow<'y, str>), ApiError> {
+    let entries = direct_uses(&root);
+    if entries.is_empty() {
+        return Ok((root, Cow::Borrowed(yaml)));
+    }
+    let mut names: Vec<String> = Vec::new();
+    for e in &entries {
+        names.push(split_use(e)?.0.to_string());
+    }
+    names.sort();
+    names.dedup();
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT name, spec FROM workflows WHERE name = ANY($1)")
+            .bind(&names)
+            .fetch_all(&state.read_pool)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = ?e, "loading template libraries");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())
+            })?;
+    let mut libs: HashMap<String, Value> = HashMap::new();
+    for (name, spec_yaml) in rows {
+        let spec: Value = serde_yaml::from_str(&spec_yaml)
+            .map_err(|e| bad(format!("library '{name}' has an invalid spec: {e}")))?;
+        // One level only: a library that imports another would make a spec's
+        // templates depend on a chain nobody can see from the spec.
+        if !direct_uses(&spec).is_empty() {
+            return Err(bad(format!(
+                "library '{name}' uses other libraries — a library must declare its templates \
+                 itself; import both libraries from the spec instead"
+            )));
+        }
+        libs.insert(name, spec);
+    }
+    let merged = merge_uses(root, &libs)?;
+    let yaml = serde_yaml::to_string(&merged)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("re-serializing spec: {e}")))?;
+    Ok((merged, Cow::Owned(yaml)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,5 +630,138 @@ mod tests {
         let spec = v("name: p\ntasks:\n  - name: call\n    workflow_ref: nope\n");
         let err = expand_pure(spec, &HashMap::new()).unwrap_err();
         assert!(err.1.contains("unknown workflow 'nope'"), "got: {}", err.1);
+    }
+
+    // ── `use:` template libraries ────────────────────────────────────────────
+
+    const LIB: &str = "name: lib\ntasks: []\ntemplates:\n  - name: stage\n    tasks:\n      - { name: plan, command: [\"true\"] }\n      - { name: gate, template: guard, depends_on: [plan] }\n  - name: guard\n    tasks:\n      - { name: check, command: [\"true\"] }\n  - name: unrelated\n    tasks:\n      - { name: x, command: [\"true\"] }\n";
+
+    fn libs() -> HashMap<String, Value> {
+        HashMap::from([("lib".to_string(), v(LIB))])
+    }
+
+    fn template_names(spec: &Value) -> Vec<String> {
+        spec.get("templates")
+            .and_then(Value::as_sequence)
+            .map(|s| s.iter().filter_map(|t| str_field(t, "name")).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn use_of_a_whole_library_imports_every_template_and_drops_the_key() {
+        let spec = v("name: p\nuse: [lib]\ntasks:\n  - { name: a, template: stage }\n");
+        let out = merge_uses(spec, &libs()).unwrap();
+        assert_eq!(template_names(&out), vec!["stage", "guard", "unrelated"]);
+        assert!(out.get("use").is_none(), "the engine must never see `use:`");
+        assert_eq!(names(&out), vec!["a"], "tasks are untouched");
+    }
+
+    #[test]
+    fn use_of_one_template_brings_the_templates_it_calls_and_no_others() {
+        let spec = v("name: p\nuse: [lib/stage]\ntasks:\n  - { name: a, template: stage }\n");
+        let out = merge_uses(spec, &libs()).unwrap();
+        let mut got = template_names(&out);
+        got.sort();
+        assert_eq!(got, vec!["guard", "stage"], "`unrelated` must not come along");
+    }
+
+    #[test]
+    fn imported_templates_keep_the_specs_own_and_import_order() {
+        let spec = v("name: p\nuse: [lib/guard]\ntemplates:\n  - { name: mine, tasks: [{ name: t, command: [\"true\"] }] }\ntasks: []\n");
+        let out = merge_uses(spec, &libs()).unwrap();
+        assert_eq!(template_names(&out), vec!["mine", "guard"]);
+    }
+
+    #[test]
+    fn importing_the_same_template_twice_is_not_a_clash() {
+        let spec = v("name: p\nuse: [lib, lib/stage]\ntasks: []\n");
+        let out = merge_uses(spec, &libs()).unwrap();
+        assert_eq!(template_names(&out), vec!["stage", "guard", "unrelated"]);
+    }
+
+    #[test]
+    fn a_local_template_with_an_imported_name_is_refused() {
+        let spec = v("name: p\nuse: [lib/guard]\ntemplates:\n  - { name: guard, tasks: [{ name: t, command: [\"true\"] }] }\ntasks: []\n");
+        let err = merge_uses(spec, &libs()).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("'guard'") && err.1.contains("this spec"), "got: {}", err.1);
+    }
+
+    #[test]
+    fn two_libraries_defining_one_name_is_refused() {
+        let other = v("name: other\ntasks: []\ntemplates:\n  - { name: guard, tasks: [{ name: t, command: [\"true\"] }] }\n");
+        let mut l = libs();
+        l.insert("other".to_string(), other);
+        let spec = v("name: p\nuse: [lib/guard, other]\ntasks: []\n");
+        let err = merge_uses(spec, &l).unwrap_err();
+        assert!(err.1.contains("library 'lib'") && err.1.contains("'other'"), "got: {}", err.1);
+    }
+
+    #[test]
+    fn unknown_library_template_and_malformed_entries_name_the_problem() {
+        let e = |u: &str| merge_uses(v(&format!("name: p\nuse: [{u}]\ntasks: []\n")), &libs()).unwrap_err().1;
+        assert!(e("nope").contains("unknown workflow 'nope'"));
+        let msg = e("lib/missing");
+        assert!(msg.contains("no template 'missing'") && msg.contains("stage"), "got: {msg}");
+        assert!(e("lib/").contains("not valid"));
+        assert!(e("/stage").contains("not valid"));
+        assert!(e("a/b/c").contains("not valid"));
+    }
+
+    #[test]
+    fn a_library_without_templates_is_refused() {
+        let empty = v("name: empty\ntasks: []\n");
+        let l = HashMap::from([("empty".to_string(), empty)]);
+        let err = merge_uses(v("name: p\nuse: [empty]\ntasks: []\n"), &l).unwrap_err();
+        assert!(err.1.contains("declares no `templates:`"), "got: {}", err.1);
+    }
+
+    #[test]
+    fn a_spec_without_use_is_left_alone() {
+        let spec = v("name: p\ntemplates: []\ntasks: []\n");
+        assert!(direct_uses(&spec).is_empty());
+    }
+
+    /// The shipped IaC library and the workflows that import it: merge, then hand
+    /// the result to the engine's own parser, exactly as `build_dag` does.
+    fn expand_iac_example(file_yaml: &str, params: &[(&str, &str)]) -> dagron_core::dag::DagGraph {
+        let lib = include_str!("../../../examples/iac/iac-library.yaml");
+        let libs = HashMap::from([("iac-library".to_string(), v(lib))]);
+        let merged = merge_uses(v(file_yaml), &libs).expect("merge");
+        let yaml = serde_yaml::to_string(&merged).unwrap();
+        let overrides: std::collections::BTreeMap<String, String> =
+            params.iter().map(|(k, val)| (k.to_string(), val.to_string())).collect();
+        dagron_core::dag::DagGraph::from_yaml_with_params(&yaml, &overrides)
+            .unwrap_or_else(|e| panic!("the engine refused the merged spec: {e:#}"))
+    }
+
+    fn command_of(g: &dagron_core::dag::DagGraph, task: &str) -> String {
+        g.task_spec(task).unwrap_or_else(|| panic!("no task {task}")).command.join(" ")
+    }
+
+    #[test]
+    fn the_terraform_example_expands_and_tofu_switches_every_binary() {
+        let wf = include_str!("../../../examples/iac/promote_terraform.yaml");
+        let g = expand_iac_example(wf, &[("promote_through", "prod")]);
+        for t in ["checks.init", "dev.plan", "staging.review", "prod.apply", "notify_failure"] {
+            assert!(g.task_spec(t).is_some(), "missing {t}");
+        }
+        assert!(g.task_spec("dev.review").is_none(), "an ungated stage has no review task");
+        assert!(command_of(&g, "dev.plan").contains("terraform -chdir='./infra'"));
+
+        let g = expand_iac_example(wf, &[("tool", "tofu"), ("promote_through", "prod")]);
+        for t in ["checks.fmt", "checks.init", "dev.plan", "staging.apply", "prod.plan"] {
+            let c = command_of(&g, t);
+            assert!(c.contains("tofu ") && !c.contains("terraform"), "{t}: {c}");
+        }
+    }
+
+    #[test]
+    fn the_pulumi_example_imports_one_template_and_expands() {
+        let wf = include_str!("../../../examples/iac/promote_pulumi.yaml");
+        let g = expand_iac_example(wf, &[("promote_through", "prod")]);
+        let apply = command_of(&g, "prod.apply");
+        assert!(apply.contains("pulumi up") && apply.contains("--stack 'prod'"), "{apply}");
+        assert!(g.task_spec("checks.init").is_none(), "only pulumi_stage was imported");
     }
 }

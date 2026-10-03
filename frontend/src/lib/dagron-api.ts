@@ -250,22 +250,30 @@ export const clearTask = (
 // Human approval gate (#19): resolve a task parked in `awaiting_approval`.
 // Approve lets the DAG continue; reject fails the task (and, per trigger rules,
 // its dependents). Mirrors POST /runs/:id/tasks/:tid/{approve,reject}.
+// The optional `comment` is recorded on the gate next to the approver's identity.
+// `digests` (`<task>/<name>` -> sha256) is what the approver reviewed of a gate's bound artifacts.
+const decisionInit = (comment?: string, digests?: Record<string, string>): RequestInit => {
+  const body: { comment?: string; digests?: Record<string, string> } = {};
+  if (comment?.trim()) body.comment = comment.trim();
+  if (digests && Object.keys(digests).length > 0) body.digests = digests;
+  return Object.keys(body).length > 0 ? { method: "POST", body: JSON.stringify(body) } : { method: "POST" };
+};
+
 export const approveTask = (
   id: string,
   tid: string,
-): Promise<{ run_id: string; task_id: string; resolution: TaskResolution }> =>
-  apiFetch(`/runs/${encodeURIComponent(id)}/tasks/${encodeURIComponent(tid)}/approve`, {
-    method: "POST",
-  });
+  comment?: string,
+  digests?: Record<string, string>,
+): Promise<{ run_id: string; task_id: string; resolution: TaskResolution; decided_by?: string; comment?: string }> =>
+  apiFetch(`/runs/${encodeURIComponent(id)}/tasks/${encodeURIComponent(tid)}/approve`, decisionInit(comment, digests));
 
 /// Reject a gate: the task fails and `all_success` dependents skip.
 export const rejectTask = (
   id: string,
   tid: string,
-): Promise<{ run_id: string; task_id: string; resolution: TaskResolution }> =>
-  apiFetch(`/runs/${encodeURIComponent(id)}/tasks/${encodeURIComponent(tid)}/reject`, {
-    method: "POST",
-  });
+  comment?: string,
+): Promise<{ run_id: string; task_id: string; resolution: TaskResolution; decided_by?: string; comment?: string }> =>
+  apiFetch(`/runs/${encodeURIComponent(id)}/tasks/${encodeURIComponent(tid)}/reject`, decisionInit(comment));
 
 // Cascade rerun a failed/cancelled run from its failure frontier: only the
 // failed/cancelled tasks (and what they blocked) re-run; succeeded tasks are
@@ -368,8 +376,14 @@ export const updateWorkflow = (
 export const deleteWorkflow = (id: string): Promise<void> =>
   apiFetch(`/workflows/${encodeURIComponent(id)}`, { method: "DELETE" });
 
-export const runWorkflow = (id: string): Promise<{ run_id: string; workflow_id: string }> =>
-  apiFetch(`/workflows/${encodeURIComponent(id)}/run`, { method: "POST" });
+export const runWorkflow = (
+  id: string,
+  parameters?: Record<string, string>,
+): Promise<{ run_id: string; workflow_id: string }> =>
+  apiFetch(`/workflows/${encodeURIComponent(id)}/run`, {
+    method: "POST",
+    ...(parameters && Object.keys(parameters).length ? { body: JSON.stringify({ parameters }) } : {}),
+  });
 
 /// Open a pull request that commits this workflow's raw DAG spec to the
 /// configured GitOps repo. Returns the PR URL and branch.
@@ -584,7 +598,7 @@ export const disconnectGitRepo = (id: string): Promise<void> =>
 //
 // dagron-api exposes no generator in the OSS build — natural-language → DAG
 // lives in `dagron-ai` and is reached today only through `dagron-mcp-ee`'s
-// `dagron_generate_and_submit` tool (docs/MCP.md, "Roadmap to 1.0" P0). The
+// `dagron_generate_and_submit` tool (docs/MCP.md, "Coverage — the agent-API gap"). The
 // console therefore *asks* rather than assumes, and the agent dock adapts to
 // the answer instead of shipping a Send button that cannot work.
 

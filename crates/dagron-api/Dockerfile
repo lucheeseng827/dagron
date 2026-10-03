@@ -56,9 +56,15 @@ COPY crates/dagron-api/src ./src
 # Bust the stub's mtime so cargo rebuilds the real binary (deps stay cached).
 RUN touch src/main.rs && cargo build --release --bin dagron-api ${CARGO_FEATURES:+--features $CARGO_FEATURES}
 
+# Non-root-owned /artifacts to COPY into the shell-less runtime. The gateway writes an
+# approval's `approved.sha256` here and serves artifacts from it; a volume mounted over a
+# path the image lacks would be created root-owned and unwritable as 65532.
+RUN mkdir -p /seed/artifacts && chown -R 65532:65532 /seed
+
 # ── Runtime: distroless/cc (glibc, no shell) ────────────────────────────────────
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=builder /app/crates/dagron-api/target/release/dagron-api /usr/local/bin/dagron-api
+COPY --from=builder --chown=65532:65532 /seed/artifacts /artifacts
 # Served at / by the binary; override the location with DAGRON_CONSOLE_DIR.
 # Absent = API-only, which is what a `cargo run` on a dev box gets.
 COPY --from=console /web/out /usr/share/dagron/console

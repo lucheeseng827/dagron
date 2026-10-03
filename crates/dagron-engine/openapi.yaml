@@ -745,6 +745,11 @@ paths:
         #19): the task succeeds and its dependents advance, so the DAG proceeds
         past the gate.
       operationId: approveTask
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ApprovalDecision" }
       parameters:
         - $ref: "#/components/parameters/RunId"
         - $ref: "#/components/parameters/TaskId"
@@ -754,6 +759,14 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApprovalResolution" }
+        "403":
+          description: >-
+            The gate sets rules that need the decider's identity (`approvers`; for
+            approve, also `not_triggerer` and `binds`), which this unauthenticated API cannot check. Decide it through
+            the dagron-api gateway.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "404":
           description: Run or task not found
           content:
@@ -776,6 +789,11 @@ paths:
         and its `all_success` dependents skip, so the DAG does not proceed past
         the gate.
       operationId: rejectTask
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ApprovalDecision" }
       parameters:
         - $ref: "#/components/parameters/RunId"
         - $ref: "#/components/parameters/TaskId"
@@ -785,6 +803,14 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApprovalResolution" }
+        "403":
+          description: >-
+            The gate sets `approvers`, which needs the decider's identity; this
+            unauthenticated API cannot check it. Decide it through the dagron-api
+            gateway.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "404":
           description: Run or task not found
           content:
@@ -1317,6 +1343,16 @@ components:
           nullable: true
           description: The `result_from` task's output on success, else null.
 
+    ApprovalDecision:
+      type: object
+      description: >
+        Optional body of approve/reject. `comment` is recorded on the gate
+        (`decision_comment`) so the run history says why it was decided. The
+        engine's management API is unauthenticated and records no identity; the
+        dagron-api gateway records the authenticated user as `decided_by`.
+      properties:
+        comment: { type: string, maxLength: 2000 }
+
     ApprovalResolution:
       type: object
       description: The outcome of resolving a human approval gate (#19).
@@ -1325,6 +1361,7 @@ components:
         run_id: { type: string, format: uuid }
         task_id: { type: string, format: uuid }
         resolution: { type: string, enum: [approved, rejected] }
+        comment: { type: string, nullable: true, description: "The recorded reason, when one was given." }
 
     CheckpointReport:
       type: object

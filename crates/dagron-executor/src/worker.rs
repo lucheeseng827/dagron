@@ -290,6 +290,12 @@ impl Actor for WorkerActor {
                     // secret too — mask it before it is logged or stored.
                     let msg = redactor.redact(&e.to_string()).into_owned();
                     tracing::error!(duration_ms, timed_out, err = %msg, "executor error");
+                    // The reason becomes the task's output; put it in the live
+                    // log as well, which the log views read first.
+                    if let Some(sink) = &p.ctx.log_sink {
+                        sink.append(&format!("{msg}
+"));
+                    }
                     (false, timed_out, Some(msg))
                 }
             };

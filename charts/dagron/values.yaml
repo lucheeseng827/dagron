@@ -70,12 +70,20 @@ engine:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+  # The PriorityClass of the engine's pod, and of every task pod it starts
+  # (the executor's DAGRON_TASK_PRIORITY_CLASS). Each must exist in the
+  # cluster, or its pods are refused. "" = the cluster's default. A task class
+  # below the engine's keeps a task from preempting its own engine.
+  priorityClassName: ""
+  taskPriorityClassName: ""
   service:
     type: ClusterIP
 
-# A Kubernetes operator (Workflow/CronWorkflow reconciler) is a separate,
-# optional component — its deployment, CRDs, and values are NOT part of this
-# chart. Deploy it from its own overlay if you use it.
+# ── Operator ────────────────────────────────────────────────────────────────
+# The Workflow/CronWorkflow reconciler renders only when an `operator:` block is
+# set, and nothing here sets one, so a standalone install runs no operator. Its
+# template and CRDs are not in the public chart; builds that carry them read the
+# operator's DATABASE_URL from the same Secret and key as the engine.
 
 # ── Datastore ──────────────────────────────────────────────────────────────
 # Throwaway single-replica Postgres for testing. For anything real, set
@@ -211,6 +219,8 @@ dagronApi:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+  # The PriorityClass of dagron-api's pod. "" = the cluster's default.
+  priorityClassName: ""
   resources:
     requests: {cpu: 50m, memory: 64Mi}
     limits: {memory: 256Mi}
@@ -235,7 +245,7 @@ envSecrets:
   existingSecret:
     name: ""
 
-# ── Frontend (Next.js UI) — DEPRECATED, removed in 1.0.0 ─────────────────────
+# ── Frontend (Next.js UI) — DEPRECATED, removed in a future breaking release ─────────────────────
 #
 # Off by default: dagron-api now serves the console itself, at / with the API under
 # /api on the same origin, so this Deployment would run a second pod to serve a page

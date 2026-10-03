@@ -33,6 +33,10 @@ export interface TaskPanelProps {
   pool?: string | null;
   priority?: number;
   cacheHit?: boolean;
+  /// Approval gate decision from the run detail: who decided (`timeout` when the
+  /// sweep did) and the reason they gave.
+  decidedBy?: string | null;
+  decisionComment?: string | null;
   /// The log filter, shared with the run's workflow log view so switching
   /// between them doesn't silently change what you're looking at.
   filter: LogFilterState;
@@ -60,6 +64,8 @@ export default function TaskPanel({
   pool,
   priority,
   cacheHit,
+  decidedBy,
+  decisionComment,
   filter,
   onFilterChange,
 }: TaskPanelProps) {
@@ -244,6 +250,16 @@ export default function TaskPanel({
                   priority {priority}
                 </span>
               )}
+            </div>
+          )}
+          {(decidedBy || decisionComment) && (
+            <div style={{ fontSize: 12.5, color: "var(--dim)" }}>
+              {decidedBy && (
+                <span>
+                  Decided by <strong>{decidedBy}</strong>
+                </span>
+              )}
+              {decisionComment && <div style={{ whiteSpace: "pre-wrap", marginTop: 2 }}>“{decisionComment}”</div>}
             </div>
           )}
           {waiting && (

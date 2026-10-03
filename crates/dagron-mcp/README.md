@@ -58,10 +58,10 @@ hints: [tool annotations](../../docs/MCP.md#tool-annotations).
 | **W** `dagron_triage_run` | `run_id`, `state`, `note?` | `POST /api/runs/{id}/triage` | destructive · idempotent |
 | **W** `dagron_clear_triage` | `run_id` | `DELETE /api/runs/{id}/triage` | destructive · idempotent |
 | `dagron_list_approvals` | — | `GET /api/approvals` | read-only |
-| **W** `dagron_approve_task` | `run_id`, `task_id` | `POST /api/runs/{id}/tasks/{tid}/approve` | idempotent · open-world |
-| **W** `dagron_reject_task` | `run_id`, `task_id` | `POST /api/runs/{id}/tasks/{tid}/reject` | destructive · idempotent · open-world |
+| **W** `dagron_approve_task` | `run_id`, `task_id`, `comment?`, `digests?` | `POST /api/runs/{id}/tasks/{tid}/approve` | idempotent · open-world |
+| **W** `dagron_reject_task` | `run_id`, `task_id`, `comment?` | `POST /api/runs/{id}/tasks/{tid}/reject` | destructive · idempotent · open-world |
 | `dagron_list_workflows` | `tag?` | `GET /api/workflows` | read-only |
-| `dagron_get_workflow` | `workflow_id` | `GET /api/workflows/{id}` | read-only |
+| `dagron_get_workflow` | `workflow_id` | `GET /api/workflows/{id}` (includes `parameters`, `param_schema`) | read-only |
 | `dagron_list_workflow_runs` | `workflow_id`, `limit?`, `offset?` | `GET /api/workflows/{id}/runs` | read-only |
 | `dagron_list_workflow_versions` | `workflow_id` | `GET /api/workflows/{id}/versions` | read-only |
 | **W** `dagron_create_workflow` | `spec`, `name?`, `description?` | `POST /api/workflows` | idempotent · open-world |
@@ -108,6 +108,7 @@ stays a decision rather than an oversight.
 | `DAGRON_MCP_TOKEN` | unset | sent as `Authorization: Bearer` when set |
 | `DAGRON_MCP_ALLOW_PLAINTEXT_TOKEN` | off | `1`/`true` permits sending the token over plaintext `http://` to a remote host |
 | `DAGRON_MCP_READONLY` | off | `1`/`true` hides **and** refuses every write tool |
+| `DAGRON_MCP_ALLOW_APPROVE` | off | `1`/`true` offers `dagron_approve_task`; without it approving is refused and hidden (rejecting is always available) |
 | `DAGRON_MCP_MAX_ARTIFACT_BYTES` | `262144` | largest artifact returned inline to the agent |
 
 > **Use `https://` for a remote `DAGRON_API_URL` when a token is set.** On

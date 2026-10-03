@@ -49,6 +49,31 @@ context window per tick to usually learn nothing. The route long-polls to
 terminal and returns `result` and `failure` in the same body, so the tool is a
 thin wrapper over work the server has already done.
 
+A wait can block for up to 600 s, and many clients give up on a request after
+60 s unless the server reports progress on it. So when the `tools/call` carries
+`params._meta.progressToken`, the stdio server sends `notifications/progress`
+while the wait blocks:
+
+```json
+{"jsonrpc":"2.0","method":"notifications/progress",
+ "params":{"progressToken":"abc","progress":7,"total":12}}
+```
+
+`progress` is how many of the run's tasks have finished (succeeded, failed,
+skipped or cancelled) and `total` is how many it has. `total` can grow while the
+run fans out. The server re-reads the run every 5 s and sends a notification
+only when `progress` went up, so a run whose one long task is still running
+sends nothing for that time. If your client's request timeout is shorter than
+that task, keep `timeout_secs` below it and call again. The token is echoed as
+given, string or number. A call without one gets exactly the response it got
+before, and nothing else. No notification follows the response. The protocol
+revision stays `2024-11-05`, so a notification has no `message`.
+
+What this does not do: the server still handles one message at a time, so a
+`ping` or a `notifications/cancelled` sent while a wait blocks is read only
+once it returns. The HTTP transport in the enterprise build answers each
+request with one JSON body and sends no progress.
+
 `idempotency_key` is a **header** (`Idempotency-Key:`), not a body field: a
 repeat of a submit under the same key returns the *same* `run_id` rather than
 creating a second run. An agent retrying a submit it is not sure landed is
@@ -59,7 +84,7 @@ exactly the case that header exists for.
 | Tool | Arguments | dagron-api | Hints |
 |---|---|---|---|
 | `dagron_list_workflows` | `tag?` | `GET /api/workflows` | read-only |
-| `dagron_get_workflow` | `workflow_id` | `GET /api/workflows/{id}` | read-only |
+| `dagron_get_workflow` | `workflow_id` | `GET /api/workflows/{id}` (includes `parameters`, `param_schema`) | read-only |
 | **W** `dagron_create_workflow` | `spec`, `name?`, `description?` | `POST /api/workflows` → `201`; `409` duplicate name | idempotent · open-world |
 | **W** `dagron_update_workflow` | `workflow_id`, `spec`, `name?`, `description?` | `PUT /api/workflows/{id}` (records the prior definition as a version) | destructive · open-world |
 | **W** `dagron_delete_workflow` | `workflow_id` | `DELETE /api/workflows/{id}` | destructive · idempotent |
@@ -100,7 +125,7 @@ reruns: it is where an agent writes down what it concluded about a failed run
 | Tool | Arguments | dagron-api | Hints |
 |---|---|---|---|
 | `dagron_list_approvals` | — | `GET /api/approvals` (the human-in-the-loop worklist) | read-only |
-| **W** `dagron_approve_task` | `run_id`, `task_id` | `POST /api/runs/{id}/tasks/{tid}/approve` | idempotent · open-world |
+| **W** `dagron_approve_task` | `run_id`, `task_id`, `comment?`, `digests?` | `POST /api/runs/{id}/tasks/{tid}/approve` | idempotent · open-world |
 | **W** `dagron_reject_task` | `run_id`, `task_id` | `POST /api/runs/{id}/tasks/{tid}/reject` | destructive · idempotent · open-world |
 
 A `type: approval` task parks a run until someone resolves the gate. Before
@@ -243,7 +268,7 @@ today, and `2025-06-18` requires an HTTP transport to refuse an unsupported
 
 ## Coverage — the agent-API gap, closed
 
-The 1.0 bar for this crate was never "wrap everything": *an agent should be able
+The bar for this crate was never "wrap everything": *an agent should be able
 to author, run, recover and inspect a workflow without a human dropping to
 `curl`*, and should be told plainly where the answer is deliberately no. That
 bar is met. The forty-two tools above cover **42 of the 84 `dagron-api`
@@ -346,9 +371,9 @@ so the decision is visible and revisitable:
 
 A test enforces the line: no tool name in the catalogue may mention a token,
 secret, login, environment, git repo, schedule or backfill.
-### 1.x — the console as an agent surface
+### Later — the console as an agent surface
 
-Post-1.0, and listed here because it is the question this crate keeps
+Not planned yet, and listed here because it is the question this crate keeps
 attracting: *can the console's prompt box talk to the MCP server?* It cannot,
 and the reason is worth writing down once so it stops being re-litigated.
 
@@ -707,6 +732,7 @@ Details worth knowing before you write one:
 | `DAGRON_API_URL` | dagron-api base URL (default `http://localhost:8080`) |
 | `DAGRON_MCP_TOKEN` | optional session JWT, sent as `Authorization: Bearer …` |
 | `DAGRON_MCP_READONLY` | `1`/`true`/`yes` hides **and** refuses every mutating tool — see [read-only mode](#read-only-mode) |
+| `DAGRON_MCP_ALLOW_APPROVE` | `1`/`true`/`yes` offers `dagron_approve_task`. Off by default: approving a gate is a human decision, and an agent that reads text you do not control can be talked into it. `dagron_reject_task` is always available |
 | `DAGRON_MCP_MAX_ARTIFACT_BYTES` | largest artifact returned inline to the agent (default `262144`) |
 | `DAGRON_MCP_ALLOW_PLAINTEXT_TOKEN` | send `DAGRON_MCP_TOKEN` over plaintext `http://` to a non-loopback host (refused otherwise) |
 

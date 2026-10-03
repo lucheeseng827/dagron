@@ -51,6 +51,46 @@ fn is_not_found(e: &anyhow::Error) -> bool {
         .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
 }
 
+/// Why a digest could not be taken.
+pub(crate) enum DigestError {
+    /// No artifact store is configured (`DAGRON_ARTIFACT_DIR` unset).
+    NoStore,
+    Failed,
+}
+
+/// Hex sha256 of the (decrypted) bytes stored under `key`, streamed in constant
+/// memory. `Ok(None)` when the artifact does not exist.
+pub(crate) async fn artifact_sha256(
+    state: &AppState,
+    key: &ArtifactKey,
+) -> Result<Option<String>, DigestError> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+
+    let s = state.artifact_store.as_deref().ok_or(DigestError::NoStore)?;
+    let mut reader = match s.get_stream(key).await {
+        Ok(r) => r,
+        Err(e) if is_not_found(&e) => return Ok(None),
+        Err(e) => {
+            tracing::error!(error = %e, "artifact digest: open failed");
+            return Err(DigestError::Failed);
+        }
+    };
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(e) => {
+                tracing::error!(error = %e, "artifact digest: read failed");
+                return Err(DigestError::Failed);
+            }
+        }
+    }
+    Ok(Some(format!("{:x}", hasher.finalize())))
+}
+
 /// `PUT /api/runs/{run_id}/artifacts/{task}/{name}` — store the request body under
 /// the key (encrypted at rest when a KEK provider is configured).
 pub async fn put_artifact(

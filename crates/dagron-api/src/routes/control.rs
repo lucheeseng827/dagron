@@ -23,7 +23,10 @@ use petgraph::graph::DiGraph;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use dagron_artifact::ArtifactKey;
+
 use crate::auth::AuthUser;
+use crate::routes::artifacts;
 use crate::state::AppState;
 
 // ── Cancel ────────────────────────────────────────────────────────────────────
@@ -255,46 +258,214 @@ pub struct ApprovalResponse {
     pub run_id: String,
     pub task_id: String,
     pub resolution: String,
+    pub decided_by: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+/// Optional JSON body of approve/reject: why the approver decided as they did.
+#[derive(Debug, Default, Deserialize)]
+pub struct DecisionBody {
+    #[serde(default)]
+    pub comment: Option<String>,
+    /// `<task>/<name>` → sha256 (hex) of each of the gate's `binds` as the
+    /// approver reviewed it; required to approve a gate that has `binds`.
+    #[serde(default)]
+    pub digests: BTreeMap<String, String>,
 }
 
 /// `POST /api/runs/:id/tasks/:tid/approve` — approve a `type: approval` gate (#19):
 /// the task succeeds and its dependents advance. Mirrors engine
 /// `db::resolve_approval`. 404 unknown run/task, 409 not awaiting approval.
+/// The authenticated user is recorded as the decider.
 pub async fn approve_task(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Path((id, tid)): Path<(String, String)>,
+    body: Option<Json<DecisionBody>>,
 ) -> Result<Json<ApprovalResponse>, (StatusCode, String)> {
-    resolve_approval(&state, &id, &tid, true).await
+    resolve_approval(&state, &id, &tid, true, &auth, body.map(|b| b.0)).await
 }
 
 /// `POST /api/runs/:id/tasks/:tid/reject` — reject a gate: the task fails and its
 /// `all_success` dependents skip. Same status codes as approve.
 pub async fn reject_task(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Path((id, tid)): Path<(String, String)>,
+    body: Option<Json<DecisionBody>>,
 ) -> Result<Json<ApprovalResponse>, (StatusCode, String)> {
-    resolve_approval(&state, &id, &tid, false).await
+    resolve_approval(&state, &id, &tid, false, &auth, body.map(|b| b.0)).await
 }
+
+/// The slice of a stored TaskSpec that decides who may resolve its gate.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct GateAuthz {
+    #[serde(default)]
+    pub(crate) approvers: Vec<String>,
+    #[serde(default)]
+    pub(crate) not_triggerer: bool,
+    #[serde(default)]
+    pub(crate) binds: Vec<String>,
+}
+
+/// Check the digests an approver sent against the bound artifacts as they are
+/// now, and return the `approved.sha256` document to publish (in `sha256sum -c`
+/// format, paths relative to `$DAGRON_ARTIFACTS`). Nothing is approved on a
+/// missing digest, a missing artifact, or a mismatch — the plan the approver
+/// read is not necessarily the plan that is there now.
+async fn check_bound_digests(
+    state: &AppState,
+    run_id: &str,
+    gate: &str,
+    binds: &[String],
+    sent: &BTreeMap<String, String>,
+) -> Result<(ArtifactKey, String), (StatusCode, String)> {
+    let missing: Vec<&str> = binds
+        .iter()
+        .filter(|b| !sent.contains_key(b.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "this gate binds its approval to artifacts, so approve it from the Approvals page, or send \"digests\" with the sha256 you reviewed for: {} (GET /api/approvals lists them)",
+                missing.join(", ")
+            ),
+        ));
+    }
+    let mut lines = String::new();
+    for bind in binds {
+        let Some((task, name)) = bind.split_once('/') else {
+            tracing::error!(%bind, "stored bind is not <task>/<name>");
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string()));
+        };
+        let key = ArtifactKey::new(run_id, task, name);
+        let now = match artifacts::artifact_sha256(state, &key).await {
+            Ok(Some(d)) => d,
+            Ok(None) => {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("bound artifact '{bind}' does not exist in this run, so there is nothing to approve"),
+                ))
+            }
+            Err(artifacts::DigestError::NoStore) => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "this gate binds its approval to artifacts but no artifact store is configured (DAGRON_ARTIFACT_DIR)".to_string(),
+                ))
+            }
+            Err(artifacts::DigestError::Failed) => {
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string()))
+            }
+        };
+        let reviewed = sent[bind].trim().to_ascii_lowercase();
+        if reviewed != now {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("'{bind}' changed since you reviewed it (sha256 is now {now}); review it again before approving"),
+            ));
+        }
+        lines.push_str(&format!(
+            "{now}  {}/{}\n",
+            dagron_artifact::sanitize_component(task),
+            dagron_artifact::sanitize_component(name)
+        ));
+    }
+    Ok((ArtifactKey::new(run_id, gate, APPROVED_DIGESTS_FILE), lines))
+}
+
+/// The artifact a gate with `binds` publishes on approval, under the gate's own
+/// task name: `$DAGRON_ARTIFACTS/<gate>/approved.sha256`.
+pub(crate) const APPROVED_DIGESTS_FILE: &str = "approved.sha256";
 
 async fn resolve_approval(
     state: &AppState,
     id: &str,
     tid: &str,
     approve: bool,
+    auth: &AuthUser,
+    body: Option<DecisionBody>,
 ) -> Result<Json<ApprovalResponse>, (StatusCode, String)> {
+    let digests = body.as_ref().map(|b| b.digests.clone()).unwrap_or_default();
+    let comment = body
+        .and_then(|b| b.comment)
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty());
+    if let Some(c) = &comment {
+        if c.chars().count() > dagron_core::dag::APPROVAL_TEXT_MAX {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("comment exceeds {} characters", dagron_core::dag::APPROVAL_TEXT_MAX),
+            ));
+        }
+    }
+    let claims = &auth.0;
+    let decided_by = caller_identity(claims);
+
+    // Who may decide. Read from the primary (a replica can lag a fresh run) and
+    // from the stored TaskSpec, which no request can edit.
+    let gate: Option<(Option<String>, Option<String>, String)> = sqlx::query_as(
+        "SELECT t.input, r.triggered_by, t.name FROM task_runs t
+           JOIN workflow_runs r ON r.id = t.run_id
+          WHERE t.id = $1 AND t.run_id = $2",
+    )
+    .bind(tid)
+    .bind(id)
+    .fetch_optional(&state.write_pool)
+    .await
+    .map_err(internal_msg)?;
+    // sha256 lines to publish for downstream tasks once the approval lands.
+    let mut approved_digests: Option<(ArtifactKey, String)> = None;
+    if let Some((input, triggered_by, gate_name)) = gate {
+        let authz: GateAuthz = match input.as_deref() {
+            Some(s) => serde_json::from_str(s).map_err(|e| {
+                tracing::error!(error = ?e, task_id = %tid, "unreadable stored task spec");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())
+            })?,
+            None => GateAuthz::default(),
+        };
+        if !dagron_core::dag::approver_permits(&authz.approvers, &claims.email, &claims.sub, &claims.groups) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!("you are not among this gate's approvers ({})", authz.approvers.join(", ")),
+            ));
+        }
+        if approve && authz.not_triggerer {
+            if let Some(t) = triggered_by.as_deref() {
+                if [claims.email.as_str(), claims.sub.as_str()]
+                    .iter()
+                    .any(|me| !me.is_empty() && me.eq_ignore_ascii_case(t))
+                {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        "this gate is not_triggerer: the person who started the run may not approve it".to_string(),
+                    ));
+                }
+            }
+        }
+        if approve && !authz.binds.is_empty() {
+            approved_digests =
+                Some(check_bound_digests(state, id, &gate_name, &authz.binds, &digests).await?);
+        }
+    }
+
     let now = chrono::Utc::now().to_rfc3339();
     let (status, output) =
         if approve { ("succeeded", "approved") } else { ("failed", "rejected") };
     let mut tx = state.write_pool.begin().await.map_err(internal_msg)?;
     let rows = sqlx::query(
-        "UPDATE task_runs SET status = $1, finished_at = $2, output = $3
-         WHERE id = $4 AND run_id = $5 AND status = 'awaiting_approval'",
+        "UPDATE task_runs SET status = $1, finished_at = $2, output = $3,
+                decided_by = $4, decision_comment = $5, log = $6
+         WHERE id = $7 AND run_id = $8 AND status = 'awaiting_approval'",
     )
     .bind(status)
     .bind(&now)
     .bind(output)
+    .bind(&decided_by)
+    .bind(comment.as_deref())
+    .bind(dagron_core::dag::approval_log(approve, Some(&decided_by), comment.as_deref(), &now))
     .bind(tid)
     .bind(id)
     .execute(&mut *tx)
@@ -333,6 +504,23 @@ async fn resolve_approval(
     .await
     .map_err(internal_msg)?;
 
+    // Publish what was approved while the gate row is still locked: nothing
+    // downstream can start before the commit, and a failed write drops the
+    // transaction (rolling the approval back) rather than leaving an approval
+    // that downstream tasks cannot verify. The put precedes the commit, so a
+    // failed commit can leave this file behind while the gate stays pending: its
+    // presence alone does not prove an approval (the next approval overwrites it).
+    if let Some((key, lines)) = &approved_digests {
+        let put = match state.artifact_store.as_deref() {
+            Some(s) => s.put(key, lines.as_bytes()).await.map(|_| ()),
+            None => Err(anyhow::anyhow!("artifact store not configured")),
+        };
+        if let Err(e) = put {
+            tracing::error!(error = %e, "could not publish approved digests");
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string()));
+        }
+    }
+
     notify(&mut tx, id).await.map_err(|s| (s, "internal server error".to_string()))?;
     tx.commit().await.map_err(internal_msg)?;
 
@@ -342,6 +530,8 @@ async fn resolve_approval(
         run_id: id.to_string(),
         task_id: tid.to_string(),
         resolution: resolution.to_string(),
+        decided_by,
+        comment,
     }))
 }
 
@@ -601,6 +791,20 @@ pub(crate) struct TaskSpecInput {
     pub(crate) approval_timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) approval_on_timeout: Option<String>,
+    /// Context shown to the approver (engine `approval_message`/`approval_show`);
+    /// only valid on a `type: approval` task. See [`validate_graph`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) approval_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) approval_show: Vec<String>,
+    /// Artifacts whose sha256 an approval must carry (engine `binds`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) binds: Vec<String>,
+    /// Who may decide the gate (engine `approvers`/`not_triggerer`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) approvers: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) not_triggerer: bool,
     /// Environment variables (engine `env`): literal `value` or
     /// `value_from: {secret: NAME}` resolved at dispatch (environment secret
     /// store first, then process env / secrets dir).
@@ -719,6 +923,13 @@ pub(crate) struct DagSpecInput {
     /// engine's parser at run creation, so nothing downstream sees a call task.
     #[serde(default)]
     pub(crate) templates: Vec<TemplateSpecInput>,
+    /// Template libraries to import (`use: [library, library/template]`): other
+    /// saved workflows whose `templates:` this spec may call. Resolved by
+    /// [`crate::expand::resolve_template_uses`] before the engine parses the
+    /// spec, so a call to an imported template is checked after resolution, not
+    /// here (see [`validate_graph`]).
+    #[serde(default, rename = "use")]
+    pub(crate) uses: Vec<String>,
     /// Named environment (variable set + secrets): its variables join the
     /// substitution scope as `{{ env.NAME }}`, its name is stamped on the run
     /// so the engine resolves its secrets at dispatch. Unknown = 400.
@@ -764,7 +975,7 @@ pub(crate) fn parse_and_validate(yaml: &str) -> Result<DagSpecInput, (StatusCode
         }
     }
     validate_templates(&spec)?;
-    validate_graph(&spec.name, &spec.tasks, &spec.templates)?;
+    validate_graph(&spec.name, &spec.tasks, &spec.templates, !spec.uses.is_empty())?;
     Ok(spec)
 }
 
@@ -813,7 +1024,12 @@ fn validate_templates(spec: &DagSpecInput) -> Result<(), (StatusCode, String)> {
                 ));
             }
         }
-        validate_graph(&format!("{} (template '{}')", spec.name, t.name), &t.tasks, &spec.templates)?;
+        validate_graph(
+            &format!("{} (template '{}')", spec.name, t.name),
+            &t.tasks,
+            &spec.templates,
+            !spec.uses.is_empty(),
+        )?;
     }
     Ok(())
 }
@@ -849,10 +1065,16 @@ fn validate_runner_class(name: &str) -> Result<(), String> {
 /// `templates` is the set of declarations a `template:` call may name. It is the
 /// same set for the top-level graph and for each template's own sub-graph, since
 /// a template may call another template.
+///
+/// `imports` is true when the spec has a `use:` block: a call may then name a
+/// template that a library supplies, which only exists after
+/// [`crate::expand::resolve_template_uses`], so the unknown-template check waits
+/// for the resolved spec (the save handlers and `build_dag` both re-validate it).
 pub(crate) fn validate_graph(
     name: &str,
     tasks: &[TaskSpecInput],
     templates: &[TemplateSpecInput],
+    imports: bool,
 ) -> Result<(), (StatusCode, String)> {
     let mut graph = DiGraph::<(), ()>::new();
     let mut idx = HashMap::new();
@@ -929,6 +1151,91 @@ pub(crate) fn validate_graph(
                 }
             }
         }
+        // Approver context mirrors `dag::validate`: approval-only, bounded, and
+        // each `approval_show` entry a `<task>/<name>` artifact key.
+        if !t.is_approval() && (t.approval_message.is_some() || !t.approval_show.is_empty()) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "task '{}' sets approval_message/approval_show but is not `type: approval`",
+                    t.name
+                ),
+            ));
+        }
+        if let Some(m) = &t.approval_message {
+            if m.chars().count() > dagron_core::dag::APPROVAL_TEXT_MAX {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "task '{}' approval_message exceeds {} characters",
+                        t.name,
+                        dagron_core::dag::APPROVAL_TEXT_MAX
+                    ),
+                ));
+            }
+        }
+        if t.approval_show.len() > dagron_core::dag::APPROVAL_SHOW_MAX {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "task '{}' approval_show has more than {} entries",
+                    t.name,
+                    dagron_core::dag::APPROVAL_SHOW_MAX
+                ),
+            ));
+        }
+        for entry in &t.approval_show {
+            if entry.contains("{{") {
+                continue;
+            }
+            dagron_core::dag::validate_approval_show(entry).map_err(|e| {
+                (StatusCode::BAD_REQUEST, format!("task '{}': {e}", t.name))
+            })?;
+        }
+        if !t.is_approval() && !t.binds.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("task '{}' sets binds but is not `type: approval`", t.name),
+            ));
+        }
+        if t.binds.len() > dagron_core::dag::APPROVAL_SHOW_MAX {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "task '{}' binds has more than {} entries",
+                    t.name,
+                    dagron_core::dag::APPROVAL_SHOW_MAX
+                ),
+            ));
+        }
+        for entry in t.binds.iter().filter(|e| !e.contains("{{")) {
+            dagron_core::dag::validate_approval_show(entry).map_err(|e| {
+                (StatusCode::BAD_REQUEST, format!("task '{}': {}", t.name, e.replace("approval_show", "binds")))
+            })?;
+        }
+        if !t.is_approval() && (!t.approvers.is_empty() || t.not_triggerer) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("task '{}' sets approvers/not_triggerer but is not `type: approval`", t.name),
+            ));
+        }
+        if t.approvers.len() > dagron_core::dag::APPROVERS_MAX {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "task '{}' approvers has more than {} entries",
+                    t.name,
+                    dagron_core::dag::APPROVERS_MAX
+                ),
+            ));
+        }
+        for entry in &t.approvers {
+            if entry.contains("{{") {
+                continue;
+            }
+            dagron_core::dag::validate_approver(entry)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("task '{}': {e}", t.name)))?;
+        }
         // Command-less task kinds are exempt from the leaf/chain rule (but must
         // not carry either): an approval gate waits for a human (#19), a
         // sub-workflow trigger runs a child workflow (#23), and a wait sensor
@@ -1001,7 +1308,7 @@ pub(crate) fn validate_graph(
         // (which resolves against the saved-workflow table at run creation), a
         // template is local to the spec, so this is fully checkable at save time.
         if let Some(called) = &t.template {
-            if !templates.iter().any(|tpl| &tpl.name == called) {
+            if !imports && !templates.iter().any(|tpl| &tpl.name == called) {
                 return Err((
                     StatusCode::BAD_REQUEST,
                     format!(
@@ -1173,6 +1480,22 @@ tasks:
 ";
         let err = parse_and_validate(spec).unwrap_err();
         assert!(err.1.contains("unknown template 'nope'"), "got: {}", err.1);
+    }
+
+    #[test]
+    fn a_call_may_name_a_template_a_use_block_supplies() {
+        // With `use:` the template exists only after the library is merged in, so
+        // the save-time check defers to the resolved spec rather than 400-ing.
+        let spec = "
+name: p
+use: [iac-library]
+tasks:
+  - { name: a, template: tf_stage }
+";
+        parse_and_validate(spec).expect("a call into an imported template must not 400");
+        // …and the same call without `use:` is still refused.
+        let err = parse_and_validate(&spec.replace("use: [iac-library]\n", "")).unwrap_err();
+        assert!(err.1.contains("unknown template 'tf_stage'"), "got: {}", err.1);
     }
 
     #[test]
@@ -1692,12 +2015,13 @@ pub async fn submit_run(
     // *this* principal's retry, never a run some other caller submitted under
     // the same string.
     let principal = auth.0.sub.as_str();
+    let triggerer = caller_identity(&auth.0);
 
     // Validated before anything is written, so a malformed key never leaves a
     // run behind that its caller cannot find again by retrying.
     let Some(key) = idempotency_key(&headers)? else {
         let run_id =
-            submit_yaml_with_params(&state, &body.yaml, &body.yaml, &body.parameters).await?;
+            submit_yaml_as(&state, &body.yaml, &body.yaml, &body.parameters, Some(&triggerer)).await?;
         return Ok((StatusCode::CREATED, Json(SubmitResponse { run_id })));
     };
 
@@ -1708,7 +2032,7 @@ pub async fn submit_run(
         // replay is a new run.
         Claim::Replay(run_id) => Ok((StatusCode::OK, Json(SubmitResponse { run_id }))),
         Claim::Held => {
-            match submit_yaml_with_params(&state, &body.yaml, &body.yaml, &body.parameters).await {
+            match submit_yaml_as(&state, &body.yaml, &body.yaml, &body.parameters, Some(&triggerer)).await {
                 Ok(run_id) => {
                     resolve_idempotency_claim(&state, principal, &key, &run_id).await;
                     Ok((StatusCode::CREATED, Json(SubmitResponse { run_id })))
@@ -1772,10 +2096,31 @@ pub(crate) async fn submit_yaml_with_params(
     authored_yaml: &str,
     caller_params: &BTreeMap<String, String>,
 ) -> Result<String, (StatusCode, String)> {
+    submit_yaml_as(state, yaml, authored_yaml, caller_params, None).await
+}
+
+/// [`submit_yaml_with_params`], recording who submitted the run. `not_triggerer`
+/// approval gates compare the approver against this. `None` = nobody
+/// interactive (schedules, dataset fires, plan submissions).
+pub(crate) async fn submit_yaml_as(
+    state: &AppState,
+    yaml: &str,
+    authored_yaml: &str,
+    caller_params: &BTreeMap<String, String>,
+    triggered_by: Option<&str>,
+) -> Result<String, (StatusCode, String)> {
     let dag = build_dag(state, yaml, caller_params).await?;
-    dagron_core::db::create_run(&state.write_pool, &dag, authored_yaml)
-        .await
-        .map_err(create_run_refusal)
+    let created = match triggered_by {
+        Some(who) => dagron_core::db::create_run_by(&state.write_pool, &dag, authored_yaml, who).await,
+        None => dagron_core::db::create_run(&state.write_pool, &dag, authored_yaml).await,
+    };
+    created.map_err(create_run_refusal)
+}
+
+/// The identity a session is recorded and matched under: its email, else its
+/// subject.
+pub(crate) fn caller_identity(claims: &crate::auth::SessionClaims) -> String {
+    if claims.email.is_empty() { claims.sub.clone() } else { claims.email.clone() }
 }
 
 /// Everything [`submit_yaml_with_params`] does before it writes: parse, fold in
@@ -1797,7 +2142,10 @@ pub(crate) async fn build_dag(
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid YAML: {e}")))?;
     let mut params = caller_params.clone();
     params.extend(environment_params(state, &root).await?);
-    let expanded = crate::expand::expand_workflow_refs(state, root, yaml).await?;
+    // Library imports first: a library's templates join this spec's own before
+    // the engine parses it, and a chained workflow is inlined from the merged text.
+    let (root, yaml) = crate::expand::resolve_template_uses(state, root, yaml).await?;
+    let expanded = crate::expand::expand_workflow_refs(state, root, &yaml).await?;
     // The engine's own parse → expand (task_defaults, parameters, templates,
     // fan-out, submit-time `when:`) → validate pipeline.
     dagron_core::dag::DagGraph::from_yaml_with_params(&expanded, &params).map_err(|e| {
@@ -1812,6 +2160,11 @@ pub(crate) async fn build_dag(
         if let Some(b) = e.downcast_ref::<dagron_core::models::ExternalBudgetExceeded>() {
             return (StatusCode::BAD_REQUEST, b.to_string());
         }
+        // A parameter value the workflow's `param_schema` refuses is the
+        // caller's input, not a broken spec: say which parameter and why.
+        if let Some(p) = e.downcast_ref::<dagron_core::models::ParameterInvalid>() {
+            return (StatusCode::BAD_REQUEST, p.to_string());
+        }
         (StatusCode::BAD_REQUEST, format!("invalid DAG: {e}"))
     })
 }
@@ -1824,10 +2177,11 @@ pub(crate) fn create_run_refusal(e: anyhow::Error) -> (StatusCode, String) {
     // type, which doesn't carry headers; the engine's equivalent is a single
     // handler free to return a header-bearing tuple directly.)
     if let Some(m) = e.downcast_ref::<dagron_core::models::MaxActiveRunsReached>() {
+        let scope = m.key.as_deref().map(|k| format!(" and concurrency_key '{k}'")).unwrap_or_default();
         return (
             StatusCode::TOO_MANY_REQUESTS,
             format!(
-                "max_active_runs reached for workflow '{}' ({} active, cap {})",
+                "max_active_runs reached for workflow '{}'{scope} ({} active, cap {})",
                 m.name, m.active, m.max
             ),
         );
@@ -1879,7 +2233,7 @@ async fn environment_params(
 /// in place), this works for any run — including a succeeded one — and produces a
 /// brand-new run_id.
 pub async fn resubmit_run(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<SubmitResponse>), (StatusCode, String)> {
@@ -1895,7 +2249,8 @@ pub async fn resubmit_run(
     let yaml = yaml.ok_or((StatusCode::NOT_FOUND, format!("run '{id}' not found")))?;
 
     parse_and_validate(&yaml)?;
-    let run_id = submit_yaml(&state, &yaml, &yaml).await?;
+    let triggerer = caller_identity(&auth.0);
+    let run_id = submit_yaml_as(&state, &yaml, &yaml, &BTreeMap::new(), Some(&triggerer)).await?;
     Ok((StatusCode::CREATED, Json(SubmitResponse { run_id })))
 }
 
@@ -1997,7 +2352,7 @@ pub(crate) async fn prepare_spec(
         // Re-validate: a surviving runtime `when` may reference a task that was
         // just dropped (its dep got scrubbed above) — that gate could never be
         // evaluated, so reject it at submit rather than strand the run.
-        validate_graph(&spec.name, &spec.tasks, &spec.templates)?;
+        validate_graph(&spec.name, &spec.tasks, &spec.templates, !spec.uses.is_empty())?;
     }
 
     // Substitute the scope into task string fields (mirror of core build_leaf

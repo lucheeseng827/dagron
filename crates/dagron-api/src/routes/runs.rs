@@ -80,6 +80,10 @@ pub struct TaskRow {
     pub pool: Option<String>,
     pub priority: i64,
     pub cache_hit: bool,
+    /// Who resolved an approval gate and why; `decided_by` is `timeout` when the
+    /// sweep did. `None` on every non-approval row and on an unresolved gate.
+    pub decided_by: Option<String>,
+    pub decision_comment: Option<String>,
 }
 
 /// Why a run failed, in the run detail itself (G-AG6).
@@ -122,7 +126,7 @@ pub struct RunFailure {
 /// failure summary can see depending on which route asked for it.
 const RUN_TASK_ROWS_SQL: &str = "SELECT id, name, status, attempt, output, scheduled_at, finished_at,
         wake_at, wait_url, wait_dataset, sub_run_id,
-        pool, priority, cache_hit
+        pool, priority, cache_hit, decided_by, decision_comment
  FROM task_runs WHERE run_id = $1 ORDER BY name";
 
 /// How much failure text to inline. Enough for a stack trace's business end,
@@ -758,6 +762,8 @@ mod failure_summary_tests {
             pool: None,
             priority: 0,
             cache_hit: false,
+            decided_by: None,
+            decision_comment: None,
         }
     }
 
