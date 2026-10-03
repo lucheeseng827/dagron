@@ -112,7 +112,7 @@ Four facts decide every procedure below.
    `_sqlx_migrations` table, and both run with `set_ignore_missing(true)` so
    neither trips over the other's rows.
 4. **A failed migration is fail-fast, not half-applied.** Postgres DDL is
-   transactional and sqlx runs each migration in one; a failure aborts startup
+   transactional and sqlx runs each migration in its own; a failure aborts startup
    with a non-zero exit before the scheduler runs. *Measured:* a tampered
    migration checksum produced `Error: migration 40 was previously applied but
    has been modified`, container exit code **1**, and the database was
@@ -235,16 +235,20 @@ down that you did.
 
 ### 6.4 Migration fails partway through an upgrade
 
-The engine exits non-zero and the transaction rolls back, so the DB stays at the
-previous version (§3, fact 4). Then:
+The engine exits non-zero and the failing migration's transaction rolls back
+(§3, fact 4). That is one migration, not the upgrade: sqlx gives each migration
+its own transaction, so the ones applied before it in the same startup stay
+applied, and a `-- no-transaction` migration (a concurrent index build) has none
+to roll back. Then:
 
 1. Read the error — it names the failing statement.
 2. If it is data-dependent (a constraint an existing row violates), fix the data
    and restart. The migration re-runs from the top.
-3. If the migration itself is wrong, run the **previous** version's binary — the
-   schema is still where it was — and report it.
-4. Restore the pre-upgrade backup only if 1–3 leave you stuck; there is no
-   partial state to clean up.
+3. If the migration itself is wrong, the **previous** version's binary will
+   usually start against what was applied — migrations only add — so you can
+   keep running while you report it. That is a holding position, not a rollback.
+4. To go back for real, restore the pre-upgrade backup; it is the only state
+   guaranteed to match the previous version.
 
 ### 6.5 Startup complains about an unknown/newer migration
 

@@ -39,7 +39,7 @@ still resolve to it; treat all three as frozen.
 ## What to run instead
 
 ```bash
-docker run -p 8080:8080 mancube/dagron-api:0.9.1
+docker run -p 8080:8080 mancube/dagron-api:0.10.0
 # then open http://localhost:8080  (same admin user, same session cookie)
 ```
 

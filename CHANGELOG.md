@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- **`docs/UPGRADING.md` — how to upgrade, and what each release asks first.**
+  The README's upgrade note covered only 0.8.x, so moving to 0.10.0 had no
+  guide at all, though it asks for a ServiceAccount allow-list, `secrets`
+  permissions on a hand-written engine Role, `allowFrom` past the chart's new
+  NetworkPolicy and the `admin` group for workflow deletion and repository
+  management before the new engine starts. The guide has the general procedure
+  (Compose, Helm, binaries), a before-you-start table for 0.9.x → 0.10.0, the
+  migrations each starting version runs, the one mixed-version hazard
+  (`defer:`), and how to roll back. `HARDENING.md` joins the mirror so its link
+  resolves.
+
 ## [0.10.0] - 2026-10-03
 
 ### Added

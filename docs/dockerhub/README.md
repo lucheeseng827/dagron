@@ -60,7 +60,13 @@ along that path.
 | [`mancube/dagron-engine-localdev`](https://hub.docker.com/r/mancube/dagron-engine-localdev) | [`dagron-engine-localdev.md`](./dagron-engine-localdev.md) | the engine on debian-slim — has a shell, so `EXECUTOR=local` tasks resolve |
 | `oci://registry-1.docker.io/mancube/dagron` | [`dagron-chart.md`](./dagron-chart.md) | Helm chart (the full stack) |
 
-All eight images are published **`linux/amd64` + `linux/arm64`** at the release version + `latest`.
+The five service images (`dagron-engine`, `-engine-localdev`, `-api`, `-mcp`,
+`-gitops`) and the chart are published **`linux/amd64` + `linux/arm64`** at the
+release version, the floating minor and `latest` — `0.10.0`, `0.10` and `latest`
+as of 0.10.0. The three step images are built by the image workflow but are
+**not on Docker Hub yet**: their repositories do not exist. Until they do, build
+one from the repository root with `podman build -f crates/dagron-step-<name>/Dockerfile .`
+(or `docker build`).
 
 Publish them with [`../../scripts/publish-dockerhub-descriptions.py`](../../scripts/publish-dockerhub-descriptions.py)
 rather than pasting: it carries UTF-8 through (hand-pasting once replaced every em

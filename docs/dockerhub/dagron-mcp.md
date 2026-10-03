@@ -23,13 +23,18 @@ Forty-two tools over the same JWT-gated API the browser uses:
 Eighteen of them change cluster state. Set `DAGRON_MCP_READONLY=1` to hide and
 refuse all eighteen, leaving the 24 read tools.
 
+`dagron_wait_run` blocks for up to 600 s. From **0.10.0**, a call that carries
+`params._meta.progressToken` gets `notifications/progress` while it waits —
+finished tasks out of the run's total, re-read every 5 s and sent when the count
+rises — so a client with a 60 s request timeout can still use it.
+
 ## Tags
 
 | Tag | Notes |
 |---|---|
 | `latest` | newest release |
-| `0.9.1` | pinned version (= current `latest`) |
-| `0.9` | floating minor — newest `0.9.x` |
+| `0.10.0` | pinned version (= current `latest`) |
+| `0.10` | floating minor — newest `0.10.x` |
 
 Pin in production — pick the newest published tag rather than copying a version
 from this page, which ages.

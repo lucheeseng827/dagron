@@ -32,6 +32,9 @@ resident; with none set, a file run drains and exits 0.
 
 ## Upgrade / rollback
 
+The procedure, and what each release needs done before it starts, is in
+[`UPGRADING.md`](UPGRADING.md). The rules behind it:
+
 - Schema migrations are **embedded and run automatically at startup** (sqlx;
   `crates/dagron-core/migrations*/`). There is no `dagron migrate` command —
   starting an engine is what migrates. They are **forward-only** — no down

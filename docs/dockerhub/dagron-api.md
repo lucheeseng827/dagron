@@ -15,10 +15,10 @@
 | Tag | Notes |
 |---|---|
 | `latest` | newest release |
-| `0.9.1` | pinned version (= current `latest`) |
-| `0.9` | floating minor — newest `0.9.x` |
+| `0.10.0` | pinned version (= current `latest`) |
+| `0.10` | floating minor — newest `0.10.x` |
 
-Pin in production: `mancube/dagron-api:0.9.1`.
+Pin in production: `mancube/dagron-api:0.10.0`.
 
 ## Run
 
@@ -28,7 +28,7 @@ docker run -p 8080:8080 \
   -e DAGRON_JWT_SECRET=replace-with-a-32+char-signing-key \
   -e DAGRON_ADMIN_EMAIL=admin@local \
   -e DAGRON_ADMIN_PASSWORD=replace-with-a-strong-password \
-  mancube/dagron-api:0.9.1
+  mancube/dagron-api:0.10.0
 ```
 
 ## Configuration (env)
