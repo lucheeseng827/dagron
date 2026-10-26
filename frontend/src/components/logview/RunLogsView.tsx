@@ -225,6 +225,7 @@ export default function RunLogsView({
       <LogLines
         ref={paneRef}
         lines={lines}
+        fold={!filtering}
         style={{ flex: 1, minHeight: 0 }}
         empty={
           loading && !data

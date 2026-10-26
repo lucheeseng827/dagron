@@ -30,15 +30,12 @@ spec:
         {{- include "dagron.labels" . | nindent 8 }}
         app.kubernetes.io/component: gitops
     spec:
+      # Must be the uid the image defines (Dockerfile: `adduser -u 10001 gitops`), not the
+      # distroless 65532: OpenSSH refuses to run for a uid with no passwd entry ("No user
+      # exists for uid"), so an ssh:// repository could never sync. On OpenShift the SCC's
+      # uid is given a name by the image's entrypoint (nss_wrapper) instead.
       securityContext:
-        runAsNonRoot: true
-        # Must be the uid the image defines (Dockerfile: `adduser -u 10001 gitops`), not the
-        # distroless 65532: OpenSSH refuses to run for a uid with no passwd entry ("No user
-        # exists for uid"), so an ssh:// repository could never sync.
-        runAsUser: 10001
-        fsGroup: 10001
-        seccompProfile:
-          type: RuntimeDefault
+        {{- include "dagron.podSecurityContext" (dict "root" $ "uid" 10001 "fsGroup" true) | nindent 8 }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

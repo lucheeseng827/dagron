@@ -1,0 +1,80 @@
+# Imported from a GitLab CI pipeline by dagron-import.
+#
+# Changed on the way (13):
+#   variables.npm_config_cache: its value names other variables: it is set at the head of each script, where the shell expands it as GitLab did
+#   lint.cache, unit.cache, e2e.cache: the cache is the job's cache "npm", keyed by package-lock.json: restored before the steps and saved after they succeed, by a trusted run, from the run's own branch and then a merge request's target
+#   lint.script, unit.script, e2e.script: it reads $CI_PROJECT_DIR: each is set at the head of its script
+#   unit.artifacts.reports.junit: the test report is the job's report: what it holds is said with the job
+#   e2e.retry: retry: 2 is max_attempts: 3, which counts the first attempt
+#   lint.script: GitLab's variables a script reads are set at its head from dagron-ci's own (CI_SHA, CI_REF, …): a program it runs that reads one the script does not is not given it
+#   lint.script: a job's script ran under bash where its image had bash, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   on.dispatch: a pipeline run from GitLab's page or its API is a run asked for here (dispatch), through the run API
+#   interruptible: a newer run of a branch or merge request takes the older one's place, all its jobs, where GitLab cancelled the interruptible ones (concurrency: cancel_superseded)
+#
+# Not carried over (1):
+#   unit.artifacts.when: a job's files are not kept here
+name: 02-node-with-defaults
+on:
+  push: {}
+  dispatch: {}
+concurrency:
+  key: '{{ ci_group }}'
+  cancel_superseded: true
+tasks:
+- name: lint
+  docker_image: node:22-bookworm-slim
+  workspace:
+    cache:
+    - prefix: npm
+      key_files:
+      - package-lock.json
+      paths:
+      - .npm/
+  steps:
+  - name: script
+    run: |-
+      export CI_PROJECT_DIR="$PWD"
+      export npm_config_cache="$CI_PROJECT_DIR/.npm"
+      npm ci --prefer-offline
+      npm run lint
+- name: unit
+  docker_image: node:22-bookworm-slim
+  depends_on:
+  - lint
+  workspace:
+    cache:
+    - prefix: npm
+      key_files:
+      - package-lock.json
+      paths:
+      - .npm/
+  report:
+    junit:
+    - junit.xml
+  steps:
+  - name: script
+    run: |-
+      export CI_PROJECT_DIR="$PWD"
+      export npm_config_cache="$CI_PROJECT_DIR/.npm"
+      npm ci --prefer-offline
+      npm test -- --reporter=junit --reporter-option output=junit.xml
+- name: e2e
+  docker_image: node:22-bookworm-slim
+  depends_on:
+  - lint
+  workspace:
+    cache:
+    - prefix: npm
+      key_files:
+      - package-lock.json
+      paths:
+      - .npm/
+  timeout_secs: 1800
+  max_attempts: 3
+  steps:
+  - name: script
+    run: |-
+      export CI_PROJECT_DIR="$PWD"
+      export npm_config_cache="$CI_PROJECT_DIR/.npm"
+      npm ci --prefer-offline
+      npx playwright test

@@ -1,0 +1,56 @@
+[package]
+name = "dagron-runner"
+version = "0.1.0"
+edition = "2021"
+# MSRV — see the root Cargo.toml for how 1.88 was measured.
+rust-version = "1.88"
+description = "dagron's remote runner: dials dagron-api over HTTPS, takes the tasks of the classes it serves, and runs them on dagron-executor's executors (local, Docker, Kubernetes). Holds no database credentials."
+
+[lib]
+name = "dagron_runner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dagron-runner"
+path = "src/main.rs"
+
+[features]
+default = ["sqlite"]
+# dagron-core compiles exactly one datastore backend (its `compile_error!`),
+# and the runner opens no database at all: SQLite is the one that links with
+# nothing else. A build that takes this crate into a Postgres workspace (the
+# enterprise build's VM runner pools) turns the default off, and
+# dagron-core gets that workspace's backend instead.
+sqlite = ["dagron-core/sqlite"]
+# The Kubernetes executor (DAGRON_RUNNER_EXECUTOR=k8s: the runner as an
+# in-cluster controller, each task a pod), and the autoscaler's Deployment
+# scaler (`dagron-runner scale`). Off by default, as the engine's is: the
+# binaries for a Mac or a Windows host have no use for it.
+kubernetes = ["dagron-executor/kubernetes", "dep:kube", "dep:k8s-openapi"]
+
+[dependencies]
+# The executors and the worker pool the engine runs its own tasks with: the
+# same redaction, caps, teardown and results, for a remote task as for a local
+# one. dagron-core is the protocol's wire types and the task model; its
+# backend is chosen by `sqlite` above.
+dagron-core = { path = "../dagron-core", default-features = false }
+dagron-executor = { path = "../dagron-executor" }
+dagron-logging = { path = "../dagron-logging" }
+async-trait = "0.1"
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs"] }
+# The one HTTP client the workspace's services use, with rustls, so the binary
+# links no OpenSSL and builds for musl, macOS and Windows alike.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+# The autoscaler's Deployment scaler (`kubernetes`), the versions the
+# Kubernetes executor already resolves.
+kube = { version = "3", default-features = false, features = ["client", "rustls-tls"], optional = true }
+k8s-openapi = { version = "0.27", features = ["v1_31"], optional = true }
+
+[dev-dependencies]
+# A stub dagron-api the run loop is driven against, in-process.
+axum = "0.8"
+tokio = { version = "1", features = ["net"] }

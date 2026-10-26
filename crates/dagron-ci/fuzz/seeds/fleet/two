@@ -1,0 +1,11 @@
+self-hosted,linux,dagron-large
+labels:
+  dagron:
+    image: ghcr.io/actions/actions-runner:2.321.0
+  dagron-large:
+    image: ghcr.io/actions/actions-runner:2.321.0
+    runner_class: large
+    pool: ci-large
+    priority: 5
+    timeout_secs: 7200
+    with: [self-hosted, linux, x64]

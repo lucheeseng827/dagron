@@ -1,0 +1,12 @@
+shows: A dispatch's input is named as a parameter is, and one that shadows the event's is refused
+source: |
+  name: ci
+  on:
+    dispatch:
+      inputs:
+        ci_sha: { default: abc }
+        "two words": { default: x }
+  tasks:
+    - name: build
+      steps:
+        - run: make

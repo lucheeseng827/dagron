@@ -1,0 +1,101 @@
+# Imported from a GitLab CI pipeline by dagron-import.
+#
+# To do by hand (3):
+#   variables.GIT_SUBMODULE_STRATEGY: a checkout here holds no submodules: fetch them in the script (git submodule update --init)
+#   package.variables.CI_MY_OWN: a variable that begins CI_ is set from the event here: give it another name
+#   bash-only.script: the script is bash's (`[[`), and a step here is run by `sh -e`: call bash in it, or write it for sh
+#
+# Changed on the way (13):
+#   image: the pipeline's image is each job's that does not set its own
+#   variables.GIT_DEPTH: how deep the checkout is: workspace.checkout.depth
+#   package.variables.GIT_STRATEGY: the job's workspace starts empty: workspace.checkout is false
+#   variables.TAG, package.variables.OUT: its value names other variables: it is set at the head of each script, where the shell expands it as GitLab did
+#   package.script: it reads $CI_COMMIT_REF_NAME, $CI_PIPELINE_SOURCE: each is set at the head of its script
+#   bash-only.after_script: it reads $CI_JOB_NAME, $CI_JOB_STAGE: each is set at the head of its script
+#   bash-only.after_script: after_script is the job's last step, and a failure of it does not fail the job: it runs where the script succeeded, and not after one that failed, where GitLab ran it whatever became of the script
+#   package.script: GitLab's variables a script reads are set at its head from dagron-ci's own (CI_SHA, CI_REF, …): a program it runs that reads one the script does not is not given it
+#   package.script: $CI_COMMIT_REF_NAME, in a merge request's pipeline, is the ref dagron-ci checks out (pull/7/head), and not the source branch's name
+#   package.script: $CI_PIPELINE_SOURCE is push in a branch's and a tag's pipeline, merge_request_event in a merge request's, and api in a run asked for here (dispatch), which stands for GitLab's web, trigger and schedule pipelines too: a script that tests it for one of those takes the other branch
+#   package.script: a job's script ran under bash where its image had bash, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   on.dispatch: a pipeline run from GitLab's page or its API is a run asked for here (dispatch), through the run API
+#
+# Not carried over (4):
+#   variables.DEPLOY_TARGET.description, variables.DEPLOY_TARGET.options: a run's form is not here: the variable has its value on every run
+#   variables.CI_DEBUG_TRACE: a setting of GitLab's runner, which has no place here
+#   no-inherit.script: the script reads $APP, which the job is not given in the file: where the project's CI/CD variables set one, give it to the job in its env
+name: 11-variables
+on:
+  push: {}
+  dispatch: {}
+tasks:
+- name: package
+  docker_image: debian:12-slim
+  env:
+  - name: APP
+    value: widgets
+  - name: LITERAL
+    value: 'cost: $5'
+  - name: DEPLOY_TARGET
+    value: staging
+  - name: VERSION
+    value: '2.0'
+  workspace:
+    checkout: false
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        variables.GIT_SUBMODULE_STRATEGY: a checkout here holds no submodules: fetch them in the script (git submodule update --init)
+        package.variables.CI_MY_OWN: a variable that begins CI_ is set from the event here: give it another name
+      DAGRON_IMPORT
+      exit 1
+  - name: script
+    run: |-
+      export CI_COMMIT_REF_NAME="${CI_REF#refs/*/}"
+      case "$CI_EVENT" in pull_request|merge_group) export CI_PIPELINE_SOURCE=merge_request_event ;; dispatch) export CI_PIPELINE_SOURCE=api ;; *) export CI_PIPELINE_SOURCE=push ;; esac
+      export TAG="$APP-$VERSION"
+      export OUT="out/$TAG.tar.gz"
+      echo "$TAG $LITERAL $OUT"
+      echo "$CI_COMMIT_REF_NAME on $CI_PIPELINE_SOURCE"
+- name: bash-only
+  docker_image: debian:12-slim
+  env:
+  - name: APP
+    value: widgets
+  - name: VERSION
+    value: '1.2'
+  - name: LITERAL
+    value: 'cost: $5'
+  - name: DEPLOY_TARGET
+    value: staging
+  workspace:
+    checkout:
+      depth: 10
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        variables.GIT_SUBMODULE_STRATEGY: a checkout here holds no submodules: fetch them in the script (git submodule update --init)
+        bash-only.script: the script is bash's (`[[`), and a step here is run by `sh -e`: call bash in it, or write it for sh
+      DAGRON_IMPORT
+      exit 1
+  - name: script
+    run: |
+      export TAG="$APP-$VERSION"
+      if [[ "$APP" == widgets ]]; then
+        echo yes
+      fi
+  - name: after_script
+    run: |-
+      export CI_JOB_NAME='bash-only'
+      export CI_JOB_STAGE='test'
+      export TAG="$APP-$VERSION"
+      echo "done with $CI_JOB_NAME in $CI_JOB_STAGE"
+    continue_on_error: true
+- name: no-inherit
+  docker_image: busybox:1.36
+  steps:
+  - name: script
+    run: echo "${APP:-none}"

@@ -3,7 +3,8 @@
 //! Correctness comes from CAS on `version`: this path is already safe for the
 //! v2 multi-worker model, it just contends harder than the Postgres
 //! `FOR UPDATE SKIP LOCKED` path. SQLite has no `LISTEN/NOTIFY`, so the
-//! reconcile loop falls back to a fixed-interval timer (see [`Waker`]).
+//! reconcile loop wakes on a fixed-interval timer, and the file's triggers
+//! name the runs a change may have ended (see [`Waker`]).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -16,6 +17,7 @@ use crate::{
     attempt_log::{AttemptEnd, Policy as AttemptPolicy},
     dag::DagGraph,
     models::{RunStatus, TaskRun},
+    quota_wait::{self, QuotaRequeue, QuotaWaitStats},
 };
 /// Only `list_task_attempts` materializes this, and that is an `ops` read
 /// endpoint — a lean engine build never constructs one.
@@ -60,6 +62,34 @@ pub async fn init_pool(db_path: &str) -> Result<Pool> {
         .busy_timeout(Duration::from_secs(5))
         .pragma("foreign_keys", "ON");
 
+    // Two processes open one file on one node, and an engine and dagron-api
+    // started together race to open it, which SQLite does not always wait
+    // out:
+    //  - a connection's pragmas (WAL) need a write lock on a file another
+    //    process is writing while it is still in rollback mode, as it is when
+    //    just made, and SQLite refuses that at once rather than deadlock
+    //    (`database is locked`, past the busy timeout);
+    //  - SQLite has no advisory lock to hold migrations to one process at a
+    //    time, and the one that loses fails on `_sqlx_migrations`' key or on a
+    //    table the other made. Each migration is its own transaction (none here
+    //    opts out), so the loser's is rolled back whole.
+    // So the open, connection and migrations, is tried again a few times.
+    let mut attempt: u64 = 1;
+    loop {
+        match open(&opts).await {
+            Ok(pool) => return Ok(pool),
+            Err(e) if attempt < 5 => {
+                tracing::warn!(attempt, error = %e, "opening the SQLite datastore; trying again");
+                tokio::time::sleep(Duration::from_millis(250 * attempt)).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// One connection to the file, migrated.
+async fn open(opts: &SqliteConnectOptions) -> Result<Pool> {
     // One connection: SQLite is single-writer, and `claim_ready` reads-then-writes
     // in a deferred transaction. With multiple pool connections that read→write
     // upgrade can lose the write lock to a sibling connection and fail *instantly*
@@ -69,9 +99,13 @@ pub async fn init_pool(db_path: &str) -> Result<Pool> {
     // Postgres backend is the path for real write concurrency.
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
-        .connect_with(opts)
+        .connect_with(opts.clone())
         .await?;
+    migrate(&pool).await?;
+    Ok(pool)
+}
 
+async fn migrate(pool: &Pool) -> Result<()> {
     // The base and enterprise (900+) sets share sqlx's single `_sqlx_migrations`
     // table. ignore_missing lets the base migrator tolerate the enterprise rows it
     // does not own; without it an enterprise DB (900 already applied) fails the base
@@ -79,7 +113,7 @@ pub async fn init_pool(db_path: &str) -> Result<Pool> {
     // migrations" — before the enterprise migrator runs.
     let mut base = sqlx::migrate!("./migrations");
     base.set_ignore_missing(true);
-    base.run(&pool).await?;
+    base.run(pool).await?;
     #[cfg(feature = "enterprise")]
     {
         // enterprise migrations share sqlx's single `_sqlx_migrations` table with the
@@ -88,9 +122,9 @@ pub async fn init_pool(db_path: &str) -> Result<Pool> {
         // not own. Mirrors the Postgres path in db/postgres.rs.
         let mut ee = sqlx::migrate!("./migrations_ee");
         ee.set_ignore_missing(true);
-        ee.run(&pool).await?;
+        ee.run(pool).await?;
     }
-    Ok(pool)
+    Ok(())
 }
 
 /// Readiness probe: one round trip proving a pooled connection can be acquired
@@ -100,10 +134,28 @@ pub async fn ping(pool: &Pool) -> Result<()> {
     Ok(())
 }
 
+/// The indexes a build left unusable. None on SQLite: its index builds run
+/// inside their migration's transaction, and one that fails leaves nothing.
+pub async fn invalid_indexes(_pool: &Pool) -> Result<Vec<String>> {
+    Ok(Vec::new())
+}
+
 /// Inserts a workflow_definition + workflow_run + all task_runs + dependency edges
 /// in a single transaction. Returns the new run_id.
 pub async fn create_run(pool: &Pool, dag: &DagGraph, yaml_spec: &str) -> Result<String> {
-    create_run_inner(pool, dag, yaml_spec, None, None).await
+    create_run_inner(pool, dag, yaml_spec, None, None, None).await
+}
+
+/// [`create_run`] that records what started the run (`run_triggers`), in the
+/// same transaction: a run is never visible without what it was for, and a run
+/// that was refused leaves no record behind.
+pub async fn create_run_triggered(
+    pool: &Pool,
+    dag: &DagGraph,
+    yaml_spec: &str,
+    trigger: &crate::models::RunTrigger,
+) -> Result<String> {
+    create_run_inner(pool, dag, yaml_spec, None, None, Some(trigger)).await
 }
 
 /// [`create_run`] that also commits a streaming source's cursor **in the same
@@ -111,14 +163,25 @@ pub async fn create_run(pool: &Pool, dag: &DagGraph, yaml_spec: &str) -> Result<
 /// source position `(source_name, position)` become durable atomically, so a
 /// crash can never leave a created run whose input position would be replayed
 /// (a duplicate run) or an advanced position whose run was lost.
+///
+/// `trigger` is what started the run, recorded with it.
 pub async fn create_run_with_offset(
     pool: &Pool,
     dag: &DagGraph,
     yaml_spec: &str,
     source_name: &str,
     position: &str,
+    trigger: Option<&crate::models::RunTrigger>,
 ) -> Result<String> {
-    create_run_inner(pool, dag, yaml_spec, Some((source_name, position)), None).await
+    create_run_inner(
+        pool,
+        dag,
+        yaml_spec,
+        Some((source_name, position)),
+        None,
+        trigger,
+    )
+    .await
 }
 
 /// [`create_run`] that deletes the dead letter `dead_letter_id` **in the same
@@ -132,33 +195,81 @@ pub async fn create_run_with_offset(
 /// The delete is the claim. SQLite has one writer, so a concurrent redrive of
 /// the same id waits for the holder's transaction and then finds the row gone:
 /// a dead letter becomes at most one run.
+///
+/// `trigger` is what started the run, recorded with it.
 #[cfg(feature = "ops")]
 pub async fn create_run_from_dead_letter(
     pool: &Pool,
     dag: &DagGraph,
     yaml_spec: &str,
     dead_letter_id: &str,
+    trigger: Option<&crate::models::RunTrigger>,
 ) -> Result<Option<String>> {
-    match create_run_inner(pool, dag, yaml_spec, None, Some(dead_letter_id)).await {
+    match create_run_inner(pool, dag, yaml_spec, None, Some(dead_letter_id), trigger).await {
         Ok(run_id) => Ok(Some(run_id)),
         Err(e) if e.is::<super::DeadLetterGone>() => Ok(None),
         Err(e) => Err(e),
     }
 }
 
-/// The run writer behind [`create_run`], [`create_run_with_offset`] and
-/// `create_run_from_dead_letter`, with the free-disk floor from
-/// `DAGRON_MIN_FREE_BYTES`. Besides the run, `offset` commits a source cursor
-/// and `dead_letter` deletes that dead letter first, as the claim, all in the
-/// one transaction.
+/// The run writer behind [`create_run`], [`create_run_triggered`],
+/// [`create_run_with_offset`] and `create_run_from_dead_letter`, with the
+/// free-disk floor from `DAGRON_MIN_FREE_BYTES`. Besides the run, `offset`
+/// commits a source cursor, `dead_letter` deletes that dead letter first, as
+/// the claim, and `trigger` records what started the run, all in the one
+/// transaction.
+/// [`create_run_triggered`] for a run a gateway's caller submitted: who that
+/// was is kept on the run as well (`triggered_by`), in the same insert. As
+/// the Postgres backend's, for dagron-api on SQLite.
+pub async fn create_run_triggered_by(
+    pool: &Pool,
+    dag: &DagGraph,
+    yaml_spec: &str,
+    triggered_by: &str,
+    trigger: &crate::models::RunTrigger,
+) -> Result<String> {
+    create_run_full(pool, dag, yaml_spec, None, None, Some(triggered_by), Some(trigger), None, min_free_bytes()).await
+}
+
+/// [`create_run_triggered_by`] for a submit made under an `Idempotency-Key`:
+/// the caller's claim on the key is resolved to the run in the same
+/// transaction, so the run and the key's answer commit together, or neither
+/// does. `Ok(None)` when the claim is no longer this submit's (taken over once
+/// it went stale, or released): then nothing is written. As the Postgres
+/// backend's, for dagron-api on SQLite.
+pub async fn create_run_claimed(
+    pool: &Pool,
+    dag: &DagGraph,
+    yaml_spec: &str,
+    triggered_by: Option<&str>,
+    trigger: Option<&crate::models::RunTrigger>,
+    claim: &super::IdempotencyClaim<'_>,
+) -> Result<Option<String>> {
+    match create_run_full(pool, dag, yaml_spec, None, None, triggered_by, trigger, Some(claim), min_free_bytes()).await {
+        Ok(run_id) => Ok(Some(run_id)),
+        Err(e) if e.is::<super::IdempotencyClaimLost>() => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 async fn create_run_inner(
     pool: &Pool,
     dag: &DagGraph,
     yaml_spec: &str,
     offset: Option<(&str, &str)>,
     dead_letter: Option<&str>,
+    trigger: Option<&crate::models::RunTrigger>,
 ) -> Result<String> {
-    create_run_inner_with_floor(pool, dag, yaml_spec, offset, dead_letter, min_free_bytes()).await
+    create_run_inner_with_floor(
+        pool,
+        dag,
+        yaml_spec,
+        offset,
+        dead_letter,
+        trigger,
+        min_free_bytes(),
+    )
+    .await
 }
 
 /// `DAGRON_MIN_FREE_BYTES` — the free-disk admission floor in bytes, `0` = off
@@ -226,12 +337,55 @@ async fn create_run_inner_with_floor(
     yaml_spec: &str,
     offset: Option<(&str, &str)>,
     dead_letter: Option<&str>,
+    trigger: Option<&crate::models::RunTrigger>,
+    floor: u64,
+) -> Result<String> {
+    create_run_full(pool, dag, yaml_spec, offset, dead_letter, None, trigger, None, floor).await
+}
+
+/// Every way a run is made: from a source's position (`offset`), a dead
+/// letter's redrive (`dead_letter`), a gateway's caller (`triggered_by`,
+/// `trigger`), under an `Idempotency-Key` (`claim`), below a free-disk
+/// `floor`.
+#[allow(clippy::too_many_arguments)]
+async fn create_run_full(
+    pool: &Pool,
+    dag: &DagGraph,
+    yaml_spec: &str,
+    offset: Option<(&str, &str)>,
+    dead_letter: Option<&str>,
+    triggered_by: Option<&str>,
+    trigger: Option<&crate::models::RunTrigger>,
+    claim: Option<&super::IdempotencyClaim<'_>>,
     floor: u64,
 ) -> Result<String> {
     // Before the transaction, before any id is minted: a refused run must
     // leave nothing behind — no definition row, no moved source cursor, no
     // consumed dead letter.
     check_disk_floor(pool, floor)?;
+    // A run that is not trusted is confined (`crate::confine`). What such a
+    // run may not use is refused here, where every run is made, before
+    // anything of it is written; and its rows are written from a copy of the
+    // graph without what it is not given.
+    let held;
+    let dag = match crate::confine::held(dag, crate::envpolicy::class_of(trigger))? {
+        Some(graph) => {
+            held = graph;
+            &held
+        }
+        None => dag,
+    };
+    // And a task of such a run that names a protected environment waits on
+    // a gate of the policy's approvers (`crate::protected`), put in here,
+    // after the run was held to what it may write.
+    let gated;
+    let dag = match crate::protected::gated(pool, dag, trigger).await? {
+        Some(graph) => {
+            gated = graph;
+            &gated
+        }
+        None => dag,
+    };
 
     let def_id = Uuid::new_v4().to_string();
     let run_id = Uuid::new_v4().to_string();
@@ -252,6 +406,29 @@ async fn create_run_inner_with_floor(
 
     let mut tx = pool.begin().await?;
 
+    // The caller's `Idempotency-Key` claim (`create_run_claimed`), held by the
+    // transaction's first statement: a write that changes nothing, so the
+    // transaction holds SQLite's write lock from here, and no other writer
+    // (an engine on the same file) can come between this check and the run's
+    // rows, where a read first would have to upgrade its lock and could lose.
+    // A claim that is not this submit's any more ends it here, with nothing
+    // written.
+    if let Some(claim) = claim {
+        let ours = sqlx::query(
+            "UPDATE run_idempotency SET created_at = created_at
+              WHERE principal = ? AND idempotency_key = ? AND run_id IS NULL AND created_at = ?",
+        )
+        .bind(claim.principal)
+        .bind(claim.key)
+        .bind(claim.claimed_at)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if ours != 1 {
+            return Err(anyhow::Error::new(super::IdempotencyClaimLost));
+        }
+    }
+
     // Redrive claim (`create_run_from_dead_letter`), the transaction's first
     // statement. Everything below that refuses the run rolls it back with the
     // rest, so the dead letter is only ever gone together with a created run.
@@ -270,28 +447,49 @@ async fn create_run_inner_with_floor(
     // (by name) already has `max_active_runs` runs in flight. Checked inside the
     // write transaction, so on single-writer SQLite it is race-free; the count
     // filters the small set of `running` runs and PK-joins their definitions.
+    //
+    // A run that arrives at a full cap is refused, unless its workflow says a
+    // run waits (`when_full`): then it is made, with `queued_at`, and each of
+    // its tasks is written with one dependency more than it has. Nothing
+    // advances such a task, and [`admit_waiting_runs`] takes the one away
+    // when the run's turn comes. A run that waits is in the way of the next
+    // one as a run that runs is, so runs are let in in the order they came.
+    let mut waits = false;
     if let Some(max) = dag.spec.max_active_runs {
         if max > 0 {
-            let active: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM workflow_runs wr
-                 JOIN workflow_definitions d ON d.id = wr.definition_id
-                 WHERE wr.status = 'running' AND d.name = ?
-                   AND wr.concurrency_key IS ?",
-            )
-            .bind(&dag.spec.name)
-            .bind(&dag.spec.concurrency_key)
-            .fetch_one(&mut *tx)
-            .await?;
-            if active >= max as i64 {
-                return Err(anyhow::Error::new(crate::models::MaxActiveRunsReached {
-                    name: dag.spec.name.clone(),
-                    max,
-                    active,
-                    key: dag.spec.concurrency_key.clone(),
-                }));
+            let when_full = dag.spec.when_full.unwrap_or_default();
+            if when_full == crate::dag::WhenFull::Supersede {
+                // A run that is not trusted takes the place of its own
+                // source's runs alone (`crate::confine::SPEC_ALLOWED`).
+                let own = trigger.filter(|t| crate::confine::confined(crate::envpolicy::class_of(Some(t))));
+                supersede_runs(
+                    &mut tx,
+                    &dag.spec.name,
+                    dag.spec.concurrency_key.as_deref(),
+                    &run_id,
+                    own,
+                    &now,
+                )
+                .await?;
+            }
+            let (active, waiting) =
+                runs_in_flight(&mut tx, &dag.spec.name, dag.spec.concurrency_key.as_deref(), None).await?;
+            if active >= i64::from(max) {
+                if !when_full.waits() || waiting >= crate::dag::max_waiting_runs() {
+                    return Err(anyhow::Error::new(crate::models::MaxActiveRunsReached {
+                        name: dag.spec.name.clone(),
+                        max,
+                        active,
+                        waiting: if when_full.waits() { waiting } else { 0 },
+                        key: dag.spec.concurrency_key.clone(),
+                    }));
+                }
+                waits = true;
             }
         }
     }
+    // The dependency a waiting run's tasks are held by, which none of them has.
+    let held_by = i64::from(waits);
 
     sqlx::query(
         "INSERT INTO workflow_definitions (id, name, spec, created_at) VALUES (?, ?, ?, ?)",
@@ -308,11 +506,24 @@ async fn create_run_inner_with_floor(
     // NULL, so "never assessed" stays distinguishable from "written before
     // the column existed". See `crate::clock`.
     let clock = crate::clock::current();
+    // The parameters the run was created with (migration 052), for templates
+    // resolved after submit. Stored even when empty: `{}` says "none", NULL
+    // says "written before the column existed".
+    let parameters = serde_json::to_string(&dag.parameters)?;
+    // A `notify.git` run's `pending` status is owed from the moment it exists
+    // (migration 054); an engine with a forge token posts it.
+    let start_pending_at = dag
+        .spec
+        .notify
+        .as_ref()
+        .and_then(|n| n.git.as_ref())
+        .map(|_| &now);
     sqlx::query(
         "INSERT INTO workflow_runs
            (id, definition_id, status, created_at, deadline_at, alert_deadline_at, result_from, environment,
-            clock_confidence, clock_offset_ms, clock_source, concurrency_key)
-         VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            clock_confidence, clock_offset_ms, clock_source, concurrency_key, parameters, start_pending_at,
+            queued_at, triggered_by)
+         VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&run_id)
     .bind(&def_id)
@@ -325,8 +536,44 @@ async fn create_run_inner_with_floor(
     .bind(clock.offset_ms)
     .bind(&clock.source)
     .bind(&dag.spec.concurrency_key)
+    .bind(&parameters)
+    .bind(start_pending_at)
+    .bind(waits.then_some(&now))
+    .bind(triggered_by)
     .execute(&mut *tx)
     .await?;
+
+    // What started the run (migration 057), with it or not at all.
+    if let Some(t) = trigger {
+        sqlx::query(
+            "INSERT INTO run_triggers
+               (run_id, kind, principal, actor, trust, source, forge_host, repo, ref, sha, base_sha, pr,
+                event_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&run_id)
+        .bind(&t.kind)
+        .bind(&t.principal)
+        .bind(&t.actor)
+        .bind(&t.trust)
+        .bind(&t.source)
+        .bind(&t.forge_host)
+        .bind(&t.repo)
+        .bind(&t.git_ref)
+        .bind(&t.sha)
+        .bind(&t.base_sha)
+        .bind(t.pr)
+        .bind(&t.event_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // Its token budget, with it or not at all.
+    #[cfg(feature = "enterprise")]
+    if let Some(budget) = dag.spec.budget.as_ref().and_then(|b| b.tokens) {
+        crate::tokens::open_budget(&mut *tx, &run_id, budget).await?;
+    }
 
     // Create task_run rows; store the full TaskSpec as JSON in `input` so the
     // row is self-contained — dispatch only needs task.id + task.input.
@@ -487,7 +734,7 @@ async fn create_run_inner_with_floor(
             task_rows.push(TaskRow {
                 id: task_id.clone(),
                 name,
-                dep_count,
+                dep_count: dep_count + held_by,
                 input_json,
                 trigger_rule: trigger_rule.to_string(),
                 allow_failure,
@@ -554,6 +801,24 @@ async fn create_run_inner_with_floor(
     // Exactly-once: the source cursor rides the run's transaction.
     if let Some((source_name, position)) = offset {
         upsert_source_offset(&mut *tx, source_name, position, &now).await?;
+    }
+
+    // The key's answer rides it too: the claim held above now names the run.
+    if let Some(claim) = claim {
+        let resolved = sqlx::query(
+            "UPDATE run_idempotency SET run_id = ?
+              WHERE principal = ? AND idempotency_key = ? AND run_id IS NULL AND created_at = ?",
+        )
+        .bind(&run_id)
+        .bind(claim.principal)
+        .bind(claim.key)
+        .bind(claim.claimed_at)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if resolved != 1 {
+            return Err(anyhow::Error::new(super::IdempotencyClaimLost));
+        }
     }
 
     tx.commit().await?;
@@ -724,19 +989,23 @@ pub async fn release_source_partitions(
     .rows_affected())
 }
 
-/// Reclaim tasks whose worker lease expired — the core crash-recovery primitive.
-pub async fn recover_expired_leases(pool: &Pool) -> Result<u64> {
-    let now = chrono::Utc::now().to_rfc3339();
-    let r = sqlx::query(
-        "UPDATE task_runs
+/// The lease sweep's statement ([`recover_expired_leases`]). A const, as each
+/// sweep's read is here, so the plan tests read the text it runs.
+pub(crate) const EXPIRED_LEASES: &str = "UPDATE task_runs
          SET status = 'ready', claimed_by = NULL, lease_expires_at = NULL
          WHERE status = 'running'
            AND lease_expires_at IS NOT NULL
-           AND lease_expires_at < ?",
-    )
-    .bind(&now)
-    .execute(pool)
-    .await?;
+           AND lease_expires_at < ?
+           AND stop_requested_at IS NULL
+           AND session_id IS NULL";
+
+/// Reclaim tasks whose worker lease expired — the core crash-recovery primitive.
+///
+/// A task that was asked to stop is not one of them: it must not run again.
+/// Its lapsed lease is [`claim_teardowns`]'s to take.
+pub async fn recover_expired_leases(pool: &Pool) -> Result<u64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let r = sqlx::query(EXPIRED_LEASES).bind(&now).execute(pool).await?;
     Ok(r.rows_affected())
 }
 
@@ -1102,6 +1371,21 @@ pub async fn claim_ready_classes(
     claim_ready_filtered(pool, worker_id, limit, classes, pool_caps, false).await
 }
 
+/// The claim's read of the ready tasks ([`claim_ready_filtered`]), whose plan
+/// a sweep's index must not take.
+pub(crate) const READY_CANDIDATES: &str =
+    "SELECT id, run_id, name, status, attempt, remaining_deps,
+                input, output, claimed_by, lease_expires_at, version,
+                scheduled_at, finished_at, pool, external_epoch
+         FROM task_runs
+         WHERE status = 'ready'
+           AND (scheduled_at IS NULL OR scheduled_at <= ?1)
+           AND (?2 = '' OR instr(?2, ',' || runner_class || ',') > 0)
+           AND (?4 = '' OR pool IS NULL OR instr(?4, ',' || pool || ',') = 0)
+           AND (?5 = 0 OR gang_id IS NULL)
+         ORDER BY priority DESC, scheduled_at
+         LIMIT ?3";
+
 /// Shared claim implementation behind [`claim_ready_classes`] and
 /// [`claim_ready_classes_nongang`]. `exclude_gangs` adds `gang_id IS NULL` so the
 /// gang-aware scheduler never claims a gang member individually — everything else
@@ -1162,26 +1446,14 @@ async fn claim_ready_filtered(
         }
     }
 
-    let candidates: Vec<TaskRun> = sqlx::query_as::<_, TaskRun>(
-        "SELECT id, run_id, name, status, attempt, remaining_deps,
-                input, output, claimed_by, lease_expires_at, version,
-                scheduled_at, finished_at, pool, external_epoch
-         FROM task_runs
-         WHERE status = 'ready'
-           AND (scheduled_at IS NULL OR scheduled_at <= ?1)
-           AND (?2 = '' OR instr(?2, ',' || runner_class || ',') > 0)
-           AND (?4 = '' OR pool IS NULL OR instr(?4, ',' || pool || ',') = 0)
-           AND (?5 = 0 OR gang_id IS NULL)
-         ORDER BY priority DESC, scheduled_at
-         LIMIT ?3",
-    )
-    .bind(&now)
-    .bind(&class_set)
-    .bind(limit)
-    .bind(&exhausted_set)
-    .bind(i64::from(exclude_gangs))
-    .fetch_all(&mut *tx)
-    .await?;
+    let candidates: Vec<TaskRun> = sqlx::query_as::<_, TaskRun>(READY_CANDIDATES)
+        .bind(&now)
+        .bind(&class_set)
+        .bind(limit)
+        .bind(&exhausted_set)
+        .bind(i64::from(exclude_gangs))
+        .fetch_all(&mut *tx)
+        .await?;
 
     if candidates.is_empty() {
         tx.commit().await?;
@@ -1207,8 +1479,9 @@ async fn claim_ready_filtered(
                  claimed_by = ?,
                  lease_expires_at = ?,
                  attempt = attempt + 1,
-                 log = NULL,
-                 version = version + 1
+                 log = NULL, log_fence = NULL, log_gen = NULL,
+                 version = version + 1,
+                 session_id = NULL
              WHERE id = ? AND status = 'ready' AND version = ?",
         )
         .bind(worker_id)
@@ -1317,8 +1590,9 @@ pub async fn claim_ready_gang(
              claimed_by = ?,
              lease_expires_at = ?,
              attempt = attempt + 1,
-             log = NULL,
-             version = version + 1
+             log = NULL, log_fence = NULL, log_gen = NULL,
+             version = version + 1,
+             session_id = NULL
          WHERE gang_id = ? AND status = 'ready'
          RETURNING id, run_id, name, status,
                    attempt - 1 AS attempt, remaining_deps,
@@ -1363,12 +1637,35 @@ pub async fn oversized_ready_gangs(pool: &Pool, max_size: i64) -> Result<Vec<(St
 }
 
 /// Die-together: a gang member failed — cancel every non-terminal sibling.
-/// The version bump fences running siblings: their next heartbeat renewal
-/// fails the claim-triple check and aborts their local execution, and any
-/// late result write is rejected. Returns siblings cancelled.
+///
+/// A sibling no worker holds is `cancelled` here, and its version bumped so
+/// that nothing late can be written under an earlier claim. One a worker
+/// holds is **asked to stop** (`stop_requested_at`) and stays `running`, with
+/// its claim, until that worker says its work is gone
+/// ([`settle_stopped_task`]): its engine sees the request at its next sweep.
+/// Returns the siblings cancelled or asked.
 pub async fn cancel_gang_siblings(pool: &Pool, member_id: &str) -> Result<u64> {
     let now = chrono::Utc::now().to_rfc3339();
-    Ok(sqlx::query(
+    let mut tx = pool.begin().await?;
+    // With a whole lease to answer in, as in `stop_run_tasks`.
+    let asked = sqlx::query(
+        "UPDATE task_runs
+         SET lease_expires_at = CASE WHEN stop_requested_at IS NULL THEN ?3
+                                     ELSE lease_expires_at END,
+             stop_requested_at = COALESCE(stop_requested_at, ?1),
+             output = COALESCE(output, 'cancelled: gang member failed')
+         WHERE gang_id IS NOT NULL
+           AND gang_id = (SELECT gang_id FROM task_runs WHERE id = ?2)
+           AND id != ?2
+           AND status = 'running' AND claimed_by IS NOT NULL",
+    )
+    .bind(&now)
+    .bind(member_id)
+    .bind(stop_lease())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    let cancelled = sqlx::query(
         "UPDATE task_runs
          SET status = 'cancelled', claimed_by = NULL, lease_expires_at = NULL,
              version = version + 1, finished_at = ?1,
@@ -1376,13 +1673,15 @@ pub async fn cancel_gang_siblings(pool: &Pool, member_id: &str) -> Result<u64> {
          WHERE gang_id IS NOT NULL
            AND gang_id = (SELECT gang_id FROM task_runs WHERE id = ?2)
            AND id != ?2
-           AND status IN ('pending', 'ready', 'running')",
+           AND (status IN ('pending', 'ready') OR (status = 'running' AND claimed_by IS NULL))",
     )
     .bind(&now)
     .bind(member_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
-    .rows_affected())
+    .rows_affected();
+    tx.commit().await?;
+    Ok(asked + cancelled)
 }
 
 /// Mark a task succeeded and decrement remaining_deps for all direct dependents.
@@ -1435,7 +1734,7 @@ async fn mark_task_succeeded_inner(
         "UPDATE task_runs
          SET status = 'succeeded', finished_at = ?, output = ?, claimed_by = NULL,
              cache_hit = ?
-         WHERE id = ? AND claimed_by = ? AND version = ?",
+         WHERE id = ? AND claimed_by = ? AND version = ? AND stop_requested_at IS NULL",
     )
     .bind(&now)
     .bind(&output)
@@ -1448,6 +1747,12 @@ async fn mark_task_succeeded_inner(
     .rows_affected();
 
     if rows == 0 {
+        // Asked to stop, and over by itself first: cancelled, not succeeded.
+        if settle_stopping(&mut tx, task_id, worker_id, fence, &now).await? {
+            tx.commit().await?;
+            tracing::info!(task_id, "the task ended after it was asked to stop: cancelled");
+            return Ok(false);
+        }
         tx.commit().await?;
         tracing::warn!(task_id, "stale completion ignored — task already reclaimed");
         return Ok(false);
@@ -1506,6 +1811,27 @@ async fn mark_task_succeeded_inner(
     Ok(true)
 }
 
+/// What the task `name` of the run `run_id` came to: its status, and the
+/// end of what it printed (its last `tail` characters, which is all a reader
+/// of its last line needs of an output that may be megabytes). `None` when
+/// the run has no such task.
+pub async fn task_outcome(
+    pool: &Pool,
+    run_id: &str,
+    name: &str,
+    tail: usize,
+) -> Result<Option<(String, String)>> {
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT status, substr(output, -?) FROM task_runs WHERE run_id = ? AND name = ?",
+    )
+    .bind(tail as i64)
+    .bind(run_id)
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(status, output)| (status, output.unwrap_or_default())))
+}
+
 /// Mark a task failed and decrement its direct dependents' dependency counters
 /// (a failure is a terminal outcome, exactly like success). Whether each
 /// dependent then runs or is skipped is decided by its `trigger_rule` in
@@ -1528,7 +1854,7 @@ pub async fn mark_task_failed(
     let rows = sqlx::query(
         "UPDATE task_runs
          SET status = 'failed', finished_at = ?, output = ?, claimed_by = NULL
-         WHERE id = ? AND claimed_by = ? AND version = ?",
+         WHERE id = ? AND claimed_by = ? AND version = ? AND stop_requested_at IS NULL",
     )
     .bind(&now)
     .bind(&error)
@@ -1540,6 +1866,12 @@ pub async fn mark_task_failed(
     .rows_affected();
 
     if rows == 0 {
+        // Asked to stop, and over by itself first: cancelled, not failed.
+        if settle_stopping(&mut tx, task_id, worker_id, fence, &now).await? {
+            tx.commit().await?;
+            tracing::info!(task_id, "the task ended after it was asked to stop: cancelled");
+            return Ok(false);
+        }
         tx.commit().await?;
         tracing::warn!(task_id, "stale failure ignored — task already reclaimed");
         return Ok(false);
@@ -1588,19 +1920,22 @@ pub async fn note_task_log(pool: &Pool, task_id: &str, fence: i64, note: &str) -
 /// chunk of an attempt — it replaces any prior-attempt output so a retried task's
 /// tail starts clean; subsequent chunks append. The task's final output is
 /// overwritten whole by `mark_task_*` at completion, so this is a live view only.
+///
+/// Returns `None`: the Postgres backend returns the run of the row it
+/// changed, for the caller to tell subscribers of, and SQLite has none.
 pub async fn append_task_output(
     pool: &Pool,
     task_id: &str,
     fence: i64,
     chunk: &str,
     reset: bool,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let sql = if reset {
-        "UPDATE task_runs SET log = ?
-         WHERE id = ? AND version = ? AND status = 'running'"
+        "UPDATE task_runs SET log = ?1, log_fence = ?3, log_gen = COALESCE(log_gen, 0) + 1
+         WHERE id = ?2 AND version = ?3 AND status = 'running'"
     } else {
-        "UPDATE task_runs SET log = COALESCE(log, '') || ?
-         WHERE id = ? AND version = ? AND status = 'running'"
+        "UPDATE task_runs SET log = COALESCE(log, '') || ?1, log_fence = ?3
+         WHERE id = ?2 AND version = ?3 AND status = 'running'"
     };
     sqlx::query(sql)
         .bind(chunk)
@@ -1608,13 +1943,643 @@ pub async fn append_task_output(
         .bind(fence)
         .execute(pool)
         .await?;
+    Ok(None)
+}
+
+/// What beginning an attempt's log again left behind ([`reset_task_log`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogReset {
+    /// The run of the task, to tell of the change.
+    pub run_id: String,
+    /// Which writing of the attempt's log this is (`log_gen`): what its
+    /// segments and open part are named by.
+    pub gen: i64,
+    /// A writing before this one was begun in the log store, and is recorded
+    /// for the store's GC to remove (`log_sweeps`): the caller wakes it.
+    pub swept: bool,
+}
+
+/// The database's clock as a record of `log_sweeps` keeps it: the text the
+/// outbox's trigger writes (066), so that no engine's clock matters.
+const SWEEP_NOW: &str = "strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')";
+
+/// [`SWEEP_NOW`], `secs` on: a parameter's or a column's number of seconds.
+fn sweep_clock_in(secs: &str) -> String {
+    format!("strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now', ({secs}) || ' seconds')")
+}
+
+/// Begin a running attempt's log again from its start: its first chunk, or
+/// its whole text once more (a seal). One transaction: the row's `log`
+/// becomes `text` (the open part, where the store keeps it in the row, or
+/// `''` for a `file://` store's notes), its `log_fence` the attempt's and
+/// its `log_gen` one more, and the closed segments' rows of this attempt and
+/// of every one before it go. So a reader sees the old log or the new one,
+/// never the old segments before the new text. `None` where the attempt is
+/// not running (it is over, or another took the row): nothing is changed.
+///
+/// The row counts the writings begun in the log store (`log_writings`), and
+/// where one was begun before this, the task is recorded for the store's GC
+/// (`log_sweeps`, due at once), in the same transaction: what the store keeps
+/// of the writing before is no reader's now, and goes from there, not here.
+pub async fn reset_task_log(
+    pool: &Pool,
+    task_id: &str,
+    fence: i64,
+    text: &str,
+) -> Result<Option<LogReset>> {
+    let mut tx = pool.begin().await?;
+    let begun: Option<(String, i64, i64)> = sqlx::query_as(
+        "UPDATE task_runs SET log = ?1, log_fence = ?3, log_gen = COALESCE(log_gen, 0) + 1,
+             log_writings = COALESCE(log_writings, 0) + 1
+         WHERE id = ?2 AND version = ?3 AND status = 'running'
+         RETURNING run_id, log_gen, log_writings",
+    )
+    .bind(text)
+    .bind(task_id)
+    .bind(fence)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((run_id, gen, writings)) = begun else {
+        return Ok(None);
+    };
+    // The row says `version = fence`, and a log's fence is never past its
+    // row's version: every attempt's segments are this one's or before it.
+    sqlx::query("DELETE FROM log_segments WHERE task_id = ?1 AND fence <= ?2")
+        .bind(task_id)
+        .bind(fence)
+        .execute(&mut *tx)
+        .await?;
+    let swept = writings > 1;
+    if swept {
+        sqlx::query(&format!(
+            "INSERT INTO log_sweeps (task_id, run_id, reason, marked_at, due_at)
+             VALUES (?1, ?2, 'superseded', {SWEEP_NOW}, {SWEEP_NOW})
+             ON CONFLICT (task_id) DO UPDATE SET reason = 'superseded', run_id = excluded.run_id,
+                 marked_at = excluded.marked_at, due_at = excluded.due_at,
+                 stamp = stamp + 1, tries = 0, last_error = NULL"
+        ))
+        .bind(task_id)
+        .bind(&run_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(Some(LogReset { run_id, gen, swept }))
+}
+
+/// Mark a task's row as one whose log the store holds a writing of, before
+/// the engine writes there what it learnt of an attempt from the database
+/// rather than began (`log_writings`, where a reset has not set it): a task
+/// is recorded for the store's GC when its row goes only so. Nothing where it
+/// is set, or where the row is gone.
+pub async fn mark_log_kept(pool: &Pool, task_id: &str) -> Result<()> {
+    sqlx::query("UPDATE task_runs SET log_writings = 1 WHERE id = ?1 AND log_writings IS NULL")
+        .bind(task_id)
+        .execute(pool)
+        .await?;
     Ok(())
+}
+
+/// Take up to `limit` records of `log_sweeps` that are due, the earliest
+/// first, for `lease_secs`: each is due again then, unless it is finished
+/// before, and its stamp moves on, so that whoever held it before cannot
+/// finish it. One writer at a time takes them here, so none is passed over.
+pub async fn claim_log_sweeps(
+    pool: &Pool,
+    limit: i64,
+    lease_secs: i64,
+    first: super::ClaimFirst,
+) -> Result<Vec<super::LogSweep>> {
+    let which = match first {
+        super::ClaimFirst::Superseded => "reason = 'superseded' AND ",
+        super::ClaimFirst::Any => "",
+    };
+    let rows: Vec<(String, Option<String>, String, i64, i64)> = sqlx::query_as(&format!(
+        "UPDATE log_sweeps SET due_at = {}, stamp = stamp + 1
+         WHERE task_id IN (SELECT task_id FROM log_sweeps WHERE {which}due_at <= {SWEEP_NOW}
+                           ORDER BY due_at LIMIT ?1)
+         RETURNING task_id, run_id, reason, stamp, tries",
+        sweep_clock_in("?2")
+    ))
+    .bind(limit)
+    .bind(lease_secs)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(task_id, run_id, reason, stamp, tries)| super::LogSweep {
+            task_id,
+            run_id,
+            reason,
+            stamp,
+            tries,
+        })
+        .collect())
+}
+
+/// The writing each of `tasks` that has a row is on ([`LOG_FENCE`],
+/// [`LOG_GEN`]): what its readers name, and what the store's GC keeps.
+pub async fn log_writings_of(pool: &Pool, tasks: &[String]) -> Result<Vec<(String, i64, i64)>> {
+    let mut out = Vec::new();
+    for chunk in tasks.chunks(500) {
+        let marks = (1..=chunk.len())
+            .map(|n| format!("?{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT id, {LOG_FENCE}, {LOG_GEN} FROM task_runs WHERE id IN ({marks})");
+        let mut q = sqlx::query_as::<_, (String, i64, i64)>(&sql);
+        for task in chunk {
+            q = q.bind(task);
+        }
+        out.extend(q.fetch_all(pool).await?);
+    }
+    Ok(out)
+}
+
+/// Finish claimed records of `log_sweeps`, each by `(task, stamp)` as its
+/// claim left it: `retire`'s go (a removal found nothing left), and
+/// `relook`'s are due again in `relook_secs` (a removal took something, and
+/// a writer that has not stopped may make more). A record whose stamp moved
+/// on since (the task was recorded again, or another sweeper claimed it) is
+/// left as it is.
+pub async fn finish_log_sweeps(
+    pool: &Pool,
+    retire: &[(String, i64)],
+    relook: &[(String, i64)],
+    relook_secs: i64,
+) -> Result<()> {
+    let pairs = |n: usize, from: usize| {
+        (0..n)
+            .map(|i| format!("(?{}, ?{})", from + 2 * i, from + 2 * i + 1))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    for chunk in retire.chunks(250) {
+        let sql = format!(
+            "DELETE FROM log_sweeps WHERE (task_id, stamp) IN (VALUES {})",
+            pairs(chunk.len(), 1)
+        );
+        let mut q = sqlx::query(&sql);
+        for (task, stamp) in chunk {
+            q = q.bind(task).bind(stamp);
+        }
+        q.execute(pool).await?;
+    }
+    for chunk in relook.chunks(250) {
+        let sql = format!(
+            "UPDATE log_sweeps SET due_at = {}, stamp = stamp + 1, tries = 0, last_error = NULL
+             WHERE (task_id, stamp) IN (VALUES {})",
+            sweep_clock_in("?1"),
+            pairs(chunk.len(), 2)
+        );
+        let mut q = sqlx::query(&sql).bind(relook_secs);
+        for (task, stamp) in chunk {
+            q = q.bind(task).bind(stamp);
+        }
+        q.execute(pool).await?;
+    }
+    Ok(())
+}
+
+/// A claimed record whose removal failed: due again in `after_secs`, with
+/// one more try and the error, where its stamp is still `stamp`. Whether it
+/// was.
+pub async fn defer_log_sweep(
+    pool: &Pool,
+    task_id: &str,
+    stamp: i64,
+    after_secs: i64,
+    error: &str,
+) -> Result<bool> {
+    let done = sqlx::query(&format!(
+        "UPDATE log_sweeps SET due_at = {}, stamp = stamp + 1, tries = tries + 1, last_error = ?4
+         WHERE task_id = ?1 AND stamp = ?2",
+        sweep_clock_in("?3")
+    ))
+    .bind(task_id)
+    .bind(stamp)
+    .bind(after_secs)
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() == 1)
+}
+
+/// What waits in `log_sweeps` ([`super::LogSweepsWaiting`]).
+pub async fn log_sweeps_waiting(pool: &Pool) -> Result<super::LogSweepsWaiting> {
+    let (waiting, failing, oldest_marked_at): (i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM(tries > 0), 0), MIN(marked_at) FROM log_sweeps",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(super::LogSweepsWaiting {
+        waiting,
+        failing,
+        oldest_marked_at,
+    })
+}
+
+/// A closed segment of a task attempt's log: its object's name in the log
+/// store, in the attempt's order.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct LogSegmentRow {
+    pub task_id: String,
+    pub fence: i64,
+    pub seq: i64,
+    pub object_key: String,
+}
+
+/// The closed log segments of `tasks`, each of the attempt its log is of
+/// alone ([`LOG_FENCE`]), in order: what a reader puts before the open part.
+pub async fn log_segments_of(pool: &Pool, tasks: &[String]) -> Result<Vec<LogSegmentRow>> {
+    let mut out = Vec::new();
+    for chunk in tasks.chunks(500) {
+        let marks = (1..=chunk.len())
+            .map(|n| format!("?{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT s.task_id, s.fence, s.seq, s.object_key FROM log_segments s \
+             JOIN task_runs t ON t.id = s.task_id \
+             AND s.fence = (CASE WHEN t.log IS NULL THEN t.version ELSE COALESCE(t.log_fence, t.version) END) \
+             WHERE s.task_id IN ({marks}) ORDER BY s.task_id, s.seq"
+        );
+        let mut q = sqlx::query_as::<_, LogSegmentRow>(&sql);
+        for task in chunk {
+            q = q.bind(task);
+        }
+        out.extend(q.fetch_all(pool).await?);
+    }
+    Ok(out)
+}
+
+/// Where a task attempt's log stands in the store: the next segment's number,
+/// how many bytes its task row's `log` holds (the open part, where the store
+/// keeps it there), and which writing of the log the row's is (`log_gen`).
+/// What the engine reads of an attempt it was not writing when it started.
+/// `None` where the task has no row: nothing of it is to be written.
+pub async fn log_open_state(
+    pool: &Pool,
+    task_id: &str,
+    fence: i64,
+) -> Result<Option<(i64, i64, i64)>> {
+    Ok(sqlx::query_as(
+        "SELECT COALESCE((SELECT MAX(seq) + 1 FROM log_segments WHERE task_id = ?1 AND fence = ?2), 0), \
+                CAST(COALESCE(octet_length(log), 0) AS BIGINT), \
+                CAST(COALESCE(log_gen, 0) AS BIGINT) \
+         FROM task_runs WHERE id = ?1",
+    )
+    .bind(task_id)
+    .bind(fence)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// A task attempt's row `log`: the open part of a store that keeps it there.
+pub async fn read_row_log(pool: &Pool, task_id: &str, fence: i64) -> Result<Option<String>> {
+    let log: Option<Option<String>> =
+        sqlx::query_scalar("SELECT log FROM task_runs WHERE id = ?1 AND version = ?2")
+            .bind(task_id)
+            .bind(fence)
+            .fetch_optional(pool)
+            .await?;
+    Ok(log.flatten())
+}
+
+/// Record a task attempt's closed segments `pieces` (each its number, its
+/// object's name, its bytes and its lines), all in one transaction, or none.
+/// Where their text was the row's open part (`from_row`: how many characters
+/// of the row's `log` they took), the characters leave the row in the same
+/// transaction, so that a reader sees each line once: as segment, or as open
+/// part. What was appended after the text was read stays. A segment recorded
+/// already is not recorded again.
+pub async fn close_log_segments(
+    pool: &Pool,
+    task_id: &str,
+    fence: i64,
+    pieces: &[(i64, String, i64, i64)],
+    from_row: Option<i64>,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    for (seq, object_key, bytes, lines) in pieces {
+        sqlx::query(
+            "INSERT INTO log_segments (task_id, fence, seq, object_key, bytes, lines, closed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')) ON CONFLICT DO NOTHING",
+        )
+        .bind(task_id)
+        .bind(fence)
+        .bind(seq)
+        .bind(object_key)
+        .bind(bytes)
+        .bind(lines)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if let Some(chars) = from_row {
+        sqlx::query(
+            "UPDATE task_runs SET log = SUBSTR(log, ?3 + 1) WHERE id = ?1 AND version = ?2",
+        )
+        .bind(task_id)
+        .bind(fence)
+        .bind(chars)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The number of closed log segments of the attempt a task row's log is of
+/// ([`LOG_FENCE`]), as a column of a query of `task_runs`: read with the
+/// row, in one statement, so that a reader's segments and the row's open
+/// part are of one moment.
+const SEGMENTS_COLUMN: &str = "(SELECT COUNT(*) FROM log_segments s \
+     WHERE s.task_id = task_runs.id AND s.fence = (CASE WHEN task_runs.log IS NULL THEN task_runs.version \
+     ELSE COALESCE(task_runs.log_fence, task_runs.version) END))";
+
+/// A task row as a reader of logs wants it: its id, the attempt its log is of
+/// ([`LOG_FENCE`]) and which writing of it ([`LOG_GEN`]), its `log`, its
+/// `output`, and how many closed segments that writing has.
+pub type TaskLogRow = (String, i64, i64, Option<String>, Option<String>, i64);
+
+/// Each task row of a run as a reader of logs wants it ([`TaskLogRow`]).
+pub async fn task_log_rows(pool: &Pool, run_id: &str) -> Result<Vec<TaskLogRow>> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT id, {LOG_FENCE}, {LOG_GEN}, log, output, {SEGMENTS_COLUMN} FROM task_runs WHERE run_id = ?1"
+    ))
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// One task row of a run as a reader of logs wants it ([`TaskLogRow`]).
+pub async fn task_log_row(pool: &Pool, run_id: &str, task_id: &str) -> Result<Option<TaskLogRow>> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT id, {LOG_FENCE}, {LOG_GEN}, log, output, {SEGMENTS_COLUMN} FROM task_runs \
+         WHERE run_id = ?1 AND id = ?2"
+    ))
+    .bind(run_id)
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// The attempt a task row's log is of, as a column of a query of
+/// `task_runs`: the fence it was begun under, which a reset keeps in
+/// `log_fence`, or, with no log yet, the attempt the row is on. Not
+/// `version` alone: a teardown's claim or a gang sibling's cancel moves
+/// `version` on and leaves the log the one it was.
+pub const LOG_FENCE: &str =
+    "(CASE WHEN log IS NULL THEN version ELSE COALESCE(log_fence, version) END)";
+
+/// Which writing of its attempt's log a task row's `log` is, as a column:
+/// one more at every reset (a first chunk, a seal). A reader that follows a
+/// log by its bytes knows by it that the bytes before its position are no
+/// longer the ones it read.
+pub const LOG_GEN: &str = "COALESCE(log_gen, 0)";
+
+/// A task of a run the live relay follows, as it reads them each pass:
+/// where its log stands, without its text.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct LogTail {
+    pub run_id: String,
+    pub task_id: String,
+    pub name: String,
+    pub status: String,
+    /// The task's attempts so far, counted through its life, as the log views
+    /// count them.
+    pub attempt: i64,
+    /// The attempt its log is of ([`LOG_FENCE`]), and which writing of it
+    /// ([`LOG_GEN`]).
+    pub fence: i64,
+    pub gen: i64,
+    /// How many closed segments the attempt has, and their bytes.
+    pub segments: i64,
+    pub closed: i64,
+    /// The bytes of the row's `log`; `None` where it has none.
+    pub row_bytes: Option<i64>,
+    /// The bytes of the row's `output`: what a view shows of a task that kept
+    /// no log.
+    pub output_bytes: i64,
+}
+
+const LOG_TAILS_SELECT: &str = "SELECT t.run_id, t.id AS task_id, t.name, t.status, t.attempt, t.fence, t.gen,
+        (SELECT COUNT(*) FROM log_segments s WHERE s.task_id = t.id AND s.fence = t.fence) AS segments,
+        CAST((SELECT COALESCE(SUM(s.bytes), 0) FROM log_segments s
+              WHERE s.task_id = t.id AND s.fence = t.fence) AS BIGINT) AS closed,
+        CAST(octet_length(t.log) AS BIGINT) AS row_bytes,
+        CAST(COALESCE(octet_length(t.output), 0) AS BIGINT) AS output_bytes
+     FROM (SELECT run_id, id, name, status, attempt_base + attempt AS attempt, scheduled_at, log, output,
+                  (CASE WHEN log IS NULL THEN version ELSE COALESCE(log_fence, version) END) AS fence,
+                  COALESCE(log_gen, 0) AS gen
+           FROM task_runs";
+
+const LOG_TAILS_ORDER: &str = "ORDER BY t.run_id, t.scheduled_at IS NULL, t.scheduled_at, t.name";
+
+/// Every task of `runs` as the live relay reads it ([`LogTail`]), in each
+/// run's order of execution, in one statement: its segments and its row of
+/// one moment.
+pub async fn log_tails(pool: &Pool, runs: &[String]) -> Result<Vec<LogTail>> {
+    let mut out = Vec::new();
+    for chunk in runs.chunks(500) {
+        let marks = (1..=chunk.len())
+            .map(|n| format!("?{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("{LOG_TAILS_SELECT} WHERE run_id IN ({marks})) t {LOG_TAILS_ORDER}");
+        let mut q = sqlx::query_as::<_, LogTail>(&sql);
+        for run in chunk {
+            q = q.bind(run);
+        }
+        out.extend(q.fetch_all(pool).await?);
+    }
+    Ok(out)
+}
+
+/// One task as the live relay reads it ([`LogTail`]): what a stream reads
+/// before it reads that task's log itself.
+pub async fn log_tail_of(pool: &Pool, task_id: &str) -> Result<Option<LogTail>> {
+    Ok(
+        sqlx::query_as::<_, LogTail>(&format!("{LOG_TAILS_SELECT} WHERE id = ?1) t"))
+            .bind(task_id)
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
+/// A read of a task row's `log` from a byte position of its attempt's whole
+/// log ([`log_row_bytes`]): the attempt and writing it is of, the position,
+/// how many bytes of the log are before the row's beside the closed segments
+/// (a `file://` store's open part, 0 elsewhere), and at most how many to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowRead {
+    pub task_id: String,
+    pub fence: i64,
+    pub gen: i64,
+    pub pos: i64,
+    pub base: i64,
+    pub max: i64,
+}
+
+/// What [`log_row_bytes`] read of a row: the closed segments' bytes as the
+/// read found them, the row's `log` in bytes, and the bytes read, which begin
+/// at `pos`, or at the row's start where `pos` is before it (a segment closed
+/// since the position was read: the bytes before the row are the segments').
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct RowBytes {
+    pub task_id: String,
+    pub closed: i64,
+    pub row_bytes: i64,
+    pub bytes: Vec<u8>,
+}
+
+/// Read task rows' `log` from byte positions of their attempts' logs (the
+/// live relay). A row is read only while its log is still the
+/// attempt and writing `reads` name; one that is not is left out, its text
+/// gone or begun again. The closed segments are summed in the statement that
+/// reads the row, so that a segment closed since the caller looked is seen.
+pub async fn log_row_bytes(pool: &Pool, reads: &[RowRead]) -> Result<Vec<RowBytes>> {
+    // One statement a task: SQLite has one connection, and a pass reads a
+    // few tasks at most.
+    let mut out = Vec::new();
+    for r in reads {
+        let row: Option<(i64, i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT c.closed, octet_length(t.log),
+                    substr(CAST(t.log AS BLOB), max(?4 - c.closed - ?5, 0) + 1, ?6)
+             FROM task_runs t,
+                  (SELECT COALESCE(SUM(bytes), 0) AS closed FROM log_segments
+                    WHERE task_id = ?1 AND fence = ?2) c
+             WHERE t.id = ?1 AND t.log IS NOT NULL AND COALESCE(t.log_fence, t.version) = ?2
+               AND COALESCE(t.log_gen, 0) = ?3",
+        )
+        .bind(&r.task_id)
+        .bind(r.fence)
+        .bind(r.gen)
+        .bind(r.pos)
+        .bind(r.base)
+        .bind(r.max)
+        .fetch_optional(pool)
+        .await?;
+        if let Some((closed, row_bytes, bytes)) = row {
+            out.push(RowBytes {
+                task_id: r.task_id.clone(),
+                closed,
+                row_bytes,
+                bytes,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// At most `max` bytes of a task row's `output` from byte `from`: what stands
+/// in for the log of a task that kept none. `None` where it has none.
+pub async fn log_output_bytes(
+    pool: &Pool,
+    task_id: &str,
+    from: i64,
+    max: i64,
+) -> Result<Option<Vec<u8>>> {
+    let bytes: Option<Option<Vec<u8>>> = sqlx::query_scalar("SELECT substr(CAST(output AS BLOB), ?2 + 1, ?3) FROM task_runs WHERE id = ?1 AND output IS NOT NULL")
+        .bind(task_id)
+        .bind(from)
+        .bind(max)
+        .fetch_optional(pool)
+        .await?;
+    Ok(bytes.flatten())
+}
+
+/// The closed segments of a task attempt's log, in order: each its number and
+/// its bytes, which put together say where each begins.
+pub async fn log_segment_spans(pool: &Pool, task_id: &str, fence: i64) -> Result<Vec<(i64, i64)>> {
+    Ok(sqlx::query_as(
+        "SELECT seq, bytes FROM log_segments WHERE task_id = ?1 AND fence = ?2 ORDER BY seq",
+    )
+    .bind(task_id)
+    .bind(fence)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Tell the subscribers of `runs` that something of theirs changed. SQLite
+/// has no `LISTEN/NOTIFY` and so no subscribers: nothing is done. The
+/// reconcile loop does not need telling here: the file's triggers name the
+/// runs a change may have ended (migrations/079, [`Waker::take_woken`]).
+pub async fn notify_runs(_pool: &Pool, _runs: &[String]) -> Result<()> {
+    Ok(())
+}
+
+/// One append of a batch: a task's attempt, and what it wrote since the last.
+pub struct LogAppend {
+    pub task_id: String,
+    /// The attempt's fence: an append of an attempt that is over reaches
+    /// nothing.
+    pub fence: i64,
+    pub text: String,
+    /// The row's log is replaced, not added to (see [`append_task_output`]).
+    pub reset: bool,
+}
+
+/// Make a batch of log appends, one after another: SQLite takes one writer
+/// at a time whatever the pool holds, so a second at once would only wait
+/// for the first, and it has no subscribers to tell. The Postgres backend
+/// makes several at once and tells of their runs (see `db::postgres`).
+///
+/// Best-effort, as a log's tail is: an append that fails is logged and its
+/// text is gone. Returns how many were made, those that reached no row among
+/// them.
+pub async fn append_task_outputs(pool: &Pool, appends: Vec<LogAppend>) -> usize {
+    let mut written = 0;
+    for append in appends {
+        match append_task_output(
+            pool,
+            &append.task_id,
+            append.fence,
+            &append.text,
+            append.reset,
+        )
+        .await
+        {
+            Ok(_) => written += 1,
+            Err(e) => {
+                tracing::warn!(task_id = %append.task_id, error = %e, "live-log append failed")
+            }
+        }
+    }
+    written
+}
+
+/// How many log appends may be in flight at once: one, for the reason
+/// [`append_task_outputs`] gives.
+pub fn log_append_lanes(_pool: &Pool) -> usize {
+    1
 }
 
 // ── Runtime fan-out (`with_output_of:`) ──────────────────────────────────────
 
 /// Statuses meaning an instance will not change again.
 const FANOUT_TERMINAL: [&str; 4] = ["succeeded", "failed", "skipped", "cancelled"];
+
+/// The fan-out sweep's read of the parked barriers ([`reconcile_fanouts`]):
+/// those with no instance of their generation still to end, a batch at a
+/// time. A barrier whose instances still run is the common case, and the
+/// sweep has nothing to do for it.
+///
+/// Exact: the expansion stamps each instance with the version its CAS wrote,
+/// and an instance of an older generation is one the sweep drops
+/// (`fanout_epoch < version`), so a barrier left out here is one the sweep
+/// would read and pass over. The statuses are [`FANOUT_TERMINAL`].
+pub(crate) const PARKED_FANOUTS: &str =
+    "SELECT b.id, b.run_id, b.input, b.allow_failure, b.version,
+                    b.runner_class, b.priority, b.pool
+             FROM task_runs b
+             WHERE b.status = 'running' AND b.fanout_of IS NOT NULL AND b.claimed_by IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM task_runs i
+                   WHERE i.fanout_parent = b.id AND i.fanout_epoch >= b.version
+                     AND i.status NOT IN ('succeeded', 'failed', 'skipped', 'cancelled')
+               )
+             LIMIT ?";
 
 /// Resolve parked runtime fan-out barriers — the sweep that makes
 /// `with_output_of:` work.
@@ -1643,15 +2608,17 @@ const FANOUT_TERMINAL: [&str; 4] = ["succeeded", "failed", "skipped", "cancelled
 /// expand it; phase 2's resolve is guarded on the parked shape, so a
 /// double-resolve is a no-op. A crash mid-expansion commits nothing and the
 /// barrier is simply expanded again next tick.
-pub async fn reconcile_fanouts(pool: &Pool) -> Result<Vec<(String, crate::models::FanoutOutcome)>> {
-    let parked: Vec<ParkedFanout> = sqlx::query_as(
-            "SELECT id, run_id, input, allow_failure, version,
-                    runner_class, priority, pool
-             FROM task_runs
-             WHERE status = 'running' AND fanout_of IS NOT NULL AND claimed_by IS NULL",
-        )
+///
+/// Reads up to [`super::SWEEP_BATCH`] barriers a pass, and says when it read
+/// that many.
+pub async fn reconcile_fanouts(
+    pool: &Pool,
+) -> Result<super::Pass<(String, crate::models::FanoutOutcome)>> {
+    let parked: Vec<ParkedFanout> = sqlx::query_as(PARKED_FANOUTS)
+        .bind(super::SWEEP_BATCH)
         .fetch_all(pool)
         .await?;
+    let full = parked.len() as i64 >= super::SWEEP_BATCH;
 
     let mut out = Vec::new();
     for (task_id, run_id, input, allow_failure, version, runner_class, priority, pool_name) in
@@ -1894,7 +2861,7 @@ pub async fn reconcile_fanouts(pool: &Pool) -> Result<Vec<(String, crate::models
             crate::models::FanoutOutcome::Expanded { instances: instances.len() },
         ));
     }
-    Ok(out)
+    Ok(super::Pass { done: out, full })
 }
 
 /// A one-line account of how the instances went, stored as the barrier's
@@ -2018,11 +2985,12 @@ pub async fn resolve_approval(
 
 /// Auto-resolve approval gates whose `approval_timeout_secs` elapsed since they
 /// began waiting (`scheduled_at`), applying `approval_on_timeout` (default
-/// `reject` — a gate fails safe). Returns the `(task_id, approved)` decisions.
+/// `reject` — a gate fails safe). Returns the `(task_id, approved, deadline)`
+/// decisions, the deadline being when the gate timed out (RFC 3339).
 /// Idempotent: `resolve_approval`'s guard means an already-resolved gate is a
 /// no-op, so a re-sweep does nothing. Not `ops`-gated — the reconcile loop
 /// calls this every tick in every build.
-pub async fn resolve_expired_approvals(pool: &Pool) -> Result<Vec<(String, bool)>> {
+pub async fn resolve_expired_approvals(pool: &Pool) -> Result<Vec<(String, bool, String)>> {
     let now = chrono::Utc::now();
     let candidates: Vec<(String, String, Option<String>, i64, Option<String>)> = sqlx::query_as(
         "SELECT id, run_id, scheduled_at, approval_timeout_secs, approval_on_timeout
@@ -2051,7 +3019,7 @@ pub async fn resolve_expired_approvals(pool: &Pool) -> Result<Vec<(String, bool)
             if approve { "approve" } else { "reject" }
         );
         if resolve_approval(pool, &run_id, &id, approve, Some("timeout"), Some(&note)).await? {
-            resolved.push((id, approve));
+            resolved.push((id, approve, deadline.to_rfc3339()));
         }
     }
     Ok(resolved)
@@ -2088,11 +3056,10 @@ pub async fn sub_workflow_depth(pool: &Pool, run_id: &str, limit: i64) -> Result
     let mut current = run_id.to_string();
     let mut depth: i64 = 0;
     while depth < limit {
-        let parent: Option<(String,)> =
-            sqlx::query_as("SELECT run_id FROM task_runs WHERE sub_run_id = ? LIMIT 1")
-                .bind(&current)
-                .fetch_optional(pool)
-                .await?;
+        let parent: Option<(String,)> = sqlx::query_as(SUB_RUN_PARENT)
+            .bind(&current)
+            .fetch_optional(pool)
+            .await?;
         match parent {
             Some((parent_run,)) => {
                 depth += 1;
@@ -2104,6 +3071,9 @@ pub async fn sub_workflow_depth(pool: &Pool, run_id: &str, limit: i64) -> Result
     Ok(depth)
 }
 
+/// One hop of [`sub_workflow_depth`]: the parked parent of a run.
+pub(crate) const SUB_RUN_PARENT: &str = "SELECT run_id FROM task_runs WHERE sub_run_id = ? LIMIT 1";
+
 pub async fn park_subworkflow(
     pool: &Pool,
     task_id: &str,
@@ -2113,7 +3083,7 @@ pub async fn park_subworkflow(
     let rows = sqlx::query(
         "UPDATE task_runs
          SET sub_run_id = ?, claimed_by = NULL, lease_expires_at = NULL
-         WHERE id = ? AND status = 'running' AND version = ?",
+         WHERE id = ? AND status = 'running' AND version = ? AND stop_requested_at IS NULL",
     )
     .bind(child_run_id)
     .bind(task_id)
@@ -2131,7 +3101,7 @@ pub async fn release_subworkflow_task(pool: &Pool, task_id: &str, fence: i64) ->
     let rows = sqlx::query(
         "UPDATE task_runs
          SET status = 'ready', claimed_by = NULL, lease_expires_at = NULL
-         WHERE id = ? AND status = 'running' AND version = ?",
+         WHERE id = ? AND status = 'running' AND version = ? AND stop_requested_at IS NULL",
     )
     .bind(task_id)
     .bind(fence)
@@ -2147,7 +3117,7 @@ pub async fn release_subworkflow_task(pool: &Pool, task_id: &str, fence: i64) ->
 /// (`status = 'running' AND sub_run_id IS NOT NULL`), so a re-sweep is a no-op.
 ///
 /// **The child run's own output becomes this task's output** when it has one,
-/// falling back to the constant below when it does not (G-AG5). Without that a
+/// falling back to the constant below when it does not. Without that a
 /// sub-workflow is a procedure and not a function: `result_from` gives a run a
 /// single return value, and the parent used to throw it away and write
 /// "sub-workflow succeeded" instead, so `{{ tasks.<child>.output }}` in the
@@ -2326,6 +3296,16 @@ pub async fn fail_parked_subworkflow(
     Ok(true)
 }
 
+/// The sub-workflow sweep's read of the parked triggers whose child run has
+/// ended ([`reconcile_subworkflows`]), a batch at a time. A trigger whose
+/// child is gone is left parked, as a trigger whose child still runs is: the
+/// join reads neither.
+pub(crate) const PARKED_SUBWORKFLOWS: &str = "SELECT t.id, t.sub_run_id, c.status, c.output
+         FROM task_runs t JOIN workflow_runs c ON c.id = t.sub_run_id
+         WHERE t.status = 'running' AND t.sub_run_id IS NOT NULL
+           AND c.status IN ('succeeded', 'failed', 'cancelled')
+         LIMIT ?";
+
 /// Sweep parked sub-workflow tasks (#23): for each `running` task holding a
 /// `sub_run_id`, if its child run is terminal, decide what happens to the
 /// trigger.
@@ -2344,22 +3324,18 @@ pub async fn fail_parked_subworkflow(
 /// Returns the `(task_id, succeeded)` resolutions — iterations that continued are
 /// not resolutions and are not reported. Run each reconcile tick; idempotent via
 /// the parked-shape guards, so every scheduler in an HA set may sweep.
-pub async fn reconcile_subworkflows(pool: &Pool) -> Result<Vec<(String, bool)>> {
-    let parked: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, sub_run_id FROM task_runs
-         WHERE status = 'running' AND sub_run_id IS NOT NULL",
-    )
-    .fetch_all(pool)
-    .await?;
+///
+/// Reads up to [`super::SWEEP_BATCH`] triggers a pass, each with its child's
+/// status and output, and says when it read that many.
+pub async fn reconcile_subworkflows(pool: &Pool) -> Result<super::Pass<(String, bool)>> {
+    let parked: Vec<(String, String, String, Option<String>)> = sqlx::query_as(PARKED_SUBWORKFLOWS)
+        .bind(super::SWEEP_BATCH)
+        .fetch_all(pool)
+        .await?;
+    let full = parked.len() as i64 >= super::SWEEP_BATCH;
 
     let mut resolved = Vec::new();
-    for (task_id, child_run_id) in parked {
-        let child: Option<(String, Option<String>)> =
-            sqlx::query_as("SELECT status, output FROM workflow_runs WHERE id = ?")
-                .bind(&child_run_id)
-                .fetch_optional(pool)
-                .await?;
-        let Some((child_status, child_output)) = child else { continue }; // child gone → leave parked
+    for (task_id, child_run_id, child_status, child_output) in parked {
         let succeeded = match child_status.as_str() {
             "succeeded" => true,
             "failed" | "cancelled" => false,
@@ -2431,7 +3407,10 @@ pub async fn reconcile_subworkflows(pool: &Pool) -> Result<Vec<(String, bool)>> 
             resolved.push((task_id, succeeded));
         }
     }
-    Ok(resolved)
+    Ok(super::Pass {
+        done: resolved,
+        full,
+    })
 }
 
 /// The `repeat:` spec of a task, from its stored `TaskSpec` JSON.
@@ -2463,7 +3442,7 @@ pub async fn park_wait(pool: &Pool, task_id: &str, fence: i64, wake_at: &str) ->
     let rows = sqlx::query(
         "UPDATE task_runs
          SET wake_at = ?, claimed_by = NULL, lease_expires_at = NULL
-         WHERE id = ? AND status = 'running' AND version = ?",
+         WHERE id = ? AND status = 'running' AND version = ? AND stop_requested_at IS NULL",
     )
     .bind(wake_at)
     .bind(task_id)
@@ -2474,22 +3453,31 @@ pub async fn park_wait(pool: &Pool, task_id: &str, fence: i64, wake_at: &str) ->
     Ok(rows > 0)
 }
 
+/// The time sensors' read of the due waits ([`reconcile_waits`]): the
+/// longest due first, a batch at a time.
+pub(crate) const DUE_WAITS: &str = "SELECT id, wake_at FROM task_runs
+         WHERE status = 'running' AND wake_at IS NOT NULL AND wake_at <= ?1
+         ORDER BY wake_at
+         LIMIT ?2";
+
 /// Sweep parked wait sensors (#27): resolve (succeed) every `running` task whose
 /// `wake_at` deadline has passed, advancing its dependents. Returns the resolved
-/// task ids. Run each reconcile tick; the guarded UPDATE is idempotent and
-/// HA-safe (only one scheduler resolves a given task).
-pub async fn reconcile_waits(pool: &Pool) -> Result<Vec<String>> {
+/// tasks, each `(task_id, wake_at)`. Run each reconcile tick; the guarded UPDATE
+/// is idempotent and HA-safe (only one scheduler resolves a given task).
+///
+/// Reads up to [`super::SWEEP_BATCH`] a pass, the longest due first, and says
+/// when it read that many.
+pub async fn reconcile_waits(pool: &Pool) -> Result<super::Pass<(String, String)>> {
     let now = chrono::Utc::now().to_rfc3339();
-    let due: Vec<(String,)> = sqlx::query_as(
-        "SELECT id FROM task_runs
-         WHERE status = 'running' AND wake_at IS NOT NULL AND wake_at <= ?",
-    )
-    .bind(&now)
-    .fetch_all(pool)
-    .await?;
+    let due: Vec<(String, String)> = sqlx::query_as(DUE_WAITS)
+        .bind(&now)
+        .bind(super::SWEEP_BATCH)
+        .fetch_all(pool)
+        .await?;
+    let full = due.len() as i64 >= super::SWEEP_BATCH;
 
     let mut resolved = Vec::new();
-    for (task_id,) in due {
+    for (task_id, wake_at) in due {
         let mut tx = pool.begin().await?;
         let rows = sqlx::query(
             "UPDATE task_runs SET status = 'succeeded', finished_at = ?, output = 'wait elapsed'
@@ -2515,9 +3503,12 @@ pub async fn reconcile_waits(pool: &Pool) -> Result<Vec<String>> {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        resolved.push(task_id);
+        resolved.push((task_id, wake_at));
     }
-    Ok(resolved)
+    Ok(super::Pass {
+        done: resolved,
+        full,
+    })
 }
 
 /// Park a claimed `type: wait` HTTP sensor (#27 follow-on): keep it `running`
@@ -2535,7 +3526,7 @@ pub async fn park_wait_url(
     let rows = sqlx::query(
         "UPDATE task_runs
          SET wait_url = ?, next_poll_at = ?, claimed_by = NULL, lease_expires_at = NULL
-         WHERE id = ? AND status = 'running' AND version = ?",
+         WHERE id = ? AND status = 'running' AND version = ? AND stop_requested_at IS NULL",
     )
     .bind(url)
     .bind(next_poll_at)
@@ -2547,24 +3538,57 @@ pub async fn park_wait_url(
     Ok(rows > 0)
 }
 
-/// List up to `limit` parked HTTP wait sensors (#27 follow-on) due for a poll
-/// (oldest deadline first — the cap bounds how much probing one tick can do):
-/// `running` tasks holding a `wait_url` whose `next_poll_at` has elapsed (or is
-/// NULL). Returns `(task_id, wait_url)` pairs for the engine to GET.
-pub async fn due_url_waits(pool: &Pool, limit: i64) -> Result<Vec<(String, String)>> {
-    let now = chrono::Utc::now().to_rfc3339();
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, wait_url FROM task_runs
-         WHERE status = 'running' AND wait_url IS NOT NULL
-           AND (next_poll_at IS NULL OR next_poll_at <= ?1)
+/// The HTTP sensors' read of the ones due a poll ([`claim_due_url_waits`]).
+/// No `next_poll_at IS NULL` branch: [`park_wait_url`] always sets it, and
+/// migrations/077 set it on any sensor parked without one, so the branch
+/// only made the read take every parked sensor.
+pub(crate) const DUE_URL_WAITS: &str = "SELECT id, wait_url, next_poll_at FROM task_runs
+         WHERE status = 'running' AND wait_url IS NOT NULL AND next_poll_at <= ?1
          ORDER BY next_poll_at
-         LIMIT ?2",
-    )
-    .bind(&now)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
+         LIMIT ?2";
+
+/// **Claim** up to `limit` parked HTTP wait sensors (#27 follow-on) due for a
+/// poll, the longest due first (the cap bounds how much probing one tick can
+/// do), and return the ones this scheduler won: `(task_id, wait_url, due at)`.
+///
+/// Claimed as the external polls are ([`claim_due_external_polls`]): a
+/// sensor read and not claimed was polled once by every scheduler that read
+/// it. The claim moves `next_poll_at` on to `claim_secs` from now, guarded on
+/// the value read, and is the crash bound too: a sensor whose scheduler dies
+/// mid-GET is due again then. The GET's answer moves it again
+/// ([`repark_url_wait`]) or resolves the sensor ([`resolve_url_wait`]). The
+/// caller makes `claim_secs` longer than its GET's timeout, so a sensor is
+/// never claimed while a GET of it is in flight.
+pub async fn claim_due_url_waits(
+    pool: &Pool,
+    limit: i64,
+    claim_secs: u64,
+) -> Result<Vec<(String, String, String)>> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let until = crate::dag::delayed_retry_at(claim_secs);
+    let rows: Vec<(String, String, String)> = sqlx::query_as(DUE_URL_WAITS)
+        .bind(&now)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    let mut won = Vec::with_capacity(rows.len());
+    for (id, url, due) in rows {
+        let claimed = sqlx::query(
+            "UPDATE task_runs SET next_poll_at = ?
+             WHERE id = ? AND status = 'running' AND wait_url IS NOT NULL
+               AND next_poll_at = ?",
+        )
+        .bind(&until)
+        .bind(&id)
+        .bind(&due)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        if claimed > 0 {
+            won.push((id, url, due));
+        }
+    }
+    Ok(won)
 }
 
 /// Push a parked HTTP wait sensor's next poll out to `next_poll_at` (#27
@@ -2646,7 +3670,7 @@ pub async fn park_external(
          SET external_kind = ?, external_handle = ?, external_endpoint = ?,
              next_poll_at = ?, external_deadline_at = ?,
              claimed_by = NULL, lease_expires_at = NULL
-         WHERE id = ? AND status = 'running' AND version = ?",
+         WHERE id = ? AND status = 'running' AND version = ? AND stop_requested_at IS NULL",
     )
     .bind(kind)
     .bind(handle)
@@ -2660,6 +3684,17 @@ pub async fn park_external(
     .rows_affected();
     Ok(rows > 0)
 }
+
+/// The external polls' read of the parked jobs due one
+/// ([`claim_due_external_polls`]).
+pub(crate) const DUE_EXTERNAL_POLLS: &str =
+    "SELECT id, name, run_id, external_kind, external_handle, external_endpoint,
+                external_epoch, external_deadline_at, input, next_poll_at
+         FROM task_runs
+         WHERE status = 'running' AND external_handle IS NOT NULL
+           AND (next_poll_at IS NULL OR next_poll_at <= ?1)
+         ORDER BY next_poll_at
+         LIMIT ?2";
 
 /// **Claim** up to `limit` parked external jobs due for a poll, oldest deadline
 /// first, and return only the rows this scheduler won.
@@ -2696,15 +3731,7 @@ pub async fn claim_due_external_polls(
     // this scheduler observed, which means reading it first.
     let rows = sqlx::query_as::<_, (
         String, String, String, String, String, Option<String>, i64, Option<String>, Option<String>, Option<String>,
-    )>(
-        "SELECT id, name, run_id, external_kind, external_handle, external_endpoint,
-                external_epoch, external_deadline_at, input, next_poll_at
-         FROM task_runs
-         WHERE status = 'running' AND external_handle IS NOT NULL
-           AND (next_poll_at IS NULL OR next_poll_at <= ?1)
-         ORDER BY next_poll_at
-         LIMIT ?2",
-    )
+    )>(DUE_EXTERNAL_POLLS)
     .bind(&now)
     .bind(limit)
     .fetch_all(pool)
@@ -2961,16 +3988,7 @@ pub async fn claim_due_external_cancels(
     let mut tx = pool.begin().await?;
     let rows = sqlx::query_as::<_, (
         String, String, String, String, Option<String>, i64, i64, Option<String>, Option<String>,
-    )>(
-        "SELECT id, run_id, external_kind, external_handle, external_endpoint,
-                external_epoch, external_cancel_attempts, finished_at, input
-         FROM task_runs
-         WHERE external_handle IS NOT NULL
-           AND status <> 'running'
-           AND (next_poll_at IS NULL OR next_poll_at <= ?1)
-         ORDER BY next_poll_at
-         LIMIT ?2",
-    )
+    )>(DUE_EXTERNAL_CANCELS)
     .bind(&now)
     .bind(limit)
     .fetch_all(&mut *tx)
@@ -3000,6 +4018,18 @@ pub async fn claim_due_external_cancels(
         })
         .collect())
 }
+
+/// The read of the rows that owe a remote teardown
+/// ([`claim_due_external_cancels`]), whose plan a sweep's index must not take.
+pub(crate) const DUE_EXTERNAL_CANCELS: &str =
+    "SELECT id, run_id, external_kind, external_handle, external_endpoint,
+                external_epoch, external_cancel_attempts, finished_at, input
+         FROM task_runs
+         WHERE external_handle IS NOT NULL
+           AND status <> 'running'
+           AND (next_poll_at IS NULL OR next_poll_at <= ?1)
+         ORDER BY next_poll_at
+         LIMIT ?2";
 
 /// Settle a row's teardown debt: drop the handle so it stops being swept.
 ///
@@ -3233,6 +4263,24 @@ pub async fn prune_dataset_triggers(pool: &Pool) -> Result<u64> {
     .rows_affected())
 }
 
+/// Drop every subscription of the registered workflows in `names`, which
+/// declare no `on_datasets:` (any more): one statement for all of them, by
+/// the table's key, whichever scheduler synced their rows, and whether or
+/// not it has restarted since. Returns the rows dropped.
+pub async fn clear_dataset_triggers(pool: &Pool, names: &[String]) -> Result<u64> {
+    if names.is_empty() {
+        return Ok(0);
+    }
+    Ok(sqlx::query(
+        "DELETE FROM dataset_triggers
+         WHERE workflow_name IN (SELECT value FROM json_each(?1))",
+    )
+    .bind(serde_json::to_string(names)?)
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
 /// Claim dataset triggers that are due to fire. For each subscribed workflow:
 /// `any` mode fires when **any** subscribed dataset has an event newer than its
 /// cursor; `all` mode fires only when **every** subscribed dataset does — the
@@ -3367,7 +4415,7 @@ pub async fn park_wait_dataset(pool: &Pool, task_id: &str, fence: i64, uri: &str
          SET wait_dataset = ?,
              wait_dataset_cursor = (SELECT COALESCE(MAX(id), 0) FROM dataset_events WHERE uri = ?),
              claimed_by = NULL, lease_expires_at = NULL
-         WHERE id = ? AND status = 'running' AND version = ?",
+         WHERE id = ? AND status = 'running' AND version = ? AND stop_requested_at IS NULL",
     )
     .bind(uri)
     .bind(uri)
@@ -3379,20 +4427,27 @@ pub async fn park_wait_dataset(pool: &Pool, task_id: &str, fence: i64, uri: &str
     Ok(rows > 0)
 }
 
-/// Sweep parked dataset sensors: resolve (succeed) every one whose dataset has
-/// an event newer than its park-time cursor, advancing dependents. Returns
-/// `(task_id, uri)` resolutions. Idempotent, HA-safe (guarded UPDATE).
-pub async fn reconcile_dataset_waits(pool: &Pool) -> Result<Vec<(String, String)>> {
-    let due: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, wait_dataset FROM task_runs t
+/// The dataset sensors' read of the ones whose dataset has moved
+/// ([`reconcile_dataset_waits`]), a batch at a time.
+pub(crate) const PARKED_DATASET_WAITS: &str = "SELECT id, wait_dataset FROM task_runs t
          WHERE status = 'running' AND wait_dataset IS NOT NULL
            AND EXISTS (
                SELECT 1 FROM dataset_events e
                WHERE e.uri = t.wait_dataset AND e.id > COALESCE(t.wait_dataset_cursor, 0)
-           )",
-    )
-    .fetch_all(pool)
-    .await?;
+           )
+         LIMIT ?";
+
+/// Sweep parked dataset sensors: resolve (succeed) every one whose dataset has
+/// an event newer than its park-time cursor, advancing dependents. Returns
+/// `(task_id, uri)` resolutions. Idempotent, HA-safe (guarded UPDATE).
+///
+/// Reads up to [`super::SWEEP_BATCH`] a pass, and says when it read that many.
+pub async fn reconcile_dataset_waits(pool: &Pool) -> Result<super::Pass<(String, String)>> {
+    let due: Vec<(String, String)> = sqlx::query_as(PARKED_DATASET_WAITS)
+        .bind(super::SWEEP_BATCH)
+        .fetch_all(pool)
+        .await?;
+    let full = due.len() as i64 >= super::SWEEP_BATCH;
 
     let now = chrono::Utc::now().to_rfc3339();
     let mut resolved = Vec::new();
@@ -3423,7 +4478,10 @@ pub async fn reconcile_dataset_waits(pool: &Pool) -> Result<Vec<(String, String)
         tx.commit().await?;
         resolved.push((task_id, uri));
     }
-    Ok(resolved)
+    Ok(super::Pass {
+        done: resolved,
+        full,
+    })
 }
 
 /// The dataset registry, most recently updated first (management API read).
@@ -3491,8 +4549,9 @@ pub async fn run_dataset_io(pool: &Pool, run_id: &str) -> Result<(Vec<String>, V
 ///
 /// Sets `scheduled_at` to `retry_at` (a future RFC-3339 timestamp) so that
 /// `claim_ready` will not pick it up until the backoff window has elapsed.
-/// The `attempt` counter is NOT touched here — it is incremented by `claim_ready`
-/// at the next claim, preserving the monotonic increment invariant.
+/// The `attempt` counter is NOT touched here. It is incremented only by the
+/// claim, and given back only by [`requeue_quota_wait`], under the fence of the
+/// claim it undoes.
 /// Guards with `claimed_by = worker_id AND version = fence` to reject stale
 /// retries from reclaimed workers.
 pub async fn retry_task(
@@ -3507,10 +4566,13 @@ pub async fn retry_task(
     let policy = AttemptPolicy::from_env();
     let mut tx = pool.begin().await?;
 
-    // `RETURNING attempt` rather than a second read: this statement is the one
-    // place that knows the CAS held, and the number it returns is the attempt
-    // whose output the same statement is about to overwrite. Reading it
-    // separately would be a race with the next claim, which increments it.
+    // `RETURNING` rather than a second read: this statement is the one place
+    // that knows the CAS held, and the number it returns is the attempt whose
+    // output the same statement is about to overwrite. Reading it separately
+    // would be a race with the next claim, which increments it. The number
+    // is the task's count for its life (`attempt_base + attempt`), which a
+    // rerun or a clear does not set back: it is what `task_attempts` is
+    // keyed by.
     let claimed: Option<(i64,)> = sqlx::query_as(
         // The fault columns describe why this row is *currently* failed. A row
         // about to run again is not failed, so the previous attempt's verdict
@@ -3530,8 +4592,8 @@ pub async fn retry_task(
              fault_class = NULL,
              fault_detail = NULL,
              fault_confidence = NULL
-         WHERE id = ? AND claimed_by = ? AND version = ?
-         RETURNING attempt",
+         WHERE id = ? AND claimed_by = ? AND version = ? AND stop_requested_at IS NULL
+         RETURNING attempt_base + attempt",
     )
     .bind(&retry_at)
     .bind(&error)
@@ -3542,6 +4604,14 @@ pub async fn retry_task(
     .await?;
 
     let Some((attempt,)) = claimed else {
+        // Asked to stop: it does not run again. Cancelled, where it would
+        // have been queued for its next attempt.
+        let now = chrono::Utc::now().to_rfc3339();
+        if settle_stopping(&mut tx, task_id, worker_id, fence, &now).await? {
+            tx.commit().await?;
+            tracing::info!(task_id, "the task ended after it was asked to stop: cancelled, not retried");
+            return Ok(false);
+        }
         tx.commit().await?;
         tracing::warn!(task_id, "stale retry ignored — task already reclaimed");
         return Ok(false);
@@ -3619,7 +4689,7 @@ pub async fn list_task_attempts(pool: &Pool, task_id: &str) -> Result<Vec<TaskAt
     // ones. Capped because `DAGRON_ATTEMPT_LOG_KEEP=0` disables eviction, and
     // an unbounded retention policy must not imply an unbounded response.
     let mut rows = sqlx::query_as::<_, TaskAttempt>(
-        "SELECT task_id, attempt, reason, output, truncated, finished_at
+        "SELECT task_id, attempt, reason, status, scheduled_at, output, truncated, finished_at
          FROM task_attempts WHERE task_id = ? ORDER BY attempt DESC LIMIT ?",
     )
     .bind(task_id)
@@ -3628,6 +4698,162 @@ pub async fn list_task_attempts(pool: &Pool, task_id: &str) -> Result<Vec<TaskAt
     .await?;
     rows.reverse();
     Ok(rows)
+}
+
+/// How many attempts `task_id` made in the rounds a rerun or a clear ended
+/// (`attempt_base`). The attempt on its row plus this is the task's count for
+/// its life, which is what its kept attempts are numbered by. 0 for a task
+/// that is not there.
+#[cfg(feature = "ops")]
+pub async fn task_attempt_base(pool: &Pool, task_id: &str) -> Result<i64> {
+    let base: Option<i64> =
+        sqlx::query_scalar("SELECT attempt_base FROM task_runs WHERE id = ?")
+            .bind(task_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(base.unwrap_or(0))
+}
+
+// ── Quota back-pressure ──────────────────────────────────────────────────────
+
+/// Hand a claimed task back to the queue because its pod was refused by a full
+/// Kubernetes namespace `ResourceQuota` (migration 051/066). That is
+/// back-pressure, not a failed attempt: nothing ran.
+///
+/// The row returns to `ready` with a future `scheduled_at`, and `attempt` is
+/// decremented. The claim incremented it for a dispatch that started nothing,
+/// so every reader of `attempt` — the retry budget, `repeat:`, checkpoint
+/// resume, the `task_attempts` key — sees the pre-claim value again. That is
+/// sound only because the caller vouches that no workload was created for this
+/// dispatch; a backend that cannot promise it must not call this.
+///
+/// Fenced like [`retry_task`], plus `status = 'running'`: the statement undoes
+/// exactly one claim, so it lands at most once per claim. A second call with
+/// the same fence, or one from a worker whose lease was reclaimed, returns
+/// [`QuotaRequeue::Stale`] and gives nothing back.
+///
+/// `version` is left alone, as in `retry_task`, and the wait marker is built on
+/// that. `quota_wait_version` is stamped with the row's version, so the row is
+/// waiting on quota exactly while `status = 'ready' AND quota_wait_version =
+/// version`. The next claim bumps `version` and the marker stops matching;
+/// nothing has to clear it. A later refusal continues this episode only when
+/// the marker is one behind its fence — the claim being undone took the row
+/// straight out of the wait. Anything else in between (an attempt that started,
+/// a dispatch lost to lease recovery, an operator reset) put another `version`
+/// bump between the marker and the fence, and the refusal opens a new episode
+/// with a new clock.
+///
+/// At the bound ([`QuotaRequeue::Expired`]) **nothing is written**: the row is
+/// still `running` and claimed, so the caller fails it under the same fence.
+/// `output`, `log`, the fault columns and `task_attempts` are untouched on
+/// every path — a wait has no result to record.
+pub async fn requeue_quota_wait(
+    pool: &Pool,
+    task_id: &str,
+    worker_id: &str,
+    fence: i64,
+    detail: &str,
+    max_wait_secs: i64,
+) -> Result<QuotaRequeue> {
+    // One wall-clock read: the bound check, the probe time and the durations
+    // reported back all derive from it.
+    let now = chrono::Utc::now();
+    let mut tx = pool.begin().await?;
+
+    let held: Option<(Option<String>, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT quota_wait_since, quota_waits, quota_wait_version FROM task_runs
+         WHERE id = ? AND claimed_by = ? AND version = ? AND status = 'running'
+           AND stop_requested_at IS NULL",
+    )
+    .bind(task_id)
+    .bind(worker_id)
+    .bind(fence)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some((since, waits, wait_version)) = held else {
+        // Asked to stop, and nothing was started for this dispatch: cancelled,
+        // where it would have been handed back to its queue.
+        if settle_stopping(&mut tx, task_id, worker_id, fence, &now.to_rfc3339()).await? {
+            tx.commit().await?;
+            tracing::info!(task_id, "the task was asked to stop before it started: cancelled, not requeued");
+            return Ok(QuotaRequeue::Stale);
+        }
+        tx.commit().await?;
+        tracing::warn!(task_id, "stale quota requeue ignored — task already reclaimed");
+        return Ok(QuotaRequeue::Stale);
+    };
+
+    // A `since` that does not parse is treated as no episode rather than as an
+    // error: the cost is a bound that restarts, not a task that cannot be
+    // handed back.
+    let prior = (wait_version == Some(fence - 1))
+        .then_some(since)
+        .flatten()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|s| (s.with_timezone(&chrono::Utc), waits));
+
+    let jitter = quota_wait::jitter_permille(task_id, fence);
+    let (since, waits, retry_at) = match quota_wait::step(now, prior, max_wait_secs, jitter) {
+        quota_wait::Step::Wait { since, waits, retry_at } => (since, waits, retry_at),
+        quota_wait::Step::GiveUp { waits, waited_secs } => {
+            tx.commit().await?;
+            return Ok(QuotaRequeue::Expired { waits, waited_secs });
+        }
+    };
+
+    let rows = sqlx::query(
+        "UPDATE task_runs
+         SET status = 'ready',
+             scheduled_at = ?,
+             claimed_by = NULL,
+             lease_expires_at = NULL,
+             attempt = MAX(attempt - 1, 0),
+             quota_wait_since = ?,
+             quota_waits = ?,
+             quota_wait_version = version,
+             quota_wait_detail = ?
+         WHERE id = ? AND claimed_by = ? AND version = ? AND status = 'running'
+           AND stop_requested_at IS NULL",
+    )
+    .bind(retry_at.to_rfc3339())
+    .bind(since.to_rfc3339())
+    .bind(waits)
+    .bind(quota_wait::clip_detail(detail))
+    .bind(task_id)
+    .bind(worker_id)
+    .bind(fence)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+
+    if rows == 0 {
+        tracing::warn!(task_id, "stale quota requeue ignored — task already reclaimed");
+        return Ok(QuotaRequeue::Stale);
+    }
+    Ok(QuotaRequeue::Requeued {
+        waits,
+        waited_secs: (now - since).num_seconds().max(0),
+        retry_in_secs: (retry_at - now).num_seconds().max(0),
+    })
+}
+
+/// Tasks waiting on quota right now, and when the longest-waiting one was first
+/// refused. Feeds the engine's periodic summary line and, through
+/// `status_counts`, the two `/metrics` gauges.
+///
+/// The predicate is the waiting rule itself, never `quota_wait_since IS NOT
+/// NULL`: the columns outlive the wait (see [`requeue_quota_wait`]). Not
+/// `ops`-gated — the summary line runs in a lean build too.
+pub async fn quota_wait_stats(pool: &Pool) -> Result<QuotaWaitStats> {
+    let (waiting, oldest_since): (i64, Option<String>) = sqlx::query_as(
+        "SELECT COUNT(*), MIN(quota_wait_since) FROM task_runs
+         WHERE status = 'ready' AND quota_wait_version = version",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(QuotaWaitStats { waiting, oldest_since })
 }
 
 // ── Fault attribution ────────────────────────────────────────────────────────
@@ -3846,8 +5072,17 @@ pub async fn reclass_ready_tasks_near_deadline(
 ) -> Result<u64> {
     let horizon =
         (chrono::Utc::now() + chrono::TimeDelta::seconds(within_secs)).to_rfc3339();
-    Ok(sqlx::query(
-        "UPDATE task_runs
+    Ok(sqlx::query(RECLASS_NEAR_DEADLINE)
+        .bind(to_class)
+        .bind(from_class)
+        .bind(&horizon)
+        .execute(pool)
+        .await?
+        .rows_affected())
+}
+
+/// [`reclass_ready_tasks_near_deadline`]' statement.
+pub(crate) const RECLASS_NEAR_DEADLINE: &str = "UPDATE task_runs
          SET runner_class = ?
          WHERE status = 'ready'
            AND runner_class = ?
@@ -3857,63 +5092,505 @@ pub async fn reclass_ready_tasks_near_deadline(
                WHERE status = 'running'
                  AND COALESCE(deadline_at, alert_deadline_at) IS NOT NULL
                  AND COALESCE(deadline_at, alert_deadline_at) <= ?
-           )",
-    )
-    .bind(to_class)
-    .bind(from_class)
-    .bind(&horizon)
-    .execute(pool)
-    .await?
-    .rows_affected())
+           )";
+
+// ── Running again: one implementation ───────────────────────────────────────
+//
+// A rerun, a retry and a clear each put tasks of a run back to run again, and
+// so does a rerun of a run whole ([`rerun_all`]). Each, in one transaction,
+// keeps what it replaces ([`keep_replaced`]), asks the concurrency key when it
+// sets a run that had ended running again ([`run_cap`], [`refuse_if_full`])
+// and writes one outbox event ([`insert_run_again`]). The Postgres backend
+// says why, and what the two doors that ask for them used to do apart.
+
+/// The tasks one of them resets: the `WHERE` its statements share.
+#[cfg(feature = "ops")]
+#[derive(Clone, Copy)]
+enum Reset<'a> {
+    /// A run's broken cone: its failed, cancelled and rule-skipped tasks.
+    BrokenCone { run_id: &'a str },
+    /// One failed or cancelled task.
+    Task { task_id: &'a str },
+    /// A completed task, and every completed task that depends on it.
+    Cone { run_id: &'a str, task_id: &'a str },
+    /// A run whole: every task of it that ended, what succeeded included,
+    /// but a runtime fan-out's instances, which [`rerun_all_in`] drops.
+    Whole { run_id: &'a str },
 }
 
-/// Resurrect a failed/cancelled task from the management API (UI retry).
+#[cfg(feature = "ops")]
+impl<'a> Reset<'a> {
+    /// The condition over `task_runs t`, its placeholders numbered from
+    /// `first`, and what they are bound to, in order. Numbered, like the
+    /// statements it goes into: sqlx counts a bare `?` apart from the
+    /// numbered ones, so the two cannot share a statement.
+    fn condition(self, first: usize) -> (String, Vec<&'a str>) {
+        match self {
+            Reset::BrokenCone { run_id } => (
+                format!("t.run_id = ?{first} AND t.status IN ('failed', 'cancelled', 'skipped')"),
+                vec![run_id],
+            ),
+            Reset::Whole { run_id } => (
+                format!(
+                    "t.run_id = ?{first} AND t.fanout_parent IS NULL
+                     AND t.status IN ('succeeded', 'failed', 'skipped', 'cancelled')"
+                ),
+                vec![run_id],
+            ),
+            Reset::Task { task_id } => (
+                format!("t.id = ?{first} AND t.status IN ('failed', 'cancelled')"),
+                vec![task_id],
+            ),
+            Reset::Cone { run_id, task_id } => (
+                format!(
+                    "t.id IN (
+                         WITH RECURSIVE cone(id) AS (
+                             SELECT id FROM task_runs WHERE id = ?{first} AND run_id = ?{}
+                             UNION
+                             SELECT td.dependent_id FROM task_dependencies td
+                             JOIN cone c ON td.dependency_id = c.id
+                         )
+                         SELECT id FROM cone)
+                     AND t.status IN ('succeeded', 'failed', 'skipped', 'cancelled')",
+                    first + 1
+                ),
+                vec![task_id, run_id],
+            ),
+        }
+    }
+}
+
+/// A decided approval gate, over `task_runs t`. A gate is never claimed, so
+/// its `attempt` stays 0, and yet its decision is what it did: a reset keeps
+/// it as an attempt ([`keep_replaced`]), numbered `attempt_base + 1`, and
+/// moves `attempt_base` on by one for it, as it moves it on by a task's
+/// attempts. Else putting a gate back would leave no record of who approved
+/// what it guarded.
+#[cfg(feature = "ops")]
+const DECIDED_GATE: &str = "(t.is_approval = 1 AND t.status IN ('succeeded', 'failed'))";
+
+/// Keep the attempts `reset` is about to replace, in its transaction and
+/// before it: for each task that ran, how the attempt ended, when it was
+/// queued and when it ended, and the tail of what it printed, under `reason`
+/// (what is replacing it), numbered by the task's count for its life
+/// (`attempt_base + attempt`). A task that never ran has no attempt to keep.
+/// A decided approval gate is kept as one attempt ([`DECIDED_GATE`]).
+/// Mirrors the Postgres backend, which says why the tail is cut in characters
+/// here.
+///
+/// A no-op when retention is off (`DAGRON_ATTEMPT_LOG_BYTES=0`).
+#[cfg(feature = "ops")]
+async fn keep_replaced(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    reset: Reset<'_>,
+    reason: &str,
+    now: &str,
+) -> Result<()> {
+    let policy = AttemptPolicy::from_env();
+    if !policy.enabled() {
+        return Ok(());
+    }
+    let (condition, bound) = reset.condition(4);
+    let sql = format!(
+        "INSERT INTO task_attempts
+             (task_id, attempt, reason, status, output, truncated, scheduled_at, finished_at)
+         SELECT t.id, t.attempt_base + MAX(t.attempt, 1), ?1, t.status,
+                substr(COALESCE(NULLIF(t.log, ''), t.output), -?2),
+                COALESCE(length(COALESCE(NULLIF(t.log, ''), t.output)) > ?2, 0),
+                t.scheduled_at, COALESCE(t.finished_at, ?3)
+         FROM task_runs t
+         WHERE (t.attempt > 0 OR {DECIDED_GATE}) AND {condition}
+         ON CONFLICT (task_id, attempt) DO UPDATE SET
+             reason = excluded.reason,
+             status = excluded.status,
+             output = excluded.output,
+             truncated = excluded.truncated,
+             scheduled_at = excluded.scheduled_at,
+             finished_at = excluded.finished_at"
+    );
+    let mut kept = sqlx::query(&sql)
+        .bind(reason)
+        .bind(i64::try_from(policy.bytes).unwrap_or(i64::MAX))
+        .bind(now);
+    for value in &bound {
+        kept = kept.bind(*value);
+    }
+    kept.execute(&mut **tx).await?;
+
+    if policy.keep > 0 {
+        let (condition, bound) = reset.condition(2);
+        let sql = format!(
+            "DELETE FROM task_attempts
+             WHERE EXISTS (
+                 SELECT 1 FROM task_runs t
+                 WHERE t.id = task_attempts.task_id AND (t.attempt > 0 OR {DECIDED_GATE})
+                   AND task_attempts.attempt <= t.attempt_base + MAX(t.attempt, 1) - ?1
+                   AND {condition})"
+        );
+        let mut evicted = sqlx::query(&sql).bind(i64::try_from(policy.keep).unwrap_or(i64::MAX));
+        for value in &bound {
+            evicted = evicted.bind(*value);
+        }
+        evicted.execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
+/// The cap a run's workflow puts on its runs in flight, and what it counts
+/// them under.
+#[cfg(feature = "ops")]
+struct RunCap {
+    name: String,
+    key: Option<String>,
+    max: u32,
+}
+
+/// `run_id`'s cap, or `None` for a workflow with no cap (or no such run).
+/// No lock, where Postgres takes one: a SQLite write transaction is the only
+/// writer there is.
+#[cfg(feature = "ops")]
+async fn run_cap(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    run_id: &str,
+) -> Result<Option<RunCap>> {
+    let run: Option<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT d.name, d.spec, wr.concurrency_key
+         FROM workflow_runs wr
+         JOIN workflow_definitions d ON d.id = wr.definition_id
+         WHERE wr.id = ?",
+    )
+    .bind(run_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((name, spec, key)) = run else {
+        return Ok(None);
+    };
+    Ok(crate::dag::DagGraph::stored_max_active_runs(&spec).map(|max| RunCap { name, key, max }))
+}
+
+/// Count `run_id`'s deadlines again from now ([`super::deadlines_again`]), in
+/// the transaction that sets it running again after it ended, and let its SLA
+/// alert fire again: the run is held to its `run_timeout_secs` and its
+/// `deadline` from when it runs again, as a run let in after a wait is
+/// ([`admit_waiting_runs`]). Each of the four that set an ended run running
+/// again calls it once it has.
+#[cfg(feature = "ops")]
+async fn rearm_deadlines(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, run_id: &str) -> Result<()> {
+    let spec: Option<String> = sqlx::query_scalar(
+        "SELECT d.spec FROM workflow_runs wr
+         JOIN workflow_definitions d ON d.id = wr.definition_id
+         WHERE wr.id = ?",
+    )
+    .bind(run_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(spec) = spec else {
+        return Ok(());
+    };
+    let (deadline_at, alert_deadline_at) = super::deadlines_again(&spec, chrono::Utc::now());
+    sqlx::query(
+        "UPDATE workflow_runs
+         SET deadline_at = COALESCE(?1, deadline_at),
+             alert_deadline_at = COALESCE(?2, alert_deadline_at),
+             alert_fired_at = NULL
+         WHERE id = ?3",
+    )
+    .bind(deadline_at)
+    .bind(alert_deadline_at)
+    .bind(run_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Refuse to set `run_id` running again while its key is full without it:
+/// [`MaxActiveRunsReached`](crate::models::MaxActiveRunsReached), as a new run
+/// of the key would be refused. Called once the run reads `running` in this
+/// transaction, which the error then rolls back.
+///
+/// Refused whatever the workflow says of a full cap (`when_full`): a run that
+/// is set running again does not wait, and does not take another's place. A
+/// run that waits for the key is in its way as one that runs is, so it does
+/// not go ahead of one either.
+#[cfg(feature = "ops")]
+async fn refuse_if_full(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    run_id: &str,
+    cap: &RunCap,
+) -> Result<()> {
+    let (active, _) = runs_in_flight(tx, &cap.name, cap.key.as_deref(), Some(run_id)).await?;
+    if active >= i64::from(cap.max) {
+        return Err(anyhow::Error::new(crate::models::MaxActiveRunsReached {
+            name: cap.name.clone(),
+            max: cap.max,
+            active,
+            waiting: 0,
+            key: cap.key.clone(),
+        }));
+    }
+    Ok(())
+}
+
+/// Refuse to rerun `run_id` whole while tasks of it still owe the teardown
+/// of a remote job: [`TeardownOwed`](crate::models::TeardownOwed), with
+/// nothing written. The rerun resets each task's handle with the rest of its
+/// result, and a handle it dropped would never be swept, so the job would run
+/// on uncounted. The rule is `gc_old_runs`' own, for the same reason.
+///
+/// Called once the run reads `running` in this transaction: the cancel that
+/// ended the run has committed, and its debt is seen.
+#[cfg(feature = "ops")]
+async fn refuse_if_teardown_owed(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    run_id: &str,
+) -> Result<()> {
+    let owing: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_runs
+         WHERE run_id = ? AND external_handle IS NOT NULL AND status <> 'running'",
+    )
+    .bind(run_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if owing > 0 {
+        return Err(anyhow::Error::new(crate::models::TeardownOwed {
+            run_id: run_id.to_string(),
+            tasks: owing,
+        }));
+    }
+    Ok(())
+}
+
+/// How many runs of workflow `name` are in flight under `key`, and how many
+/// of those wait for their turn: `(in flight, waiting)`. `except` leaves one
+/// run out, for a run that asks about the others.
+///
+/// A run being stopped is in flight until its work is gone, and a run that
+/// waits is in flight from the moment it is made.
+async fn runs_in_flight(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    name: &str,
+    key: Option<&str>,
+    except: Option<&str>,
+) -> Result<(i64, i64)> {
+    Ok(sqlx::query_as(RUNS_IN_FLIGHT)
+        .bind(name)
+        .bind(key)
+        .bind(except)
+        .fetch_one(&mut **tx)
+        .await?)
+}
+
+/// [`runs_in_flight`]' statement.
+pub(crate) const RUNS_IN_FLIGHT: &str = "SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN wr.queued_at IS NOT NULL AND wr.admitted_at IS NULL
+                                  THEN 1 ELSE 0 END), 0)
+         FROM workflow_runs wr
+         JOIN workflow_definitions d ON d.id = wr.definition_id
+         WHERE wr.status = 'running' AND d.name = ?1
+           AND wr.concurrency_key IS ?2
+           AND wr.id IS NOT ?3";
+
+/// Cancel the runs a new run of workflow `name` and `key` takes the place of
+/// (`when_full: supersede`): every run of the key that has not ended and is
+/// not being stopped already, the ones that wait as the ones that run.
+/// Returns how many were asked.
+///
+/// Each is cancelled as [`cancel_run`] cancels one, in the new run's own
+/// transaction: a task nothing runs for is `cancelled` here, and one a worker
+/// holds is asked to stop. A run with nothing stopping ends at once, with its
+/// `run.completed` event, which the rest of its end-of-run work is owed to.
+/// One with work still running stays `running`
+/// until that is gone, and holds its key until then: the new run waits for
+/// it, and is let in by [`admit_waiting_runs`]. Its `output` says which run
+/// took its place (`by`).
+///
+/// `own` is the new run's record where that run is not trusted. Such a run
+/// takes the place of runs of its own source alone: the same forge and
+/// repository, and the same pull request and ref. Its key is its author's to
+/// write, and one that named another pull request's key would otherwise
+/// cancel that one's runs. What it may not cancel stays in its way, and it
+/// waits behind it.
+async fn supersede_runs(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    name: &str,
+    key: Option<&str>,
+    by: &str,
+    own: Option<&crate::models::RunTrigger>,
+    now: &str,
+) -> Result<u64> {
+    let before: Vec<String> = sqlx::query_scalar(SUPERSEDED_RUNS)
+        .bind(name)
+        .bind(key)
+        .bind(own.is_some())
+        .bind(own.and_then(|t| t.forge_host.as_deref()))
+        .bind(own.and_then(|t| t.repo.as_deref()))
+        .bind(own.and_then(|t| t.pr))
+        .bind(own.and_then(|t| t.git_ref.as_deref()))
+        .fetch_all(&mut **tx)
+        .await?;
+
+    let mut asked = 0;
+    for run_id in &before {
+        let ours = sqlx::query(
+            "UPDATE workflow_runs
+             SET stopping_as = 'cancelled', stop_requested_at = ?1, start_pending_at = NULL,
+                 output = ?3
+             WHERE id = ?2 AND status = 'running' AND stopping_as IS NULL",
+        )
+        .bind(now)
+        .bind(run_id)
+        .bind(format!("superseded by run {by}"))
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+        if ours == 0 {
+            continue;
+        }
+        stop_run_tasks(tx, run_id, now).await?;
+        finish_stopped_run(tx, run_id, now).await?;
+        asked += 1;
+    }
+    Ok(asked)
+}
+
+/// [`supersede_runs`]' read of the runs a new run takes the place of.
+pub(crate) const SUPERSEDED_RUNS: &str = "SELECT wr.id FROM workflow_runs wr
+         JOIN workflow_definitions d ON d.id = wr.definition_id
+         WHERE wr.status = 'running' AND wr.stopping_as IS NULL AND d.name = ?1
+           AND wr.concurrency_key IS ?2
+           AND (NOT ?3 OR EXISTS (
+               SELECT 1 FROM run_triggers t
+               WHERE t.run_id = wr.id
+                 AND t.forge_host IS ?4
+                 AND t.repo IS ?5
+                 AND t.pr IS ?6
+                 AND t.ref IS ?7
+           ))
+         ORDER BY wr.created_at, wr.id";
+
+/// Write the event that says tasks of `run_id` were put back to run again
+/// ([`RunAgain::event`](crate::models::RunAgain::event)), in the transaction
+/// that puts them back.
+#[cfg(feature = "ops")]
+async fn insert_run_again(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    run_id: &str,
+    by: crate::models::RunAgain,
+    tasks: u64,
+    task_id: Option<&str>,
+    now: &str,
+) -> Result<()> {
+    let (event_type, payload) = by.event(run_id, tasks, task_id);
+    sqlx::query(
+        "INSERT INTO event_outbox
+           (id, run_id, event_type, payload, status, attempts, next_attempt_at, created_at)
+         VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(run_id)
+    .bind(event_type)
+    .bind(&payload)
+    .bind(now)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Resurrect a failed/cancelled task from the management API (a retry).
 ///
 /// Unlike [`retry_task`], this carries NO worker fence — a human retrying a dead
-/// task has no claim to match. Resets the task to `ready` (version bumped so any
-/// late stale worker is fenced off) and re-arms the run if it had already been
-/// finalized to `failed`. Phase 1 retries only this task; cascade-retry of
-/// downstream tasks the failure cancelled is deferred. Returns false if the task
-/// was not in a retryable (`failed`/`cancelled`) state. No NOTIFY (SQLite).
-#[allow(dead_code)] // consumed by dagron-api (management API), not the engine binary
+/// task has no claim to match. Resets the task to `ready`, queued now (version
+/// bumped so any late stale worker is fenced off), and sets its run running
+/// again if it had ended, failed or cancelled: a run whose task is about to
+/// run is a running run. Only this task is retried; what its failure
+/// cancelled downstream is a rerun's or a clear's to bring back. The attempt
+/// it replaces is kept, the concurrency key is asked if the run had ended,
+/// and an event is written (see "Running again", above). No NOTIFY (SQLite).
+///
+/// `false` if the task is not in a retryable (`failed`/`cancelled`) state.
+/// [`MaxActiveRunsReached`](crate::models::MaxActiveRunsReached) if its run had
+/// ended and its key is full: then nothing is written.
+#[cfg(feature = "ops")]
 pub async fn retry_task_from_ui(pool: &Pool, task_id: &str) -> Result<bool> {
+    retry_task_from_ui_by(pool, task_id, None).await
+}
+
+/// [`retry_task_from_ui`], saying who asked for it (`reset_by`): the person
+/// dagron-api was asked by, whom a gate put back to ask again does not take
+/// an approval from where it is `not_triggerer`.
+#[cfg(feature = "ops")]
+pub async fn retry_task_from_ui_by(pool: &Pool, task_id: &str, who: Option<&str>) -> Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
     let mut tx = pool.begin().await?;
+
+    let run_id: Option<String> = sqlx::query_scalar("SELECT run_id FROM task_runs WHERE id = ?")
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(run_id) = run_id else {
+        tx.commit().await?;
+        return Ok(false);
+    };
+    let cap = run_cap(&mut tx, &run_id).await?;
+    keep_replaced(&mut tx, Reset::Task { task_id }, crate::models::RunAgain::Retry.reason(), &now).await?;
 
     let updated = sqlx::query(
         "UPDATE task_runs
          SET status = 'ready',
              claimed_by = NULL,
              lease_expires_at = NULL,
-             scheduled_at = NULL,
+             scheduled_at = ?3,
+             finished_at = NULL,
              output = NULL,
-             log = NULL,
+             log = NULL, log_fence = NULL, log_gen = NULL,
+             -- As a worker's own retry clears them: the verdict says why the
+             -- row is failed, and a row about to run again is not.
+             fault_class = NULL,
+             fault_detail = NULL,
+             fault_confidence = NULL,
+             -- A rejected gate's decision is kept as an attempt of its
+             -- (`DECIDED_GATE`), and the gate asks again from nothing; what
+             -- parked a row last time goes as a rerun's reset has it go.
+             attempt_base = attempt_base
+                 + CASE WHEN attempt = 0 AND is_approval = 1 AND status IN ('succeeded', 'failed')
+                        THEN 1 ELSE 0 END,
+             sub_run_id = NULL, wake_at = NULL, wait_url = NULL,
+             wait_dataset = NULL, wait_dataset_cursor = NULL,
+             decided_by = NULL, decision_comment = NULL, cache_hit = 0,
+             reset_by = ?2,
              version = version + 1
-         WHERE id = ? AND status IN ('failed', 'cancelled')",
+         WHERE id = ?1 AND status IN ('failed', 'cancelled')",
     )
     .bind(task_id)
+    .bind(who)
+    .bind(&now)
     .execute(&mut *tx)
     .await?
     .rows_affected();
-
     if updated == 0 {
-        tx.commit().await?;
+        // Not retryable: what was kept above goes with it.
+        tx.rollback().await?;
         return Ok(false);
     }
 
-    // Re-arm a run that was already finalized failed so the reconcile loop re-engages.
-    let run_id: String =
-        sqlx::query_scalar("SELECT run_id FROM task_runs WHERE id = ?")
-            .bind(task_id)
-            .fetch_one(&mut *tx)
-            .await?;
-    sqlx::query(
-        "UPDATE workflow_runs SET status = 'running', finished_at = NULL
-         WHERE id = ? AND status = 'failed'",
+    let rearmed = sqlx::query(
+        "UPDATE workflow_runs SET status = 'running', finished_at = NULL,
+             queued_at = CASE WHEN admitted_at IS NULL THEN NULL ELSE queued_at END
+         WHERE id = ? AND status IN ('failed', 'cancelled')",
     )
     .bind(&run_id)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if rearmed == 1 {
+        if let Some(cap) = &cap {
+            refuse_if_full(&mut tx, &run_id, cap).await?;
+        }
+        rearm_deadlines(&mut tx, &run_id).await?;
+    }
 
+    insert_run_again(&mut tx, &run_id, crate::models::RunAgain::Retry, 1, Some(task_id), &now).await?;
     tx.commit().await?;
     Ok(true)
 }
@@ -3936,28 +5613,71 @@ pub async fn retry_task_from_ui(pool: &Pool, task_id: &str) -> Result<bool> {
 /// `Some(n)` with the number of tasks reset. `version` is bumped on every reset
 /// row to fence any late stale worker. No NOTIFY (SQLite); the reconcile poll
 /// picks the work up.
+/// [`MaxActiveRunsReached`](crate::models::MaxActiveRunsReached) if the run's
+/// concurrency key is full: then nothing is written. The attempts it replaces
+/// are kept and an event is written (see "Running again", above).
 #[cfg(feature = "ops")]
 pub async fn rerun_from_failed(pool: &Pool, run_id: &str) -> Result<Option<u64>> {
-    let now = chrono::Utc::now().to_rfc3339();
+    rerun_from_failed_as(pool, run_id, crate::models::RunAgain::Rerun).await
+}
+
+/// [`rerun_from_failed`], saying what asked for it: a person's rerun, or the
+/// engine's own ([`RunAgain::AutoRerun`](crate::models::RunAgain::AutoRerun)),
+/// whose event keeps its own type.
+#[cfg(feature = "ops")]
+pub async fn rerun_from_failed_as(
+    pool: &Pool,
+    run_id: &str,
+    by: crate::models::RunAgain,
+) -> Result<Option<u64>> {
     let mut tx = pool.begin().await?;
+    let reset = rerun_from_failed_in(&mut tx, run_id, by, None).await?;
+    tx.commit().await?;
+    Ok(reset)
+}
+
+/// [`rerun_from_failed_as`] inside the caller's transaction, for a caller
+/// with a write of its own to land with the rerun or not at all (dagron-api's
+/// `params` override of the reset tasks' input). The caller commits. `who`
+/// is the person dagron-api was asked by, recorded on each task put back
+/// (`reset_by`). As the Postgres backend's.
+#[cfg(feature = "ops")]
+pub async fn rerun_from_failed_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    run_id: &str,
+    by: crate::models::RunAgain,
+    who: Option<&str>,
+) -> Result<Option<u64>> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let cap = run_cap(tx, run_id).await?;
 
     // Re-arm the run as the atomic gate: only the tx that flips the run
     // failed/cancelled → running proceeds to reset its tasks. A miss (run absent,
     // not rerunnable, or a lost race) → `None`, so no caller reports a false
     // success. SQLite serializes writers, so the loser sees 'running' here.
+    // A run that was cancelled as it waited for its key was never let in, and
+    // its tasks are put back below with the dependencies they have: it does
+    // not wait now, and `admit_waiting_runs` must not take it for one that
+    // does. The same holds for the two other statements that set a run
+    // running again.
     let armed = sqlx::query(
         "UPDATE workflow_runs
-         SET status = 'running', finished_at = NULL, output = NULL
+         SET status = 'running', finished_at = NULL, output = NULL,
+             queued_at = CASE WHEN admitted_at IS NULL THEN NULL ELSE queued_at END
          WHERE id = ? AND status IN ('failed', 'cancelled')",
     )
     .bind(run_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?
     .rows_affected();
     if armed == 0 {
-        tx.commit().await?;
         return Ok(None);
     }
+    if let Some(cap) = &cap {
+        refuse_if_full(tx, run_id, cap).await?;
+    }
+    rearm_deadlines(tx, run_id).await?;
+    keep_replaced(tx, Reset::BrokenCone { run_id }, by.reason(), &now).await?;
 
     // Reset the broken cone: failed, cancelled, and rule-skipped tasks (a task
     // skipped because a dependency failed should get another chance on rerun).
@@ -3967,11 +5687,18 @@ pub async fn rerun_from_failed(pool: &Pool, run_id: &str) -> Result<Option<u64>>
     let reset = sqlx::query(
         "UPDATE task_runs
          SET status = 'pending',
+             -- The round's attempts join the task's count for its life, which
+             -- is what its kept attempts are numbered by, and the round starts
+             -- again from none: the task has its `max_attempts` once more. A
+             -- rejected gate's decision counts as one (`DECIDED_GATE`).
+             attempt_base = attempt_base
+                 + CASE WHEN attempt = 0 AND is_approval = 1 AND status IN ('succeeded', 'failed')
+                        THEN 1 ELSE attempt END,
              attempt = 0,
              claimed_by = NULL,
              lease_expires_at = NULL,
              output = NULL,
-             log = NULL,
+             log = NULL, log_fence = NULL, log_gen = NULL,
              finished_at = NULL,
              -- The fault verdict describes why this row is *currently* failed.
              -- A row being reset to run again is not failed, so the previous
@@ -3996,13 +5723,20 @@ pub async fn rerun_from_failed(pool: &Pool, run_id: &str) -> Result<Option<u64>>
              external_deadline_at = NULL,
              next_poll_at = NULL,
              external_epoch = external_epoch + 1,
-             scheduled_at = ?,
+             -- What parked the row last time, and who decided it, as a whole
+             -- rerun's reset has them go (see there).
+             sub_run_id = NULL, wake_at = NULL, wait_url = NULL,
+             wait_dataset = NULL, wait_dataset_cursor = NULL,
+             decided_by = NULL, decision_comment = NULL, cache_hit = 0,
+             reset_by = ?3,
+             scheduled_at = ?1,
              version = version + 1
-         WHERE run_id = ? AND status IN ('failed', 'cancelled', 'skipped')",
+         WHERE run_id = ?2 AND status IN ('failed', 'cancelled', 'skipped')",
     )
     .bind(&now)
     .bind(run_id)
-    .execute(&mut *tx)
+    .bind(who)
+    .execute(&mut **tx)
     .await?
     .rows_affected();
 
@@ -4022,10 +5756,124 @@ pub async fn rerun_from_failed(pool: &Pool, run_id: &str) -> Result<Option<u64>>
          WHERE run_id = ? AND status = 'pending'",
     )
     .bind(run_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
+    insert_run_again(tx, run_id, by, reset, None, &now).await?;
+    Ok(Some(reset))
+}
+
+/// Rerun a run whole (`from: all`): every task of a run that has ended,
+/// succeeded, failed or cancelled, is put back, what succeeded included, and
+/// the run runs again from its first tasks. `None`, `Some(n)` and a full
+/// concurrency key as for [`rerun_from_failed`]. As the Postgres backend's,
+/// which says the rest.
+#[cfg(feature = "ops")]
+pub async fn rerun_all(pool: &Pool, run_id: &str) -> Result<Option<u64>> {
+    let mut tx = pool.begin().await?;
+    let reset = rerun_all_in(&mut tx, run_id, None).await?;
     tx.commit().await?;
+    Ok(reset)
+}
+
+/// [`rerun_all`] inside the caller's transaction, which the caller commits.
+/// `who` is the person dagron-api was asked by (`reset_by`).
+#[cfg(feature = "ops")]
+pub async fn rerun_all_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    run_id: &str,
+    who: Option<&str>,
+) -> Result<Option<u64>> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let by = crate::models::RunAgain::RerunAll;
+    let cap = run_cap(tx, run_id).await?;
+
+    // The gate, as a rerun from the failed tasks has it, and open to a run
+    // that succeeded too. It counts the rerun of every job.
+    let armed = sqlx::query(
+        "UPDATE workflow_runs
+         SET status = 'running', finished_at = NULL, output = NULL,
+             queued_at = CASE WHEN admitted_at IS NULL THEN NULL ELSE queued_at END,
+             whole_reruns = whole_reruns + 1
+         WHERE id = ? AND status IN ('succeeded', 'failed', 'cancelled')",
+    )
+    .bind(run_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if armed == 0 {
+        return Ok(None);
+    }
+    if let Some(cap) = &cap {
+        refuse_if_full(tx, run_id, cap).await?;
+    }
+    refuse_if_teardown_owed(tx, run_id).await?;
+    rearm_deadlines(tx, run_id).await?;
+    keep_replaced(tx, Reset::Whole { run_id }, by.reason(), &now).await?;
+
+    // A runtime fan-out's instances go, edges first, as the barrier's next
+    // expansion would drop them: they are made again from its producer's
+    // output, which runs again first.
+    sqlx::query(
+        "DELETE FROM task_dependencies
+         WHERE dependency_id IN (
+                   SELECT id FROM task_runs WHERE run_id = ?1 AND fanout_parent IS NOT NULL)
+            OR dependent_id IN (
+                   SELECT id FROM task_runs WHERE run_id = ?1 AND fanout_parent IS NOT NULL)",
+    )
+    .bind(run_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM task_runs WHERE run_id = ? AND fanout_parent IS NOT NULL")
+        .bind(run_id)
+        .execute(&mut **tx)
+        .await?;
+
+    // Every other task, as a clear resets one.
+    let reset = sqlx::query(
+        "UPDATE task_runs
+         SET status = 'pending',
+             attempt_base = attempt_base
+                 + CASE WHEN attempt = 0 AND is_approval = 1 AND status IN ('succeeded', 'failed')
+                        THEN 1 ELSE attempt END,
+             attempt = 0,
+             claimed_by = NULL, lease_expires_at = NULL,
+             output = NULL, log = NULL, log_fence = NULL, log_gen = NULL, finished_at = NULL, scheduled_at = ?1, version = version + 1,
+             checkpoint_uri = NULL, checkpoint_marker = NULL,
+             external_kind = NULL, external_handle = NULL, external_endpoint = NULL,
+             external_deadline_at = NULL, next_poll_at = NULL,
+             external_epoch = external_epoch + 1,
+             fault_class = NULL, fault_detail = NULL, fault_confidence = NULL,
+             sub_run_id = NULL, wake_at = NULL, wait_url = NULL,
+             wait_dataset = NULL, wait_dataset_cursor = NULL,
+             decided_by = NULL, decision_comment = NULL, cache_hit = 0,
+             reset_by = ?3
+         WHERE run_id = ?2 AND fanout_parent IS NULL
+           AND status IN ('succeeded', 'failed', 'skipped', 'cancelled')",
+    )
+    .bind(&now)
+    .bind(run_id)
+    .bind(who)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+
+    // Each task waits for each of its dependencies again, all of them pending.
+    sqlx::query(
+        "UPDATE task_runs
+         SET remaining_deps = (
+                 SELECT COUNT(*) FROM task_dependencies d
+                 JOIN task_runs dep ON dep.id = d.dependency_id
+                 WHERE d.dependent_id = task_runs.id
+                   AND dep.status NOT IN ('succeeded', 'skipped')
+             )
+         WHERE run_id = ? AND status = 'pending'",
+    )
+    .bind(run_id)
+    .execute(&mut **tx)
+    .await?;
+
+    insert_run_again(tx, run_id, by, reset, None, &now).await?;
     Ok(Some(reset))
 }
 
@@ -4049,14 +5897,30 @@ pub async fn task_exists(pool: &Pool, run_id: &str, task_id: &str) -> Result<boo
 /// and the run is re-armed to `running` if it had finished. Returns the number
 /// of tasks reset, or `None` if the target doesn't exist in the run or isn't in
 /// a terminal state (a running/pending task can't be cleared — `409`).
+/// [`MaxActiveRunsReached`](crate::models::MaxActiveRunsReached) if the run had
+/// ended and its concurrency key is full: then nothing is written. The attempts
+/// it replaces are kept and an event is written (see "Running again", above).
 #[cfg(feature = "ops")]
 pub async fn clear_task_with_downstream(
     pool: &Pool,
     run_id: &str,
     task_id: &str,
 ) -> Result<Option<u64>> {
+    clear_task_with_downstream_by(pool, run_id, task_id, None).await
+}
+
+/// [`clear_task_with_downstream`], saying who asked for it (`reset_by`), as
+/// [`retry_task_from_ui_by`] does.
+#[cfg(feature = "ops")]
+pub async fn clear_task_with_downstream_by(
+    pool: &Pool,
+    run_id: &str,
+    task_id: &str,
+    who: Option<&str>,
+) -> Result<Option<u64>> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = pool.begin().await?;
+    let cap = run_cap(&mut tx, run_id).await?;
 
     let status: Option<String> =
         sqlx::query_scalar("SELECT status FROM task_runs WHERE id = ? AND run_id = ?")
@@ -4072,18 +5936,31 @@ pub async fn clear_task_with_downstream(
         tx.commit().await?;
         return Ok(None); // only a completed task can be cleared
     }
+    keep_replaced(
+        &mut tx,
+        Reset::Cone { run_id, task_id },
+        crate::models::RunAgain::Clear.reason(),
+        &now,
+    )
+    .await?;
 
     // Reset the target + its transitive downstream cone (terminal tasks only).
     let reset = sqlx::query(
         "WITH RECURSIVE cone(id) AS (
-             SELECT id FROM task_runs WHERE id = ? AND run_id = ?
+             SELECT id FROM task_runs WHERE id = ?1 AND run_id = ?2
              UNION
              SELECT td.dependent_id FROM task_dependencies td
              JOIN cone c ON td.dependency_id = c.id
          )
          UPDATE task_runs
-         SET status = 'pending', attempt = 0, claimed_by = NULL, lease_expires_at = NULL,
-             output = NULL, log = NULL, finished_at = NULL, scheduled_at = ?, version = version + 1,
+         SET status = 'pending',
+             -- A decided gate's decision counts as an attempt (`DECIDED_GATE`).
+             attempt_base = attempt_base
+                 + CASE WHEN attempt = 0 AND is_approval = 1 AND status IN ('succeeded', 'failed')
+                        THEN 1 ELSE attempt END,
+             attempt = 0,
+             claimed_by = NULL, lease_expires_at = NULL,
+             output = NULL, log = NULL, log_fence = NULL, log_gen = NULL, finished_at = NULL, scheduled_at = ?3, version = version + 1,
              checkpoint_uri = NULL, checkpoint_marker = NULL,
              -- …and for the same reason a cleared deferred row drops its remote
              -- handle and takes a fresh epoch: the next submit must start a new
@@ -4094,13 +5971,22 @@ pub async fn clear_task_with_downstream(
              -- Same reason as `retry_task` and `rerun_from_failed`: a cleared
              -- row is not a failed row, so it must not carry a failed row's
              -- verdict into whatever happens next.
-             fault_class = NULL, fault_detail = NULL, fault_confidence = NULL
+             fault_class = NULL, fault_detail = NULL, fault_confidence = NULL,
+             -- What parked the row last time, and who decided it: a cleared
+             -- row is parked again, and a gate asks again, from nothing. Left,
+             -- a sweep could resolve the row from its last child run or its
+             -- last deadline between its claim and its park.
+             sub_run_id = NULL, wake_at = NULL, wait_url = NULL,
+             wait_dataset = NULL, wait_dataset_cursor = NULL,
+             decided_by = NULL, decision_comment = NULL, cache_hit = 0,
+             reset_by = ?4
          WHERE id IN (SELECT id FROM cone)
            AND status IN ('succeeded', 'failed', 'skipped', 'cancelled')",
     )
     .bind(task_id)
     .bind(run_id)
     .bind(&now)
+    .bind(who)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -4125,14 +6011,23 @@ pub async fn clear_task_with_downstream(
     .await?;
 
     // Re-arm a run that had finished so the reconcile loop resumes.
-    sqlx::query(
-        "UPDATE workflow_runs SET status = 'running', finished_at = NULL, output = NULL
+    let rearmed = sqlx::query(
+        "UPDATE workflow_runs SET status = 'running', finished_at = NULL, output = NULL,
+             queued_at = CASE WHEN admitted_at IS NULL THEN NULL ELSE queued_at END
          WHERE id = ? AND status IN ('succeeded', 'failed', 'cancelled')",
     )
     .bind(run_id)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if rearmed == 1 {
+        if let Some(cap) = &cap {
+            refuse_if_full(&mut tx, run_id, cap).await?;
+        }
+        rearm_deadlines(&mut tx, run_id).await?;
+    }
 
+    insert_run_again(&mut tx, run_id, crate::models::RunAgain::Clear, reset, Some(task_id), &now).await?;
     tx.commit().await?;
     Ok(Some(reset))
 }
@@ -4454,23 +6349,25 @@ pub async fn list_failed_runs_for_rerun(
     cooldown_cutoff: &str,
     limit: i64,
 ) -> Result<Vec<String>> {
-    let ids: Vec<(String,)> = sqlx::query_as(
-        "SELECT wr.id
+    let ids: Vec<(String,)> = sqlx::query_as(FAILED_RUNS_FOR_RERUN)
+        .bind(max_attempts)
+        .bind(cooldown_cutoff)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(ids.into_iter().map(|(id,)| id).collect())
+}
+
+/// [`list_failed_runs_for_rerun`]' statement.
+#[cfg(feature = "enterprise")]
+pub(crate) const FAILED_RUNS_FOR_RERUN: &str = "SELECT wr.id
          FROM workflow_runs wr
          LEFT JOIN run_reruns rr ON rr.run_id = wr.id
          WHERE wr.status = 'failed'
            AND COALESCE(rr.attempts, 0) < ?
            AND (rr.last_rerun_at IS NULL OR rr.last_rerun_at < ?)
          ORDER BY wr.finished_at DESC
-         LIMIT ?",
-    )
-    .bind(max_attempts)
-    .bind(cooldown_cutoff)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
-    Ok(ids.into_iter().map(|(id,)| id).collect())
-}
+         LIMIT ?";
 
 /// Record one auto-rerun attempt against a run (upsert: first attempt inserts,
 /// subsequent attempts increment). Bounds the self-healing loop so a
@@ -4496,14 +6393,17 @@ pub async fn bump_rerun_attempt(pool: &Pool, run_id: &str, now: &str) -> Result<
 /// gauge (a stall-SLA alerting signal, not an auto-action).
 #[cfg(feature = "enterprise")]
 pub async fn count_incomplete_runs(pool: &Pool, stall_cutoff: &str) -> Result<i64> {
-    let n: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM workflow_runs WHERE status = 'running' AND created_at < ?",
-    )
-    .bind(stall_cutoff)
-    .fetch_one(pool)
-    .await?;
+    let n: i64 = sqlx::query_scalar(INCOMPLETE_RUNS)
+        .bind(stall_cutoff)
+        .fetch_one(pool)
+        .await?;
     Ok(n)
 }
+
+/// [`count_incomplete_runs`]' statement.
+#[cfg(feature = "enterprise")]
+pub(crate) const INCOMPLETE_RUNS: &str =
+    "SELECT COUNT(*) FROM workflow_runs WHERE status = 'running' AND created_at < ?";
 
 /// Append a `pending` event to the transactional outbox out-of-band (i.e. not
 /// inside a run-finalization transaction). The auto-backfill loop and the
@@ -4542,11 +6442,15 @@ pub async fn enqueue_outbox_event(
 /// `task_runs` table. This is the backpressure that lets the scheduler absorb a
 /// large influx without unbounded memory/DB growth.
 pub async fn count_active_runs(pool: &Pool) -> Result<i64> {
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_runs WHERE status = 'running'")
+    let n: i64 = sqlx::query_scalar(ACTIVE_RUNS_COUNT)
         .fetch_one(pool)
         .await?;
     Ok(n)
 }
+
+/// [`count_active_runs`]' statement.
+pub(crate) const ACTIVE_RUNS_COUNT: &str =
+    "SELECT COUNT(*) FROM workflow_runs WHERE status = 'running'";
 
 /// Tasks currently in flight across every active run.
 ///
@@ -4571,12 +6475,54 @@ pub async fn count_active_tasks(pool: &Pool) -> Result<i64> {
 
 /// Finalize every `running` workflow_run whose task_runs are all terminal.
 ///
-/// The multi-run generalization of [`is_run_complete`]: rather than polling one
-/// `run_id`, this sweeps all in-flight runs in one pass and flips each completed
-/// one to `succeeded`/`failed`. The terminal `UPDATE` is guarded with
-/// `status = 'running'`, so when several schedulers race only one finalizes a
-/// given run. Returns the runs newly transitioned to terminal (for logging).
+/// The multi-run generalization of [`is_run_complete`]: every running run,
+/// a slice of [`REAP_ALL_SLICE`] at a time ([`reap_woken`] with
+/// [`super::Woken::All`]), so it reads the running runs alone, never the
+/// history. Kept for its callers, which are all tests: dagron-core's and
+/// dagron-engine's (`api.rs`, `cdevents.rs`). The loop reaps by
+/// [`reap_woken`] and [`reap_slice`].
 pub async fn reap_completed_runs(pool: &Pool) -> Result<Vec<(String, RunStatus)>> {
+    reap_woken(pool, &super::Woken::All).await
+}
+
+/// The runs the reap may end, word for word idx_workflow_runs_reapable's
+/// WHERE (migrations/079): SQLite lets a read use a partial index only if it
+/// carries the index's terms as written.
+pub(crate) const REAPABLE: &str =
+    "status = 'running' AND stopping_as IS NULL AND (queued_at IS NULL OR admitted_at IS NOT NULL)";
+
+/// [`reap_slice`]'s read: the next reapable runs after a cursor, in id order.
+pub(crate) fn reap_slice_sql() -> String {
+    format!("SELECT id FROM workflow_runs WHERE {REAPABLE} AND id > ?1 ORDER BY id LIMIT ?2")
+}
+
+/// The named reap's read of the tasks of the runs in a JSON array ?1. The
+/// CROSS JOIN keeps the array the outer loop, so each run is found by its
+/// key: written as `wr.id IN (SELECT value FROM json_each(?1))` it plans on
+/// the enterprise build as its own index's `status=?` and reads every
+/// running run.
+pub(crate) const NAMED_REAP_TASKS: &str =
+    "SELECT wr.id AS run_id, tr.status AS status, tr.allow_failure AS allow_failure, COUNT(*) AS cnt
+       FROM json_each(?1) AS j
+       CROSS JOIN workflow_runs AS wr ON wr.id = j.value
+       JOIN task_runs AS tr ON tr.run_id = wr.id
+      WHERE wr.status = 'running' AND wr.stopping_as IS NULL
+        AND (wr.queued_at IS NULL OR wr.admitted_at IS NOT NULL)
+      GROUP BY wr.id, tr.status, tr.allow_failure";
+
+/// The named reap's read of those runs that have no task at all.
+pub(crate) const NAMED_REAP_EMPTY: &str = "SELECT wr.id
+       FROM json_each(?1) AS j
+       CROSS JOIN workflow_runs AS wr ON wr.id = j.value
+      WHERE wr.status = 'running' AND wr.stopping_as IS NULL
+        AND (wr.queued_at IS NULL OR wr.admitted_at IS NOT NULL)
+        AND NOT EXISTS (SELECT 1 FROM task_runs tr WHERE tr.run_id = wr.id)";
+
+/// Finalize what is complete among `runs`, each found by its key. The
+/// terminal `UPDATE` is guarded with `status = 'running'`, so when two
+/// reaps race only one finalizes a given run. Returns the runs newly
+/// transitioned to terminal.
+async fn reap(pool: &Pool, runs: &[String]) -> Result<Vec<(String, RunStatus)>> {
     #[derive(sqlx::FromRow)]
     struct Row {
         run_id: String,
@@ -4585,17 +6531,13 @@ pub async fn reap_completed_runs(pool: &Pool) -> Result<Vec<(String, RunStatus)>
         cnt: i64,
     }
 
+    let named = serde_json::to_string(runs)?;
     // Group by (status, allow_failure) so a `failed` task with allow_failure=1
     // counts as terminal but does not fail the run (fast-win #11).
-    let rows: Vec<Row> = sqlx::query_as::<_, Row>(
-        "SELECT wr.id AS run_id, tr.status AS status, tr.allow_failure AS allow_failure, COUNT(*) AS cnt
-         FROM workflow_runs wr
-         JOIN task_runs tr ON tr.run_id = wr.id
-         WHERE wr.status = 'running'
-         GROUP BY wr.id, tr.status, tr.allow_failure",
-    )
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<Row> = sqlx::query_as::<_, Row>(NAMED_REAP_TASKS)
+        .bind(&named)
+        .fetch_all(pool)
+        .await?;
 
     struct Agg {
         total: i64,
@@ -4617,11 +6559,23 @@ pub async fn reap_completed_runs(pool: &Pool) -> Result<Vec<(String, RunStatus)>
             _ => {}
         }
     }
+    // A run with no task at all (each one a `when:` of its parameters left
+    // out) has nothing to wait for: it is complete, and succeeded. A run's
+    // tasks are made in the transaction that makes it, so none is a run
+    // whose tasks are yet to come. One that waits for its turn at a full cap
+    // (`when_full: queue`) ends once it is let in, in the order it came.
+    let empty: Vec<String> = sqlx::query_scalar(NAMED_REAP_EMPTY)
+        .bind(&named)
+        .fetch_all(pool)
+        .await?;
+    for run_id in empty {
+        runs.entry(run_id).or_insert(Agg { total: 0, terminal: 0, failed: 0 });
+    }
 
     let now = chrono::Utc::now().to_rfc3339();
     let mut finalized = Vec::new();
     for (run_id, agg) in runs {
-        if agg.total == 0 || agg.terminal < agg.total {
+        if agg.terminal < agg.total {
             continue;
         }
         let (status, status_str) = if agg.failed > 0 {
@@ -4631,9 +6585,17 @@ pub async fn reap_completed_runs(pool: &Pool) -> Result<Vec<(String, RunStatus)>
         };
         // Finalize the run and append its outbox event in ONE transaction, so the
         // event exists iff the finalization commits (transactional outbox).
+        //
+        // `completion_pending_at` is cleared because the end-of-run work is
+        // this end's event's. A stamp can only be here if a run a release
+        // before 10.7 ended outside the reaper was rerun before any tick
+        // claimed it; that end is superseded by this one. `start_pending_at` is cleared because
+        // a start never announced is moot once the run has ended.
         let mut tx = pool.begin().await?;
         let affected = sqlx::query(
-            "UPDATE workflow_runs SET status = ?, finished_at = ? WHERE id = ? AND status = 'running'",
+            "UPDATE workflow_runs
+             SET status = ?, finished_at = ?, completion_pending_at = NULL, start_pending_at = NULL
+             WHERE id = ? AND status = 'running'",
         )
         .bind(status_str)
         .bind(&now)
@@ -4658,19 +6620,7 @@ pub async fn reap_completed_runs(pool: &Pool) -> Result<Vec<(String, RunStatus)>
                 .execute(&mut *tx)
                 .await?;
             }
-            let payload = serde_json::json!({ "run_id": run_id, "status": status_str }).to_string();
-            sqlx::query(
-                "INSERT INTO event_outbox
-                   (id, run_id, event_type, payload, status, attempts, next_attempt_at, created_at)
-                 VALUES (?, ?, 'run.completed', ?, 'pending', 0, ?, ?)",
-            )
-            .bind(uuid::Uuid::new_v4().to_string())
-            .bind(&run_id)
-            .bind(&payload)
-            .bind(&now)
-            .bind(&now)
-            .execute(&mut *tx)
-            .await?;
+            insert_run_completed(&mut tx, &run_id, status_str, &now).await?;
             tx.commit().await?;
             finalized.push((run_id, status));
         } else {
@@ -4679,6 +6629,100 @@ pub async fn reap_completed_runs(pool: &Pool) -> Result<Vec<(String, RunStatus)>
         }
     }
     Ok(finalized)
+}
+
+/// Append `run_id`'s `run.completed` event to the outbox inside `tx`, the
+/// transaction that ends the run, so the event exists iff the end commits.
+/// Every path that ends a run writes it: the reaper, [`cancel_run`] and
+/// [`cancel_overdue_runs`]. The payload is `{"run_id", "status"}` on all three.
+async fn insert_run_completed(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    run_id: &str,
+    status: &str,
+    now: &str,
+) -> Result<()> {
+    let payload = serde_json::json!({ "run_id": run_id, "status": status }).to_string();
+    sqlx::query(
+        "INSERT INTO event_outbox
+           (id, run_id, event_type, payload, status, attempts, next_attempt_at, created_at)
+         VALUES (?, ?, 'run.completed', ?, 'pending', 0, ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(run_id)
+    .bind(&payload)
+    .bind(now)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Claim up to `limit` runs that a release before 10.7 ended outside the
+/// reaper and that still owe their end-of-run work: cancelled through either
+/// API, or failed by the `run_timeout_secs` sweep, which stamped
+/// `completion_pending_at`. Nothing stamps a run now: its `run.completed`
+/// event is owed to the engine's end-of-run sinks. The claim clears the stamp, so each run is returned to exactly one caller, which then
+/// runs the work the reaper's own process runs for a run that finished.
+///
+/// A stamped run that is `running` again (rerun before any tick claimed it) is
+/// left alone: its end was superseded, and its next end is owed instead.
+pub async fn claim_pending_completions(
+    pool: &Pool,
+    limit: i64,
+) -> Result<Vec<(String, RunStatus)>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(PENDING_COMPLETIONS)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter()
+        .map(|(id, status)| Ok((id, status.parse()?)))
+        .collect()
+}
+
+/// [`claim_pending_completions`]' statement. It reads
+/// idx_workflow_runs_completion_pending (migrations/078).
+pub(crate) const PENDING_COMPLETIONS: &str = "UPDATE workflow_runs SET completion_pending_at = NULL
+         WHERE id IN (
+             SELECT id FROM workflow_runs
+             WHERE completion_pending_at IS NOT NULL
+               AND status IN ('succeeded', 'failed', 'cancelled')
+             ORDER BY completion_pending_at
+             LIMIT ?
+         )
+         RETURNING id, status";
+
+/// Claim up to `limit` running runs whose start is still to be announced:
+/// created with a `notify.git` block (`start_pending_at`), and no `pending`
+/// commit status posted for them yet. The claim clears the stamp, so each run
+/// is announced by exactly one caller. A run that has already ended is never
+/// returned: its end cleared the stamp.
+pub async fn claim_pending_starts(pool: &Pool, limit: i64) -> Result<Vec<String>> {
+    let ids: Vec<String> = sqlx::query_scalar(PENDING_STARTS)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(ids)
+}
+
+/// [`claim_pending_starts`]' statement, whose plan a sweep's index must not
+/// take.
+pub(crate) const PENDING_STARTS: &str = "UPDATE workflow_runs SET start_pending_at = NULL
+         WHERE id IN (
+             SELECT id FROM workflow_runs
+             WHERE start_pending_at IS NOT NULL AND status = 'running'
+             ORDER BY start_pending_at
+             LIMIT ?
+         )
+         RETURNING id";
+
+/// A run's status, or `None` when there is no such run.
+pub async fn run_status(pool: &Pool, run_id: &str) -> Result<Option<RunStatus>> {
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM workflow_runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await?;
+    status.map(|s| s.parse()).transpose()
 }
 
 /// The workflow definition's name for a run (for lineage / display), if found.
@@ -4707,6 +6751,27 @@ pub async fn workflow_name_for_task(pool: &Pool, task_id: &str) -> Result<Option
     .fetch_optional(pool)
     .await?;
     Ok(name)
+}
+
+/// A task's name and attempt, with its workflow's name where its run has
+/// one: what a build output's provenance says made it. The attempt is
+/// numbered by the task's count for its life (`attempt_base + attempt`), as
+/// its kept attempts are: a task that runs again after a rerun or a clear
+/// does not give a second build the number of the first.
+pub async fn task_in_workflow(
+    pool: &Pool,
+    task_id: &str,
+) -> Result<Option<(String, i64, Option<String>)>> {
+    let row: Option<(String, i64, Option<String>)> = sqlx::query_as(
+        "SELECT tr.name, tr.attempt_base + tr.attempt, d.name FROM task_runs tr
+         LEFT JOIN workflow_runs wr ON wr.id = tr.run_id
+         LEFT JOIN workflow_definitions d ON d.id = wr.definition_id
+         WHERE tr.id = ?",
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
 }
 
 /// Look up a memoized task result (#22): the cached output when a memo exists for
@@ -4785,6 +6850,93 @@ pub async fn spec_for_run(pool: &Pool, run_id: &str) -> Result<Option<String>> {
     Ok(row.map(|r| r.0))
 }
 
+/// How many tasks `run_id` has: every row of it, as it is now. A run grows
+/// where a task fans out over what another printed.
+pub async fn run_task_count(pool: &Pool, run_id: &str) -> Result<i64> {
+    let tasks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_runs WHERE run_id = ?")
+        .bind(run_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(tasks)
+}
+
+/// What started `run_id`, as it was recorded when the run was made
+/// (`run_triggers`). `None` for a run with no record: one made before every
+/// run had one, or a run that does not exist.
+pub async fn run_trigger(pool: &Pool, run_id: &str) -> Result<Option<crate::models::RunTrigger>> {
+    #[allow(clippy::type_complexity)]
+    let row: Option<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT kind, principal, actor, trust, source, forge_host, repo, ref, sha, base_sha, pr, event_id
+         FROM run_triggers WHERE run_id = ?",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(
+        |(
+            kind,
+            principal,
+            actor,
+            trust,
+            source,
+            forge_host,
+            repo,
+            git_ref,
+            sha,
+            base_sha,
+            pr,
+            event_id,
+        )| {
+            crate::models::RunTrigger {
+                kind,
+                principal,
+                actor,
+                trust,
+                source,
+                forge_host,
+                repo,
+                git_ref,
+                sha,
+                base_sha,
+                pr,
+                event_id,
+            }
+        },
+    ))
+}
+
+/// The parameters `run_id` was created with: the spec's defaults with the
+/// caller's overrides merged over them (`DagGraph::parameters`). `None` when
+/// the run does not exist, or predates the column, so a caller falls back to
+/// the spec's own defaults, which is all such a run ever had.
+pub async fn run_parameters(
+    pool: &Pool,
+    run_id: &str,
+) -> Result<Option<std::collections::BTreeMap<String, String>>> {
+    let raw: Option<Option<String>> =
+        sqlx::query_scalar("SELECT parameters FROM workflow_runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await?;
+    match raw.flatten() {
+        Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+        None => Ok(None),
+    }
+}
+
 /// Read a dagron-api-owned `ui_settings` value (e.g. the instance-wide
 /// notification defaults). The table may not exist on engine-only deployments;
 /// callers should treat an `Err` as "no setting".
@@ -4859,93 +7011,392 @@ pub async fn environment_secret(
     Ok(row.map(|r| r.0))
 }
 
-// ── Transactional outbox: drain API (for the delivery worker) ──────────────────
+/// The policy of the environment `name` ([`crate::envpolicy`]): which runs
+/// may use it. `None` where it has none, and where there is no such
+/// environment: both have the default policy, which admits `trusted` runs
+/// alone. A stored policy that cannot be read is an error, never "none": a
+/// row someone wrote to close an environment must not read as an open one.
+pub async fn environment_policy(
+    pool: &Pool,
+    name: &str,
+) -> Result<Option<crate::envpolicy::EnvironmentPolicy>> {
+    type Row = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT p.allowed_trust, p.allowed_refs, p.allowed_pipelines,
+                p.allowed_identity, p.approvers
+           FROM environment_policies p
+           JOIN environments e ON e.id = p.environment_id
+          WHERE e.name = ?",
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+    let Some((trust, refs, pipelines, identity, approvers)) = row else {
+        return Ok(None);
+    };
+    let list = |field: &str, json: &str| -> Result<Vec<String>> {
+        serde_json::from_str(json).map_err(|e| {
+            anyhow::anyhow!("environment '{name}': its policy's {field} is not a list: {e}")
+        })
+    };
+    Ok(Some(crate::envpolicy::EnvironmentPolicy {
+        allowed_trust: list("allowed_trust", &trust)?,
+        allowed_refs: refs
+            .as_deref()
+            .map(|j| list("allowed_refs", j))
+            .transpose()?,
+        allowed_pipelines: pipelines
+            .as_deref()
+            .map(|j| list("allowed_pipelines", j))
+            .transpose()?,
+        allowed_identity: identity
+            .as_deref()
+            .map(|j| list("allowed_identity", j))
+            .transpose()?
+            .unwrap_or_default(),
+        approvers: approvers
+            .as_deref()
+            .map(|j| list("approvers", j))
+            .transpose()?
+            .unwrap_or_default(),
+    }))
+}
 
-/// Claim up to `limit` due, pending outbox events for delivery, deferring each by
-/// `lease_secs` (bump `next_attempt_at`) so a concurrent worker won't grab the
-/// same event mid-delivery. At-least-once: a worker that dies after claiming but
-/// before marking simply lets the lease lapse and the event is re-claimed.
+// ── Transactional outbox: drain API, a sink at a time ─────────────────────────
+//
+// Each consumer of the outbox is a sink ([`super::OutboxSink`])
+// with its own delivery state of each event, in `outbox_deliveries`: a sink
+// is first handed an event by [`outbox_enroll`], then claims, leases and
+// marks its own row of it exactly as the single-consumer outbox did its row
+// of `event_outbox`. What one sink does with an event is no other's concern.
+
+/// Name `sink` a consumer of the outbox, if it is not one yet: from now on it
+/// is handed every event written, of its types, and where it
+/// [`adopts_legacy`](super::OutboxSink::adopts_legacy) also those the
+/// single-consumer outbox held pending when this release's migration ran. A sink is also registered by
+/// its first enrolment; registering one first is how a process says that the
+/// events written from here on are its, before it drains any of them.
+pub async fn register_outbox_sink(pool: &Pool, sink: &super::OutboxSink<'_>) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    if sink.adopts_legacy {
+        // What the single-consumer outbox held pending when this release's
+        // migration ran (`outbox_epoch`), handed before the sink is named,
+        // and only while it is not: a replica that registers it again finds
+        // it named and adopts nothing.
+        sqlx::query(
+            "INSERT INTO outbox_deliveries (outbox_id, sink, status, attempts, next_attempt_at)
+             SELECT e.id, ?1, 'pending', 0, e.created_at
+             FROM event_outbox e, outbox_epoch w
+             WHERE e.status = 'pending' AND e.created_at < w.per_sink_since
+               AND (?2 = '[]' OR e.event_type IN (SELECT value FROM json_each(?2)))
+               AND NOT EXISTS (SELECT 1 FROM outbox_sinks s WHERE s.sink = ?1)
+             ON CONFLICT (outbox_id, sink) DO NOTHING",
+        )
+        .bind(sink.name)
+        .bind(super::outbox_types_json(sink))
+        .execute(pool)
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO outbox_sinks (sink, since, cursor, registered_at) VALUES (?1, ?2, ?2, ?2)
+         ON CONFLICT (sink) DO NOTHING",
+    )
+    .bind(sink.name)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    if sink.wants_tasks() {
+        renew_task_events(pool, sink, None).await?;
+    }
+    Ok(())
+}
+
+/// Have task events written for `sink` a day more (`wants_tasks_until`),
+/// where it would otherwise run out within the day; `until` what it is now,
+/// where read.
+async fn renew_task_events(
+    pool: &Pool,
+    sink: &super::OutboxSink<'_>,
+    until: Option<&str>,
+) -> Result<()> {
+    if let Some(next) = super::outbox_task_events_renew(until, chrono::Utc::now()) {
+        sqlx::query(
+            "UPDATE outbox_sinks SET wants_tasks_until = ?1
+             WHERE sink = ?2 AND (wants_tasks_until IS NULL OR wants_tasks_until < ?1)",
+        )
+        .bind(&next)
+        .bind(sink.name)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Hand `sink` the events written since it last looked, up to
+/// [`super::OUTBOX_ENROLL_ROWS`]: a `pending` row of `outbox_deliveries` for
+/// each, due at once. Returns how many. Replicas enrol side by side: an event
+/// is handed to a sink once, whichever enrols it.
+///
+/// It looks from its cursor less [`super::OUTBOX_LATE_COMMIT_SECS`], for an
+/// event written with an earlier time than one already handed but committed
+/// after it, so that a sink never reads the outbox back to its beginning.
+pub async fn outbox_enroll(pool: &Pool, sink: &super::OutboxSink<'_>) -> Result<u64> {
+    let now = chrono::Utc::now();
+    let (since, cursor) = outbox_sink_position(pool, sink).await?;
+    let from = super::outbox_enrol_from(&since, &cursor);
+    // Read first, and written only where there is something to write: an
+    // INSERT takes the database's write lock even where it inserts nothing,
+    // and a sink drains every few seconds.
+    let found: Vec<(String, String)> = sqlx::query_as(
+        "SELECT e.id, e.created_at FROM event_outbox e
+         WHERE e.status = 'pending' AND e.created_at >= ?2
+           AND ((?3 = '[]' AND e.event_type NOT LIKE 'task.%')
+                OR e.event_type IN (SELECT value FROM json_each(?3)))
+           AND NOT EXISTS (SELECT 1 FROM outbox_deliveries d WHERE d.outbox_id = e.id AND d.sink = ?1)
+         ORDER BY e.created_at, e.id
+         LIMIT ?4",
+    )
+    .bind(sink.name)
+    .bind(&from)
+    .bind(super::outbox_types_json(sink))
+    .bind(super::OUTBOX_ENROLL_ROWS)
+    .fetch_all(pool)
+    .await?;
+    let enrolled: Vec<String> = if found.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_scalar(
+            "INSERT OR IGNORE INTO outbox_deliveries (outbox_id, sink, status, attempts, next_attempt_at)
+             SELECT e.id, ?1, 'pending', 0, e.created_at FROM event_outbox e
+             WHERE e.id IN (SELECT value FROM json_each(?2))
+             RETURNING next_attempt_at",
+        )
+        .bind(sink.name)
+        .bind(
+            serde_json::to_string(&found.iter().map(|(id, _)| id).collect::<Vec<_>>())
+                .expect("a list of strings serialises"),
+        )
+        .fetch_all(pool)
+        .await?
+    };
+    // The cursor goes by what was found, not by what was inserted: another
+    // process enrolling the same sink may have inserted some of them first,
+    // and a batch it filled is still a full one.
+    let n = enrolled.len() as i64;
+    let latest = found.iter().map(|(_, at)| at.clone()).max();
+    let found = found.len() as i64;
+    let next = super::outbox_next_cursor(latest, found, now);
+    if let Some(next) = next.filter(|next| super::outbox_cursor_moves(&cursor, next, found)) {
+        sqlx::query("UPDATE outbox_sinks SET cursor = ?1 WHERE sink = ?2 AND cursor < ?1")
+            .bind(&next)
+            .bind(sink.name)
+            .execute(pool)
+            .await?;
+    }
+    Ok(n as u64)
+}
+
+/// Where `sink` enrols from, `(since, cursor)`, registering it first where
+/// it is new.
+async fn outbox_sink_position(
+    pool: &Pool,
+    sink: &super::OutboxSink<'_>,
+) -> Result<(String, String)> {
+    let read = || {
+        sqlx::query_as::<_, (String, String, Option<String>)>(
+            "SELECT since, cursor, wants_tasks_until FROM outbox_sinks WHERE sink = ?",
+        )
+        .bind(sink.name)
+        .fetch_optional(pool)
+    };
+    if let Some((since, cursor, until)) = read().await? {
+        // A sink that asks for task events is written them while it claims.
+        if sink.wants_tasks() {
+            renew_task_events(pool, sink, until.as_deref()).await?;
+        }
+        return Ok((since, cursor));
+    }
+    register_outbox_sink(pool, sink).await?;
+    let (since, cursor, _) = read().await?.expect("a sink just registered is there");
+    Ok((since, cursor))
+}
+
+/// Enrol `sink` ([`outbox_enroll`]), then claim up to `limit` of its due,
+/// pending events, deferring each by `lease_secs` (bump `next_attempt_at`) so
+/// a concurrent worker of the same sink won't take the same event
+/// mid-delivery. At-least-once: a crashed
+/// worker's lease lapses and the event is claimed again.
 pub async fn claim_outbox_batch(
     pool: &Pool,
+    sink: &super::OutboxSink<'_>,
     limit: i64,
     lease_secs: i64,
 ) -> Result<Vec<crate::models::OutboxEvent>> {
+    Ok(claim_deliveries(pool, sink, limit, lease_secs)
+        .await?
+        .into_iter()
+        .map(|row| row.event)
+        .collect())
+}
+
+async fn claim_deliveries(
+    pool: &Pool,
+    sink: &super::OutboxSink<'_>,
+    limit: i64,
+    lease_secs: i64,
+) -> Result<Vec<OutboxUplinkRow>> {
+    use sqlx::Row;
+    outbox_enroll(pool, sink).await?;
     let now = chrono::Utc::now();
     let now_s = now.to_rfc3339();
-    let lease_until = (now + chrono::TimeDelta::seconds(lease_secs)).to_rfc3339();
-
-    #[derive(sqlx::FromRow)]
-    struct Row {
-        id: String,
-        run_id: String,
-        event_type: String,
-        payload: String,
-        attempts: i64,
-    }
+    let lease_until =
+        (now + chrono::TimeDelta::seconds(lease_secs.clamp(0, MAX_SPOOL_SECS))).to_rfc3339();
 
     let mut tx = pool.begin().await?;
-    let rows: Vec<Row> = sqlx::query_as::<_, Row>(
-        "SELECT id, run_id, event_type, payload, attempts FROM event_outbox
-         WHERE status = 'pending' AND next_attempt_at <= ?
-         ORDER BY next_attempt_at LIMIT ?",
+    let rows = sqlx::query(
+        "SELECT e.id, e.run_id, e.event_type, e.payload, d.attempts, e.created_at
+         FROM outbox_deliveries d JOIN event_outbox e ON e.id = d.outbox_id
+         WHERE d.sink = ? AND d.status = 'pending' AND d.next_attempt_at <= ?
+         ORDER BY d.next_attempt_at LIMIT ?",
     )
+    .bind(sink.name)
     .bind(&now_s)
     .bind(limit)
     .fetch_all(&mut *tx)
     .await?;
-    for r in &rows {
-        sqlx::query("UPDATE event_outbox SET next_attempt_at = ? WHERE id = ?")
-            .bind(&lease_until)
-            .bind(&r.id)
-            .execute(&mut *tx)
-            .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        out.push(OutboxUplinkRow {
+            event: crate::models::OutboxEvent {
+                id: row.try_get("id")?,
+                run_id: row.try_get("run_id")?,
+                event_type: row.try_get("event_type")?,
+                payload: row.try_get("payload")?,
+                attempts: row.try_get("attempts")?,
+                created_at: row.try_get("created_at")?,
+            },
+            created_at: row.try_get("created_at")?,
+        });
+    }
+    for row in &out {
+        sqlx::query(
+            "UPDATE outbox_deliveries SET next_attempt_at = ? WHERE sink = ? AND outbox_id = ?",
+        )
+        .bind(&lease_until)
+        .bind(sink.name)
+        .bind(&row.event.id)
+        .execute(&mut *tx)
+        .await?;
     }
     tx.commit().await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| crate::models::OutboxEvent {
-            id: r.id,
-            run_id: r.run_id,
-            event_type: r.event_type,
-            payload: r.payload,
-            attempts: r.attempts,
-        })
-        .collect())
+    Ok(out)
 }
 
-/// Mark an outbox event delivered.
-pub async fn mark_outbox_delivered(pool: &Pool, id: &str) -> Result<()> {
-    let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query("UPDATE event_outbox SET status = 'delivered', delivered_at = ? WHERE id = ? AND status = 'pending'")
-        .bind(&now)
-        .bind(id)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-/// Delivery failed but is retryable: bump attempts, record the error, and set the
-/// next eligible time (`retry_at`, caller computes the backoff).
-pub async fn mark_outbox_failed(pool: &Pool, id: &str, error: &str, retry_at: &str) -> Result<()> {
-    sqlx::query(
-        "UPDATE event_outbox SET attempts = attempts + 1, last_error = ?, next_attempt_at = ? WHERE id = ? AND status = 'pending'",
+/// Delete up to `limit` task events (`task.*`) written before `before`
+/// (RFC 3339), with every sink's delivery of them, oldest first. Returns how
+/// many. See the Postgres backend's.
+pub async fn prune_task_events(pool: &Pool, before: &str, limit: i64) -> Result<u64> {
+    let mut tx = pool.begin().await?;
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM event_outbox
+         WHERE created_at < ?1 AND event_type LIKE 'task.%'
+         ORDER BY created_at LIMIT ?2",
     )
-    .bind(error)
-    .bind(retry_at)
+    .bind(before)
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let ids = serde_json::to_string(&ids).expect("a list of strings serialises");
+    sqlx::query(
+        "DELETE FROM outbox_deliveries WHERE outbox_id IN (SELECT value FROM json_each(?1))",
+    )
+    .bind(&ids)
+    .execute(&mut *tx)
+    .await?;
+    let n = sqlx::query("DELETE FROM event_outbox WHERE id IN (SELECT value FROM json_each(?1))")
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+    Ok(n)
+}
+
+/// Mark the event `id` delivered to `sink`.
+pub async fn mark_outbox_delivered(pool: &Pool, sink: &str, id: &str) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE outbox_deliveries SET status = 'delivered', delivered_at = ?
+         WHERE sink = ? AND outbox_id = ? AND status = 'pending'",
+    )
+    .bind(&now)
+    .bind(sink)
     .bind(id)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-/// Delivery exhausted its retries: park the event as `dead` (the broker-DLQ analog).
-pub async fn mark_outbox_dead(pool: &Pool, id: &str, error: &str) -> Result<()> {
-    sqlx::query("UPDATE event_outbox SET status = 'dead', attempts = attempts + 1, last_error = ? WHERE id = ? AND status = 'pending'")
-        .bind(error)
-        .bind(id)
-        .execute(pool)
-        .await?;
+/// Delivery to `sink` failed but is retryable: bump attempts, record the
+/// error, and set the next eligible time (`retry_at`, caller computes the
+/// backoff).
+pub async fn mark_outbox_failed(
+    pool: &Pool,
+    sink: &str,
+    id: &str,
+    error: &str,
+    retry_at: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE outbox_deliveries SET attempts = attempts + 1, last_error = ?, next_attempt_at = ?
+         WHERE sink = ? AND outbox_id = ? AND status = 'pending'",
+    )
+    .bind(error)
+    .bind(retry_at)
+    .bind(sink)
+    .bind(id)
+    .execute(pool)
+    .await?;
     Ok(())
+}
+
+/// Delivery to `sink` exhausted its retries: park its row of the event as
+/// `dead` (the broker-DLQ analog). Other sinks' rows of it are untouched.
+pub async fn mark_outbox_dead(pool: &Pool, sink: &str, id: &str, error: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE outbox_deliveries SET status = 'dead', attempts = attempts + 1, last_error = ?
+         WHERE sink = ? AND outbox_id = ? AND status = 'pending'",
+    )
+    .bind(error)
+    .bind(sink)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// What each sink has of the outbox: `(sink, pending, dead, last delivered)`,
+/// by sink name.
+pub async fn outbox_sink_counts(pool: &Pool) -> Result<Vec<(String, i64, i64, Option<String>)>> {
+    Ok(sqlx::query_as(
+        "SELECT s.sink,
+                COALESCE(SUM(d.status = 'pending'), 0),
+                COALESCE(SUM(d.status = 'dead'), 0),
+                MAX(CASE WHEN d.status = 'delivered' THEN d.delivered_at END)
+         FROM outbox_sinks s LEFT JOIN outbox_deliveries d ON d.sink = s.sink
+         GROUP BY s.sink ORDER BY s.sink",
+    )
+    .fetch_all(pool)
+    .await?)
 }
 
 // ── Transactional outbox: spool bounds for the fleet uplink ───────────────────
@@ -4960,6 +7411,11 @@ pub async fn mark_outbox_dead(pool: &Pool, id: &str, error: &str) -> Result<()> 
 // a feature-on build does, and this is the datastore half of that contract, kept here
 // so both backends stay identical and the SQL lives beside the outbox it
 // touches.
+//
+// Each is of one sink's spool: what was handed to it ([`outbox_enroll`]) and
+// it has not yet delivered. Signature-for-signature identical to the SQLite
+// backend's region; the tests live there, because a unit runs on SQLite and
+// that is where the behaviour is exercised.
 
 /// The largest number of seconds this region will hand to
 /// [`chrono::TimeDelta::seconds`]. That constructor panics outside its
@@ -4969,10 +7425,9 @@ pub async fn mark_outbox_dead(pool: &Pool, id: &str, error: &str) -> Result<()> 
 /// configuring and far short of the panic.
 const MAX_SPOOL_SECS: i64 = 100 * 366 * 24 * 3600;
 
-/// The status a row shed by [`shed_outbox`] carries. `event_outbox.status` has
-/// no `CHECK` constraint (see the `008_event_outbox.sql` DDL), so this needs no
-/// migration; nothing re-claims such a row, because every claim filters
-/// `pending`.
+/// The status a sink's row shed by [`shed_outbox`] carries.
+/// `outbox_deliveries.status` has no `CHECK` constraint; nothing re-claims
+/// such a row, because every claim filters `pending`.
 pub const OUTBOX_STATUS_SHED: &str = "shed";
 
 /// One claimed outbox row, plus the wall-clock time the engine wrote it.
@@ -4992,94 +7447,55 @@ pub struct OutboxUplinkRow {
 
 /// [`claim_outbox_batch`] with `created_at` attached (see [`OutboxUplinkRow`]).
 ///
-/// Identical lease discipline: the claim defers each row by `lease_secs`, so a
-/// worker that dies mid-upload simply lets the lease lapse and the rows are
+/// Identical lease discipline — a per-row lease — so a worker that dies mid-upload simply lets the lease lapse and the rows are
 /// re-claimed. That makes delivery at-least-once, which is safe because the
-/// plane deduplicates on the row id — the same property the webhook drain
-/// relies on.
+/// plane deduplicates on the row id: the same property the webhook drain relies
+/// on.
 pub async fn claim_outbox_batch_for_uplink(
     pool: &Pool,
+    sink: &super::OutboxSink<'_>,
     limit: i64,
     lease_secs: i64,
 ) -> Result<Vec<OutboxUplinkRow>> {
-    let now = chrono::Utc::now();
-    let now_s = now.to_rfc3339();
-    let lease_until =
-        (now + chrono::TimeDelta::seconds(lease_secs.clamp(0, MAX_SPOOL_SECS))).to_rfc3339();
-
-    #[derive(sqlx::FromRow)]
-    struct Row {
-        id: String,
-        run_id: String,
-        event_type: String,
-        payload: String,
-        attempts: i64,
-        created_at: String,
-    }
-
-    let mut tx = pool.begin().await?;
-    let rows: Vec<Row> = sqlx::query_as::<_, Row>(
-        "SELECT id, run_id, event_type, payload, attempts, created_at FROM event_outbox
-         WHERE status = 'pending' AND next_attempt_at <= ?
-         ORDER BY next_attempt_at LIMIT ?",
-    )
-    .bind(&now_s)
-    .bind(limit)
-    .fetch_all(&mut *tx)
-    .await?;
-    for r in &rows {
-        sqlx::query("UPDATE event_outbox SET next_attempt_at = ? WHERE id = ?")
-            .bind(&lease_until)
-            .bind(&r.id)
-            .execute(&mut *tx)
-            .await?;
-    }
-    tx.commit().await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| OutboxUplinkRow {
-            event: crate::models::OutboxEvent {
-                id: r.id,
-                run_id: r.run_id,
-                event_type: r.event_type,
-                payload: r.payload,
-                attempts: r.attempts,
-            },
-            created_at: r.created_at,
-        })
-        .collect())
+    claim_deliveries(pool, sink, limit, lease_secs).await
 }
 
-/// Bytes of event payload still waiting to be delivered (`status = 'pending'`).
+/// Bytes of event payload `sink` still has to deliver (`pending`).
 ///
 /// The payload is the row's whole variable cost — ids, types and timestamps are
 /// bounded and small — so it is what a byte budget is measured against.
-/// `LENGTH` over TEXT counts characters in SQLite, which under-counts anything
-/// non-ASCII; the `CAST(… AS BLOB)` makes it count bytes, matching the disk the
-/// budget is protecting.
-pub async fn outbox_pending_bytes(pool: &Pool) -> Result<i64> {
+/// Bytes, not characters (`LENGTH` of the payload as a BLOB): characters
+/// under-count anything non-ASCII, and the budget is protecting a disk.
+pub async fn outbox_pending_bytes(pool: &Pool, sink: &str) -> Result<i64> {
     // SUM over no rows is NULL, not 0.
     let total: Option<i64> = sqlx::query_scalar(
-        "SELECT SUM(LENGTH(CAST(payload AS BLOB))) FROM event_outbox WHERE status = 'pending'",
+        "SELECT SUM(LENGTH(CAST(e.payload AS BLOB)))
+         FROM outbox_deliveries d JOIN event_outbox e ON e.id = d.outbox_id
+         WHERE d.sink = ? AND d.status = 'pending'",
     )
+    .bind(sink)
     .fetch_one(pool)
     .await?;
     Ok(total.unwrap_or(0))
 }
 
-/// How long the oldest still-undelivered event has been waiting, in seconds
-/// (`0` when the spool is empty).
+/// How long the oldest event `sink` has still to deliver has been waiting, in
+/// seconds (`0` when its spool is empty).
 ///
 /// `created_at` is written as `chrono::Utc::now().to_rfc3339()` everywhere the
 /// engine emits an event, and that spelling is fixed-width and always UTC, so
 /// the lexicographic `MIN` the datastore computes is also the chronological
 /// one. A row whose timestamp does not parse reads as age `0` rather than as an
 /// error: an unparseable clock is not a reason to refuse to measure the spool.
-pub async fn outbox_oldest_pending_age_secs(pool: &Pool) -> Result<i64> {
-    let oldest: Option<String> =
-        sqlx::query_scalar("SELECT MIN(created_at) FROM event_outbox WHERE status = 'pending'")
-            .fetch_one(pool)
-            .await?;
+pub async fn outbox_oldest_pending_age_secs(pool: &Pool, sink: &str) -> Result<i64> {
+    let oldest: Option<String> = sqlx::query_scalar(
+        "SELECT MIN(e.created_at)
+         FROM outbox_deliveries d JOIN event_outbox e ON e.id = d.outbox_id
+         WHERE d.sink = ? AND d.status = 'pending'",
+    )
+    .bind(sink)
+    .fetch_one(pool)
+    .await?;
     let Some(oldest) = oldest else {
         return Ok(0);
     };
@@ -5090,8 +7506,8 @@ pub async fn outbox_oldest_pending_age_secs(pool: &Pool) -> Result<i64> {
     Ok((chrono::Utc::now() - ts.with_timezone(&chrono::Utc)).num_seconds().max(0))
 }
 
-/// Bring the pending spool back inside its budget, parking what no longer fits
-/// as [`OUTBOX_STATUS_SHED`]. Returns how many rows were shed.
+/// Bring `sink`'s pending spool back inside its budget, parking what no
+/// longer fits as [`OUTBOX_STATUS_SHED`]. Returns how many rows were shed.
 ///
 /// Two budgets, applied in that order; `0` disables either one:
 ///
@@ -5107,13 +7523,15 @@ pub async fn outbox_oldest_pending_age_secs(pool: &Pool) -> Result<i64> {
 ///   machine for are the newest ones.
 ///
 /// Shed rows are never re-claimed (every claim filters `status = 'pending'`),
-/// keep their payload, and carry the budget that dropped them in `last_error`,
-/// so `SELECT COUNT(*), last_error FROM event_outbox WHERE status = 'shed'` is a
-/// readable answer to "what did this disk cost me". They are data loss by
+/// and carry the budget that dropped them in `last_error`, so
+/// `SELECT COUNT(*), last_error FROM outbox_deliveries WHERE status = 'shed'` is
+/// a readable answer to "what did this disk cost me". They are data loss by
 /// design: the alternative is a spool that grows until the datastore itself
-/// stops accepting writes, which loses the *run state* too.
+/// stops accepting writes, which loses the *run state* too. Only this sink's
+/// rows are shed: the event is still every other sink's to deliver.
 pub async fn shed_outbox(
     pool: &Pool,
+    sink: &str,
     max_bytes: i64,
     max_age_secs: i64,
     policy: &str,
@@ -5140,10 +7558,13 @@ pub async fn shed_outbox(
         .to_rfc3339();
         let reason = format!("shed: older than the {max_age_secs}s outbox age budget");
         shed += sqlx::query(
-            "UPDATE event_outbox SET status = 'shed', last_error = ?
-             WHERE status = 'pending' AND created_at < ? AND next_attempt_at <= ?",
+            "UPDATE outbox_deliveries SET status = 'shed', last_error = ?
+             WHERE sink = ? AND status = 'pending'
+               AND outbox_id IN (SELECT id FROM event_outbox WHERE created_at < ?)
+               AND next_attempt_at <= ?",
         )
         .bind(&reason)
+        .bind(sink)
         .bind(&cutoff)
         .bind(&due_now)
         .execute(pool)
@@ -5157,25 +7578,31 @@ pub async fn shed_outbox(
         // cannot be a bind parameter, so the only safe spelling is one where no
         // caller-supplied string ever reaches the SQL text.
         let sql = if largest_first {
-            "SELECT id, LENGTH(CAST(payload AS BLOB)) AS bytes FROM event_outbox
-             WHERE status = 'pending' AND next_attempt_at <= ?
-             ORDER BY bytes DESC, created_at ASC LIMIT ?"
+            "SELECT e.id, LENGTH(CAST(e.payload AS BLOB)) AS bytes
+             FROM outbox_deliveries d JOIN event_outbox e ON e.id = d.outbox_id
+             WHERE d.sink = ? AND d.status = 'pending' AND d.next_attempt_at <= ?
+             ORDER BY bytes DESC, e.created_at ASC LIMIT ?"
         } else {
-            "SELECT id, LENGTH(CAST(payload AS BLOB)) AS bytes FROM event_outbox
-             WHERE status = 'pending' AND next_attempt_at <= ?
-             ORDER BY created_at ASC LIMIT ?"
+            "SELECT e.id, LENGTH(CAST(e.payload AS BLOB)) AS bytes
+             FROM outbox_deliveries d JOIN event_outbox e ON e.id = d.outbox_id
+             WHERE d.sink = ? AND d.status = 'pending' AND d.next_attempt_at <= ?
+             ORDER BY e.created_at ASC LIMIT ?"
         };
         let reason = format!(
             "shed: over the {max_bytes}-byte outbox budget ({} first)",
             if largest_first { "largest" } else { "oldest" }
         );
-        let mut pending = outbox_pending_bytes(pool).await?;
+        let mut pending = outbox_pending_bytes(pool, sink).await?;
         loop {
             if pending <= max_bytes {
                 break;
             }
-            let victims: Vec<(String, i64)> =
-                sqlx::query_as(sql).bind(&due_now).bind(PAGE).fetch_all(pool).await?;
+            let victims: Vec<(String, i64)> = sqlx::query_as(sql)
+                .bind(sink)
+                .bind(&due_now)
+                .bind(PAGE)
+                .fetch_all(pool)
+                .await?;
             if victims.is_empty() {
                 break;
             }
@@ -5185,10 +7612,11 @@ pub async fn shed_outbox(
                     break;
                 }
                 let n = sqlx::query(
-                    "UPDATE event_outbox SET status = 'shed', last_error = ?
-                     WHERE id = ? AND status = 'pending'",
+                    "UPDATE outbox_deliveries SET status = 'shed', last_error = ?
+                     WHERE sink = ? AND outbox_id = ? AND status = 'pending'",
                 )
                 .bind(&reason)
+                .bind(sink)
                 .bind(&id)
                 .execute(pool)
                 .await?
@@ -5210,6 +7638,7 @@ pub async fn shed_outbox(
     if shed > 0 {
         tracing::warn!(
             shed,
+            sink,
             max_bytes,
             max_age_secs,
             policy,
@@ -5250,24 +7679,58 @@ pub async fn latest_run_for_spec(pool: &Pool, spec: &str, since: &str) -> Result
 mod outbox_spool_tests {
     use super::*;
     use crate::dag::DagGraph;
+    use crate::db::{OutboxSink, OUTBOX_LATE_COMMIT_SECS};
+
+    /// The fleet uplink's sink, which took over the single-consumer outbox.
+    const FLEET: OutboxSink<'static> = OutboxSink {
+        name: "fleet",
+        event_types: &[],
+        adopts_legacy: true,
+    };
 
     /// Own fixture rather than `mod tests`'s: this module is the outbox spool's
     /// contract and stays readable on its own.
     async fn temp_pool() -> (Pool, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!("module54_spool_{}.db", Uuid::new_v4()));
         let pool = init_pool(path.to_str().unwrap()).await.unwrap();
+        // The uplink was configured long before any event these tests write,
+        // some of which they write as hours or a week old.
+        register_outbox_sink(&pool, &FLEET).await.unwrap();
+        sqlx::query("UPDATE outbox_sinks SET since = '2000-01-01T00:00:00+00:00', cursor = '2000-01-01T00:00:00+00:00' WHERE sink = 'fleet'")
+            .execute(&pool)
+            .await
+            .unwrap();
         (pool, path)
     }
 
-    /// Seed one pending outbox row with an exact payload and age.
+    /// Move the watermark to `age_secs` ago: what was written before it is
+    /// what the single-consumer outbox held when this release came up.
+    async fn upgraded(pool: &Pool, age_secs: i64) {
+        let at = (chrono::Utc::now() - chrono::TimeDelta::seconds(age_secs)).to_rfc3339();
+        sqlx::query("UPDATE outbox_epoch SET per_sink_since = ?")
+            .bind(&at)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// Seed one pending outbox row with an exact payload and age, and hand it
+    /// to the fleet's sink.
     async fn seed(pool: &Pool, id: &str, payload: &str, age_secs: i64) {
+        write_event(pool, id, "run.completed", payload, age_secs).await;
+        outbox_enroll(pool, &FLEET).await.unwrap();
+    }
+
+    /// Write one event to the outbox, `age_secs` old, as the engine does.
+    async fn write_event(pool: &Pool, id: &str, event_type: &str, payload: &str, age_secs: i64) {
         let created = (chrono::Utc::now() - chrono::TimeDelta::seconds(age_secs)).to_rfc3339();
         sqlx::query(
             "INSERT INTO event_outbox
                (id, run_id, event_type, payload, status, attempts, next_attempt_at, created_at)
-             VALUES (?, 'run-1', 'run.completed', ?, 'pending', 0, ?, ?)",
+             VALUES (?, 'run-1', ?, ?, 'pending', 0, ?, ?)",
         )
         .bind(id)
+        .bind(event_type)
         .bind(payload)
         .bind(&created)
         .bind(&created)
@@ -5276,12 +7739,394 @@ mod outbox_spool_tests {
         .unwrap();
     }
 
+    /// The fleet sink's state of the event `id`.
     async fn status_of(pool: &Pool, id: &str) -> String {
-        sqlx::query_scalar("SELECT status FROM event_outbox WHERE id = ?")
-            .bind(id)
-            .fetch_one(pool)
+        sqlx::query_scalar(
+            "SELECT status FROM outbox_deliveries WHERE sink = 'fleet' AND outbox_id = ?",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The ids of the events `sink` claims now.
+    async fn claimed(pool: &Pool, sink: &OutboxSink<'_>) -> Vec<String> {
+        claim_outbox_batch(pool, sink, 100, 30)
             .await
             .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect()
+    }
+
+    /// 10.6: each sink is handed every event, and keeps its own state of it.
+    /// The webhook delivering an event leaves it the uplink's to deliver; one
+    /// sink dead-lettering it costs no other; and an event leased by one is
+    /// free for the other.
+    #[tokio::test]
+    async fn every_sink_is_handed_every_event_and_keeps_its_own_state_of_it() {
+        let (pool, path) = temp_pool().await;
+        let webhook = OutboxSink {
+            name: "webhook",
+            event_types: &[],
+            adopts_legacy: true,
+        };
+        register_outbox_sink(&pool, &webhook).await.unwrap();
+        write_event(&pool, "e-1", "run.completed", "{}", 0).await;
+        write_event(&pool, "e-2", "run.rerun", "{}", 0).await;
+
+        assert_eq!(claimed(&pool, &webhook).await, ["e-1", "e-2"]);
+        assert!(claimed(&pool, &webhook).await.is_empty(), "leased");
+        assert_eq!(
+            claimed(&pool, &FLEET).await,
+            ["e-1", "e-2"],
+            "the webhook's lease is not the fleet's"
+        );
+
+        mark_outbox_delivered(&pool, "webhook", "e-1")
+            .await
+            .unwrap();
+        mark_outbox_dead(&pool, "webhook", "e-2", "HTTP 410")
+            .await
+            .unwrap();
+        assert_eq!(status_of(&pool, "e-1").await, "pending");
+        assert_eq!(status_of(&pool, "e-2").await, "pending");
+        mark_outbox_delivered(&pool, "fleet", "e-2").await.unwrap();
+        assert_eq!(status_of(&pool, "e-2").await, "delivered");
+        assert_eq!(
+            outbox_sink_counts(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(s, p, d, _)| (s, p, d))
+                .collect::<Vec<_>>(),
+            [("fleet".to_string(), 1, 0), ("webhook".to_string(), 0, 1)]
+        );
+        // What the single-consumer outbox kept of the event is untouched.
+        let legacy: Vec<String> = sqlx::query_scalar("SELECT status FROM event_outbox ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(legacy, ["pending", "pending"]);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A sink is handed the events written once it was configured, of its
+    /// types; one that takes over the single-consumer outbox is handed what
+    /// that still held pending when this release came up, and never what it
+    /// delivered, nor what was written between the upgrade and the sink
+    /// being configured.
+    #[tokio::test]
+    async fn a_sink_is_handed_what_was_written_once_it_was_configured_of_its_types() {
+        let (pool, path) = temp_pool().await;
+        write_event(&pool, "before", "run.completed", "{}", 60).await;
+        write_event(&pool, "delivered", "run.completed", "{}", 50).await;
+        sqlx::query("UPDATE event_outbox SET status = 'delivered' WHERE id = 'delivered'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        upgraded(&pool, 40).await;
+        write_event(&pool, "between", "run.completed", "{}", 30).await;
+
+        let ends = OutboxSink {
+            name: "engine.forge",
+            event_types: &["run.completed"],
+            adopts_legacy: false,
+        };
+        register_outbox_sink(&pool, &ends).await.unwrap();
+        let webhook = OutboxSink {
+            name: "webhook",
+            event_types: &[],
+            adopts_legacy: true,
+        };
+        register_outbox_sink(&pool, &webhook).await.unwrap();
+        // Again, as another replica would: it adopts nothing twice.
+        register_outbox_sink(&pool, &webhook).await.unwrap();
+        write_event(&pool, "after", "run.completed", "{}", 0).await;
+        write_event(&pool, "rerun", "run.rerun", "{}", 0).await;
+        assert_eq!(
+            claimed(&pool, &ends).await,
+            ["after"],
+            "only its type, only from when it was configured"
+        );
+
+        let mut got = claimed(&pool, &webhook).await;
+        got.sort();
+        assert_eq!(
+            got,
+            ["after", "before", "rerun"],
+            "never what the old outbox delivered, nor what came between"
+        );
+        assert!(claimed(&pool, &webhook).await.is_empty(), "each once");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An event that commits after one written later than it is still
+    /// handed to a sink whose cursor has passed it, inside
+    /// `OUTBOX_LATE_COMMIT_SECS`; and the cursor moves on, so that the
+    /// outbox is not read back to its beginning.
+    #[tokio::test]
+    async fn an_event_that_commits_late_is_still_handed_and_the_cursor_moves_on() {
+        let (pool, path) = temp_pool().await;
+        let ends = OutboxSink {
+            name: "engine.notify",
+            event_types: &["run.completed"],
+            adopts_legacy: false,
+        };
+        register_outbox_sink(&pool, &ends).await.unwrap();
+        sqlx::query("UPDATE outbox_sinks SET since = '2020-01-01T00:00:00+00:00'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        write_event(&pool, "on-time", "run.completed", "{}", 0).await;
+        assert_eq!(claimed(&pool, &ends).await, ["on-time"]);
+
+        // Written a minute ago, committed only now.
+        write_event(&pool, "late", "run.completed", "{}", 60).await;
+        assert_eq!(claimed(&pool, &ends).await, ["late"]);
+        // Past the window, it is not looked for.
+        write_event(
+            &pool,
+            "too-late",
+            "run.completed",
+            "{}",
+            3 * OUTBOX_LATE_COMMIT_SECS,
+        )
+        .await;
+        assert!(claimed(&pool, &ends).await.is_empty());
+        let behind = |cursor: String| {
+            (chrono::Utc::now()
+                - chrono::DateTime::parse_from_rfc3339(&cursor)
+                    .unwrap()
+                    .with_timezone(&chrono::Utc))
+            .num_seconds()
+        };
+        let cursor_of = |sink: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>("SELECT cursor FROM outbox_sinks WHERE sink = ?")
+                    .bind(sink)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(
+            behind(cursor_of("engine.notify").await) < 5,
+            "at the newest event it was handed"
+        );
+
+        // A sink none of whose events were written still moves on, to what
+        // has surely committed, so that it does not read again all the others
+        // wrote meanwhile.
+        let none = OutboxSink {
+            name: "engine.none",
+            event_types: &["run.never"],
+            adopts_legacy: false,
+        };
+        register_outbox_sink(&pool, &none).await.unwrap();
+        sqlx::query("UPDATE outbox_sinks SET since = '2020-01-01T00:00:00+00:00', cursor = '2020-01-01T00:00:00+00:00' WHERE sink = 'engine.none'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(claimed(&pool, &none).await.is_empty());
+        let behind_none = behind(cursor_of("engine.none").await);
+        assert!(
+            (OUTBOX_LATE_COMMIT_SECS - 5..=OUTBOX_LATE_COMMIT_SECS + 5).contains(&behind_none),
+            "{behind_none}s behind"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The event types of the events written for `run`, in the order written.
+    async fn types_of(pool: &Pool, run: &str) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT event_type || ':' || COALESCE(json_extract(payload, '$.name'), '')
+             FROM event_outbox WHERE run_id = ? ORDER BY created_at, rowid",
+        )
+        .bind(run)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Run a two-task run to its end, `b` after `a`, and return its id.
+    async fn run_two(pool: &Pool) -> String {
+        let yaml = "name: two\ntasks:\n  - name: a\n    command: [\"true\"]\n  - name: b\n    command: [\"true\"]\n    depends_on: [a]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let run = create_run(pool, &dag, yaml).await.unwrap();
+        for _ in 0..2 {
+            advance_ready_tasks(pool).await.unwrap();
+            for t in claim_ready(pool, "w", 10).await.unwrap() {
+                assert!(mark_task_succeeded(pool, &t.id, "w", t.version + 1, None)
+                    .await
+                    .unwrap());
+            }
+        }
+        assert_eq!(reap_completed_runs(pool).await.unwrap().len(), 1);
+        run
+    }
+
+    /// 10.22: while a sink that asks for them claims, each task's start and
+    /// end is an event, in the order they happened, and the sink is handed
+    /// them with the run's end; a sink of every type is not. With no such
+    /// sink, or one that has stopped claiming, a task writes nothing.
+    #[tokio::test]
+    async fn a_task_s_start_and_end_are_events_only_while_a_sink_asks_for_them() {
+        let (pool, path) = temp_pool().await;
+        let quiet = run_two(&pool).await;
+        assert_eq!(
+            types_of(&pool, &quiet).await,
+            ["run.completed:"],
+            "no sink asks"
+        );
+
+        register_outbox_sink(&pool, &crate::db::CI_SINK)
+            .await
+            .unwrap();
+        let told = run_two(&pool).await;
+        assert_eq!(
+            types_of(&pool, &told).await,
+            [
+                "task.started:a",
+                "task.finished:a",
+                "task.started:b",
+                "task.finished:b",
+                "run.completed:"
+            ]
+        );
+        let handed: Vec<String> = claim_outbox_batch(&pool, &crate::db::CI_SINK, 100, 30)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.run_id == told)
+            .map(|e| e.event_type)
+            .collect();
+        assert_eq!(handed.len(), 5, "{handed:?}");
+        let payload: String = sqlx::query_scalar(
+            "SELECT payload FROM event_outbox WHERE run_id = ? AND event_type = 'task.finished' ORDER BY created_at LIMIT 1",
+        )
+        .bind(&told)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            (
+                v["name"].as_str(),
+                v["status"].as_str(),
+                v["attempt"].as_i64()
+            ),
+            (Some("a"), Some("succeeded"), Some(1))
+        );
+
+        // The uplink takes every event but a task's.
+        let fleet: Vec<String> = claim_outbox_batch_for_uplink(&pool, &FLEET, 100, 30)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event.run_id == told)
+            .map(|r| r.event.event_type)
+            .collect();
+        assert_eq!(fleet, ["run.completed"]);
+
+        // A sink that has not claimed for a day is written none.
+        sqlx::query("UPDATE outbox_sinks SET wants_tasks_until = '2020-01-01T00:00:00+00:00' WHERE sink = 'ci'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let lapsed = run_two(&pool).await;
+        assert_eq!(types_of(&pool, &lapsed).await, ["run.completed:"]);
+        // And its next claim asks for them again.
+        claim_outbox_batch(&pool, &crate::db::CI_SINK, 100, 30)
+            .await
+            .unwrap();
+        let again = run_two(&pool).await;
+        assert_eq!(types_of(&pool, &again).await.len(), 5);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Task events a day old are deleted with every sink's delivery of them;
+    /// a later one, and any other event, are kept.
+    #[tokio::test]
+    async fn task_events_are_pruned_a_day_on_with_their_deliveries() {
+        let (pool, path) = temp_pool().await;
+        register_outbox_sink(&pool, &crate::db::CI_SINK)
+            .await
+            .unwrap();
+        let run = run_two(&pool).await;
+        claim_outbox_batch(&pool, &crate::db::CI_SINK, 100, 30)
+            .await
+            .unwrap();
+        // Two of the run's task events, as though written two days ago.
+        sqlx::query(
+            "UPDATE event_outbox SET created_at = '2020-01-01T00:00:00+00:00'
+             WHERE run_id = ? AND event_type LIKE 'task.%' AND json_extract(payload, '$.name') = 'a'",
+        )
+        .bind(&run)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let day_ago = (chrono::Utc::now() - chrono::TimeDelta::days(1)).to_rfc3339();
+        assert_eq!(
+            prune_task_events(&pool, &day_ago, 1).await.unwrap(),
+            1,
+            "a batch at a time"
+        );
+        assert_eq!(prune_task_events(&pool, &day_ago, 100).await.unwrap(), 1);
+        assert_eq!(prune_task_events(&pool, &day_ago, 100).await.unwrap(), 0);
+        assert_eq!(
+            types_of(&pool, &run).await,
+            ["task.started:b", "task.finished:b", "run.completed:"]
+        );
+        let orphans: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM outbox_deliveries d WHERE NOT EXISTS (SELECT 1 FROM event_outbox e WHERE e.id = d.outbox_id)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(orphans, 0, "their deliveries go with them");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A task that comes to wait on an approval is an event of its own.
+    #[tokio::test]
+    async fn a_task_waiting_on_an_approval_is_an_event() {
+        let (pool, path) = temp_pool().await;
+        register_outbox_sink(&pool, &crate::db::CI_SINK)
+            .await
+            .unwrap();
+        let yaml = "name: gate\ntasks:\n  - name: gate\n    type: approval\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let run = create_run(&pool, &dag, yaml).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+        assert_eq!(types_of(&pool, &run).await, ["task.waiting:gate"]);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The renewal of a task sink's lease on its events is written once an
+    /// hour, not on every claim.
+    #[test]
+    fn a_task_sink_s_lease_on_its_events_is_renewed_within_its_last_hour_alone() {
+        let now = chrono::Utc::now();
+        let at = |secs: i64| (now + chrono::TimeDelta::seconds(secs)).to_rfc3339();
+        assert!(crate::db::outbox_task_events_renew(None, now).is_some());
+        assert!(crate::db::outbox_task_events_renew(Some(&at(-5)), now).is_some());
+        assert!(crate::db::outbox_task_events_renew(Some(&at(23 * 3600 - 60)), now).is_some());
+        assert!(crate::db::outbox_task_events_renew(Some(&at(23 * 3600 + 60)), now).is_none());
     }
 
     /// The uplink claim is the webhook claim plus `created_at`: same lease, same
@@ -5300,7 +8145,7 @@ mod outbox_spool_tests {
             .unwrap());
         assert_eq!(reap_completed_runs(&pool).await.unwrap().len(), 1);
 
-        let batch = claim_outbox_batch_for_uplink(&pool, 10, 30).await.unwrap();
+        let batch = claim_outbox_batch_for_uplink(&pool, &FLEET, 10, 30).await.unwrap();
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].event.run_id, run_id);
         assert_eq!(batch[0].event.event_type, "run.completed");
@@ -5310,7 +8155,10 @@ mod outbox_spool_tests {
             batch[0].created_at
         );
         assert!(
-            claim_outbox_batch_for_uplink(&pool, 10, 30).await.unwrap().is_empty(),
+            claim_outbox_batch_for_uplink(&pool, &FLEET, 10, 30)
+                .await
+                .unwrap()
+                .is_empty(),
             "a leased row is not re-claimed inside its lease window"
         );
 
@@ -5323,22 +8171,27 @@ mod outbox_spool_tests {
     async fn pending_bytes_and_age_measure_only_undelivered_rows() {
         let (pool, path) = temp_pool().await;
         assert_eq!(
-            outbox_pending_bytes(&pool).await.unwrap(),
+            outbox_pending_bytes(&pool, "fleet").await.unwrap(),
             0,
             "an empty spool sums to 0, not NULL"
         );
-        assert_eq!(outbox_oldest_pending_age_secs(&pool).await.unwrap(), 0);
+        assert_eq!(
+            outbox_oldest_pending_age_secs(&pool, "fleet")
+                .await
+                .unwrap(),
+            0
+        );
 
         seed(&pool, "e-old", &"x".repeat(100), 3_600).await;
         seed(&pool, "e-new", &"y".repeat(50), 10).await;
-        assert_eq!(outbox_pending_bytes(&pool).await.unwrap(), 150);
-        let age = outbox_oldest_pending_age_secs(&pool).await.unwrap();
+        assert_eq!(outbox_pending_bytes(&pool, "fleet").await.unwrap(), 150);
+        let age = outbox_oldest_pending_age_secs(&pool, "fleet").await.unwrap();
         assert!((3_595..=3_605).contains(&age), "oldest pending row is about an hour old: {age}");
 
         // A delivered row has already left the spool; it costs nothing.
-        mark_outbox_delivered(&pool, "e-old").await.unwrap();
-        assert_eq!(outbox_pending_bytes(&pool).await.unwrap(), 50);
-        let age = outbox_oldest_pending_age_secs(&pool).await.unwrap();
+        mark_outbox_delivered(&pool, "fleet", "e-old").await.unwrap();
+        assert_eq!(outbox_pending_bytes(&pool, "fleet").await.unwrap(), 50);
+        let age = outbox_oldest_pending_age_secs(&pool, "fleet").await.unwrap();
         assert!(age < 60, "only the fresh row is left: {age}");
 
         pool.close().await;
@@ -5354,15 +8207,15 @@ mod outbox_spool_tests {
         seed(&pool, "e-2", &"b".repeat(100), 200).await;
         seed(&pool, "e-3", &"c".repeat(100), 100).await;
 
-        let shed = shed_outbox(&pool, 250, 0, "oldest").await.unwrap();
+        let shed = shed_outbox(&pool, "fleet", 250, 0, "oldest").await.unwrap();
         assert_eq!(shed, 1, "dropping one 100-byte row brings 300 under 250");
         assert_eq!(status_of(&pool, "e-1").await, OUTBOX_STATUS_SHED);
         assert_eq!(status_of(&pool, "e-2").await, "pending");
         assert_eq!(status_of(&pool, "e-3").await, "pending");
-        assert_eq!(outbox_pending_bytes(&pool).await.unwrap(), 200);
+        assert_eq!(outbox_pending_bytes(&pool, "fleet").await.unwrap(), 200);
 
         let reason: Option<String> =
-            sqlx::query_scalar("SELECT last_error FROM event_outbox WHERE id = 'e-1'")
+            sqlx::query_scalar("SELECT last_error FROM outbox_deliveries WHERE outbox_id = 'e-1'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -5371,7 +8224,7 @@ mod outbox_spool_tests {
         assert!(reason.contains("oldest"), "{reason}");
 
         // A shed row is out of the drain's reach for good.
-        let ids: Vec<String> = claim_outbox_batch_for_uplink(&pool, 10, 30)
+        let ids: Vec<String> = claim_outbox_batch_for_uplink(&pool, &FLEET, 10, 30)
             .await
             .unwrap()
             .into_iter()
@@ -5392,12 +8245,14 @@ mod outbox_spool_tests {
         seed(&pool, "e-huge", &"b".repeat(500), 300).await;
         seed(&pool, "e-small-new", &"c".repeat(10), 10).await;
 
-        let shed = shed_outbox(&pool, 100, 0, "LARGEST").await.unwrap();
+        let shed = shed_outbox(&pool, "fleet", 100, 0, "LARGEST")
+            .await
+            .unwrap();
         assert_eq!(shed, 1, "one row carries the whole overshoot");
         assert_eq!(status_of(&pool, "e-huge").await, OUTBOX_STATUS_SHED);
         assert_eq!(status_of(&pool, "e-small-old").await, "pending");
         assert_eq!(status_of(&pool, "e-small-new").await, "pending");
-        assert_eq!(outbox_pending_bytes(&pool).await.unwrap(), 20);
+        assert_eq!(outbox_pending_bytes(&pool, "fleet").await.unwrap(), 20);
 
         pool.close().await;
         let _ = std::fs::remove_file(&path);
@@ -5411,10 +8266,16 @@ mod outbox_spool_tests {
         seed(&pool, "e-week", &"a".repeat(10), 7 * 24 * 3_600 + 60).await;
         seed(&pool, "e-fresh", &"b".repeat(10), 30).await;
 
-        assert_eq!(shed_outbox(&pool, 0, 0, "oldest").await.unwrap(), 0, "no budget, no loss");
+        assert_eq!(
+            shed_outbox(&pool, "fleet", 0, 0, "oldest").await.unwrap(),
+            0,
+            "no budget, no loss"
+        );
         assert_eq!(status_of(&pool, "e-week").await, "pending");
 
-        let shed = shed_outbox(&pool, 0, 7 * 24 * 3_600, "oldest").await.unwrap();
+        let shed = shed_outbox(&pool, "fleet", 0, 7 * 24 * 3_600, "oldest")
+            .await
+            .unwrap();
         assert_eq!(shed, 1);
         assert_eq!(status_of(&pool, "e-week").await, OUTBOX_STATUS_SHED);
         assert_eq!(status_of(&pool, "e-fresh").await, "pending");
@@ -5430,10 +8291,21 @@ mod outbox_spool_tests {
     async fn an_absurd_age_budget_clamps_instead_of_panicking() {
         let (pool, path) = temp_pool().await;
         seed(&pool, "e-1", "payload", 60).await;
-        assert_eq!(shed_outbox(&pool, 0, i64::MAX, "oldest").await.unwrap(), 0);
+        assert_eq!(
+            shed_outbox(&pool, "fleet", 0, i64::MAX, "oldest")
+                .await
+                .unwrap(),
+            0
+        );
         assert_eq!(status_of(&pool, "e-1").await, "pending");
         // The same clamp on the claim's lease.
-        assert_eq!(claim_outbox_batch_for_uplink(&pool, 10, i64::MAX).await.unwrap().len(), 1);
+        assert_eq!(
+            claim_outbox_batch_for_uplink(&pool, &FLEET, 10, i64::MAX)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         pool.close().await;
         let _ = std::fs::remove_file(&path);
@@ -5642,10 +8514,6 @@ pub async fn list_runs(
     limit: i64,
 ) -> Result<Vec<crate::models::RunSummary>> {
     use crate::models::RunSummary;
-    let base = "SELECT wr.id AS id, wd.name AS name, wr.status AS status,
-                       wr.created_at AS created_at, wr.finished_at AS finished_at
-                FROM workflow_runs wr
-                JOIN workflow_definitions wd ON wd.id = wr.definition_id";
     let rows = match status {
         Some(s) => {
             // The status is bound as a parameter below (never interpolated), so
@@ -5654,24 +8522,34 @@ pub async fn list_runs(
             let _: RunStatus = s
                 .parse()
                 .map_err(|_| anyhow::anyhow!("invalid run status filter '{s}'"))?;
-            sqlx::query_as::<_, RunSummary>(&format!(
-                "{base} WHERE wr.status = ? ORDER BY wr.created_at DESC LIMIT ?"
-            ))
-            .bind(s)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
+            sqlx::query_as::<_, RunSummary>(&list_runs_sql(true))
+                .bind(s)
+                .bind(limit)
+                .fetch_all(pool)
+                .await?
         }
         None => {
-            sqlx::query_as::<_, RunSummary>(&format!(
-                "{base} ORDER BY wr.created_at DESC LIMIT ?"
-            ))
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
+            sqlx::query_as::<_, RunSummary>(&list_runs_sql(false))
+                .bind(limit)
+                .fetch_all(pool)
+                .await?
         }
     };
     Ok(rows)
+}
+
+/// [`list_runs`]' read, of one status where `by_status`.
+#[cfg(feature = "ops")]
+pub(crate) fn list_runs_sql(by_status: bool) -> String {
+    format!(
+        "SELECT wr.id AS id, wd.name AS name, wr.status AS status,
+                       wr.created_at AS created_at, wr.finished_at AS finished_at,
+                       wr.stopping_as AS stopping_as,
+                       wr.queued_at AS queued_at, wr.admitted_at AS admitted_at
+                FROM workflow_runs wr
+                JOIN workflow_definitions wd ON wd.id = wr.definition_id{} ORDER BY wr.created_at DESC LIMIT ?",
+        if by_status { " WHERE wr.status = ?" } else { "" }
+    )
 }
 
 /// Fetch one run by id (or `None`). Backs `GET /runs/:id`.
@@ -5680,7 +8558,8 @@ pub async fn get_run(pool: &Pool, run_id: &str) -> Result<Option<crate::models::
     use crate::models::WorkflowRun;
     let row = sqlx::query_as::<_, WorkflowRun>(
         "SELECT id, definition_id, status, input, output, created_at, finished_at,
-                clock_confidence, clock_offset_ms, clock_source
+                clock_confidence, clock_offset_ms, clock_source,
+                stopping_as, stop_requested_at, queued_at, admitted_at
          FROM workflow_runs WHERE id = ?",
     )
     .bind(run_id)
@@ -5697,17 +8576,18 @@ pub async fn get_run(pool: &Pool, run_id: &str) -> Result<Option<crate::models::
 /// history. Returns the number of runs touched. Not `ops`-gated: the lean
 /// daemon runs the detector too.
 pub async fn mark_runs_clock_drifted(pool: &Pool, offset_ms: i64, source: &str) -> Result<u64> {
-    let r = sqlx::query(
-        "UPDATE workflow_runs
-         SET clock_confidence = 'drifted', clock_offset_ms = ?, clock_source = ?
-         WHERE status = 'running'",
-    )
-    .bind(offset_ms)
-    .bind(source)
-    .execute(pool)
-    .await?;
+    let r = sqlx::query(CLOCK_DRIFTED)
+        .bind(offset_ms)
+        .bind(source)
+        .execute(pool)
+        .await?;
     Ok(r.rows_affected())
 }
+
+/// [`mark_runs_clock_drifted`]' statement.
+pub(crate) const CLOCK_DRIFTED: &str = "UPDATE workflow_runs
+         SET clock_confidence = 'drifted', clock_offset_ms = ?, clock_source = ?
+         WHERE status = 'running'";
 
 /// `created_at` of the newest run in the datastore (RFC 3339), or `None` on
 /// an empty store — the boot plausibility probe: a clock that reads *earlier*
@@ -5727,7 +8607,7 @@ pub async fn latest_run_created_at(pool: &Pool) -> Result<Option<String>> {
 #[cfg(feature = "ops")]
 pub async fn task_log(pool: &Pool, run_id: &str, task_id: &str) -> Result<Option<String>> {
     let row: Option<(Option<String>,)> =
-        sqlx::query_as("SELECT COALESCE(log, output) FROM task_runs WHERE run_id = ? AND id = ?")
+        sqlx::query_as("SELECT COALESCE(NULLIF(log, ''), output) FROM task_runs WHERE run_id = ? AND id = ?")
             .bind(run_id)
             .bind(task_id)
             .fetch_optional(pool)
@@ -5740,22 +8620,30 @@ pub async fn task_log(pool: &Pool, run_id: &str, task_id: &str) -> Result<Option
 #[cfg(feature = "ops")]
 pub async fn task_logs(pool: &Pool, run_id: &str) -> Result<std::collections::HashMap<String, String>> {
     let rows: Vec<(String, Option<String>)> =
-        sqlx::query_as("SELECT id, COALESCE(log, output) FROM task_runs WHERE run_id = ?")
+        sqlx::query_as("SELECT id, COALESCE(NULLIF(log, ''), output) FROM task_runs WHERE run_id = ?")
             .bind(run_id)
             .fetch_all(pool)
             .await?;
     Ok(rows.into_iter().map(|(id, log)| (id, log.unwrap_or_default())).collect())
 }
 
-/// All task rows of a run, ordered by name. Backs `GET /runs/:id`.
-#[cfg(feature = "ops")]
+/// All task rows of a run, ordered by name. Backs `GET /runs/:id`, and the
+/// engine's fetch ahead of a run's images, in every build.
 pub async fn list_tasks(pool: &Pool, run_id: &str) -> Result<Vec<TaskRun>> {
     let rows = sqlx::query_as::<_, TaskRun>(
+        // The quota columns are never cleared, so they are projected through
+        // the waiting rule: set while the row waits, NULL / 0 on any other.
         "SELECT id, run_id, name, status, attempt, remaining_deps,
                 input, output, claimed_by, lease_expires_at, version,
                 scheduled_at, finished_at, pool, priority, cache_hit,
                 wake_at, wait_url, wait_dataset, sub_run_id,
-                decided_by, decision_comment
+                decided_by, decision_comment, stop_requested_at,
+                CASE WHEN status = 'ready' AND quota_wait_version = version
+                     THEN quota_wait_since END AS quota_wait_since,
+                CASE WHEN status = 'ready' AND quota_wait_version = version
+                     THEN quota_wait_detail END AS quota_wait_detail,
+                CASE WHEN status = 'ready' AND quota_wait_version = version
+                     THEN quota_waits ELSE 0 END AS quota_waits
          FROM task_runs WHERE run_id = ? ORDER BY name",
     )
     .bind(run_id)
@@ -5764,18 +8652,38 @@ pub async fn list_tasks(pool: &Pool, run_id: &str) -> Result<Vec<TaskRun>> {
     Ok(rows)
 }
 
-/// Cancel a still-running run: every non-terminal task → `cancelled`, the run row
-/// → `cancelled`. Idempotent — a second call (or a run already terminal) returns
-/// `false`. Backs `POST /runs/:id/cancel`. A `running` task's lease is also
-/// cleared; if its executor finishes anyway the fence guard in `mark_task_*`
-/// rejects the stale write, so cancellation cannot be clobbered.
+/// Cancel a still-running run. Returns what it did to the run's tasks, or
+/// `None` when there was nothing to cancel (no such run, or one already over).
+/// Backs `POST /runs/:id/cancel`.
+///
+/// **A cancel asks.** A task nothing is running for (`pending`, `ready`,
+/// `awaiting_approval`, or parked) is `cancelled` here. A task a worker holds
+/// is asked to stop (`stop_requested_at`) and stays `running`, with its claim:
+/// its engine sees the request at its next sweep and tells the executor, and
+/// the row becomes `cancelled` when that worker says the work is gone
+/// ([`settle_stopped_task`]). Any other result it reports is not applied.
+///
+/// **The run ends when its work has.** With no task still stopping, that is
+/// now: the run is `cancelled`, its `run.completed` event is written in this
+/// transaction, and the rest of the end-of-run work is owed to that event
+/// (the engine's end-of-run sinks). Otherwise
+/// the run stays `running` with `stopping_as = 'cancelled'`, and all of that
+/// happens in the transaction that settles its last stopping task. Until then
+/// it holds its concurrency key, and no record says it is over.
+///
+/// A `pending` status never posted (`start_pending_at`) is dropped: the end is
+/// what the commit should show. A second cancel of a run still stopping
+/// changes nothing and answers with what is still stopping.
 #[cfg(feature = "ops")]
-pub async fn cancel_run(pool: &Pool, run_id: &str) -> Result<bool> {
+pub async fn cancel_run(pool: &Pool, run_id: &str) -> Result<Option<crate::models::Cancelled>> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = pool.begin().await?;
 
-    let run_rows = sqlx::query(
-        "UPDATE workflow_runs SET status = 'cancelled', finished_at = ?
+    let asked = sqlx::query(
+        "UPDATE workflow_runs
+         SET stopping_as = COALESCE(stopping_as, 'cancelled'),
+             stop_requested_at = COALESCE(stop_requested_at, ?),
+             start_pending_at = NULL
          WHERE id = ? AND status = 'running'",
     )
     .bind(&now)
@@ -5784,64 +8692,479 @@ pub async fn cancel_run(pool: &Pool, run_id: &str) -> Result<bool> {
     .await?
     .rows_affected();
 
-    if run_rows == 0 {
+    if asked == 0 {
         tx.commit().await?;
-        return Ok(false);
+        return Ok(None);
     }
 
-    sqlx::query(
-        "UPDATE task_runs
-         SET status = 'cancelled', finished_at = ?, claimed_by = NULL, lease_expires_at = NULL
-         WHERE run_id = ? AND status IN ('pending', 'ready', 'running', 'awaiting_approval')",
-    )
-    .bind(&now)
-    .bind(run_id)
-    .execute(&mut *tx)
-    .await?;
-
+    let did = stop_run_tasks(&mut tx, run_id, &now).await?;
+    finish_stopped_run(&mut tx, run_id, &now).await?;
     tx.commit().await?;
-    Ok(true)
+    Ok(Some(did))
 }
 
 /// Enforce run-level deadlines (spec `run_timeout_secs`): every `running` run
-/// whose `deadline_at` has passed is marked **failed** (deadline exceeded is an
-/// error, unlike an operator cancel) and its non-terminal tasks are cancelled,
-/// mirroring [`cancel_run`]'s task semantics — leases cleared, and any executor
-/// that finishes anyway is rejected by the fence guard in `mark_task_*`.
-/// Idempotent by construction (the run leaves `running` in the same statement);
-/// safe to call from every scheduler's reconcile tick without leadership.
-/// Returns the ids of runs failed by this sweep.
-pub async fn cancel_overdue_runs(pool: &Pool) -> Result<Vec<String>> {
+/// whose `deadline_at` has passed ends **failed** (deadline exceeded is an
+/// error, unlike an operator cancel), and its tasks are stopped as
+/// [`cancel_run`] stops them: one nothing runs for is `cancelled` here, one a
+/// worker holds is asked to stop. The run is `failed` at once when none is
+/// stopping, and otherwise when the last of them has
+/// (`stopping_as = 'failed'`).
+///
+/// Idempotent by construction (a run it has asked is not asked again), and
+/// safe to call from every scheduler's reconcile tick without leadership. A
+/// run already being cancelled is left to end as cancelled. Returns the runs
+/// whose deadline this sweep acted on, each `(run_id, deadline_at)`.
+///
+/// A run that waits for its workflow's cap is not one of them: its budget is
+/// for what it runs, and is counted from when it is let in
+/// ([`admit_waiting_runs`]).
+pub async fn cancel_overdue_runs(pool: &Pool) -> Result<Vec<(String, String)>> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = pool.begin().await?;
 
-    let overdue: Vec<String> = sqlx::query_scalar(
-        "UPDATE workflow_runs
-         SET status = 'failed', finished_at = ?,
-             output = 'run deadline exceeded (run_timeout_secs)'
-         WHERE status = 'running' AND deadline_at IS NOT NULL AND deadline_at < ?
-         RETURNING id",
-    )
-    .bind(&now)
-    .bind(&now)
-    .fetch_all(&mut *tx)
-    .await?;
-
-    for run_id in &overdue {
-        sqlx::query(
-            "UPDATE task_runs
-             SET status = 'cancelled', finished_at = ?, claimed_by = NULL, lease_expires_at = NULL
-             WHERE run_id = ? AND status IN ('pending', 'ready', 'running', 'awaiting_approval')",
-        )
+    let overdue: Vec<(String, String)> = sqlx::query_as(OVERDUE_RUNS)
         .bind(&now)
-        .bind(run_id)
-        .execute(&mut *tx)
+        .bind(&now)
+        .fetch_all(&mut *tx)
         .await?;
+
+    for (run_id, _) in &overdue {
+        stop_run_tasks(&mut tx, run_id, &now).await?;
+        finish_stopped_run(&mut tx, run_id, &now).await?;
     }
 
     tx.commit().await?;
     Ok(overdue)
 }
+
+/// The deadline sweep's statement ([`cancel_overdue_runs`]).
+pub(crate) const OVERDUE_RUNS: &str = "UPDATE workflow_runs
+         SET stopping_as = 'failed', stop_requested_at = ?, start_pending_at = NULL,
+             output = 'run deadline exceeded (run_timeout_secs)'
+         WHERE status = 'running' AND stopping_as IS NULL
+           AND deadline_at IS NOT NULL AND deadline_at < ?
+           AND (queued_at IS NULL OR admitted_at IS NOT NULL)
+         RETURNING id, deadline_at";
+
+/// Let in the runs that wait for their workflow's cap (`when_full`), where a
+/// run before them has ended: oldest first, as many as the cap has room for.
+/// Returns the ids of the runs let in.
+///
+/// A run is let in by taking away the dependency its tasks were held by
+/// (`create_run`), in the transaction that writes `admitted_at`: its roots
+/// are then `pending` with nothing left to wait for, and the next advance
+/// makes them ready. Their `scheduled_at` is now, so what they then wait for a
+/// worker is counted from here. So is the run's `run_timeout_secs`: its
+/// deadline is moved on by as long as it waited.
+///
+/// The cap is each waiting run's own, read from the definition it was made
+/// with, and a run that cannot be let in stops the ones behind it: runs go in
+/// the order they came. A run being stopped holds its place until its work is
+/// gone, so a run that took another's place waits for that.
+///
+/// One write transaction, which on SQLite is the only writer there is. Reads
+/// a partial index of the runs that wait, which is empty when none does.
+pub async fn admit_waiting_runs(pool: &Pool) -> Result<Vec<String>> {
+    let keys: Vec<(String, Option<String>)> =
+        sqlx::query_as(WAITING_RUN_KEYS).fetch_all(pool).await?;
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut admitted = Vec::new();
+    let mut tx = pool.begin().await?;
+    for (name, key) in &keys {
+        let (in_flight, waiting) = runs_in_flight(&mut tx, name, key.as_deref(), None).await?;
+        let mut running = in_flight - waiting;
+        let next: Vec<(String, String, String, Option<String>)> = sqlx::query_as(ADMISSION_NEXT)
+            .bind(name)
+            .bind(key)
+            .bind(ADMIT_AT_ONCE)
+            .fetch_all(&mut *tx)
+            .await?;
+        let now_dt = chrono::Utc::now();
+        let now = now_dt.to_rfc3339();
+        for (run_id, spec, queued_at, deadline_at) in &next {
+            // A definition with no cap now reads as one that holds nothing
+            // back, which only a row written by hand could be.
+            let cap = crate::dag::DagGraph::stored_max_active_runs(spec).map_or(i64::MAX, i64::from);
+            if running >= cap {
+                break;
+            }
+            let let_in = sqlx::query(
+                "UPDATE workflow_runs SET admitted_at = ?1, deadline_at = ?2
+                 WHERE id = ?3 AND status = 'running' AND stopping_as IS NULL
+                   AND queued_at IS NOT NULL AND admitted_at IS NULL",
+            )
+            .bind(&now)
+            .bind(super::deadline_after_wait(deadline_at.as_deref(), queued_at, now_dt))
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if let_in == 0 {
+                continue;
+            }
+            sqlx::query(
+                "UPDATE task_runs SET remaining_deps = remaining_deps - 1, scheduled_at = ?1
+                 WHERE run_id = ?2 AND status = 'pending' AND remaining_deps > 0",
+            )
+            .bind(&now)
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+            running += 1;
+            admitted.push(run_id.clone());
+        }
+    }
+    tx.commit().await?;
+    Ok(admitted)
+}
+
+/// How many waiting runs of one key a pass of [`admit_waiting_runs`] reads.
+/// More than any cap lets in at once; what is left is the next pass's.
+const ADMIT_AT_ONCE: i64 = 64;
+
+/// [`admit_waiting_runs`]' read of the next runs of one key to let in.
+pub(crate) const ADMISSION_NEXT: &str = "SELECT wr.id, d.spec, wr.queued_at, wr.deadline_at
+             FROM workflow_runs wr
+             JOIN workflow_definitions d ON d.id = wr.definition_id
+             WHERE wr.queued_at IS NOT NULL AND wr.admitted_at IS NULL
+               AND wr.status = 'running' AND wr.stopping_as IS NULL
+               AND d.name = ?1 AND wr.concurrency_key IS ?2
+             ORDER BY wr.queued_at, wr.id
+             LIMIT ?3";
+
+/// The admission sweep's read of the keys that have runs waiting
+/// ([`admit_waiting_runs`]).
+pub(crate) const WAITING_RUN_KEYS: &str = "SELECT DISTINCT d.name, wr.concurrency_key
+         FROM workflow_runs wr
+         JOIN workflow_definitions d ON d.id = wr.definition_id
+         WHERE wr.queued_at IS NOT NULL AND wr.admitted_at IS NULL
+           AND wr.status = 'running' AND wr.stopping_as IS NULL";
+
+/// The read of the stopped runs [`end_stopped_runs`] ends.
+pub(crate) const STRANDED_STOPPED_RUNS: &str = "SELECT id FROM workflow_runs
+         WHERE stopping_as IS NOT NULL AND status = 'running'
+           AND NOT EXISTS (
+               SELECT 1 FROM task_runs t
+               WHERE t.run_id = workflow_runs.id
+                 AND t.status = 'running' AND t.stop_requested_at IS NOT NULL
+           )";
+
+/// End the runs that were asked to stop and have been left with no task
+/// stopping: a sweep, for what the statements that settle a task cannot reach.
+///
+/// A cancel and a settle each end the run in their own transaction, so an
+/// engine of this version never leaves one. An engine from before the stop
+/// request does: it knows nothing of the request, finishes the task under its
+/// claim as it always did (succeeded, failed, or queued for a retry), and ends
+/// no run. With engines of both versions on one datastore, such a run would
+/// read `running` for good.
+///
+/// For each, the stop is applied again (a task that came back to the queue is
+/// cancelled; one a worker has since claimed is asked), a request left on a
+/// task that is over is cleared, and the run ends if nothing is stopping now.
+/// Returns how many runs it ended. Reads a partial index of the runs being
+/// stopped, which is empty when none is.
+pub async fn end_stopped_runs(pool: &Pool) -> Result<u64> {
+    let stranded: Vec<String> = sqlx::query_scalar(STRANDED_STOPPED_RUNS)
+        .fetch_all(pool)
+        .await?;
+
+    let mut ended = 0;
+    for run_id in &stranded {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut tx = pool.begin().await?;
+        stop_run_tasks(&mut tx, run_id, &now).await?;
+        sqlx::query(
+            "UPDATE task_runs SET stop_requested_at = NULL
+             WHERE run_id = ? AND status <> 'running' AND stop_requested_at IS NOT NULL",
+        )
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+        if finish_stopped_run(&mut tx, run_id, &now).await?.is_some() {
+            ended += 1;
+        }
+        tx.commit().await?;
+    }
+    Ok(ended)
+}
+
+/// Stop a run's tasks, for [`cancel_run`] and [`cancel_overdue_runs`]: cancel
+/// those nothing is running for, and ask the ones a worker holds.
+///
+/// A row that is `running` with no claim is parked (a sensor, a sub-workflow,
+/// a deferred job): no worker runs anything for it. One with a claim was
+/// dispatched, and only its worker can say when what it started is gone.
+///
+/// A task that is asked for the first time is given a whole lease from now to
+/// answer in, whatever was left of its own. Its worker is watching it, and may
+/// renew nothing (`TASK_LEASE_HEARTBEAT=false`): without this a task that had
+/// outlived its lease would be claimed for a teardown in the tick that asked
+/// it, ahead of the worker stopping it. A task asked before keeps the lease it
+/// has, which [`release_stopping_task`] may have cut short on purpose.
+async fn stop_run_tasks(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    run_id: &str,
+    now: &str,
+) -> Result<crate::models::Cancelled> {
+    let lease = stop_lease();
+    let cancelled = sqlx::query(
+        "UPDATE task_runs
+         SET status = 'cancelled', finished_at = ?, claimed_by = NULL, lease_expires_at = NULL
+         WHERE run_id = ?
+           AND (status IN ('pending', 'ready', 'awaiting_approval')
+                OR (status = 'running' AND claimed_by IS NULL))",
+    )
+    .bind(now)
+    .bind(run_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    let stopping = sqlx::query(
+        "UPDATE task_runs
+         SET lease_expires_at = CASE WHEN stop_requested_at IS NULL THEN ?3
+                                     ELSE lease_expires_at END,
+             stop_requested_at = COALESCE(stop_requested_at, ?1)
+         WHERE run_id = ?2 AND status = 'running' AND claimed_by IS NOT NULL",
+    )
+    .bind(now)
+    .bind(run_id)
+    .bind(&lease)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(crate::models::Cancelled { cancelled, stopping })
+}
+
+/// When the lease given to a task that is asked to stop runs out: a whole
+/// lease from now (see [`stop_run_tasks`]).
+fn stop_lease() -> String {
+    (chrono::Utc::now() + chrono::TimeDelta::seconds(super::lease_secs())).to_rfc3339()
+}
+
+/// End a run that was asked to stop, once none of its tasks is still stopping:
+/// the status it was to take (`stopping_as`), and its `run.completed` event,
+/// which the rest of the end-of-run work is owed to. Nothing while
+/// a task still is, and nothing for a run that was not asked.
+async fn finish_stopped_run(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    run_id: &str,
+    now: &str,
+) -> Result<Option<String>> {
+    let ended: Option<String> = sqlx::query_scalar(
+        "UPDATE workflow_runs
+         SET status = stopping_as, finished_at = ?1, completion_pending_at = NULL,
+             start_pending_at = NULL, stopping_as = NULL, stop_requested_at = NULL
+         WHERE id = ?2 AND status = 'running' AND stopping_as IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM task_runs
+               WHERE run_id = ?2 AND status = 'running' AND stop_requested_at IS NOT NULL
+           )
+         RETURNING status",
+    )
+    .bind(now)
+    .bind(run_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(status) = &ended {
+        insert_run_completed(tx, run_id, status, now).await?;
+    }
+    Ok(ended)
+}
+
+/// `cancelled`, for a task that was asked to stop and is held under this
+/// claim: its work is gone, or was never started. Ends its run too when it was
+/// the last one stopping ([`finish_stopped_run`]). `false`, and nothing
+/// written, for any other row. SQLite has one writer, so two of these cannot
+/// each miss the other's task, as the Postgres twin must guard against.
+async fn settle_stopping(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task_id: &str,
+    worker_id: &str,
+    fence: i64,
+    now: &str,
+) -> Result<bool> {
+    let run_id: Option<String> = sqlx::query_scalar(
+        "UPDATE task_runs
+         SET status = 'cancelled', finished_at = ?, claimed_by = NULL, lease_expires_at = NULL,
+             stop_requested_at = NULL
+         WHERE id = ? AND claimed_by = ? AND version = ?
+           AND status = 'running' AND stop_requested_at IS NOT NULL
+         RETURNING run_id",
+    )
+    .bind(now)
+    .bind(task_id)
+    .bind(worker_id)
+    .bind(fence)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(run_id) = run_id else {
+        return Ok(false);
+    };
+    finish_stopped_run(tx, &run_id, now).await?;
+    Ok(true)
+}
+
+/// A task that was asked to stop, and whose worker says its work is gone:
+/// `cancelled`, and its run ended if it was the last one stopping. `false`
+/// when the row is not such a task under this claim (it was never asked, or
+/// the claim is another's now): nothing is written.
+pub async fn settle_stopped_task(
+    pool: &Pool,
+    task_id: &str,
+    worker_id: &str,
+    fence: i64,
+) -> Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    let settled = settle_stopping(&mut tx, task_id, worker_id, fence, &now).await?;
+    tx.commit().await?;
+    Ok(settled)
+}
+
+/// A task that was asked to stop, and whose worker could not say its work is
+/// gone: left `running` and asked, with a lease that lapses in `retry_secs`,
+/// so that [`claim_teardowns`] takes it and its work is looked for again.
+/// `false` when the row is not such a task under this claim.
+pub async fn release_stopping_task(
+    pool: &Pool,
+    task_id: &str,
+    worker_id: &str,
+    fence: i64,
+    retry_secs: i64,
+) -> Result<bool> {
+    let retry_at = (chrono::Utc::now() + chrono::TimeDelta::seconds(retry_secs)).to_rfc3339();
+    let rows = sqlx::query(
+        "UPDATE task_runs SET lease_expires_at = ?
+         WHERE id = ? AND claimed_by = ? AND version = ?
+           AND status = 'running' AND stop_requested_at IS NOT NULL",
+    )
+    .bind(&retry_at)
+    .bind(task_id)
+    .bind(worker_id)
+    .bind(fence)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(rows == 1)
+}
+
+/// The teardown claim's read of the stopping tasks whose lease has lapsed
+/// ([`claim_teardowns`]).
+pub(crate) const DUE_TEARDOWNS: &str = "SELECT id, run_id, name, status, attempt, remaining_deps,
+                input, output, claimed_by, lease_expires_at, version,
+                scheduled_at, finished_at, pool, stop_requested_at
+         FROM task_runs
+         WHERE status = 'running' AND stop_requested_at IS NOT NULL
+           AND lease_expires_at IS NOT NULL AND lease_expires_at < ?1
+           AND session_id IS NULL
+           AND (?2 = '' OR instr(?2, ',' || runner_class || ',') > 0)
+         ORDER BY lease_expires_at";
+
+/// Claim tasks that were asked to stop and whose lease has lapsed: the worker
+/// that held them died, or could not see its teardown through. Nobody is
+/// watching their work, so it is looked for again, by a dispatch that only
+/// tears down.
+///
+/// The claim is a new one (`version + 1`), which is what makes everything the
+/// task left a predecessor of this dispatch, and voids a late word from the
+/// worker that held it. No attempt is spent: nothing runs. Returns the rows as
+/// a claim does, with the version from before it. `classes` is the claim's
+/// own filter: a teardown goes to an engine that serves the task's backend.
+///
+/// `held` are the tasks the asking engine still has an execution out for.
+/// They are not claimed: their worker is watching the work, lease or none,
+/// and its word is the one to wait for. Another engine cannot know that, and
+/// has the lease alone to go by.
+pub async fn claim_teardowns(
+    pool: &Pool,
+    worker_id: &str,
+    limit: i64,
+    classes: &[String],
+    held: &[String],
+) -> Result<Vec<TaskRun>> {
+    let class_set = if classes.is_empty() {
+        String::new()
+    } else {
+        format!(",{},", classes.join(","))
+    };
+    let now_dt = chrono::Utc::now();
+    let now = now_dt.to_rfc3339();
+    let lease_exp = (now_dt + chrono::TimeDelta::seconds(super::lease_secs())).to_rfc3339();
+    let mut tx = pool.begin().await?;
+
+    // Every candidate is read and the engine's own are passed over here, not
+    // in the statement: SQLite has no array to bind them as, and the stopping
+    // tasks whose lease has lapsed are few. The limit is applied after.
+    let candidates: Vec<TaskRun> = sqlx::query_as::<_, TaskRun>(DUE_TEARDOWNS)
+        .bind(&now)
+        .bind(&class_set)
+        .fetch_all(&mut *tx)
+        .await?;
+    let candidates = candidates
+        .into_iter()
+        .filter(|task| !held.contains(&task.id))
+        .take(usize::try_from(limit).unwrap_or(0));
+
+    let mut claimed = Vec::new();
+    for task in candidates {
+        let rows = sqlx::query(
+            "UPDATE task_runs
+             SET claimed_by = ?, lease_expires_at = ?, version = version + 1
+             WHERE id = ? AND version = ?
+               AND status = 'running' AND stop_requested_at IS NOT NULL",
+        )
+        .bind(worker_id)
+        .bind(&lease_exp)
+        .bind(&task.id)
+        .bind(task.version)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if rows > 0 {
+            claimed.push(task);
+        }
+    }
+    tx.commit().await?;
+    Ok(claimed)
+}
+
+/// Of the tasks an engine has dispatched (`held`: each id with its fence),
+/// those whose work should stop now: asked to stop, or no longer this
+/// engine's under that claim. The engine asks at every sweep, so a cancel
+/// reaches the work within one, whether or not its worker renews a lease.
+pub async fn tasks_to_stop(
+    pool: &Pool,
+    worker_id: &str,
+    held: &[(String, i64)],
+) -> Result<Vec<String>> {
+    let mut rows = Vec::with_capacity(held.len());
+    // Built rather than bound as one array, as in `live_task_ids`: SQLite has
+    // no array type. In chunks, under its limit on bound values.
+    for chunk in held.chunks(500) {
+        let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, version, claimed_by, status, stop_requested_at \
+               FROM task_runs WHERE id IN ({placeholders})"
+        );
+        let mut q = sqlx::query_as::<_, (String, i64, Option<String>, String, Option<String>)>(&sql);
+        for (id, _) in chunk {
+            q = q.bind(id);
+        }
+        rows.extend(q.fetch_all(pool).await?);
+    }
+    Ok(super::not_held(worker_id, held, rows))
+}
+
+/// The alert sweep's statement ([`fire_deadline_alerts`]).
+pub(crate) const DUE_DEADLINE_ALERTS: &str = "UPDATE workflow_runs SET alert_fired_at = ?
+         WHERE status = 'running' AND alert_deadline_at IS NOT NULL
+           AND alert_deadline_at < ? AND alert_fired_at IS NULL
+         RETURNING id, alert_deadline_at";
 
 /// Emit a soft SLA deadline alert (spec `deadline`) for each still-running run
 /// past its `alert_deadline_at` that hasn't alerted yet (#20). Fire-once and
@@ -5849,23 +9172,19 @@ pub async fn cancel_overdue_runs(pool: &Pool) -> Result<Vec<String>> {
 /// it winner-take-all across schedulers, so each run alerts exactly once. Unlike
 /// the run-timeout sweep this does NOT cancel — it appends a
 /// `run.deadline_exceeded` event to the transactional outbox (drained by the
-/// outbox delivery worker) in the same transaction. Returns the alerted run ids.
-pub async fn fire_deadline_alerts(pool: &Pool) -> Result<Vec<String>> {
+/// outbox delivery worker) in the same transaction. Returns the alerted runs,
+/// each `(run_id, alert_deadline_at)`.
+pub async fn fire_deadline_alerts(pool: &Pool) -> Result<Vec<(String, String)>> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = pool.begin().await?;
 
-    let fired: Vec<String> = sqlx::query_scalar(
-        "UPDATE workflow_runs SET alert_fired_at = ?
-         WHERE status = 'running' AND alert_deadline_at IS NOT NULL
-           AND alert_deadline_at < ? AND alert_fired_at IS NULL
-         RETURNING id",
-    )
-    .bind(&now)
-    .bind(&now)
-    .fetch_all(&mut *tx)
-    .await?;
+    let fired: Vec<(String, String)> = sqlx::query_as(DUE_DEADLINE_ALERTS)
+        .bind(&now)
+        .bind(&now)
+        .fetch_all(&mut *tx)
+        .await?;
 
-    for run_id in &fired {
+    for (run_id, _) in &fired {
         let payload = serde_json::json!({ "run_id": run_id, "reason": "deadline_exceeded" }).to_string();
         sqlx::query(
             "INSERT INTO event_outbox
@@ -5886,35 +9205,149 @@ pub async fn fire_deadline_alerts(pool: &Pool) -> Result<Vec<String>> {
 }
 
 /// Run- and task-count gauges grouped by status, read straight from the
-/// datastore for the `/metrics` endpoint.
+/// datastore: [`status_counts_live`] and [`status_counts_history`] in one.
 #[cfg(feature = "ops")]
 pub async fn status_counts(pool: &Pool) -> Result<crate::models::MetricsSnapshot> {
-    let runs: Vec<(String, i64)> =
-        sqlx::query_as("SELECT status, COUNT(*) FROM workflow_runs GROUP BY status")
-            .fetch_all(pool)
-            .await?;
-    let tasks: Vec<(String, i64)> =
-        sqlx::query_as("SELECT status, COUNT(*) FROM task_runs GROUP BY status")
-            .fetch_all(pool)
-            .await?;
-    let dead_letters: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM dead_letters").fetch_one(pool).await?;
-    // Per-workflow views. Each is bounded by something other than the size of
-    // the run history: a time window, the non-terminal task set, the parked
-    // dead letters.
+    let live = status_counts_live(pool).await?;
+    Ok(live.with_history(&status_counts_history(pool).await?, 0.0))
+}
+
+/// The `/metrics` gauges of the runs and tasks that have finished, by status,
+/// and of the runs of the last 24 hours that have: what grows
+/// with every run, read apart from the rest and cached longer. `NOT IN` the
+/// statuses [`status_counts_live`] reads, so a status added later is still
+/// counted.
+#[cfg(feature = "ops")]
+pub async fn status_counts_history(pool: &Pool) -> Result<crate::models::MetricsHistory> {
+    let finished = status_counts_finished(pool).await?;
+    Ok(crate::models::MetricsHistory {
+        recent_runs: recent_runs(pool, false).await?,
+        ..finished
+    })
+}
+
+/// The runs of the last [`crate::models::RECENT_RUNS_WINDOW_SECS`] by
+/// workflow, environment and status: those that have not finished where
+/// `unfinished`, and the rest where not. Bounded by a time window, not by the
+/// size of the run history, but a join of two tables that grow with it: the
+/// finished are read with the history, and those that have not for a scrape.
+#[cfg(feature = "ops")]
+async fn recent_runs(pool: &Pool, unfinished: bool) -> Result<Vec<crate::models::RecentRuns>> {
     let since = (chrono::Utc::now()
         - chrono::TimeDelta::seconds(crate::models::RECENT_RUNS_WINDOW_SECS))
     .to_rfc3339();
-    let recent: Vec<(String, Option<String>, String, i64)> = sqlx::query_as(
+    let recent: Vec<(String, Option<String>, String, i64)> =
+        sqlx::query_as(&recent_runs_sql(unfinished))
+            .bind(&since)
+            .fetch_all(pool)
+            .await?;
+    Ok(recent
+        .into_iter()
+        .map(
+            |(workflow, environment, status, count)| crate::models::RecentRuns {
+                workflow,
+                environment,
+                status,
+                count,
+            },
+        )
+        .collect())
+}
+
+/// [`recent_runs`]' read. Of the unfinished, it carries
+/// idx_workflow_runs_live's WHERE word for word (migrations/078).
+#[cfg(feature = "ops")]
+pub(crate) fn recent_runs_sql(unfinished: bool) -> String {
+    format!(
         "SELECT wd.name, wr.environment, wr.status, COUNT(*)
          FROM workflow_runs wr
          JOIN workflow_definitions wd ON wd.id = wr.definition_id
-         WHERE wr.created_at >= ?
+         WHERE wr.status {} ({}) AND wr.created_at >= ?
          GROUP BY wd.name, wr.environment, wr.status",
+        if unfinished { "IN" } else { "NOT IN" },
+        super::sql_list(&crate::models::LIVE_RUN_STATUSES)
     )
-    .bind(&since)
+}
+
+/// Of [`status_counts_history`], the runs and tasks that have finished, by
+/// status, alone: all dagron-api's `GET /api/metrics` serves of the history.
+#[cfg(feature = "ops")]
+pub async fn status_counts_finished(pool: &Pool) -> Result<crate::models::MetricsHistory> {
+    let runs: Vec<(String, i64)> = sqlx::query_as(&finished_runs_by_status_sql())
+        .fetch_all(pool)
+        .await?;
+    let tasks: Vec<(String, i64)> = sqlx::query_as(&format!(
+        "SELECT status, COUNT(*) FROM task_runs WHERE status NOT IN ({}) GROUP BY status",
+        super::sql_list(&crate::models::LIVE_TASK_STATUSES)
+    ))
     .fetch_all(pool)
     .await?;
+    Ok(crate::models::MetricsHistory {
+        runs_by_status: runs,
+        tasks_by_status: tasks,
+        recent_runs: Vec::new(),
+    })
+}
+
+/// [`status_counts_finished`]' read of the runs.
+#[cfg(feature = "ops")]
+pub(crate) fn finished_runs_by_status_sql() -> String {
+    format!(
+        "SELECT status, COUNT(*) FROM workflow_runs WHERE status NOT IN ({}) GROUP BY status",
+        super::sql_list(&crate::models::LIVE_RUN_STATUSES)
+    )
+}
+
+/// Of [`status_counts_live`], the runs and tasks that have not finished, by
+/// status, and the dead letters, alone: all dagron-api's `GET /api/metrics`
+/// serves of what has not finished. Three reads, where the whole is nine.
+#[cfg(feature = "ops")]
+pub async fn status_counts_unfinished(pool: &Pool) -> Result<crate::models::MetricsSnapshot> {
+    let runs: Vec<(String, i64)> = sqlx::query_as(&live_runs_by_status_sql())
+        .fetch_all(pool)
+        .await?;
+    let tasks: Vec<(String, i64)> = sqlx::query_as(&format!(
+        "SELECT status, COUNT(*) FROM task_runs WHERE status IN ({}) GROUP BY status",
+        super::sql_list(&crate::models::LIVE_TASK_STATUSES)
+    ))
+    .fetch_all(pool)
+    .await?;
+    let dead_letters: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dead_letters")
+        .fetch_one(pool)
+        .await?;
+    Ok(crate::models::MetricsSnapshot {
+        runs_by_status: runs,
+        tasks_by_status: tasks,
+        dead_letters,
+        ..Default::default()
+    })
+}
+
+/// [`status_counts_unfinished`]' read of the runs. It carries
+/// idx_workflow_runs_live's WHERE word for word (migrations/078).
+#[cfg(feature = "ops")]
+pub(crate) fn live_runs_by_status_sql() -> String {
+    format!(
+        "SELECT status, COUNT(*) FROM workflow_runs WHERE status IN ({}) GROUP BY status",
+        super::sql_list(&crate::models::LIVE_RUN_STATUSES)
+    )
+}
+
+/// The runs-waiting gauge's read ([`status_counts_live`]), of
+/// idx_workflow_runs_waiting.
+#[cfg(feature = "ops")]
+pub(crate) const RUNS_WAITING: &str = "SELECT COUNT(*), MIN(queued_at) FROM workflow_runs
+         WHERE queued_at IS NOT NULL AND admitted_at IS NULL AND status = 'running'";
+
+/// The `/metrics` gauges of what has not finished: runs and
+/// tasks in the statuses of work still to do, by status; the dead letters;
+/// the recent runs still to end; and the rest of the snapshot, each bounded
+/// by what is waiting, not by what has run. Read for a scrape.
+#[cfg(feature = "ops")]
+pub async fn status_counts_live(pool: &Pool) -> Result<crate::models::MetricsSnapshot> {
+    let unfinished = status_counts_unfinished(pool).await?;
+    // Per-workflow views. Each is bounded by something other than the size of
+    // the run history: the non-terminal task set, the parked dead letters.
     let active_tasks: Vec<(String, String, i64)> = sqlx::query_as(
         "SELECT wd.name, tr.status, COUNT(*)
          FROM task_runs tr
@@ -5930,20 +9363,14 @@ pub async fn status_counts(pool: &Pool) -> Result<crate::models::MetricsSnapshot
     )
     .fetch_all(pool)
     .await?;
+    let quota = quota_wait_stats(pool).await?;
+    let sweeps = log_sweeps_waiting(pool).await?;
+    // The partial index of the runs that wait, which is empty when none does.
+    let (runs_waiting, runs_waiting_oldest_since): (i64, Option<String>) =
+        sqlx::query_as(RUNS_WAITING).fetch_one(pool).await?;
     Ok(crate::models::MetricsSnapshot {
-        runs_by_status: runs,
-        tasks_by_status: tasks,
-        dead_letters,
         ready_by_class: ready_backlog_by_class(pool).await?,
-        recent_runs: recent
-            .into_iter()
-            .map(|(workflow, environment, status, count)| crate::models::RecentRuns {
-                workflow,
-                environment,
-                status,
-                count,
-            })
-            .collect(),
+        recent_runs: recent_runs(pool, true).await?,
         active_tasks,
         dead_letters_by_source: by_source
             .into_iter()
@@ -5953,6 +9380,15 @@ pub async fn status_counts(pool: &Pool) -> Result<crate::models::MetricsSnapshot
                 oldest_first_seen_at,
             })
             .collect(),
+        quota_waiting: quota.waiting,
+        quota_wait_oldest_since: quota.oldest_since,
+        runs_waiting,
+        runs_waiting_oldest_since,
+        log_sweeps_waiting: sweeps.waiting,
+        log_sweeps_failing: sweeps.failing,
+        log_sweeps_oldest_marked_at: sweeps.oldest_marked_at,
+        history_age_secs: 0.0,
+        ..unfinished
     })
 }
 
@@ -6032,16 +9468,11 @@ pub async fn archivable_runs(
     cutoff: &str,
     limit: i64,
 ) -> Result<Vec<(String, serde_json::Value)>> {
-    let ids: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM workflow_runs
-         WHERE status IN ('succeeded','failed','cancelled')
-           AND finished_at IS NOT NULL AND finished_at < ?
-         ORDER BY finished_at LIMIT ?",
-    )
-    .bind(cutoff)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+    let ids: Vec<String> = sqlx::query_scalar(ARCHIVABLE_RUNS)
+        .bind(cutoff)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
 
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
@@ -6054,6 +9485,13 @@ pub async fn archivable_runs(
     }
     Ok(out)
 }
+
+/// [`archivable_runs`]' read of the runs to archive.
+#[cfg(feature = "ops")]
+pub(crate) const ARCHIVABLE_RUNS: &str = "SELECT id FROM workflow_runs
+         WHERE status IN ('succeeded','failed','cancelled')
+           AND finished_at IS NOT NULL AND finished_at < ?
+         ORDER BY finished_at LIMIT ?";
 
 /// Build one run's `dagron.run-archive.v1` document — run + definition + tasks
 /// + outbox events, the self-contained record the sink stores.
@@ -6223,59 +9661,16 @@ pub async fn purge_runs_by_id(pool: &Pool, run_ids: &[String]) -> Result<u64> {
 #[cfg(feature = "ops")]
 pub async fn gc_old_runs(pool: &Pool, cutoff: &str) -> Result<u64> {
     let mut tx = pool.begin().await?;
-
-    // A run whose tasks still owe a remote teardown is NOT collectable. Deleting
-    // it drops the only record of a job still running on someone's cluster, and
-    // turns the visible leak the orphan counter exists to advertise into a
-    // silent one. The debt settles itself — the teardown sweep gives up after
-    // its bound and NULLs the handle — so this only ever defers collection by
-    // that window, which is far inside any sane GC cutoff.
-    const OWES_TEARDOWN: &str = "EXISTS (
-             SELECT 1 FROM task_runs owing
-             WHERE owing.run_id = wr.id AND owing.external_handle IS NOT NULL
-         )";
+    let [deps, tasks, runs] = gc_old_runs_sql();
 
     // Children first to respect the FK edges (dependencies → tasks → run).
-    sqlx::query(&format!(
-        "DELETE FROM task_dependencies
-         WHERE dependent_id IN (
-             SELECT tr.id FROM task_runs tr
-             JOIN workflow_runs wr ON wr.id = tr.run_id
-             WHERE wr.status IN ('succeeded','failed','cancelled')
-               AND wr.finished_at IS NOT NULL AND wr.finished_at < ?
-               AND NOT {OWES_TEARDOWN}
-         )"
-    ))
-    .bind(cutoff)
-    .execute(&mut *tx)
-    .await?;
-
-    sqlx::query(&format!(
-        "DELETE FROM task_runs
-         WHERE run_id IN (
-             SELECT wr.id FROM workflow_runs wr
-             WHERE wr.status IN ('succeeded','failed','cancelled')
-               AND wr.finished_at IS NOT NULL AND wr.finished_at < ?
-               AND NOT {OWES_TEARDOWN}
-         )"
-    ))
-    .bind(cutoff)
-    .execute(&mut *tx)
-    .await?;
-
-    let deleted = sqlx::query(&format!(
-        "DELETE FROM workflow_runs
-         WHERE id IN (
-             SELECT wr.id FROM workflow_runs wr
-             WHERE wr.status IN ('succeeded','failed','cancelled')
-               AND wr.finished_at IS NOT NULL AND wr.finished_at < ?
-               AND NOT {OWES_TEARDOWN}
-         )"
-    ))
-    .bind(cutoff)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
+    sqlx::query(&deps).bind(cutoff).execute(&mut *tx).await?;
+    sqlx::query(&tasks).bind(cutoff).execute(&mut *tx).await?;
+    let deleted = sqlx::query(&runs)
+        .bind(cutoff)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
 
     // Drop definitions no run references any more.
     sqlx::query(
@@ -6287,6 +9682,89 @@ pub async fn gc_old_runs(pool: &Pool, cutoff: &str) -> Result<u64> {
 
     tx.commit().await?;
     Ok(deleted)
+}
+
+/// [`gc_old_runs`]' three deletes: the dependencies, the tasks and the runs.
+#[cfg(feature = "ops")]
+pub(crate) fn gc_old_runs_sql() -> [String; 3] {
+    // A run whose tasks still owe a remote teardown is NOT collectable. Deleting
+    // it drops the only record of a job still running on someone's cluster, and
+    // turns the visible leak the orphan counter exists to advertise into a
+    // silent one. The debt settles itself — the teardown sweep gives up after
+    // its bound and NULLs the handle — so this only ever defers collection by
+    // that window, which is far inside any sane GC cutoff.
+    const OWES_TEARDOWN: &str = "EXISTS (
+             SELECT 1 FROM task_runs owing
+             WHERE owing.run_id = wr.id AND owing.external_handle IS NOT NULL
+         )";
+    [
+        format!(
+            "DELETE FROM task_dependencies
+         WHERE dependent_id IN (
+             SELECT tr.id FROM task_runs tr
+             JOIN workflow_runs wr ON wr.id = tr.run_id
+             WHERE wr.status IN ('succeeded','failed','cancelled')
+               AND wr.finished_at IS NOT NULL AND wr.finished_at < ?
+               AND NOT {OWES_TEARDOWN}
+         )"
+        ),
+        format!(
+            "DELETE FROM task_runs
+         WHERE run_id IN (
+             SELECT wr.id FROM workflow_runs wr
+             WHERE wr.status IN ('succeeded','failed','cancelled')
+               AND wr.finished_at IS NOT NULL AND wr.finished_at < ?
+               AND NOT {OWES_TEARDOWN}
+         )"
+        ),
+        format!(
+            "DELETE FROM workflow_runs
+         WHERE id IN (
+             SELECT wr.id FROM workflow_runs wr
+             WHERE wr.status IN ('succeeded','failed','cancelled')
+               AND wr.finished_at IS NOT NULL AND wr.finished_at < ?
+               AND NOT {OWES_TEARDOWN}
+         )"
+        ),
+    ]
+}
+
+// ── Sweep slots ────────────────────────────────────────────────────────────────
+//
+// SQLite is one engine (dagron-api only opens the same file), so every sweep
+// is its own and there is no table of slots to write a tick: Postgres's
+// shares a sweep among the engines of one installation.
+
+/// Every sweep asked for is this engine's: each slot at turn 0, with no
+/// cursor, which tells the engine to keep its own.
+pub async fn claim_sweep_slots(
+    _pool: &Pool,
+    _holder: &str,
+    sweeps: &[(&str, f64)],
+) -> Result<Vec<super::SweepSlot>> {
+    Ok(sweeps
+        .iter()
+        .map(|(name, _)| super::SweepSlot {
+            name: name.to_string(),
+            turn: 0,
+            cursor: None,
+        })
+        .collect())
+}
+
+/// Nothing to write: the engine keeps its own cursor.
+pub async fn set_sweep_cursor(
+    _pool: &Pool,
+    _name: &str,
+    _turn: i64,
+    _cursor: Option<&str>,
+) -> Result<bool> {
+    Ok(false)
+}
+
+/// Nothing to hand back: the engine takes its next batch on its next tick.
+pub async fn hand_back_sweep_slot(_pool: &Pool, _name: &str, _turn: i64) -> Result<bool> {
+    Ok(false)
 }
 
 // ── v5 leadership singleton ─────────────────────────────────────────────────
@@ -6330,23 +9808,259 @@ pub async fn try_acquire_leadership(
     Ok(rows > 0)
 }
 
-/// Reconcile-loop waker.
-///
-/// SQLite has no `LISTEN/NOTIFY`, so the wake strategy is a plain fixed-interval
-/// timer. The Postgres backend swaps this for an event-driven listener that wakes
-/// the loop the instant any worker changes task readiness (see `db::postgres`).
-pub struct Waker;
+/// Reconcile-loop waker. SQLite has no `LISTEN/NOTIFY`: the file's triggers
+/// (migrations/079) write each run a change may have ended to `run_wakes`,
+/// and this takes them. The loop still sleeps a fixed interval between
+/// ticks.
+pub struct Waker {
+    pool: Pool,
+    /// Whether the first take has emptied `run_wakes` (see [`Self::take_woken`]).
+    started: bool,
+    /// While takes fail: when that was last logged, and the failures since.
+    failing: Option<(std::time::Instant, u64)>,
+}
+
+/// The most runs one take names, as Postgres' `MAX_NAMED_RUNS`; the rest
+/// are the next tick's.
+const MAX_NAMED_RUNS: i64 = 4096;
+
+/// While takes keep failing, how often that is logged again: a take is
+/// tried every tick, twice a second by default.
+const TAKE_FAILED_WARN_EVERY: Duration = Duration::from_secs(60);
 
 impl Waker {
-    pub async fn connect(_pool: &Pool) -> Result<Self> {
-        Ok(Self)
+    pub async fn connect(pool: &Pool) -> Result<Self> {
+        Ok(Self {
+            pool: pool.clone(),
+            started: false,
+            failing: None,
+        })
     }
 
-    /// Sleep for the full poll interval — there is no early-wake source.
-    pub async fn wait(&mut self, interval: Duration) -> Result<()> {
-        tokio::time::sleep(interval).await;
-        Ok(())
+    /// A take that failed says `All`. It is logged when takes begin to fail,
+    /// and then at most once each [`TAKE_FAILED_WARN_EVERY`] while they go on
+    /// failing, with how many failed since; [`Self::took`] says when they
+    /// recover.
+    fn failed(&mut self, what: &str, e: &sqlx::Error) -> super::Woken {
+        let now = std::time::Instant::now();
+        match &mut self.failing {
+            None => {
+                tracing::warn!(error = %e, "{what}: each tick reaps every running run until a take succeeds");
+                self.failing = Some((now, 0));
+            }
+            Some((logged, since)) if now.duration_since(*logged) >= TAKE_FAILED_WARN_EVERY => {
+                tracing::warn!(error = %e, failed = *since + 1, "{what}: still failing");
+                *logged = now;
+                *since = 0;
+            }
+            Some((_, since)) => *since += 1,
+        }
+        super::Woken::All
     }
+
+    /// A take that succeeded, after some that failed.
+    fn took(&mut self) {
+        if self.failing.take().is_some() {
+            tracing::info!("run_wakes taken again");
+        }
+    }
+
+    /// Sleep for the full poll interval — there is no early-wake source. The
+    /// count is of notifications taken, as the Postgres waker returns it, and
+    /// here is always 0.
+    pub async fn wait(&mut self, interval: Duration) -> Result<usize> {
+        tokio::time::sleep(interval).await;
+        Ok(0)
+    }
+
+    /// The runs the file says may have ended since the last take.
+    ///
+    /// The first take empties `run_wakes` and says `All`: what a crash between
+    /// a take and the end it led to left, and what an engine from before 079
+    /// never took, are then looked at with every other running run. A take
+    /// that finds nothing writes nothing: an EXISTS is a read under WAL, where
+    /// a DELETE would take the write lock each idle tick, beside dagron-api.
+    /// The rows are deleted as they are taken. A wake written after the take
+    /// is a new row, the next tick's. A reap that fails after a take ends the
+    /// loop (its `?`), and the restart's `All` covers what was taken. An error
+    /// here says `All`, as a Postgres waker that lost its connection does; the
+    /// rows it could not take stay for the next. Errors that go on are logged
+    /// once a minute, not each tick ([`Self::failed`]).
+    pub async fn take_woken(&mut self) -> super::Woken {
+        if !self.started {
+            return match sqlx::query("DELETE FROM run_wakes")
+                .execute(&self.pool)
+                .await
+            {
+                Ok(_) => {
+                    self.started = true;
+                    self.took();
+                    super::Woken::All
+                }
+                Err(e) => self.failed("could not empty run_wakes", &e),
+            };
+        }
+        let any: std::result::Result<bool, sqlx::Error> =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM run_wakes)")
+                .fetch_one(&self.pool)
+                .await;
+        match any {
+            Ok(false) => {
+                self.took();
+                return super::Woken::Runs(Vec::new());
+            }
+            Ok(true) => {}
+            Err(e) => return self.failed("could not read run_wakes", &e),
+        }
+        match sqlx::query_scalar::<_, String>(
+            "DELETE FROM run_wakes
+              WHERE run_id IN (SELECT run_id FROM run_wakes LIMIT ?1)
+              RETURNING run_id",
+        )
+        .bind(MAX_NAMED_RUNS)
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(ids) => {
+                self.took();
+                super::Woken::Runs(ids)
+            }
+            Err(e) => self.failed("could not take run_wakes", &e),
+        }
+    }
+}
+
+/// How many changes behind the newest a reader of `run_changes` may be and
+/// still find every change it has not read: migrations/081 takes away, each
+/// 1,024th change, the rows this many changes or more behind it.
+#[cfg(feature = "ops")]
+pub const RUN_CHANGES_KEPT: i64 = 65_536;
+
+/// What [`run_changes_after`] found past a cursor.
+#[cfg(feature = "ops")]
+#[derive(Debug, PartialEq, Eq)]
+pub enum RunChanges {
+    /// The changes past it, oldest first, each its `seq` and its run: as
+    /// many as were asked for at most, and more may follow.
+    Since(Vec<(i64, String)>),
+    /// The cursor is more than [`RUN_CHANGES_KEPT`] changes behind the
+    /// newest, `newest`, so rows past it may be gone; or past it, as when
+    /// the file was put back from an older copy, so changes it has not read
+    /// may be numbered below it. Read every live run again
+    /// ([`live_stream_runs`]).
+    Behind { newest: i64 },
+}
+
+/// The newest `seq` written to `run_changes`, or 0 where none has been.
+#[cfg(feature = "ops")]
+const RUN_CHANGES_NEWEST: &str =
+    "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'run_changes'), 0)";
+
+/// [`run_changes_after`]'s read of the rows past a cursor: by the rowid.
+#[cfg(feature = "ops")]
+pub(crate) const RUN_CHANGES_SINCE: &str =
+    "SELECT seq, run_id FROM run_changes WHERE seq > ?1 ORDER BY seq LIMIT ?2";
+
+/// The runs a change has touched since `after`, a `seq` this reader has read
+/// up to, at most `limit` of them. The newest `seq` and the rows are read in
+/// one snapshot, so that what is past the cursor is not pruned between the
+/// two. Nothing is written: any number of readers keep their own cursors.
+#[cfg(feature = "ops")]
+pub async fn run_changes_after(pool: &Pool, after: i64, limit: i64) -> Result<RunChanges> {
+    let mut tx = pool.begin().await?;
+    let newest: i64 = sqlx::query_scalar(RUN_CHANGES_NEWEST)
+        .fetch_one(&mut *tx)
+        .await?;
+    let read = if after < newest - RUN_CHANGES_KEPT || after > newest {
+        RunChanges::Behind { newest }
+    } else {
+        RunChanges::Since(
+            sqlx::query_as(RUN_CHANGES_SINCE)
+                .bind(after)
+                .bind(limit)
+                .fetch_all(&mut *tx)
+                .await?,
+        )
+    };
+    tx.commit().await?;
+    Ok(read)
+}
+
+/// Every run a live stream shows: not finished, or finished at `since` or
+/// after; and the newest `seq` of `run_changes` read in the same snapshot,
+/// which a reader then reads past. What a reader reads at its start, and
+/// when it has fallen behind ([`RunChanges::Behind`]): a read of every run
+/// kept, as each read of dagron-api's stream was before 081.
+#[cfg(feature = "ops")]
+pub async fn live_stream_runs(pool: &Pool, since: &str) -> Result<(i64, Vec<String>)> {
+    let mut tx = pool.begin().await?;
+    let newest: i64 = sqlx::query_scalar(RUN_CHANGES_NEWEST)
+        .fetch_one(&mut *tx)
+        .await?;
+    let runs: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM workflow_runs WHERE finished_at IS NULL OR finished_at >= ?1",
+    )
+    .bind(since)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok((newest, runs))
+}
+
+/// The runs a slice of `All` reads at once: as the engine's REAP_SLICE.
+const REAP_ALL_SLICE: i64 = 500;
+
+/// Finalize the runs the waker named. `All` walks every slice of the
+/// reapable runs from the start (at a start, after a take that failed, and
+/// each tick with REAP_INTERVAL_MS=0): it reads the running runs alone,
+/// never the history.
+pub async fn reap_woken(pool: &Pool, woken: &super::Woken) -> Result<Vec<(String, RunStatus)>> {
+    match woken {
+        super::Woken::All => {
+            let mut ended = Vec::new();
+            let mut after: Option<String> = None;
+            loop {
+                let (swept, next) = reap_slice(pool, after.as_deref(), REAP_ALL_SLICE).await?;
+                ended.extend(swept);
+                match next {
+                    Some(n) => after = Some(n),
+                    None => break,
+                }
+            }
+            Ok(ended)
+        }
+        super::Woken::Runs(runs) if runs.is_empty() => Ok(Vec::new()),
+        super::Woken::Runs(runs) => reap(pool, runs).await,
+    }
+}
+
+/// Finalize what is complete among the next `limit` reapable runs after
+/// `after`, in the order of their ids, and say where the next slice starts:
+/// `None` when this one reached the end, so the next begins again. As
+/// Postgres', on idx_workflow_runs_reapable (migrations/079).
+///
+/// The net under [`reap_woken`]: a run whose wake was lost is finalized
+/// when its slice comes round. A slice is bounded, so a pass costs the same
+/// whatever the history holds.
+pub async fn reap_slice(
+    pool: &Pool,
+    after: Option<&str>,
+    limit: i64,
+) -> Result<(Vec<(String, RunStatus)>, Option<String>)> {
+    let runs: Vec<String> = sqlx::query_scalar(&reap_slice_sql())
+        .bind(after.unwrap_or(""))
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    let next = if (runs.len() as i64) < limit {
+        None
+    } else {
+        runs.last().cloned()
+    };
+    if runs.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+    Ok((reap(pool, &runs).await?, next))
 }
 
 #[cfg(test)]
@@ -6359,8 +10073,17 @@ mod tests {
     async fn temp_pool() -> (Pool, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!("module54_test_{}.db", Uuid::new_v4()));
         let pool = init_pool(path.to_str().unwrap()).await.unwrap();
+        // The end-of-run sink [`ends_owed`] reads, configured before any run.
+        register_outbox_sink(&pool, &ENDS).await.unwrap();
         (pool, path)
     }
+
+    /// An end-of-run sink of the tests' own ([`ends_owed`]).
+    const ENDS: crate::db::OutboxSink<'static> = crate::db::OutboxSink {
+        name: "test.ends",
+        event_types: &["run.completed"],
+        adopts_legacy: false,
+    };
 
     /// The whole point of the fencing token: a stale attempt whose lease was
     /// reclaimed (so the row's version moved on) must NOT be able to mark the
@@ -6545,17 +10268,48 @@ mod tests {
         let gang = claim_ready_gang(&pool, "w", 3, &[], &Default::default()).await.unwrap();
         assert_eq!(gang.len(), 3, "all members claimed together");
 
-        // One member fails → siblings cancelled with a fencing version bump.
+        // One member fails. Its siblings are held by a worker: they are asked
+        // to stop, and stay running until that worker says their work is gone.
         let victim = &gang[0];
         mark_task_failed(&pool, &victim.id, "w", victim.version + 1, Some("rank died".into()))
             .await
             .unwrap();
         assert_eq!(cancel_gang_siblings(&pool, &victim.id).await.unwrap(), 2);
-        let sibling = &gang[1];
+        let read = |id: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+                    "SELECT status, stop_requested_at, output FROM task_runs WHERE id = ?",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let (sibling, other) = (&gang[1], &gang[2]);
+        let (status, asked, _) = read(sibling.id.clone()).await;
+        assert_eq!(status, "running", "its work has not stopped yet");
+        assert!(asked.is_some(), "and it has been asked to");
         assert!(
-            !renew_task_lease(&pool, &sibling.id, "w", sibling.version + 1, 30).await.unwrap(),
-            "cancelled sibling's heartbeat is fenced off (aborts its execution)"
+            renew_task_lease(&pool, &sibling.id, "w", sibling.version + 1, 30).await.unwrap(),
+            "its claim holds while its work is being stopped"
         );
+        assert_eq!(
+            tasks_to_stop(&pool, "w", &[(sibling.id.clone(), sibling.version + 1)]).await.unwrap(),
+            [sibling.id.clone()],
+            "its engine is told at its next sweep"
+        );
+        // Whatever it reports now, it is cancelled; and so is the other, on
+        // its worker's word.
+        assert!(!mark_task_succeeded(&pool, &sibling.id, "w", sibling.version + 1, None).await.unwrap());
+        assert!(settle_stopped_task(&pool, &other.id, "w", other.version + 1).await.unwrap());
+        for id in [&sibling.id, &other.id] {
+            let (status, asked, output) = read(id.clone()).await;
+            assert_eq!(status, "cancelled");
+            assert_eq!(asked, None);
+            assert_eq!(output.as_deref(), Some("cancelled: gang member failed"));
+        }
 
         pool.close().await;
         let _ = std::fs::remove_file(&path);
@@ -6865,11 +10619,14 @@ mod tests {
 
         // Lease recovery leaves it alone; a still-running child resolves nothing.
         recover_expired_leases(&pool).await.unwrap();
-        assert!(reconcile_subworkflows(&pool).await.unwrap().is_empty(), "child still running → no resolution");
+        assert!(
+            reconcile_subworkflows(&pool).await.unwrap().done.is_empty(),
+            "child still running → no resolution"
+        );
 
         // Child succeeds → the trigger resolves succeeded and `down` advances.
         sqlx::query("UPDATE workflow_runs SET status='succeeded' WHERE id = ?").bind(&child_run).execute(&pool).await.unwrap();
-        let resolved = reconcile_subworkflows(&pool).await.unwrap();
+        let resolved = reconcile_subworkflows(&pool).await.unwrap().done;
         assert_eq!(resolved, vec![(trigger.id.clone(), true)]);
         advance_ready_tasks(&pool).await.unwrap();
         let down: (String,) = sqlx::query_as("SELECT status FROM task_runs WHERE name='down' AND run_id = ?")
@@ -6923,7 +10680,7 @@ mod tests {
 
         // Not a resolution — the loop continues, so nothing is reported.
         assert!(
-            reconcile_subworkflows(&pool).await.unwrap().is_empty(),
+            reconcile_subworkflows(&pool).await.unwrap().done.is_empty(),
             "a continuing iteration is not a resolution"
         );
 
@@ -6954,7 +10711,7 @@ mod tests {
             .bind(&child2).execute(&pool).await.unwrap();
 
         assert_eq!(
-            reconcile_subworkflows(&pool).await.unwrap(),
+            reconcile_subworkflows(&pool).await.unwrap().done,
             vec![(trigger_id.clone(), true)],
             "the condition holds — now it is a resolution"
         );
@@ -6990,7 +10747,7 @@ mod tests {
             .bind(&child).execute(&pool).await.unwrap();
 
         assert_eq!(
-            reconcile_subworkflows(&pool).await.unwrap(),
+            reconcile_subworkflows(&pool).await.unwrap().done,
             vec![(trigger.id.clone(), false)],
             "the only iteration allowed did not converge"
         );
@@ -7029,7 +10786,7 @@ mod tests {
             .bind(&child).execute(&pool).await.unwrap();
 
         assert_eq!(
-            reconcile_subworkflows(&pool).await.unwrap(),
+            reconcile_subworkflows(&pool).await.unwrap().done,
             vec![(trigger.id.clone(), false)],
             "iterations remained, but a failed turn is not something to repeat"
         );
@@ -7174,7 +10931,7 @@ tasks:
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A sub-workflow's `result_from` result reaches the parent (G-AG5).
+    /// A sub-workflow's `result_from` result reaches the parent.
     ///
     /// Without this a sub-workflow is a procedure, not a function: the run has a
     /// single return value and the parent threw it away for the constant
@@ -7202,7 +10959,7 @@ tasks:
         sqlx::query("UPDATE workflow_runs SET status='succeeded', output='done' WHERE id = ?")
             .bind(&child_run).execute(&pool).await.unwrap();
         assert_eq!(
-            reconcile_subworkflows(&pool).await.unwrap(),
+            reconcile_subworkflows(&pool).await.unwrap().done,
             vec![(trigger.id.clone(), true)]
         );
 
@@ -7243,7 +11000,7 @@ tasks:
         )
         .bind(&child_run).execute(&pool).await.unwrap();
         assert_eq!(
-            reconcile_subworkflows(&pool).await.unwrap(),
+            reconcile_subworkflows(&pool).await.unwrap().done,
             vec![(trigger.id.clone(), false)]
         );
 
@@ -7335,12 +11092,24 @@ tasks:
         assert_eq!(status, "running");
         assert!(lease.is_none());
         recover_expired_leases(&pool).await.unwrap();
-        assert!(reconcile_waits(&pool).await.unwrap().is_empty(), "future deadline → not resolved");
+        assert!(
+            reconcile_waits(&pool).await.unwrap().done.is_empty(),
+            "future deadline → not resolved"
+        );
 
         // Deadline in the past → the sweep resolves it and `down` advances.
         sqlx::query("UPDATE task_runs SET wake_at = '2000-01-01T00:00:00+00:00' WHERE id = ?")
             .bind(&pause.id).execute(&pool).await.unwrap();
-        assert_eq!(reconcile_waits(&pool).await.unwrap(), vec![pause.id.clone()]);
+        assert_eq!(
+            reconcile_waits(&pool)
+                .await
+                .unwrap()
+                .done
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec![pause.id.clone()]
+        );
         advance_ready_tasks(&pool).await.unwrap();
         let down: (String,) = sqlx::query_as("SELECT status FROM task_runs WHERE name='down' AND run_id = ?")
             .bind(&run).fetch_one(&pool).await.unwrap();
@@ -7380,16 +11149,29 @@ tasks:
         assert!(lease.is_none());
         assert!(wake.is_none());
         recover_expired_leases(&pool).await.unwrap();
-        assert!(reconcile_waits(&pool).await.unwrap().is_empty(), "url sensor is not a time sensor");
+        assert!(
+            reconcile_waits(&pool).await.unwrap().done.is_empty(),
+            "url sensor is not a time sensor"
+        );
 
-        // It shows up as due for a poll.
-        let due = due_url_waits(&pool, 32).await.unwrap();
-        assert_eq!(due, vec![(probe.id.clone(), "https://example.com/ready".to_string())]);
+        // It is claimed for a poll, with when it was due.
+        let due = claim_due_url_waits(&pool, 32, 30).await.unwrap();
+        assert_eq!(
+            due,
+            vec![(
+                probe.id.clone(),
+                "https://example.com/ready".to_string(),
+                now.clone()
+            )]
+        );
 
         // A miss re-parks it far in the future → no longer due.
         let future = (chrono::Utc::now() + chrono::TimeDelta::hours(1)).to_rfc3339();
         assert!(repark_url_wait(&pool, &probe.id, &future).await.unwrap());
-        assert!(due_url_waits(&pool, 32).await.unwrap().is_empty(), "re-parked → not due until next_poll_at");
+        assert!(
+            claim_due_url_waits(&pool, 32, 30).await.unwrap().is_empty(),
+            "re-parked → not due until next_poll_at"
+        );
 
         // A hit resolves it (succeeded) and `down` advances.
         assert!(resolve_url_wait(&pool, &probe.id).await.unwrap());
@@ -7463,15 +11245,29 @@ tasks:
         assert!(lease.is_none());
         assert_eq!(cursor, Some(2), "cursor = max event id at park time");
         recover_expired_leases(&pool).await.unwrap();
-        assert!(reconcile_dataset_waits(&pool).await.unwrap().is_empty(), "park-time history never resolves the sensor");
+        assert!(
+            reconcile_dataset_waits(&pool)
+                .await
+                .unwrap()
+                .done
+                .is_empty(),
+            "park-time history never resolves the sensor"
+        );
 
         // A fresh update (external-event flavor) resolves it; `down` advances.
         record_external_dataset_event(&pool, &uri).await.unwrap();
         assert_eq!(
-            reconcile_dataset_waits(&pool).await.unwrap(),
+            reconcile_dataset_waits(&pool).await.unwrap().done,
             vec![(sense.id.clone(), uri.clone())]
         );
-        assert!(reconcile_dataset_waits(&pool).await.unwrap().is_empty(), "second sweep is a no-op");
+        assert!(
+            reconcile_dataset_waits(&pool)
+                .await
+                .unwrap()
+                .done
+                .is_empty(),
+            "second sweep is a no-op"
+        );
         advance_ready_tasks(&pool).await.unwrap();
         let (dstatus,): (String,) =
             sqlx::query_as("SELECT status FROM task_runs WHERE name='down' AND run_id = ?")
@@ -7791,7 +11587,7 @@ tasks:
             .unwrap();
         advance_ready_tasks(&pool).await.unwrap();
 
-        let events = reconcile_fanouts(&pool).await.unwrap();
+        let events = reconcile_fanouts(&pool).await.unwrap().done;
         assert_eq!(
             events[0].1,
             crate::models::FanoutOutcome::Expanded { instances: 3 },
@@ -7852,7 +11648,7 @@ tasks:
 
         // The barrier parks, holding no worker — and must not hold the slot.
         advance_ready_tasks(&pool).await.unwrap();
-        let events = reconcile_fanouts(&pool).await.unwrap();
+        let events = reconcile_fanouts(&pool).await.unwrap().done;
         assert_eq!(events.len(), 1, "the barrier expanded");
 
         let claimed = claim_ready_classes(&pool, "w", 10, &[], &caps).await.unwrap();
@@ -8036,7 +11832,12 @@ tasks:
             .await
             .unwrap();
 
-        let swept = cancel_overdue_runs(&pool).await.unwrap();
+        let swept = cancel_overdue_runs(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
         assert_eq!(swept, vec![overdue_run.clone()]);
 
         let (run_status, run_output): (String, Option<String>) =
@@ -8252,7 +12053,13 @@ tasks:
         let (pool, path) = temp_pool().await;
         let yaml = merged_iac(workflow, only);
         let overrides = std::collections::BTreeMap::from([("promote_through".to_string(), promote_through.to_string())]);
-        let dag = DagGraph::from_yaml_with_params(&yaml, &overrides).expect("the merged example must validate");
+        // Expanding reads DAGRON_MAX_TASKS_PER_RUN, which a fan-out test lowers
+        // to 4 for the process: the examples are larger than that. Held for
+        // the expansion alone, not across an await.
+        let dag = {
+            let _g = crate::env_lock();
+            DagGraph::from_yaml_with_params(&yaml, &overrides).expect("the merged example must validate")
+        };
         let run_id = create_run(&pool, &dag, &yaml).await.unwrap();
         (pool, path, run_id)
     }
@@ -8408,7 +12215,15 @@ tasks:
             .await
             .unwrap();
 
-        assert_eq!(fire_deadline_alerts(&pool).await.unwrap(), vec![run_id.clone()]);
+        assert_eq!(
+            fire_deadline_alerts(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec![run_id.clone()]
+        );
         // The run keeps running (not cancelled/failed).
         let status: String = sqlx::query_scalar("SELECT status FROM workflow_runs WHERE id = ?")
             .bind(&run_id)
@@ -8611,12 +12426,75 @@ task timed out after 5s
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A run its parameters leave no task in (each task's `when:` false for
+    /// them) is ended by the reaper as one with nothing to wait for: it
+    /// succeeds, with its `run.completed` event, where it stayed `running`
+    /// and a caller waiting on it waited for ever. A run with a task still
+    /// to run is not ended by it.
+    #[tokio::test]
+    async fn a_run_its_parameters_leave_no_task_in_succeeds() {
+        let (pool, path) = temp_pool().await;
+        register_outbox_sink(&pool, &crate::db::WEBHOOK_SINK)
+            .await
+            .unwrap();
+        let yaml = "name: tags-only\nparameters: { event: push }\ntasks:\n  \
+            - { name: release, command: [\"true\"], when: \"{{ event }} == tag\" }\n";
+        let dag =
+            DagGraph::from_yaml_with_params(yaml, &std::collections::BTreeMap::new()).unwrap();
+        assert!(dag.spec.tasks.is_empty(), "the when leaves the task out");
+        let empty = create_run(&pool, &dag, yaml).await.unwrap();
+
+        let other = "name: other\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let busy = create_run(&pool, &DagGraph::from_yaml(other).unwrap(), other)
+            .await
+            .unwrap();
+
+        let finalized = reap_completed_runs(&pool).await.unwrap();
+        assert_eq!(finalized.len(), 1, "{finalized:?}");
+        assert_eq!(finalized[0].0, empty);
+        assert!(matches!(finalized[0].1, RunStatus::Succeeded));
+        let status = |id: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>("SELECT status FROM workflow_runs WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(status(empty.clone()).await, "succeeded");
+        assert_eq!(
+            status(busy).await,
+            "running",
+            "a run with a task to run goes on"
+        );
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM event_outbox WHERE run_id = ? AND event_type = 'run.completed'",
+        )
+        .bind(&empty)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(events, 1, "its end is announced as any run's");
+        assert!(
+            reap_completed_runs(&pool).await.unwrap().is_empty(),
+            "ended once"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Transactional outbox: finalizing a run emits exactly one pending
     /// `run.completed` event (atomic with the finalize), and the drain API can
     /// claim → deliver it, after which it is not re-claimed.
     #[tokio::test]
     async fn reap_emits_outbox_event_then_drains() {
         let (pool, path) = temp_pool().await;
+        register_outbox_sink(&pool, &crate::db::WEBHOOK_SINK)
+            .await
+            .unwrap();
         let yaml = "name: ob\ntasks:\n  - name: a\n    command: [\"true\"]\n";
         let dag = DagGraph::from_yaml(yaml).unwrap();
         let run_id = create_run(&pool, &dag, yaml).await.unwrap();
@@ -8640,20 +12518,27 @@ task timed out after 5s
         .unwrap();
         assert_eq!(pending, 1, "finalization emitted exactly one pending event");
 
-        let batch = claim_outbox_batch(&pool, 10, 30).await.unwrap();
+        let batch = claim_outbox_batch(&pool, &crate::db::WEBHOOK_SINK, 10, 30)
+            .await
+            .unwrap();
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].event_type, "run.completed");
         assert_eq!(batch[0].run_id, run_id);
 
         // Leased rows aren't re-claimed within the lease window.
         assert!(
-            claim_outbox_batch(&pool, 10, 30).await.unwrap().is_empty(),
+            claim_outbox_batch(&pool, &crate::db::WEBHOOK_SINK, 10, 30)
+                .await
+                .unwrap()
+                .is_empty(),
             "a leased event is not re-claimed"
         );
 
-        mark_outbox_delivered(&pool, &batch[0].id).await.unwrap();
+        mark_outbox_delivered(&pool, "webhook", &batch[0].id)
+            .await
+            .unwrap();
         let delivered: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM event_outbox WHERE status = 'delivered'")
+            sqlx::query_scalar("SELECT COUNT(*) FROM outbox_deliveries WHERE sink = 'webhook' AND status = 'delivered'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -8672,14 +12557,18 @@ task timed out after 5s
     }
 
     /// cancel_run flips a running run + all its non-terminal tasks to cancelled,
-    /// and is a no-op (false) the second time.
+    /// and is a no-op (`None`) the second time.
     #[tokio::test]
     #[cfg(feature = "ops")]
     async fn cancel_run_is_idempotent() {
         let (pool, path) = temp_pool().await;
         let run_id = seed_run(&pool).await;
 
-        assert!(cancel_run(&pool, &run_id).await.unwrap(), "first cancel succeeds");
+        assert_eq!(
+            cancel_run(&pool, &run_id).await.unwrap(),
+            Some(crate::models::Cancelled { cancelled: 2, stopping: 0 }),
+            "both tasks called off, and neither had started"
+        );
         let run = get_run(&pool, &run_id).await.unwrap().unwrap();
         assert_eq!(run.status.to_string(), "cancelled");
         let tasks = list_tasks(&pool, &run_id).await.unwrap();
@@ -8688,7 +12577,716 @@ task timed out after 5s
             "all tasks cancelled"
         );
 
-        assert!(!cancel_run(&pool, &run_id).await.unwrap(), "second cancel is a no-op");
+        assert_eq!(
+            cancel_run(&pool, &run_id).await.unwrap(),
+            None,
+            "second cancel is a no-op"
+        );
+        assert_eq!(cancel_run(&pool, "no-such-run").await.unwrap(), None);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `seed_run`'s run with its first task claimed by `w`: the run, the task
+    /// and the claim's fence.
+    #[cfg(feature = "ops")]
+    async fn running_run(pool: &Pool) -> (String, TaskRun, i64) {
+        let run_id = seed_run(pool).await;
+        advance_ready_tasks(pool).await.unwrap();
+        let task = claim_ready(pool, "w", 10).await.unwrap().remove(0);
+        let fence = task.version + 1;
+        (run_id, task, fence)
+    }
+
+    /// A task's status and whether it is asked to stop.
+    #[cfg(feature = "ops")]
+    async fn stopping(pool: &Pool, task_id: &str) -> (String, bool) {
+        let (status, asked): (String, Option<String>) =
+            sqlx::query_as("SELECT status, stop_requested_at FROM task_runs WHERE id = ?")
+                .bind(task_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        (status, asked.is_some())
+    }
+
+    /// A cancel asks. The task a worker holds stays running, with its claim,
+    /// until that worker says its work is gone, and the run stays running
+    /// with it: no event, no end-of-run work, nothing that reads as over.
+    /// Then both are cancelled, once. It used to write `cancelled` on both in
+    /// the cancel's own statement, while the container ran on.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_cancel_asks_a_running_task_to_stop_and_the_run_ends_when_it_has() {
+        use crate::models::Cancelled;
+        let (pool, path) = temp_pool().await;
+        let (run_id, task, fence) = running_run(&pool).await;
+
+        assert_eq!(
+            cancel_run(&pool, &run_id).await.unwrap(),
+            Some(Cancelled { cancelled: 1, stopping: 1 }),
+            "the task that had not started is cancelled; the one a worker holds is asked"
+        );
+        let run = get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Running, "its work has not stopped");
+        assert_eq!(run.stopping_as.as_deref(), Some("cancelled"));
+        assert!(run.stop_requested_at.is_some());
+        assert_eq!(run.finished_at, None);
+        let tasks = list_tasks(&pool, &run_id).await.unwrap();
+        let (a, b) = (&tasks[0], &tasks[1]);
+        assert_eq!((a.name.as_str(), a.status.to_string().as_str()), ("a", "running"));
+        assert!(a.stop_requested_at.is_some());
+        assert_eq!(a.claimed_by.as_deref(), Some("w"), "its claim is its worker's still");
+        assert_eq!((b.name.as_str(), b.status.to_string().as_str()), ("b", "cancelled"));
+        assert_eq!(b.stop_requested_at, None);
+        assert!(completed_events(&pool, &run_id).await.is_empty(), "no end is announced");
+        assert!(ends_owed(&pool).await.is_empty());
+
+        // The worker's claim holds, and its engine learns at its next sweep.
+        assert!(renew_task_lease(&pool, &task.id, "w", fence, 30).await.unwrap());
+        assert_eq!(
+            tasks_to_stop(&pool, "w", &[(task.id.clone(), fence)]).await.unwrap(),
+            [task.id.clone()]
+        );
+
+        // A second cancel changes nothing, and says what is still stopping.
+        assert_eq!(
+            cancel_run(&pool, &run_id).await.unwrap(),
+            Some(Cancelled { cancelled: 0, stopping: 1 })
+        );
+        // Only the claim that holds it can say its work is gone.
+        assert!(!settle_stopped_task(&pool, &task.id, "another", fence).await.unwrap());
+        assert!(!settle_stopped_task(&pool, &task.id, "w", fence + 1).await.unwrap());
+        assert_eq!(stopping(&pool, &task.id).await, ("running".into(), true));
+
+        assert!(settle_stopped_task(&pool, &task.id, "w", fence).await.unwrap());
+        assert_eq!(stopping(&pool, &task.id).await, ("cancelled".into(), false));
+        let run = get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Cancelled);
+        assert_eq!((run.stopping_as, run.stop_requested_at), (None, None));
+        assert!(run.finished_at.is_some());
+        assert_eq!(completed_events(&pool, &run_id).await, ["cancelled"]);
+        assert_eq!(
+            ends_owed(&pool).await,
+            vec![(run_id.clone(), RunStatus::Cancelled)]
+        );
+
+        // And once: nothing is left to settle or to cancel.
+        assert!(!settle_stopped_task(&pool, &task.id, "w", fence).await.unwrap());
+        assert_eq!(cancel_run(&pool, &run_id).await.unwrap(), None);
+        assert_eq!(completed_events(&pool, &run_id).await, ["cancelled"]);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A task that was asked to stop takes no other result. One that ends by
+    /// itself first is cancelled where it would have succeeded, failed, been
+    /// queued for a retry or handed back to its queue; and it is not parked.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_task_asked_to_stop_takes_no_other_result() {
+        let (pool, path) = temp_pool().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let (run, t, fence) = running_run(&pool).await;
+        cancel_run(&pool, &run).await.unwrap();
+        assert!(!mark_task_succeeded(&pool, &t.id, "w", fence, Some("done".into())).await.unwrap());
+        assert_eq!(stopping(&pool, &t.id).await, ("cancelled".into(), false));
+        assert_eq!(completed_events(&pool, &run).await, ["cancelled"], "and its run ends with it");
+
+        let (run, t, fence) = running_run(&pool).await;
+        cancel_run(&pool, &run).await.unwrap();
+        assert!(!mark_task_failed(&pool, &t.id, "w", fence, Some("boom".into())).await.unwrap());
+        assert_eq!(stopping(&pool, &t.id).await, ("cancelled".into(), false));
+
+        let (run, t, fence) = running_run(&pool).await;
+        cancel_run(&pool, &run).await.unwrap();
+        assert!(
+            !retry_task(&pool, &t.id, "w", fence, Some("boom".into()), now.clone(), AttemptEnd::Failed)
+                .await
+                .unwrap(),
+            "it does not run again"
+        );
+        assert_eq!(stopping(&pool, &t.id).await, ("cancelled".into(), false));
+
+        let (run, t, fence) = running_run(&pool).await;
+        cancel_run(&pool, &run).await.unwrap();
+        assert_eq!(
+            requeue_quota_wait(&pool, &t.id, "w", fence, "the namespace is full", 3600).await.unwrap(),
+            QuotaRequeue::Stale
+        );
+        assert_eq!(stopping(&pool, &t.id).await, ("cancelled".into(), false));
+        assert_eq!(completed_events(&pool, &run).await, ["cancelled"]);
+
+        // Not parked, and not handed back to be claimed again: it stays as it
+        // is, for its worker or a teardown to settle.
+        let (run, t, fence) = running_run(&pool).await;
+        cancel_run(&pool, &run).await.unwrap();
+        assert!(!park_wait(&pool, &t.id, fence, &now).await.unwrap());
+        assert!(!park_external(&pool, &t.id, fence, "http", "job-1", None, &now, None).await.unwrap());
+        assert!(!release_subworkflow_task(&pool, &t.id, fence).await.unwrap());
+        assert_eq!(stopping(&pool, &t.id).await, ("running".into(), true));
+        assert!(completed_events(&pool, &run).await.is_empty());
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A run past its deadline whose task a worker holds is failed once that
+    /// task has stopped, and is not asked twice. A cancel in between does not
+    /// make it a cancelled run.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_run_past_its_deadline_fails_once_its_running_task_has_stopped() {
+        let (pool, path) = temp_pool().await;
+        let yaml =
+            "name: slow\nrun_timeout_secs: 60\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let run_id = create_run(&pool, &dag, yaml).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+        let task = claim_ready(&pool, "w", 10).await.unwrap().remove(0);
+        let fence = task.version + 1;
+        sqlx::query(
+            "UPDATE workflow_runs SET deadline_at = '2020-01-01T00:00:00+00:00' WHERE id = ?",
+        )
+        .bind(&run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            cancel_overdue_runs(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec![run_id.clone()]
+        );
+        assert!(cancel_overdue_runs(&pool).await.unwrap().is_empty(), "it is asked once");
+        let run = get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Running);
+        assert_eq!(run.stopping_as.as_deref(), Some("failed"));
+        assert_eq!(stopping(&pool, &task.id).await, ("running".into(), true));
+        assert!(completed_events(&pool, &run_id).await.is_empty());
+
+        // A cancel now finds it stopping already, and leaves it to fail.
+        assert_eq!(
+            cancel_run(&pool, &run_id).await.unwrap(),
+            Some(crate::models::Cancelled { cancelled: 0, stopping: 1 })
+        );
+
+        assert!(settle_stopped_task(&pool, &task.id, "w", fence).await.unwrap());
+        let run = get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.output.as_deref(), Some("run deadline exceeded (run_timeout_secs)"));
+        assert_eq!(stopping(&pool, &task.id).await, ("cancelled".into(), false));
+        assert_eq!(completed_events(&pool, &run_id).await, ["failed"]);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A cancelled run holds its concurrency key until its work has stopped:
+    /// the next run of the key is refused while it has, and admitted after.
+    /// The key used to be free from the cancel on, with the old run's
+    /// container still running beside the new one's.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_cancelled_run_holds_its_concurrency_key_until_its_work_has_stopped() {
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: deploy\nmax_active_runs: 1\nconcurrency_key: stack-a\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let first = create_run(&pool, &dag, yaml).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+        let task = claim_ready(&pool, "w", 10).await.unwrap().remove(0);
+
+        cancel_run(&pool, &first).await.unwrap();
+        let refused = create_run(&pool, &dag, yaml).await.unwrap_err();
+        assert!(
+            refused.downcast_ref::<crate::models::MaxActiveRunsReached>().is_some(),
+            "{refused}"
+        );
+
+        assert!(settle_stopped_task(&pool, &task.id, "w", task.version + 1).await.unwrap());
+        create_run(&pool, &dag, yaml).await.expect("the key is free once the work is gone");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A task that is asked to stop is given a whole lease to answer in. One
+    /// that had outlived its lease, as a task may with no lease heartbeat,
+    /// would otherwise be claimed for a teardown in the tick that asked it,
+    /// ahead of the worker that is stopping it. Asked again, it keeps the
+    /// lease it has: one cut short on purpose stays short.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_task_asked_to_stop_is_given_a_lease_to_answer_in() {
+        let (pool, path) = temp_pool().await;
+        let lease = |id: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT lease_expires_at FROM task_runs WHERE id = ?",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .expect("a claimed task has a lease")
+            }
+        };
+        let (run_id, task, fence) = running_run(&pool).await;
+        // It has outlived its lease: nothing renewed it.
+        sqlx::query("UPDATE task_runs SET lease_expires_at = '2020-01-01T00:00:00+00:00' WHERE id = ?")
+            .bind(&task.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let asked_at = chrono::Utc::now().to_rfc3339();
+        cancel_run(&pool, &run_id).await.unwrap();
+        assert!(lease(task.id.clone()).await > asked_at, "a lease from the request on");
+        assert!(
+            claim_teardowns(&pool, "w2", 10, &[], &[]).await.unwrap().is_empty(),
+            "its worker has that long to say the work is gone"
+        );
+        assert!(settle_stopped_task(&pool, &task.id, "w", fence).await.unwrap(), "and its word counts");
+
+        // Cut short because its teardown was not seen through, then asked
+        // again: the lease stays as it was cut.
+        let (run_id, task, fence) = running_run(&pool).await;
+        cancel_run(&pool, &run_id).await.unwrap();
+        assert!(release_stopping_task(&pool, &task.id, "w", fence, -1).await.unwrap());
+        let cut = lease(task.id.clone()).await;
+        cancel_run(&pool, &run_id).await.unwrap();
+        assert_eq!(lease(task.id.clone()).await, cut);
+        assert_eq!(claim_teardowns(&pool, "w2", 10, &[], &[]).await.unwrap().len(), 1);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An engine from before the stop request finishes a task that was asked
+    /// to stop as it always did, and ends no run: the run would read running
+    /// for good. The sweep ends it, clears the request the task still carried,
+    /// and cancels a task such an engine had queued to run again.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_run_an_older_engine_left_with_nothing_stopping_is_ended_by_the_sweep() {
+        let (pool, path) = temp_pool().await;
+
+        // It marks the task succeeded, by a statement that knows no request.
+        let (run_id, task, _) = running_run(&pool).await;
+        cancel_run(&pool, &run_id).await.unwrap();
+        assert_eq!(end_stopped_runs(&pool).await.unwrap(), 0, "a task is still stopping");
+        sqlx::query("UPDATE task_runs SET status = 'succeeded', claimed_by = NULL WHERE id = ?")
+            .bind(&task.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(get_run(&pool, &run_id).await.unwrap().unwrap().status, RunStatus::Running);
+        assert_eq!(end_stopped_runs(&pool).await.unwrap(), 1);
+        assert_eq!(get_run(&pool, &run_id).await.unwrap().unwrap().status, RunStatus::Cancelled);
+        assert_eq!(stopping(&pool, &task.id).await, ("succeeded".into(), false));
+        assert_eq!(completed_events(&pool, &run_id).await, ["cancelled"]);
+        assert_eq!(end_stopped_runs(&pool).await.unwrap(), 0, "once");
+
+        // It queues the task for a retry: that task must not run again.
+        let (run_id, task, _) = running_run(&pool).await;
+        cancel_run(&pool, &run_id).await.unwrap();
+        sqlx::query(
+            "UPDATE task_runs SET status = 'ready', claimed_by = NULL, lease_expires_at = NULL
+             WHERE id = ?",
+        )
+        .bind(&task.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(end_stopped_runs(&pool).await.unwrap(), 1);
+        assert_eq!(stopping(&pool, &task.id).await, ("cancelled".into(), false));
+        assert_eq!(get_run(&pool, &run_id).await.unwrap().unwrap().status, RunStatus::Cancelled);
+        assert!(claim_ready(&pool, "w", 10).await.unwrap().is_empty());
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A stopping task whose lease has lapsed has nobody watching its work:
+    /// its worker died, or could not see its teardown through. It is not run
+    /// again. It is claimed for a teardown alone, under a new claim and with
+    /// no attempt spent, and that claim's word settles it.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_stopping_task_whose_lease_lapsed_is_claimed_for_a_teardown_alone() {
+        let (pool, path) = temp_pool().await;
+        let (run_id, task, fence) = running_run(&pool).await;
+        cancel_run(&pool, &run_id).await.unwrap();
+        assert!(
+            claim_teardowns(&pool, "w2", 10, &[], &[]).await.unwrap().is_empty(),
+            "its worker's lease still holds"
+        );
+
+        // The worker could not see its teardown through: it says so, and its
+        // lease is cut short.
+        assert!(!release_stopping_task(&pool, &task.id, "another", fence, -1).await.unwrap());
+        assert!(release_stopping_task(&pool, &task.id, "w", fence, -1).await.unwrap());
+
+        assert_eq!(recover_expired_leases(&pool).await.unwrap(), 0, "it is not run again");
+        assert!(claim_ready(&pool, "w2", 10).await.unwrap().is_empty());
+        assert!(
+            claim_teardowns(&pool, "w2", 10, &["some-other-class".to_string()], &[])
+                .await
+                .unwrap()
+                .is_empty(),
+            "nor torn down by an engine that does not serve its class"
+        );
+        assert!(
+            claim_teardowns(&pool, "w", 10, &[], &[task.id.clone()]).await.unwrap().is_empty(),
+            "nor by the engine that still has its execution out, whatever its lease says"
+        );
+
+        let torn = claim_teardowns(&pool, "w2", 10, &[], &[]).await.unwrap();
+        assert_eq!(torn.len(), 1);
+        assert_eq!(torn[0].id, task.id);
+        assert_eq!(torn[0].version, fence, "the version from before this claim, as a claim returns");
+        let (attempt, by): (i64, Option<String>) =
+            sqlx::query_as("SELECT attempt, claimed_by FROM task_runs WHERE id = ?")
+                .bind(&task.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((attempt, by.as_deref()), (1, Some("w2")), "no attempt is spent on a teardown");
+        assert!(claim_teardowns(&pool, "w3", 10, &[], &[]).await.unwrap().is_empty(), "one claim");
+
+        // The worker that held it is too late, and the teardown's word counts.
+        assert!(!settle_stopped_task(&pool, &task.id, "w", fence).await.unwrap());
+        assert!(settle_stopped_task(&pool, &task.id, "w2", fence + 1).await.unwrap());
+        assert_eq!(stopping(&pool, &task.id).await, ("cancelled".into(), false));
+        assert_eq!(completed_events(&pool, &run_id).await, ["cancelled"]);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The ends an end-of-run sink is handed now, as `(run, status)` in the
+    /// order they were written, each then done: the work a run's end owes,
+    /// whichever path ended it. It is configured with the database
+    /// (`temp_pool`), so it is handed every end.
+    async fn ends_owed(pool: &Pool) -> Vec<(String, RunStatus)> {
+        let mut out = Vec::new();
+        for ev in claim_outbox_batch(pool, &ENDS, 100, 60).await.unwrap() {
+            let v: serde_json::Value = serde_json::from_str(&ev.payload).unwrap();
+            out.push((
+                ev.run_id.clone(),
+                v["status"].as_str().unwrap().parse().unwrap(),
+            ));
+            mark_outbox_delivered(pool, ENDS.name, &ev.id)
+                .await
+                .unwrap();
+        }
+        out
+    }
+
+    /// The statuses of the `run.completed` events in the outbox for `run_id`,
+    /// oldest first. Each payload must name the run.
+    async fn completed_events(pool: &Pool, run_id: &str) -> Vec<String> {
+        let payloads: Vec<String> = sqlx::query_scalar(
+            "SELECT payload FROM event_outbox WHERE run_id = ? AND event_type = 'run.completed'
+             ORDER BY created_at",
+        )
+        .bind(run_id)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        payloads
+            .iter()
+            .map(|p| {
+                let v: serde_json::Value = serde_json::from_str(p).unwrap();
+                assert_eq!(v["run_id"], run_id, "{p}");
+                v["status"].as_str().unwrap().to_string()
+            })
+            .collect()
+    }
+
+    /// A cancel ends the run fully: one `run.completed` event with
+    /// status `cancelled`, written with the cancel, and its end-of-run work
+    /// owed once to each end-of-run sink. And nothing is stamped for the
+    /// loop to claim (`completion_pending_at`), as a release before 10.7 did. Before this, a cancelled run emitted
+    /// nothing, and a commit status it had set stayed "pending" forever.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_cancelled_run_emits_its_end_once_and_owes_its_end_of_run_work_once() {
+        let (pool, path) = temp_pool().await;
+        let run_id = seed_run(&pool).await;
+        assert!(
+            ends_owed(&pool).await.is_empty(),
+            "a running run owes nothing"
+        );
+
+        assert!(cancel_run(&pool, &run_id).await.unwrap().is_some());
+        assert!(cancel_run(&pool, &run_id).await.unwrap().is_none());
+        assert_eq!(
+            completed_events(&pool, &run_id).await,
+            ["cancelled"],
+            "one event, from the first cancel only"
+        );
+
+        assert_eq!(
+            ends_owed(&pool).await,
+            vec![(run_id.clone(), RunStatus::Cancelled)]
+        );
+        assert!(
+            ends_owed(&pool).await
+                .is_empty(),
+            "claimed once"
+        );
+        assert!(claim_pending_completions(&pool, 10).await.unwrap().is_empty(), "nothing stamped");
+        // The reaper never sees it: it reads running runs only.
+        assert!(reap_completed_runs(&pool).await.unwrap().is_empty());
+        assert_eq!(completed_events(&pool, &run_id).await, ["cancelled"]);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The run_timeout_secs sweep ends a run as a cancel does, with status
+    /// `failed`, which is what the run is.
+    #[tokio::test]
+    async fn a_run_failed_by_its_deadline_emits_its_end_and_owes_its_end_of_run_work() {
+        let (pool, path) = temp_pool().await;
+        let yaml =
+            "name: slow\nrun_timeout_secs: 60\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let run_id = create_run(&pool, &dag, yaml).await.unwrap();
+        assert!(
+            cancel_overdue_runs(&pool).await.unwrap().is_empty(),
+            "not overdue yet"
+        );
+        sqlx::query(
+            "UPDATE workflow_runs SET deadline_at = '2020-01-01T00:00:00+00:00' WHERE id = ?",
+        )
+        .bind(&run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            cancel_overdue_runs(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec![run_id.clone()]
+        );
+        assert!(
+            cancel_overdue_runs(&pool).await.unwrap().is_empty(),
+            "it fails once"
+        );
+        assert_eq!(completed_events(&pool, &run_id).await, ["failed"]);
+        assert_eq!(
+            ends_owed(&pool).await,
+            vec![(run_id.clone(), RunStatus::Failed)]
+        );
+        assert!(ends_owed(&pool).await
+            .is_empty());
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A run the reaper finalizes owes its end to the end-of-run sinks as a
+    /// cancelled one does. And a cancelled run rerun before its end was done
+    /// has each end handed, in turn: the engine does an end only while it is
+    /// still the run's (`run_end::owed`), so the superseded cancel's work
+    /// never runs.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_finished_run_owes_no_claim_and_a_rerun_supersedes_a_pending_end() {
+        let (pool, path) = temp_pool().await;
+        let run_id = seed_run(&pool).await;
+
+        assert!(cancel_run(&pool, &run_id).await.unwrap().is_some());
+        assert!(
+            rerun_from_failed(&pool, &run_id).await.unwrap().is_some(),
+            "re-armed"
+        );
+        assert_eq!(
+            ends_owed(&pool).await,
+            vec![(run_id.clone(), RunStatus::Cancelled)],
+            "handed, while the run is running again"
+        );
+        assert_eq!(
+            run_status(&pool, &run_id).await.unwrap(),
+            Some(RunStatus::Running)
+        );
+
+        for _round in 0..2 {
+            advance_ready_tasks(&pool).await.unwrap();
+            for t in claim_ready(&pool, "w", 10).await.unwrap() {
+                assert!(mark_task_succeeded(&pool, &t.id, "w", t.version + 1, None)
+                    .await
+                    .unwrap());
+            }
+        }
+        assert_eq!(
+            reap_completed_runs(&pool).await.unwrap(),
+            vec![(run_id.clone(), RunStatus::Succeeded)]
+        );
+        assert_eq!(
+            ends_owed(&pool).await,
+            vec![(run_id.clone(), RunStatus::Succeeded)],
+            "the reaper's end is owed like any other"
+        );
+        assert_eq!(
+            completed_events(&pool, &run_id).await,
+            ["cancelled", "succeeded"]
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    const NOTIFY_GIT: &str = "name: ci\n\
+        parameters: { commit_sha: abc }\n\
+        notify:\n  git: { provider: github, repo: acme/etl, sha: \"{{ commit_sha }}\" }\n\
+        tasks:\n  - name: a\n    command: [\"true\"]\n";
+
+    /// A run created with a `notify.git` block owes its commit a `pending`
+    /// status, claimed once; a run without one owes nothing, so the claim
+    /// never touches the runs that cannot use it.
+    #[tokio::test]
+    async fn a_notify_git_run_owes_its_start_once() {
+        let (pool, path) = temp_pool().await;
+        let plain = "name: plain\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        create_run(&pool, &DagGraph::from_yaml(plain).unwrap(), plain)
+            .await
+            .unwrap();
+        let run_id = create_run(&pool, &DagGraph::from_yaml(NOTIFY_GIT).unwrap(), NOTIFY_GIT)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            claim_pending_starts(&pool, 10).await.unwrap(),
+            vec![run_id.clone()]
+        );
+        assert!(
+            claim_pending_starts(&pool, 10).await.unwrap().is_empty(),
+            "announced once"
+        );
+        assert_eq!(
+            run_status(&pool, &run_id).await.unwrap(),
+            Some(RunStatus::Running)
+        );
+        assert_eq!(run_status(&pool, "no-such-run").await.unwrap(), None);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A run that ends before any tick announced its start never gets the
+    /// `pending` status: posted after the end, it would be the status the
+    /// commit shows. Every end clears the stamp: the reaper, a cancel, and the
+    /// deadline sweep.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_run_that_ends_first_is_never_announced() {
+        let (pool, path) = temp_pool().await;
+        let dag = DagGraph::from_yaml(NOTIFY_GIT).unwrap();
+
+        // One the reaper ends,
+        create_run(&pool, &dag, NOTIFY_GIT).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+        for t in claim_ready(&pool, "w", 10).await.unwrap() {
+            assert!(mark_task_succeeded(&pool, &t.id, "w", t.version + 1, None)
+                .await
+                .unwrap());
+        }
+        assert_eq!(reap_completed_runs(&pool).await.unwrap().len(), 1);
+
+        // one a cancel ends,
+        let cancelled = create_run(&pool, &dag, NOTIFY_GIT).await.unwrap();
+        assert!(cancel_run(&pool, &cancelled).await.unwrap().is_some());
+
+        // and one the deadline sweep ends.
+        let overdue = create_run(&pool, &dag, NOTIFY_GIT).await.unwrap();
+        sqlx::query(
+            "UPDATE workflow_runs SET deadline_at = '2020-01-01T00:00:00+00:00' WHERE id = ?",
+        )
+        .bind(&overdue)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            cancel_overdue_runs(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec![overdue.clone()]
+        );
+
+        let stamped: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workflow_runs WHERE start_pending_at IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stamped, 0, "every end cleared its start");
+        assert!(claim_pending_starts(&pool, 10).await.unwrap().is_empty());
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The claim takes at most `limit` runs, oldest stamp first, so a mass
+    /// cancel a release before 10.7 stamped is worked off over several ticks
+    /// rather than in one. Nothing stamps a run now: the stamps are written
+    /// here as that release wrote them.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn the_claim_is_bounded_and_oldest_first() {
+        let (pool, path) = temp_pool().await;
+        let mut runs = Vec::new();
+        for _ in 0..3 {
+            let run_id = seed_run(&pool).await;
+            assert!(cancel_run(&pool, &run_id).await.unwrap().is_some());
+            runs.push(run_id);
+        }
+        // Distinct stamps, oldest first, whatever the clock's resolution.
+        for (i, run_id) in runs.iter().enumerate() {
+            sqlx::query("UPDATE workflow_runs SET completion_pending_at = ? WHERE id = ?")
+                .bind(format!("2026-10-04T00:00:0{i}+00:00"))
+                .bind(run_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let first: Vec<String> = claim_pending_completions(&pool, 2)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(first.len(), 2);
+        assert!(
+            first.contains(&runs[0]) && first.contains(&runs[1]),
+            "{first:?}"
+        );
+        assert_eq!(
+            claim_pending_completions(&pool, 2).await.unwrap(),
+            vec![(runs[2].clone(), RunStatus::Cancelled)]
+        );
+        assert!(claim_pending_completions(&pool, 2)
+            .await
+            .unwrap()
+            .is_empty());
 
         pool.close().await;
         let _ = std::fs::remove_file(&path);
@@ -8947,7 +13545,12 @@ task timed out after 5s
             .execute(&pool)
             .await
             .unwrap();
-        let resolved = resolve_expired_approvals(&pool).await.unwrap();
+        let resolved: Vec<(String, bool)> = resolve_expired_approvals(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(id, approved, _)| (id, approved))
+            .collect();
         assert_eq!(resolved, vec![(gate2.clone(), false)], "default reject");
         let g2 = by_name(&list_tasks(&pool, &run2).await.unwrap());
         assert_eq!(g2["gate"].decided_by.as_deref(), Some("timeout"));
@@ -9227,9 +13830,9 @@ task timed out after 5s
                 .unwrap()
         };
 
-        let err = create_run_from_dead_letter(&pool, &dag, yaml, &id).await.unwrap_err();
+        let err = create_run_from_dead_letter(&pool, &dag, yaml, &id, None).await.unwrap_err();
         assert!(err.downcast_ref::<crate::models::MaxActiveRunsReached>().is_some(), "{err}");
-        let err = create_run_inner_with_floor(&pool, &dag, yaml, None, Some(&id), u64::MAX)
+        let err = create_run_inner_with_floor(&pool, &dag, yaml, None, Some(&id), None, u64::MAX)
             .await
             .unwrap_err();
         assert!(err.downcast_ref::<crate::models::DatastoreLowOnDisk>().is_some(), "{err}");
@@ -9246,7 +13849,7 @@ task timed out after 5s
             .execute(&pool)
             .await
             .unwrap();
-        let run_id = create_run_from_dead_letter(&pool, &dag, yaml, &id)
+        let run_id = create_run_from_dead_letter(&pool, &dag, yaml, &id, None)
             .await
             .unwrap()
             .expect("the row was there to claim");
@@ -9261,8 +13864,291 @@ task timed out after 5s
         .unwrap();
         assert_eq!(spec, yaml, "the run is the parked payload");
 
-        assert!(create_run_from_dead_letter(&pool, &dag, yaml, &id).await.unwrap().is_none());
+        assert!(create_run_from_dead_letter(&pool, &dag, yaml, &id, None)
+            .await
+            .unwrap()
+            .is_none());
         assert_eq!(runs(pool.clone()).await, 2, "a consumed id creates nothing");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A run that is not trusted is confined where it is made
+    /// (`crate::confine`). One that names what it may not use is not made,
+    /// and leaves nothing behind. One that is made has rows without what it
+    /// is not given. A trusted run of the same workflow has all of it.
+    #[tokio::test]
+    async fn a_run_that_is_not_trusted_is_confined_where_it_is_made() {
+        use crate::models::{trigger_kind, RunTrigger};
+        let (pool, path) = temp_pool().await;
+        let fork = RunTrigger {
+            kind: trigger_kind::CI.to_string(),
+            principal: "ci:svc@example.com".to_string(),
+            trust: Some("untrusted".to_string()),
+            ..Default::default()
+        };
+        let own = RunTrigger {
+            trust: Some("trusted".to_string()),
+            ..fork.clone()
+        };
+        let rows = |pool: Pool, table: &'static str| async move {
+            sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+
+        // Refused: the engine itself would post where the workflow says.
+        let calls = "name: calls\nnotify:\n  webhook: { url: \"http://127.0.0.1:9/\" }\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(calls).unwrap();
+        let err = create_run_triggered(&pool, &dag, calls, &fork)
+            .await
+            .unwrap_err();
+        let refused = err
+            .downcast_ref::<crate::confine::ConfinedRefused>()
+            .unwrap_or_else(|| panic!("{err}"));
+        assert_eq!(
+            (refused.class.as_str(), refused.what.as_str()),
+            ("untrusted", "`notify`")
+        );
+        // So is a task that has the engine start another workflow, and a
+        // record that names no class, which a CI service's is not trusted for.
+        let starts =
+            "name: starts\ntasks:\n  - name: call\n    type: workflow\n    workflow: deploy\n";
+        let unsaid = RunTrigger {
+            trust: None,
+            ..fork.clone()
+        };
+        let err = create_run_triggered(
+            &pool,
+            &DagGraph::from_yaml(starts).unwrap(),
+            starts,
+            &unsaid,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::confine::ConfinedRefused>()
+                .is_some(),
+            "{err}"
+        );
+        for table in [
+            "workflow_definitions",
+            "workflow_runs",
+            "task_runs",
+            "run_triggers",
+        ] {
+            assert_eq!(rows(pool.clone(), table).await, 0, "{table}");
+        }
+        // A trusted run's workflow is its author's to write.
+        create_run_triggered(&pool, &dag, calls, &own)
+            .await
+            .unwrap();
+
+        // Made, without what it is not given.
+        let shared = "name: shared\ntasks:\n  - name: a\n    command: [\"true\"]\n    cache: { key: one }\n    pool: builders\n    priority: 9\n";
+        let dag = DagGraph::from_yaml(shared).unwrap();
+        let row = |pool: Pool, run: String| async move {
+            let (pool_named, priority, input) =
+                sqlx::query_as::<_, (Option<String>, i64, Option<String>)>(
+                    "SELECT pool, priority, input FROM task_runs WHERE run_id = ?",
+                )
+                .bind(run)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            let stored: crate::dag::TaskSpec =
+                serde_json::from_str(&input.expect("the task's spec is stored")).unwrap();
+            (pool_named, priority, stored)
+        };
+        let confined = create_run_triggered(&pool, &dag, shared, &fork)
+            .await
+            .unwrap();
+        let (pool_named, priority, stored) = row(pool.clone(), confined.clone()).await;
+        // Its own pool, not the one it named.
+        assert_eq!((pool_named.as_deref(), priority), (Some("untrusted"), 0));
+        assert!(stored.cache.is_none());
+        assert_eq!(stored.pool.as_deref(), Some("untrusted"));
+        assert_eq!(run_task_count(&pool, &confined).await.unwrap(), 1);
+        assert_eq!(run_task_count(&pool, "no-such-run").await.unwrap(), 0);
+        assert_eq!(stored.priority, 0);
+        // What was written is kept as it was written.
+        let kept: String = sqlx::query_scalar(
+            "SELECT d.spec FROM workflow_definitions d JOIN workflow_runs r ON r.definition_id = d.id WHERE r.id = ?",
+        )
+        .bind(&confined)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(kept, shared);
+
+        let trusted = create_run_triggered(&pool, &dag, shared, &own)
+            .await
+            .unwrap();
+        let (pool_named, priority, stored) = row(pool.clone(), trusted).await;
+        assert_eq!((pool_named.as_deref(), priority), (Some("builders"), 9));
+        assert!(stored.cache.is_some());
+        // And so has a run with no record, which is this installation's own.
+        let plain = create_run(&pool, &dag, shared).await.unwrap();
+        let (pool_named, _, stored) = row(pool.clone(), plain).await;
+        assert_eq!(pool_named.as_deref(), Some("builders"));
+        assert!(stored.cache.is_some());
+
+        // A cap on active runs counts by a workflow's name and key, which
+        // are its author's to write. A fork's run of a workflow named as one
+        // of the installation's holds none of that workflow's slots, and is
+        // capped among its own kind.
+        let capped = "name: deploy\nmax_active_runs: 1\nconcurrency_key: main\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(capped).unwrap();
+        let theirs = create_run_triggered(&pool, &dag, capped, &fork)
+            .await
+            .unwrap();
+        let key = |pool: Pool, run: String| async move {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT concurrency_key FROM workflow_runs WHERE id = ?",
+            )
+            .bind(run)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(
+            key(pool.clone(), theirs).await.as_deref(),
+            Some("untrusted:main")
+        );
+        // The installation's own run is admitted while the fork's is active,
+        let ours = create_run_triggered(&pool, &dag, capped, &own)
+            .await
+            .unwrap();
+        assert_eq!(key(pool.clone(), ours).await.as_deref(), Some("main"));
+        // and each is refused a second of its kind.
+        for record in [&fork, &own] {
+            let err = create_run_triggered(&pool, &dag, capped, record)
+                .await
+                .unwrap_err();
+            assert!(
+                err.downcast_ref::<crate::models::MaxActiveRunsReached>()
+                    .is_some(),
+                "{err}"
+            );
+        }
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// What started a run is written with it, and read back as it was
+    /// written, by each way a run is made. A run made with none has none. A
+    /// run that is refused leaves none behind. And the record goes when its
+    /// run goes.
+    #[tokio::test]
+    async fn a_run_s_trigger_record_is_written_with_it_and_goes_with_it() {
+        use crate::models::{trigger_kind, RunTrigger};
+        let (pool, path) = temp_pool().await;
+        let yaml =
+            "name: recorded\nmax_active_runs: 2\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let records = |pool: Pool| async move {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM run_triggers")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+
+        // Every field, as a CI service's record has them.
+        let whole = RunTrigger {
+            kind: trigger_kind::CI.to_string(),
+            principal: "ci:svc@example.com".to_string(),
+            actor: Some("octocat".to_string()),
+            trust: Some("untrusted".to_string()),
+            source: None,
+            forge_host: Some("github.com".to_string()),
+            repo: Some("acme/widgets".to_string()),
+            git_ref: Some("refs/pull/7/head".to_string()),
+            sha: Some("a1".to_string()),
+            base_sha: Some("b2".to_string()),
+            pr: Some(7),
+            event_id: Some("e-1".to_string()),
+        };
+        let run = create_run_triggered(&pool, &dag, yaml, &whole)
+            .await
+            .unwrap();
+        assert_eq!(
+            run_trigger(&pool, &run).await.unwrap().as_ref(),
+            Some(&whole)
+        );
+
+        // With a source's cursor, which is the engine's own to write.
+        let message = RunTrigger::engine(trigger_kind::SOURCE, "source:stream").of_event("42");
+        let from_source = create_run_with_offset(&pool, &dag, yaml, "stream", "42", Some(&message))
+            .await
+            .unwrap();
+        assert_eq!(
+            run_trigger(&pool, &from_source).await.unwrap(),
+            Some(message)
+        );
+
+        // A run made with none has none, and neither has a run that is not there.
+        let plain = create_run(&pool, &dag, yaml).await.unwrap();
+        assert_eq!(run_trigger(&pool, &plain).await.unwrap(), None);
+        assert_eq!(run_trigger(&pool, "no-such-run").await.unwrap(), None);
+        assert_eq!(records(pool.clone()).await, 2);
+
+        // Refused: two of the installation's own are running, and two is the
+        // cap. (The first run is a fork's, which is counted apart.) No run,
+        // no record.
+        let own = RunTrigger {
+            trust: Some("trusted".to_string()),
+            ..whole.clone()
+        };
+        let err = create_run_triggered(&pool, &dag, yaml, &own)
+            .await
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::models::MaxActiveRunsReached>()
+                .is_some(),
+            "{err}"
+        );
+        assert_eq!(
+            records(pool.clone()).await,
+            2,
+            "a refused run leaves no record"
+        );
+
+        // The record goes with its run, and no other does.
+        for sql in [
+            "DELETE FROM task_dependencies WHERE dependent_id IN (SELECT id FROM task_runs WHERE run_id = ?)",
+            "DELETE FROM task_runs WHERE run_id = ?",
+            "DELETE FROM workflow_runs WHERE id = ?",
+        ] {
+            sqlx::query(sql).bind(&run).execute(&pool).await.unwrap();
+        }
+        assert_eq!(run_trigger(&pool, &run).await.unwrap(), None);
+        assert_eq!(records(pool.clone()).await, 1);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A run made from a dead letter is recorded as whoever asked for it, of
+    /// that dead letter.
+    #[cfg(feature = "ops")]
+    #[tokio::test]
+    async fn a_redriven_run_is_recorded_as_its_redrive() {
+        use crate::models::RunTrigger;
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: parked\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let id = record_dead_letter(&pool, yaml, "transient", "redis", 3)
+            .await
+            .unwrap();
+        let asked = RunTrigger::ops_api().from_source(format!("dead-letter:{id}"));
+        let run = create_run_from_dead_letter(&pool, &dag, yaml, &id, Some(&asked))
+            .await
+            .unwrap()
+            .expect("the row was there to claim");
+        assert_eq!(run_trigger(&pool, &run).await.unwrap(), Some(asked));
 
         pool.close().await;
         let _ = std::fs::remove_file(&path);
@@ -9702,8 +14588,9 @@ task timed out after 5s
             "with a 9h cutoff the 5h-old run is not yet stalled"
         );
 
+        register_outbox_sink(&pool, &crate::db::WEBHOOK_SINK).await.unwrap();
         enqueue_outbox_event(&pool, &run_id, "backfill.catchup", "{\"k\":1}").await.unwrap();
-        let batch = claim_outbox_batch(&pool, 10, 30).await.unwrap();
+        let batch = claim_outbox_batch(&pool, &crate::db::WEBHOOK_SINK, 10, 30).await.unwrap();
         assert_eq!(batch.len(), 1, "the enqueued event is claimable");
         assert_eq!(batch[0].event_type, "backfill.catchup");
         assert_eq!(batch[0].run_id, run_id);
@@ -10064,12 +14951,14 @@ task timed out after 5s
         };
 
         assert!(
-            create_run_inner_with_floor(&pool, &dag, yaml, None, None, 0).await.is_ok(),
+            create_run_inner_with_floor(&pool, &dag, yaml, None, None, None, 0)
+                .await
+                .is_ok(),
             "0 = off"
         );
 
         let err =
-            create_run_inner_with_floor(&pool, &dag, yaml, None, None, u64::MAX).await.unwrap_err();
+            create_run_inner_with_floor(&pool, &dag, yaml, None, None, None, u64::MAX).await.unwrap_err();
         let low = err
             .downcast_ref::<crate::models::DatastoreLowOnDisk>()
             .expect("a typed refusal, not a bare string");
@@ -10078,13 +14967,13 @@ task timed out after 5s
         assert!(err.to_string().contains("DAGRON_MIN_FREE_BYTES"), "{err}");
 
         assert!(
-            create_run_inner_with_floor(&pool, &dag, yaml, None, None, 1).await.is_ok(),
+            create_run_inner_with_floor(&pool, &dag, yaml, None, None, None, 1).await.is_ok(),
             "one byte of headroom admits"
         );
         assert_eq!(counts(pool.clone()).await, (2, 2), "the refused run left no rows behind");
 
         // The exactly-once path is refused the same way, before its cursor moves.
-        let err = create_run_inner_with_floor(&pool, &dag, yaml, Some(("src", "9")), None, u64::MAX)
+        let err = create_run_inner_with_floor(&pool, &dag, yaml, Some(("src", "9")), None, None, u64::MAX)
             .await
             .unwrap_err();
         assert!(err.downcast_ref::<crate::models::DatastoreLowOnDisk>().is_some());
@@ -10169,8 +15058,14 @@ task timed out after 5s
         let (still,): (String,) = sqlx::query_as("SELECT status FROM task_runs WHERE id = ?")
             .bind(&sub.id).fetch_one(&pool).await.unwrap();
         assert_eq!(still, "running", "lease recovery cannot reclaim a parked row");
-        assert!(reconcile_waits(&pool).await.unwrap().is_empty(), "not a time sensor");
-        assert!(due_url_waits(&pool, 32).await.unwrap().is_empty(), "not an http sensor");
+        assert!(
+            reconcile_waits(&pool).await.unwrap().done.is_empty(),
+            "not a time sensor"
+        );
+        assert!(
+            claim_due_url_waits(&pool, 32, 30).await.unwrap().is_empty(),
+            "not an http sensor"
+        );
 
         // Due for a poll, carrying everything the poller needs off the row alone.
         let due = claim_due_external_polls(&pool, 32, 30).await.unwrap();
@@ -10373,7 +15268,7 @@ task timed out after 5s
         // Nothing owes teardown while the job is parked and being polled.
         assert!(claim_due_external_cancels(&pool, 16, 30).await.unwrap().is_empty());
 
-        assert!(cancel_run(&pool, &run).await.unwrap());
+        assert!(cancel_run(&pool, &run).await.unwrap().is_some());
 
         let owing = claim_due_external_cancels(&pool, 16, 30).await.unwrap();
         assert_eq!(owing.len(), 1, "the cancelled row still holds its handle — that IS the debt");
@@ -10503,7 +15398,7 @@ task timed out after 5s
         let now = chrono::Utc::now().to_rfc3339();
         assert!(park_external(&pool, &t.id, t.version + 1, "http", "job-1", None, &now, None)
             .await.unwrap());
-        assert!(cancel_run(&pool, &run).await.unwrap());
+        assert!(cancel_run(&pool, &run).await.unwrap().is_some());
 
         // Well past any cutoff, but the debt is outstanding.
         let future = (chrono::Utc::now() + chrono::TimeDelta::days(365)).to_rfc3339();
@@ -10519,6 +15414,68 @@ task timed out after 5s
         // Settle the debt and it collects normally.
         assert!(clear_external_handle(&pool, &t.id, "job-1").await.unwrap());
         assert_eq!(gc_old_runs(&pool, &future).await.unwrap(), 1, "settled → collectable");
+
+        drop(pool);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A whole rerun must not drop a handle the teardown sweep has still to
+    /// reach. A cancel ends a run whose only task is a parked deferred job at
+    /// once, with the job still running; a rerun then would reset the handle
+    /// with the rest of the task's result, and the job would run on unswept.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_whole_rerun_waits_for_an_owed_teardown() {
+        let (pool, path) = temp_pool().await;
+
+        let yaml = "name: p\ntasks:\n  - { name: a, command: [\"true\"], defer: { kind: http } }\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let run = create_run(&pool, &dag, yaml).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+        let t = claim_ready(&pool, "w", 10).await.unwrap().remove(0);
+        let now = chrono::Utc::now().to_rfc3339();
+        assert!(park_external(
+            &pool,
+            &t.id,
+            t.version + 1,
+            "http",
+            "job-1",
+            None,
+            &now,
+            None
+        )
+        .await
+        .unwrap());
+        assert!(cancel_run(&pool, &run).await.unwrap().is_some());
+
+        let err = rerun_all(&pool, &run).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<crate::models::TeardownOwed>()
+                .expect("refused for the debt")
+                .tasks,
+            1
+        );
+        let (status, whole): (String, i64) =
+            sqlx::query_as("SELECT status, whole_reruns FROM workflow_runs WHERE id = ?")
+                .bind(&run)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            (status.as_str(), whole),
+            ("cancelled", 0),
+            "nothing was written"
+        );
+        let owed = claim_due_external_cancels(&pool, 16, 30).await.unwrap();
+        assert_eq!(owed.len(), 1);
+        assert_eq!(
+            owed[0].external_handle, "job-1",
+            "the sweep still sees the job"
+        );
+
+        // Settle the debt and the run reruns.
+        assert!(clear_external_handle(&pool, &t.id, "job-1").await.unwrap());
+        assert_eq!(rerun_all(&pool, &run).await.unwrap(), Some(1));
 
         drop(pool);
         let _ = std::fs::remove_file(path);
@@ -10543,12 +15500,12 @@ task timed out after 5s
         let t = claim_ready(&pool, "w", 10).await.unwrap().remove(0);
         let fence = t.version + 1;
 
-        assert!(cancel_run(&pool, &run).await.unwrap());
+        assert!(cancel_run(&pool, &run).await.unwrap().is_some());
 
         // The worker finishes and reports success with the fence it still holds.
         assert!(
             !mark_task_succeeded(&pool, &t.id, "w", fence, Some("done".into())).await.unwrap(),
-            "the claimed_by guard rejects it — cancel NULLed the claim"
+            "it was asked to stop: what it reports is not applied"
         );
         let (status,): (String,) = sqlx::query_as("SELECT status FROM task_runs WHERE id = ?")
             .bind(&t.id).fetch_one(&pool).await.unwrap();
@@ -10760,7 +15717,7 @@ tasks:
 
     /// Drive a run to the point where `process` is parked, with `list` having
     /// produced `output`. Returns (pool, path, run_id, barrier task id).
-    async fn parked_fanout(output: &str) -> (Pool, std::path::PathBuf, String, String) {
+    pub(super) async fn parked_fanout(output: &str) -> (Pool, std::path::PathBuf, String, String) {
         let (pool, path) = temp_pool().await;
         let dag = DagGraph::from_yaml(FANOUT_YAML).unwrap();
         let run_id = create_run(&pool, &dag, FANOUT_YAML).await.unwrap();
@@ -10800,7 +15757,7 @@ tasks:
         // not exist yet and the barrier itself must never be dispatched.
         assert!(claim_ready(&pool, "w1", 10).await.unwrap().is_empty());
 
-        let events = reconcile_fanouts(&pool).await.unwrap();
+        let events = reconcile_fanouts(&pool).await.unwrap().done;
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0].1,
@@ -10852,7 +15809,7 @@ tasks:
                 .await
                 .unwrap();
         }
-        let events = reconcile_fanouts(&pool).await.unwrap();
+        let events = reconcile_fanouts(&pool).await.unwrap().done;
         assert_eq!(
             events[0].1,
             crate::models::FanoutOutcome::Joined { succeeded: true, instances: 3 }
@@ -10909,7 +15866,7 @@ tasks:
         }
         advance_ready_tasks(&pool).await.unwrap();
 
-        let events = reconcile_fanouts(&pool).await.unwrap();
+        let events = reconcile_fanouts(&pool).await.unwrap().done;
         assert_eq!(
             events[0].1,
             crate::models::FanoutOutcome::Expanded { instances: 2 },
@@ -10981,7 +15938,7 @@ tasks:
         let _g = crate::env_lock();
         let (pool, path, run_id, barrier) = parked_chain([r#"["a","b"]"#, r#"["c"]"#]).await;
 
-        let events = reconcile_fanouts(&pool).await.unwrap();
+        let events = reconcile_fanouts(&pool).await.unwrap().done;
         assert_eq!(
             events[0].1,
             crate::models::FanoutOutcome::Expanded { instances: 3 },
@@ -11033,7 +15990,7 @@ tasks:
         let _g = crate::env_lock();
         let (pool, path, _run, barrier) = parked_chain([r#"[]"#, r#"["c","d"]"#]).await;
 
-        let events = reconcile_fanouts(&pool).await.unwrap();
+        let events = reconcile_fanouts(&pool).await.unwrap().done;
         assert_eq!(events[0].1, crate::models::FanoutOutcome::Expanded { instances: 2 });
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_runs WHERE fanout_parent = ?")
             .bind(&barrier)
@@ -11053,7 +16010,7 @@ tasks:
         let _g = crate::env_lock();
         let (pool, path, run_id, _b) = parked_chain([r#"[]"#, r#"[]"#]).await;
 
-        let events = reconcile_fanouts(&pool).await.unwrap();
+        let events = reconcile_fanouts(&pool).await.unwrap().done;
         assert_eq!(
             events[0].1,
             crate::models::FanoutOutcome::Joined { succeeded: true, instances: 0 }
@@ -11080,7 +16037,7 @@ tasks:
         let _g = crate::env_lock();
         let (pool, path, _run, _b) = parked_chain([r#"["a"]"#, r#"{"oops": 1}"#]).await;
 
-        let events = reconcile_fanouts(&pool).await.unwrap();
+        let events = reconcile_fanouts(&pool).await.unwrap().done;
         let crate::models::FanoutOutcome::Failed { reason } = &events[0].1 else {
             panic!("expected a failure, got {:?}", events[0].1);
         };
@@ -11101,7 +16058,7 @@ tasks:
         let _g = crate::env_lock();
         let (pool, path, run_id, barrier) = parked_fanout("[]").await;
 
-        let events = reconcile_fanouts(&pool).await.unwrap();
+        let events = reconcile_fanouts(&pool).await.unwrap().done;
         assert_eq!(
             events[0].1,
             crate::models::FanoutOutcome::Joined { succeeded: true, instances: 0 }
@@ -11131,7 +16088,7 @@ tasks:
         let _g = crate::env_lock();
         let (pool, path, _run, barrier) = parked_fanout("partition-a\npartition-b").await;
 
-        let events = reconcile_fanouts(&pool).await.unwrap();
+        let events = reconcile_fanouts(&pool).await.unwrap().done;
         let crate::models::FanoutOutcome::Failed { reason } = &events[0].1 else {
             panic!("expected a failure, got {:?}", events[0].1);
         };
@@ -11144,7 +16101,7 @@ tasks:
         assert!(output.unwrap().contains("not valid JSON"), "the reason is on the row");
 
         // Re-sweeping a resolved barrier does nothing — it is no longer parked.
-        assert!(reconcile_fanouts(&pool).await.unwrap().is_empty());
+        assert!(reconcile_fanouts(&pool).await.unwrap().done.is_empty());
 
         pool.close().await;
         let _ = std::fs::remove_file(&path);
@@ -11158,7 +16115,7 @@ tasks:
         // `reconcile_fanouts` reads DAGRON_MAX_TASKS_PER_RUN.
         let _g = crate::env_lock();
         let (pool, path, _run, _b) = parked_fanout(r#"{"partitions": ["a"]}"#).await;
-        let events = reconcile_fanouts(&pool).await.unwrap();
+        let events = reconcile_fanouts(&pool).await.unwrap().done;
         let crate::models::FanoutOutcome::Failed { reason } = &events[0].1 else {
             panic!("expected a failure");
         };
@@ -11181,7 +16138,7 @@ tasks:
 
         // The run already holds 3 tasks; 4 more instances would make 7 > 4.
         let (pool, path, _run, barrier) = parked_fanout(r#"["a","b","c","d"]"#).await;
-        let events = reconcile_fanouts(&pool).await.unwrap();
+        let events = reconcile_fanouts(&pool).await.unwrap().done;
         let crate::models::FanoutOutcome::Failed { reason } = &events[0].1 else {
             panic!("expected a budget refusal, got {:?}", events[0].1);
         };
@@ -11219,7 +16176,7 @@ tasks:
             .await
             .unwrap();
 
-        let events = reconcile_fanouts(&pool).await.unwrap();
+        let events = reconcile_fanouts(&pool).await.unwrap().done;
         assert_eq!(
             events[0].1,
             crate::models::FanoutOutcome::Joined { succeeded: false, instances: 2 }
@@ -11244,11 +16201,11 @@ tasks:
         let _g = crate::env_lock();
         let (pool, path, _run, barrier) = parked_fanout(r#"["a","b"]"#).await;
 
-        let first = reconcile_fanouts(&pool).await.unwrap();
+        let first = reconcile_fanouts(&pool).await.unwrap().done;
         assert_eq!(first[0].1, crate::models::FanoutOutcome::Expanded { instances: 2 });
         // The second sweep finds instances and takes the join path instead —
         // which, with nothing terminal yet, is a no-op.
-        let second = reconcile_fanouts(&pool).await.unwrap();
+        let second = reconcile_fanouts(&pool).await.unwrap().done;
         assert!(second.is_empty(), "no second expansion, and no premature join");
 
         assert_eq!(
@@ -11567,4 +16524,5704 @@ tasks:
         let _ = std::fs::remove_file(&path);
     }
 
+    // ── Quota back-pressure (migration 051) ──────────────────────────────────
+    //
+    // A pod refused by a full namespace quota is handed back, not failed. These
+    // prove the give-back is exact and fenced, that reaching the bound writes
+    // nothing by itself, and that the wait marker dies with the claim that ends
+    // the wait — without any reset path having to clear it.
+
+    const REFUSAL: &str = "not started: pod refused by namespace ResourceQuota 'tenant-quota' \
+        (requested: limits.cpu=550m, used: limits.cpu=3750m, limited: limits.cpu=4)";
+
+    /// `task_runs` as these tests need to see it: the raw columns, not the
+    /// guarded projection `list_tasks` serves.
+    #[derive(sqlx::FromRow)]
+    struct QuotaRow {
+        status: String,
+        attempt: i64,
+        version: i64,
+        claimed_by: Option<String>,
+        lease_expires_at: Option<String>,
+        scheduled_at: Option<String>,
+        output: Option<String>,
+        quota_wait_since: Option<String>,
+        quota_waits: i64,
+        quota_wait_version: Option<i64>,
+        quota_wait_detail: Option<String>,
+    }
+
+    async fn quota_row(pool: &Pool, id: &str) -> QuotaRow {
+        sqlx::query_as(
+            "SELECT status, attempt, version, claimed_by, lease_expires_at, scheduled_at, output,
+                    quota_wait_since, quota_waits, quota_wait_version, quota_wait_detail
+             FROM task_runs WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A one-task run, advanced to `ready`: (pool, path, run_id, task_id).
+    async fn quota_task() -> (Pool, std::path::PathBuf, String, String) {
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: q\ntasks:\n  - name: pod\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let run_id = create_run(&pool, &dag, yaml).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+        let id: String = sqlx::query_scalar("SELECT id FROM task_runs WHERE run_id = ?")
+            .bind(&run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        (pool, path, run_id, id)
+    }
+
+    /// The engine's next dispatch of the task: its backoff elapses and it is
+    /// claimed. Returns the fence of that claim.
+    async fn claim_due(pool: &Pool, id: &str, worker: &str) -> i64 {
+        sqlx::query("UPDATE task_runs SET scheduled_at = NULL WHERE id = ?")
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let claimed = claim_ready(pool, worker, 10).await.unwrap();
+        assert_eq!(claimed.len(), 1, "the task is claimable once it is due");
+        assert_eq!(claimed[0].id, id);
+        claimed[0].version + 1
+    }
+
+    /// Move an episode's clock back, as if its first refusal were that long ago.
+    async fn backdate_quota_wait(pool: &Pool, id: &str, secs: i64) -> String {
+        let since = (chrono::Utc::now() - chrono::TimeDelta::seconds(secs)).to_rfc3339();
+        sqlx::query("UPDATE task_runs SET quota_wait_since = ? WHERE id = ?")
+            .bind(&since)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+        since
+    }
+
+    fn rfc3339(t: &Option<String>) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(t.as_deref().expect("timestamp is set"))
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[tokio::test]
+    async fn a_quota_requeue_gives_the_attempt_back() {
+        let (pool, path, _run, id) = quota_task().await;
+        let fence = claim_due(&pool, &id, "w1").await;
+        // What an earlier attempt left on the row has to survive the wait.
+        sqlx::query("UPDATE task_runs SET output = 'from the attempt before' WHERE id = ?")
+            .bind(&id).execute(&pool).await.unwrap();
+        let claimed = quota_row(&pool, &id).await;
+        assert_eq!((claimed.status.as_str(), claimed.attempt), ("running", 1));
+
+        let before = chrono::Utc::now();
+        let outcome = requeue_quota_wait(&pool, &id, "w1", fence, REFUSAL, 3600).await.unwrap();
+        let QuotaRequeue::Requeued { waits, waited_secs, retry_in_secs } = outcome else {
+            panic!("a first refusal inside the bound is a requeue, got {outcome:?}");
+        };
+        assert_eq!((waits, waited_secs), (1, 0));
+        assert!((3..=6).contains(&retry_in_secs), "5 s give or take the jitter, got {retry_in_secs}");
+
+        let row = quota_row(&pool, &id).await;
+        assert_eq!(row.status, "ready");
+        assert!(row.claimed_by.is_none() && row.lease_expires_at.is_none(), "the claim is gone");
+        assert_eq!(row.attempt, 0, "the attempt the claim consumed is given back");
+        assert_eq!(row.version, fence, "version is left alone, as retry_task leaves it");
+        assert_eq!(row.quota_wait_version, Some(row.version), "which is what marks the row as waiting");
+        assert_eq!(row.quota_waits, 1);
+        assert_eq!(row.quota_wait_detail.as_deref(), Some(REFUSAL));
+        let since = rfc3339(&row.quota_wait_since);
+        assert!(since >= before && since <= chrono::Utc::now(), "the clock starts at this refusal");
+        assert!(
+            rfc3339(&row.scheduled_at) >= since + chrono::TimeDelta::milliseconds(3_750),
+            "due a backoff after the refusal, not at it"
+        );
+        assert_eq!(
+            row.output.as_deref(),
+            Some("from the attempt before"),
+            "a wait has no result, so it must not overwrite one"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task_attempts")
+                .fetch_one(&pool).await.unwrap(),
+            0,
+            "and it is not an attempt, so it leaves no attempt row"
+        );
+        assert!(
+            claim_ready(&pool, "w1", 10).await.unwrap().is_empty(),
+            "not claimable until the backoff elapses"
+        );
+
+        // Ten refusals in a row are one episode, and still cost no attempt.
+        for cycle in 2..=10 {
+            let fence = claim_due(&pool, &id, "w1").await;
+            let detail = format!("{REFUSAL} #{cycle}");
+            let outcome = requeue_quota_wait(&pool, &id, "w1", fence, &detail, 3600).await.unwrap();
+            assert!(
+                matches!(outcome, QuotaRequeue::Requeued { waits, .. } if waits == cycle),
+                "refusal {cycle}: {outcome:?}"
+            );
+        }
+        let after = quota_row(&pool, &id).await;
+        assert_eq!(after.attempt, 0, "ten refusals consumed no attempt");
+        assert_eq!(after.quota_waits, 10);
+        assert_eq!(after.quota_wait_since, row.quota_wait_since, "one episode, one clock");
+        assert_eq!(after.quota_wait_version, Some(after.version));
+        assert!(
+            after.quota_wait_detail.as_deref().is_some_and(|d| d.ends_with("#10")),
+            "the detail is the last refusal's"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The give-back undoes exactly one claim. Anyone who does not hold that
+    /// claim — another worker, an older or newer fence, the same call a second
+    /// time, a worker whose lease was recovered — gets nothing back.
+    #[tokio::test]
+    async fn a_quota_requeue_is_fenced() {
+        let (pool, path, _run, id) = quota_task().await;
+        let fence = claim_due(&pool, &id, "w1").await;
+
+        for (worker, f) in [("w2", fence), ("w1", fence + 1), ("w1", fence - 1)] {
+            assert_eq!(
+                requeue_quota_wait(&pool, &id, worker, f, REFUSAL, 3600).await.unwrap(),
+                QuotaRequeue::Stale,
+                "{worker} with fence {f} does not hold the claim"
+            );
+        }
+        let row = quota_row(&pool, &id).await;
+        assert_eq!(
+            (row.status.as_str(), row.attempt, row.quota_waits, row.claimed_by.as_deref()),
+            ("running", 1, 0, Some("w1")),
+            "a stale call changes nothing"
+        );
+
+        // The holder's call lands, storing a bounded detail…
+        let long = "x".repeat(1000);
+        assert!(matches!(
+            requeue_quota_wait(&pool, &id, "w1", fence, &long, 3600).await.unwrap(),
+            QuotaRequeue::Requeued { waits: 1, .. }
+        ));
+        // …and lands once: the same fence again has nothing left to undo.
+        assert_eq!(
+            requeue_quota_wait(&pool, &id, "w1", fence, REFUSAL, 3600).await.unwrap(),
+            QuotaRequeue::Stale
+        );
+        let row = quota_row(&pool, &id).await;
+        assert_eq!((row.attempt, row.quota_waits), (0, 1), "one claim, one attempt given back");
+        assert_eq!(
+            row.quota_wait_detail.map(|d| d.chars().count()),
+            Some(crate::quota_wait::DETAIL_MAX_CHARS)
+        );
+        assert!(
+            !renew_task_lease(&pool, &id, "w1", fence, 300).await.unwrap(),
+            "the claim triple is gone, so the heartbeat stops with it"
+        );
+
+        // A claim whose lease lapsed and was recovered is no longer this
+        // worker's to hand back. Lease recovery keeps the attempt, and a late
+        // requeue must not take it.
+        let fence = claim_due(&pool, &id, "w1").await;
+        sqlx::query("UPDATE task_runs SET lease_expires_at = '1970-01-01T00:00:00+00:00' WHERE id = ?")
+            .bind(&id).execute(&pool).await.unwrap();
+        assert_eq!(recover_expired_leases(&pool).await.unwrap(), 1);
+        assert_eq!(
+            requeue_quota_wait(&pool, &id, "w1", fence, REFUSAL, 3600).await.unwrap(),
+            QuotaRequeue::Stale
+        );
+        let row = quota_row(&pool, &id).await;
+        assert_eq!((row.status.as_str(), row.attempt, row.quota_waits), ("ready", 1, 1));
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// At the bound the datastore reports and steps back: the row is still the
+    /// caller's, so the caller can fail it with a reason under the same fence.
+    #[tokio::test]
+    async fn a_quota_wait_expires_without_writing() {
+        let (pool, path, _run, id) = quota_task().await;
+        let fence = claim_due(&pool, &id, "w1").await;
+        assert!(matches!(
+            requeue_quota_wait(&pool, &id, "w1", fence, REFUSAL, 600).await.unwrap(),
+            QuotaRequeue::Requeued { .. }
+        ));
+        // The episode began fifteen minutes ago, against a ten-minute bound.
+        let since = backdate_quota_wait(&pool, &id, 900).await;
+
+        let fence = claim_due(&pool, &id, "w1").await;
+        let held = quota_row(&pool, &id).await;
+        let outcome = requeue_quota_wait(&pool, &id, "w1", fence, REFUSAL, 600).await.unwrap();
+        let QuotaRequeue::Expired { waits, waited_secs } = outcome else {
+            panic!("past the bound on a continuing episode, got {outcome:?}");
+        };
+        assert_eq!(waits, 2, "the refusal that reached the bound is counted");
+        assert!((900..=905).contains(&waited_secs), "measured from the first refusal, got {waited_secs}");
+
+        let row = quota_row(&pool, &id).await;
+        assert_eq!(
+            (row.status.as_str(), row.claimed_by.as_deref(), row.attempt),
+            ("running", Some("w1"), held.attempt),
+            "still running and still claimed"
+        );
+        assert_eq!(row.lease_expires_at, held.lease_expires_at);
+        assert_eq!(row.scheduled_at, held.scheduled_at);
+        assert_eq!((row.quota_waits, row.quota_wait_since), (1, Some(since)), "nothing was written");
+
+        assert!(
+            mark_task_failed(&pool, &id, "w1", fence, Some("gave up waiting for namespace quota".into()))
+                .await
+                .unwrap(),
+            "the fence still holds for the failure that follows"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The marker is never cleared; a claim outruns it. Once the task has been
+    /// dispatched again it is not waiting, however it comes back to `ready`,
+    /// and its next refusal starts a new episode with a new clock.
+    #[tokio::test]
+    async fn a_claim_ends_the_quota_wait_episode() {
+        let (pool, path, run_id, id) = quota_task().await;
+        // `list_tasks` is an ops read; the lean build checks the rest.
+        #[cfg(not(feature = "ops"))]
+        let _ = &run_id;
+
+        let fence = claim_due(&pool, &id, "w1").await;
+        assert!(matches!(
+            requeue_quota_wait(&pool, &id, "w1", fence, REFUSAL, 600).await.unwrap(),
+            QuotaRequeue::Requeued { waits: 1, .. }
+        ));
+        assert_eq!(quota_wait_stats(&pool).await.unwrap().waiting, 1);
+        #[cfg(feature = "ops")]
+        {
+            let task = &list_tasks(&pool, &run_id).await.unwrap()[0];
+            assert!(task.quota_wait_since.is_some(), "a waiter says since when");
+            assert_eq!(task.quota_wait_detail.as_deref(), Some(REFUSAL));
+            assert_eq!(task.quota_waits, 1);
+        }
+        // Were the old episode to continue, the next refusal would be past the
+        // ten-minute bound at once.
+        backdate_quota_wait(&pool, &id, 3600).await;
+
+        // The next dispatch starts, and fails for an ordinary reason.
+        let fence = claim_due(&pool, &id, "w1").await;
+        assert_eq!(quota_wait_stats(&pool).await.unwrap().waiting, 0, "a running task is not waiting");
+        assert!(retry_task(
+            &pool, &id, "w1", fence, Some("boom".into()),
+            chrono::Utc::now().to_rfc3339(), AttemptEnd::Failed,
+        )
+        .await
+        .unwrap());
+
+        // `ready` again, old columns and all — but the claim moved `version`.
+        let row = quota_row(&pool, &id).await;
+        assert_eq!((row.status.as_str(), row.quota_waits), ("ready", 1), "the columns are never cleared");
+        assert_ne!(row.quota_wait_version, Some(row.version));
+        assert_eq!(quota_wait_stats(&pool).await.unwrap(), QuotaWaitStats::default());
+        #[cfg(feature = "ops")]
+        {
+            let task = &list_tasks(&pool, &run_id).await.unwrap()[0];
+            assert_eq!(
+                (task.quota_wait_since.as_deref(), task.quota_wait_detail.as_deref(), task.quota_waits),
+                (None, None, 0),
+                "a task backing off after a real failure does not read as waiting on quota"
+            );
+        }
+
+        let fence = claim_due(&pool, &id, "w1").await;
+        let outcome = requeue_quota_wait(&pool, &id, "w1", fence, REFUSAL, 600).await.unwrap();
+        assert!(
+            matches!(outcome, QuotaRequeue::Requeued { waits: 1, waited_secs: 0, .. }),
+            "a new episode, not the hour-old one: {outcome:?}"
+        );
+
+        // The same when the dispatch in between died and its lease was recovered.
+        backdate_quota_wait(&pool, &id, 3600).await;
+        claim_due(&pool, &id, "w1").await;
+        sqlx::query("UPDATE task_runs SET lease_expires_at = '1970-01-01T00:00:00+00:00' WHERE id = ?")
+            .bind(&id).execute(&pool).await.unwrap();
+        assert_eq!(recover_expired_leases(&pool).await.unwrap(), 1);
+        assert_eq!(quota_wait_stats(&pool).await.unwrap().waiting, 0, "recovered, not waiting");
+
+        let fence = claim_due(&pool, &id, "w1").await;
+        let outcome = requeue_quota_wait(&pool, &id, "w1", fence, REFUSAL, 600).await.unwrap();
+        assert!(
+            matches!(outcome, QuotaRequeue::Requeued { waits: 1, waited_secs: 0, .. }),
+            "a new episode after lease recovery: {outcome:?}"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The reason the wait columns need no clearing: every way an operator
+    /// brings a cancelled task back bumps `version`, so the marker a cancelled
+    /// waiter still carries cannot match again. If one of these ever stopped
+    /// bumping it, the revived task would read as waiting — and its next
+    /// refusal would expire on the spot, against a clock from before the cancel.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn no_reset_path_resurrects_a_quota_wait() {
+        let (pool, path, run_id, id) = quota_task().await;
+
+        // `retry_task_from_ui` goes last: it re-arms only a failed run, so
+        // after it there is no running run left to cancel.
+        for reset in [
+            "rerun_from_failed",
+            "rerun_all",
+            "clear_task_with_downstream",
+            "retry_task_from_ui",
+        ] {
+            let fence = claim_due(&pool, &id, "w1").await;
+            let outcome = requeue_quota_wait(&pool, &id, "w1", fence, REFUSAL, 600).await.unwrap();
+            assert!(
+                matches!(outcome, QuotaRequeue::Requeued { waits: 1, waited_secs: 0, .. }),
+                "before {reset}: a fresh episode, got {outcome:?}"
+            );
+            // A live waiter, already past the bound if its episode were to continue.
+            backdate_quota_wait(&pool, &id, 3600).await;
+            assert_eq!(quota_wait_stats(&pool).await.unwrap().waiting, 1);
+
+            assert!(cancel_run(&pool, &run_id).await.unwrap().is_some());
+            assert_eq!(quota_wait_stats(&pool).await.unwrap().waiting, 0, "cancelled is not waiting");
+
+            match reset {
+                "rerun_from_failed" => {
+                    assert_eq!(rerun_from_failed(&pool, &run_id).await.unwrap(), Some(1))
+                }
+                "rerun_all" => assert_eq!(rerun_all(&pool, &run_id).await.unwrap(), Some(1)),
+                "clear_task_with_downstream" => {
+                    assert_eq!(clear_task_with_downstream(&pool, &run_id, &id).await.unwrap(), Some(1))
+                }
+                _ => assert!(retry_task_from_ui(&pool, &id).await.unwrap()),
+            }
+            advance_ready_tasks(&pool).await.unwrap();
+
+            let row = quota_row(&pool, &id).await;
+            assert_eq!(row.status, "ready", "{reset} brought the task back");
+            assert_ne!(row.quota_wait_version, Some(row.version), "{reset} must bump version");
+            assert_eq!(
+                quota_wait_stats(&pool).await.unwrap().waiting,
+                0,
+                "{reset} must not bring the old wait back with it"
+            );
+            let task = &list_tasks(&pool, &run_id).await.unwrap()[0];
+            assert!(task.quota_wait_since.is_none(), "{reset}: the task view agrees");
+        }
+
+        // And the last path's revived task starts a fresh episode like the rest.
+        let fence = claim_due(&pool, &id, "w1").await;
+        let outcome = requeue_quota_wait(&pool, &id, "w1", fence, REFUSAL, 600).await.unwrap();
+        assert!(
+            matches!(outcome, QuotaRequeue::Requeued { waits: 1, waited_secs: 0, .. }),
+            "after retry_task_from_ui: a fresh episode, got {outcome:?}"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The gauge counts rows that are waiting *now*. A task that waited and was
+    /// then dispatched, or failed, keeps its wait columns and must not be in it.
+    #[tokio::test]
+    async fn quota_wait_stats_counts_only_live_waiters() {
+        let (pool, path) = temp_pool().await;
+        assert_eq!(quota_wait_stats(&pool).await.unwrap(), QuotaWaitStats::default());
+
+        let yaml = "name: q\ntasks:\n  - name: a\n    command: [\"true\"]\n  - name: b\n    command: [\"true\"]\n  - name: c\n    command: [\"true\"]\n  - name: d\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        create_run(&pool, &dag, yaml).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+
+        // All four are refused once.
+        let mut ids = std::collections::HashMap::new();
+        for task in claim_ready(&pool, "w1", 10).await.unwrap() {
+            let outcome =
+                requeue_quota_wait(&pool, &task.id, "w1", task.version + 1, REFUSAL, 86_400)
+                    .await
+                    .unwrap();
+            assert!(matches!(outcome, QuotaRequeue::Requeued { .. }), "{}: {outcome:?}", task.name);
+            ids.insert(task.name, task.id);
+        }
+        assert_eq!(ids.len(), 4);
+        assert_eq!(quota_wait_stats(&pool).await.unwrap().waiting, 4);
+        // Hold all four in backoff for the length of the test, so each claim
+        // below takes only the row it makes due.
+        sqlx::query("UPDATE task_runs SET scheduled_at = '2999-01-01T00:00:00+00:00'")
+            .execute(&pool).await.unwrap();
+
+        // `a` has waited five minutes; `c` and `d` longer still, but they are
+        // about to stop waiting.
+        let oldest = backdate_quota_wait(&pool, &ids["a"], 300).await;
+        backdate_quota_wait(&pool, &ids["c"], 9_000).await;
+        backdate_quota_wait(&pool, &ids["d"], 9_000).await;
+
+        // `c` is dispatched and runs; `d` is dispatched and fails.
+        claim_due(&pool, &ids["c"], "w1").await;
+        let fence = claim_due(&pool, &ids["d"], "w1").await;
+        assert!(mark_task_failed(&pool, &ids["d"], "w1", fence, Some("boom".into())).await.unwrap());
+        for name in ["c", "d"] {
+            assert_eq!(quota_row(&pool, &ids[name]).await.quota_waits, 1, "{name} still carries its wait");
+        }
+
+        let stats = quota_wait_stats(&pool).await.unwrap();
+        assert_eq!(stats.waiting, 2, "a and b; not the running row, not the failed one");
+        assert_eq!(stats.oldest_since.as_deref(), Some(oldest.as_str()), "a's clock, not c's or d's");
+        assert!((300..=305).contains(&stats.oldest_age_secs(chrono::Utc::now())));
+
+        #[cfg(feature = "ops")]
+        {
+            let snap = status_counts(&pool).await.unwrap();
+            assert_eq!(snap.quota_waiting, 2, "/metrics reads the same count");
+            assert_eq!(snap.quota_wait_oldest_since, stats.oldest_since);
+        }
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `attempt` numbers the attempts that ran. A refusal between two real
+    /// failures must not shift the second one's number, or overwrite the
+    /// first one's history row.
+    #[tokio::test]
+    async fn a_quota_wait_between_two_failures_does_not_shift_the_attempt_history() {
+        let _g = attempt_env();
+        set_attempt_env(None, None);
+        let (pool, path, _run, id) = quota_task().await;
+        async fn history(pool: &Pool, id: &str) -> Vec<(i64, String, Option<String>)> {
+            sqlx::query_as(
+                "SELECT attempt, reason, output FROM task_attempts WHERE task_id = ? ORDER BY attempt",
+            )
+            .bind(id)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+        }
+
+        // Attempt 1 starts and fails for real.
+        let fence = claim_due(&pool, &id, "w1").await;
+        assert!(retry_task(
+            &pool, &id, "w1", fence, Some("boom 1".into()),
+            chrono::Utc::now().to_rfc3339(), AttemptEnd::Failed,
+        )
+        .await
+        .unwrap());
+
+        // Its retry is refused for quota: attempt 2 never started.
+        let fence = claim_due(&pool, &id, "w1").await;
+        assert_eq!(quota_row(&pool, &id).await.attempt, 2, "the claim counted it");
+        assert!(matches!(
+            requeue_quota_wait(&pool, &id, "w1", fence, REFUSAL, 3600).await.unwrap(),
+            QuotaRequeue::Requeued { .. }
+        ));
+        let row = quota_row(&pool, &id).await;
+        assert_eq!(row.attempt, 1, "back to the one attempt that ran");
+        assert_eq!(row.output.as_deref(), Some("boom 1"), "whose output is still the row's");
+        assert_eq!(
+            history(&pool, &id).await,
+            vec![(1, "failed".to_string(), Some("boom 1".to_string()))],
+            "and whose history row is intact"
+        );
+
+        // The dispatch that does start is attempt 2, and is recorded as 2.
+        let fence = claim_due(&pool, &id, "w1").await;
+        assert!(retry_task(
+            &pool, &id, "w1", fence, Some("boom 2".into()),
+            chrono::Utc::now().to_rfc3339(), AttemptEnd::Failed,
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            history(&pool, &id).await,
+            vec![
+                (1, "failed".to_string(), Some("boom 1".to_string())),
+                (2, "failed".to_string(), Some("boom 2".to_string())),
+            ]
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── Running again keeps what it replaces (migration 056) ─────────────────
+    //
+    // A rerun, a retry and a clear each wiped the attempt that was on the row.
+    // These prove the attempt is kept first, that a task's attempts are
+    // numbered through its life, that a run which had ended asks its
+    // concurrency key before it runs again, and that each writes its event.
+
+    /// The events that say tasks of `run_id` were put back to run again.
+    #[cfg(feature = "ops")]
+    async fn run_again_events(pool: &Pool, run_id: &str) -> Vec<(String, serde_json::Value)> {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT event_type, payload FROM event_outbox
+             WHERE run_id = ? AND event_type IN ('run.rerun', 'run.auto_rerun')
+             ORDER BY created_at, rowid",
+        )
+        .bind(run_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(kind, payload)| (kind, serde_json::from_str(&payload).unwrap()))
+        .collect()
+    }
+
+    /// End `run_id` as failed at its task `a`, which ran once and printed
+    /// `output`, with every other task cancelled before it ran: the shape a
+    /// failure leaves.
+    #[cfg(feature = "ops")]
+    async fn fail_at(pool: &Pool, run_id: &str, a: &str, output: &str) {
+        sqlx::query("UPDATE task_runs SET status = 'cancelled' WHERE run_id = ? AND id <> ?")
+            .bind(run_id)
+            .bind(a)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE task_runs SET status = 'failed', attempt = 1, output = ?,
+                 scheduled_at = '2026-01-01T00:00:00Z', finished_at = '2026-01-01T00:00:05Z'
+             WHERE id = ?",
+        )
+        .bind(output)
+        .bind(a)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE workflow_runs SET status = 'failed', finished_at = '2026-01-01T00:00:05Z' WHERE id = ?",
+        )
+        .bind(run_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A run of `a → b` under `head` (the spec's lines before its tasks), and
+    /// its two tasks' ids.
+    #[cfg(feature = "ops")]
+    async fn chain_run(pool: &Pool, head: &str) -> (String, String, String) {
+        let yaml = format!(
+            "{head}tasks:\n  - name: a\n    command: [\"true\"]\n  - name: b\n    command: [\"true\"]\n    depends_on: [\"a\"]\n"
+        );
+        let dag = DagGraph::from_yaml(&yaml).unwrap();
+        let run_id = create_run(pool, &dag, &yaml).await.unwrap();
+        let tasks = list_tasks(pool, &run_id).await.unwrap();
+        let id = |name: &str| tasks.iter().find(|t| t.name == name).unwrap().id.clone();
+        (run_id, id("a"), id("b"))
+    }
+
+    /// `(attempt, attempt_base, status)` of a task's row.
+    #[cfg(feature = "ops")]
+    async fn round(pool: &Pool, id: &str) -> (i64, i64, String) {
+        sqlx::query_as("SELECT attempt, attempt_base, status FROM task_runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// A rerun keeps the attempt it wipes: how it ended, when, and what it
+    /// printed. The task's next attempts are numbered on from it, though the
+    /// row's own count starts again so that the task has its retries back. A
+    /// task that never ran has nothing to keep.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_rerun_keeps_the_attempts_it_replaces_and_numbers_on_from_them() {
+        let _g = attempt_env();
+        set_attempt_env(None, None);
+        let (pool, path) = temp_pool().await;
+        let (run, a, b) = chain_run(&pool, "name: chain\n").await;
+        fail_at(&pool, &run, &a, "boom").await;
+
+        assert_eq!(rerun_from_failed(&pool, &run).await.unwrap(), Some(2));
+        let kept = list_task_attempts(&pool, &a).await.unwrap();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        let first = &kept[0];
+        assert_eq!(
+            (first.attempt, first.reason.as_str(), first.status.as_deref(), first.output.as_deref()),
+            (1, "rerun", Some("failed"), Some("boom"))
+        );
+        assert_eq!(first.scheduled_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(first.finished_at, "2026-01-01T00:00:05Z", "when the attempt ended, not now");
+        assert!(!first.truncated);
+        assert!(list_task_attempts(&pool, &b).await.unwrap().is_empty(), "b never ran");
+
+        assert_eq!(round(&pool, &a).await, (0, 1, "pending".to_string()));
+        assert_eq!(task_attempt_base(&pool, &a).await.unwrap(), 1);
+        assert_eq!(task_attempt_base(&pool, "no-such-task").await.unwrap(), 0);
+
+        // The round after: a worker takes it, fails, and its own retry keeps
+        // that attempt as the task's second, not as a second "attempt 1".
+        advance_ready_tasks(&pool).await.unwrap();
+        assert_eq!(claim_ready(&pool, "w1", 10).await.unwrap()[0].id, a);
+        let fence: i64 = sqlx::query_scalar("SELECT version FROM task_runs WHERE id = ?")
+            .bind(&a)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(retry_task(
+            &pool, &a, "w1", fence, Some("boom again".into()),
+            chrono::Utc::now().to_rfc3339(), AttemptEnd::Failed,
+        )
+        .await
+        .unwrap());
+        let kept = list_task_attempts(&pool, &a).await.unwrap();
+        assert_eq!(
+            kept.iter().map(|k| (k.attempt, k.reason.as_str(), k.output.as_deref())).collect::<Vec<_>>(),
+            vec![(1, "rerun", Some("boom")), (2, "failed", Some("boom again"))]
+        );
+        assert_eq!(kept[1].status, None, "a worker's retry: the task was not terminal");
+
+        assert_eq!(
+            run_again_events(&pool, &run).await,
+            vec![(
+                "run.rerun".to_string(),
+                serde_json::json!({ "run_id": run, "by": "rerun", "reset_tasks": 2 })
+            )],
+            "one event, for the one rerun"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A retry keeps the failed attempt it replaces, sets a run that had ended
+    /// running again, and leaves the task's count where it was. A clear keeps
+    /// an attempt that succeeded, and says so.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_retry_and_a_clear_keep_what_they_replace() {
+        let _g = attempt_env();
+        set_attempt_env(None, None);
+        let (pool, path) = temp_pool().await;
+        let (run, a, b) = chain_run(&pool, "name: chain\n").await;
+        fail_at(&pool, &run, &a, "boom").await;
+        sqlx::query("UPDATE workflow_runs SET status = 'cancelled' WHERE id = ?")
+            .bind(&run)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(retry_task_from_ui(&pool, &a).await.unwrap());
+        assert_eq!(round(&pool, &a).await, (1, 0, "ready".to_string()), "its count goes on");
+        assert_eq!(round(&pool, &b).await.2, "cancelled", "only the task asked for");
+        let run_row = get_run(&pool, &run).await.unwrap().unwrap();
+        assert_eq!(run_row.status.to_string(), "running", "a run whose task is to run is running");
+        let kept = list_task_attempts(&pool, &a).await.unwrap();
+        assert_eq!(
+            kept.iter().map(|k| (k.attempt, k.reason.as_str(), k.status.as_deref())).collect::<Vec<_>>(),
+            vec![(1, "retry", Some("failed"))]
+        );
+        assert!(!retry_task_from_ui(&pool, &a).await.unwrap(), "not failed any more");
+        assert!(!retry_task_from_ui(&pool, "no-such-task").await.unwrap());
+
+        // Its second attempt succeeds, and is then cleared.
+        sqlx::query(
+            "UPDATE task_runs SET status = 'succeeded', attempt = 2, output = 'ok',
+                 finished_at = '2026-01-01T00:01:00Z' WHERE id = ?",
+        )
+        .bind(&a)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(clear_task_with_downstream(&pool, &run, &a).await.unwrap(), Some(2));
+        assert_eq!(round(&pool, &a).await, (0, 2, "pending".to_string()));
+        let kept = list_task_attempts(&pool, &a).await.unwrap();
+        assert_eq!(
+            kept.iter()
+                .map(|k| (k.attempt, k.reason.as_str(), k.status.as_deref(), k.output.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![(1, "retry", Some("failed"), Some("boom")), (2, "clear", Some("succeeded"), Some("ok"))]
+        );
+
+        assert_eq!(
+            run_again_events(&pool, &run).await,
+            vec![
+                (
+                    "run.rerun".to_string(),
+                    serde_json::json!({ "run_id": run, "by": "retry", "reset_tasks": 1, "task_id": a })
+                ),
+                (
+                    "run.rerun".to_string(),
+                    serde_json::json!({ "run_id": run, "by": "clear", "reset_tasks": 2, "task_id": a })
+                ),
+            ]
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A retried task is queued when it is retried, as a rerun's and a
+    /// clear's are: its time is kept, and it is claimed at once.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_retried_task_is_queued_when_it_is_retried() {
+        let _g = attempt_env();
+        set_attempt_env(None, None);
+        let (pool, path) = temp_pool().await;
+        let (run, a, _) = chain_run(&pool, "name: chain\n").await;
+        fail_at(&pool, &run, &a, "boom").await;
+        let before = chrono::Utc::now();
+
+        assert!(retry_task_from_ui(&pool, &a).await.unwrap());
+        let queued = task_queued_at(&pool, &a)
+            .await
+            .unwrap()
+            .expect("a retried task's time is kept");
+        let queued = chrono::DateTime::parse_from_rfc3339(&queued).unwrap();
+        assert!(
+            queued >= before,
+            "queued at the retry, not before it: {queued}"
+        );
+        let claimed = claim_ready(&pool, "w1", 10).await.unwrap();
+        assert_eq!(
+            claimed.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec![a.as_str()]
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A run that had ended asks its concurrency key before it runs again, as
+    /// a new run of the key would: while the key is full a rerun, a retry and
+    /// a clear are each refused, and write nothing. A task retried in a run
+    /// that is running already asks nothing.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_run_set_running_again_asks_its_concurrency_key() {
+        let _g = attempt_env();
+        set_attempt_env(None, None);
+        let (pool, path) = temp_pool().await;
+        let head = "name: one-at-a-time\nmax_active_runs: 1\n";
+        let (older, a, _) = chain_run(&pool, head).await;
+        fail_at(&pool, &older, &a, "boom").await;
+        let (newer, _, _) = chain_run(&pool, head).await;
+
+        let full = |e: anyhow::Error| {
+            let m = e
+                .downcast_ref::<crate::models::MaxActiveRunsReached>()
+                .unwrap_or_else(|| panic!("not a full key: {e:?}"));
+            (m.name.clone(), m.max, m.active)
+        };
+        let want = ("one-at-a-time".to_string(), 1, 1);
+        assert_eq!(full(rerun_from_failed(&pool, &older).await.unwrap_err()), want);
+        assert_eq!(full(rerun_all(&pool, &older).await.unwrap_err()), want);
+        assert_eq!(full(retry_task_from_ui(&pool, &a).await.unwrap_err()), want);
+        assert_eq!(full(clear_task_with_downstream(&pool, &older, &a).await.unwrap_err()), want);
+
+        assert_eq!(get_run(&pool, &older).await.unwrap().unwrap().status.to_string(), "failed");
+        assert_eq!(round(&pool, &a).await, (1, 0, "failed".to_string()), "nothing was reset");
+        assert!(list_task_attempts(&pool, &a).await.unwrap().is_empty(), "and nothing kept");
+        assert!(run_again_events(&pool, &older).await.is_empty(), "and nothing announced");
+
+        // The key's run ends: the older one may run again.
+        sqlx::query("UPDATE workflow_runs SET status = 'succeeded' WHERE id = ?")
+            .bind(&newer)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rerun_from_failed(&pool, &older).await.unwrap(), Some(2));
+
+        // It is the key's one run now. A task of it that fails and is retried
+        // asks nothing: the run is not being set running, it is running.
+        sqlx::query("UPDATE task_runs SET status = 'failed', attempt = 1 WHERE id = ?")
+            .bind(&a)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(retry_task_from_ui(&pool, &a).await.unwrap());
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The engine's own rerun keeps what it replaces as a person's does, and
+    /// writes the event it always wrote, now with the rerun or not at all.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn the_engine_s_own_rerun_writes_its_event_with_the_rerun() {
+        let _g = attempt_env();
+        set_attempt_env(None, None);
+        let (pool, path) = temp_pool().await;
+        let (run, a, _) = chain_run(&pool, "name: chain\n").await;
+        fail_at(&pool, &run, &a, "boom").await;
+
+        let reset = rerun_from_failed_as(&pool, &run, crate::models::RunAgain::AutoRerun)
+            .await
+            .unwrap();
+        assert_eq!(reset, Some(2));
+        assert_eq!(list_task_attempts(&pool, &a).await.unwrap()[0].reason, "rerun");
+        assert_eq!(
+            run_again_events(&pool, &run).await,
+            vec![(
+                "run.auto_rerun".to_string(),
+                serde_json::json!({
+                    "run_id": run, "reset_tasks": 2, "reason": "auto_rerun_incomplete"
+                })
+            )]
+        );
+        // Already running: no second rerun, and no second event.
+        let again = rerun_from_failed_as(&pool, &run, crate::models::RunAgain::AutoRerun)
+            .await
+            .unwrap();
+        assert_eq!(again, None);
+        assert_eq!(run_again_events(&pool, &run).await.len(), 1);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The bound still bounds: a replaced attempt's output is kept as a tail,
+    /// the window drops the oldest attempts, and retention switched off keeps
+    /// nothing.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_replaced_attempt_is_a_bounded_tail_within_the_window() {
+        let _g = attempt_env();
+        set_attempt_env(Some("4"), Some("1"));
+        let (pool, path) = temp_pool().await;
+        let (run, a, _) = chain_run(&pool, "name: chain\n").await;
+
+        fail_at(&pool, &run, &a, "abcdefghij").await;
+        assert_eq!(rerun_from_failed(&pool, &run).await.unwrap(), Some(2));
+        let kept = list_task_attempts(&pool, &a).await.unwrap();
+        assert_eq!((kept[0].output.as_deref(), kept[0].truncated), (Some("ghij"), true));
+
+        // A second round, replaced in its turn: one attempt is kept, the newest.
+        fail_at(&pool, &run, &a, "xy").await;
+        assert_eq!(rerun_from_failed(&pool, &run).await.unwrap(), Some(2));
+        let kept = list_task_attempts(&pool, &a).await.unwrap();
+        assert_eq!(
+            kept.iter().map(|k| (k.attempt, k.output.as_deref(), k.truncated)).collect::<Vec<_>>(),
+            vec![(2, Some("xy"), false)]
+        );
+
+        set_attempt_env(Some("0"), None);
+        fail_at(&pool, &run, &a, "unkept").await;
+        assert_eq!(rerun_from_failed(&pool, &run).await.unwrap(), Some(2));
+        assert_eq!(list_task_attempts(&pool, &a).await.unwrap().len(), 1, "retention is off");
+        assert_eq!(round(&pool, &a).await, (0, 3, "pending".to_string()), "the count goes on all the same");
+
+        set_attempt_env(None, None);
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── A rerun of a run whole (`from: all`) ─────────────────────────────────
+
+    /// A rerun of a run whole puts back every task, what succeeded included,
+    /// in a run that succeeded as in one that failed. It keeps what it
+    /// replaces, drops a checkpoint with the rest of a task's result, and
+    /// says `"from": "all"` in its event. A run that has not ended, or does
+    /// not exist, is not rerun.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_rerun_of_a_run_whole_puts_back_what_succeeded() {
+        let _g = attempt_env();
+        set_attempt_env(None, None);
+        let (pool, path) = temp_pool().await;
+        let (run, a, b) = chain_run(&pool, "name: chain\n").await;
+        sqlx::query(
+            "UPDATE task_runs SET status = 'succeeded', attempt = 1, output = 'ok',
+                 checkpoint_uri = 'file:///cp', scheduled_at = '2026-01-01T00:00:00Z',
+                 finished_at = '2026-01-01T00:00:05Z'
+             WHERE run_id = ?",
+        )
+        .bind(&run)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE workflow_runs SET status = 'succeeded', output = 'ok',
+                 finished_at = '2026-01-01T00:00:05Z' WHERE id = ?",
+        )
+        .bind(&run)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let version = |id: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("SELECT version FROM task_runs WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        let before = version(a.clone()).await;
+
+        assert_eq!(
+            rerun_from_failed(&pool, &run).await.unwrap(),
+            None,
+            "from the failed: none failed"
+        );
+        assert_eq!(rerun_all(&pool, &run).await.unwrap(), Some(2));
+        let row = get_run(&pool, &run).await.unwrap().unwrap();
+        assert_eq!(row.status.to_string(), "running");
+        assert_eq!((row.finished_at, row.output), (None, None));
+        for id in [&a, &b] {
+            assert_eq!(round(&pool, id).await, (0, 1, "pending".to_string()));
+            let kept = list_task_attempts(&pool, id).await.unwrap();
+            assert_eq!(
+                kept.iter()
+                    .map(|k| (
+                        k.attempt,
+                        k.reason.as_str(),
+                        k.status.as_deref(),
+                        k.output.as_deref()
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![(1, "rerun", Some("succeeded"), Some("ok"))]
+            );
+        }
+        assert_eq!(
+            version(a.clone()).await,
+            before + 1,
+            "a stale worker is fenced off"
+        );
+        let (deps, checkpoint): (i64, Option<String>) =
+            sqlx::query_as("SELECT remaining_deps, checkpoint_uri FROM task_runs WHERE id = ?")
+                .bind(&b)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            (deps, checkpoint),
+            (1, None),
+            "b waits for a again, and resumes nothing"
+        );
+        assert_eq!(
+            run_again_events(&pool, &run).await,
+            vec![(
+                "run.rerun".to_string(),
+                serde_json::json!({ "run_id": run, "by": "rerun", "reset_tasks": 2, "from": "all" })
+            )]
+        );
+
+        // It runs again from its first task.
+        advance_ready_tasks(&pool).await.unwrap();
+        assert_eq!(round(&pool, &a).await.2, "ready");
+        assert_eq!(round(&pool, &b).await.2, "pending");
+
+        // Running: not rerun again, and nothing more written.
+        assert_eq!(rerun_all(&pool, &run).await.unwrap(), None);
+        assert_eq!(rerun_all(&pool, "no-such-run").await.unwrap(), None);
+        assert_eq!(run_again_events(&pool, &run).await.len(), 1);
+
+        // A run that failed: what failed, what was cancelled and what
+        // succeeded are all put back.
+        let (failed, a, b) = chain_run(&pool, "name: chain\n").await;
+        fail_at(&pool, &failed, &a, "boom").await;
+        assert_eq!(rerun_all(&pool, &failed).await.unwrap(), Some(2));
+        assert_eq!(round(&pool, &a).await, (0, 1, "pending".to_string()));
+        assert_eq!(round(&pool, &b).await, (0, 0, "pending".to_string()));
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A runtime fan-out run whole again: its instances go, and are made again
+    /// from what its producer prints this time. A failed instance of the run
+    /// before holds nothing back, as it would were it kept until the barrier
+    /// is expanded again.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_rerun_of_a_run_whole_fans_out_again() {
+        let _g = crate::env_lock();
+        let (pool, path, run_id, barrier) = parked_fanout(r#"["a","b"]"#).await;
+        reconcile_fanouts(&pool).await.unwrap();
+        let instances = claim_ready(&pool, "w1", 10).await.unwrap();
+        assert_eq!(instances.len(), 2);
+        mark_task_succeeded(
+            &pool,
+            &instances[0].id,
+            "w1",
+            instances[0].version + 1,
+            None,
+        )
+        .await
+        .unwrap();
+        mark_task_failed(
+            &pool,
+            &instances[1].id,
+            "w1",
+            instances[1].version + 1,
+            None,
+        )
+        .await
+        .unwrap();
+        reconcile_fanouts(&pool).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+        reap_completed_runs(&pool).await.unwrap();
+        assert_eq!(
+            get_run(&pool, &run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                .to_string(),
+            "failed"
+        );
+
+        // `list`, `process` and `summarize`: the two instances are not among them.
+        assert_eq!(rerun_all(&pool, &run_id).await.unwrap(), Some(3));
+        let instances: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_runs WHERE fanout_parent = ?")
+                .bind(&barrier)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(instances, 0, "the instances went");
+        let edges: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_dependencies WHERE dependent_id = ?")
+                .bind(&barrier)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(edges, 1, "the barrier waits for its producer alone");
+
+        advance_ready_tasks(&pool).await.unwrap();
+        let c = claim_ready(&pool, "w1", 10).await.unwrap();
+        assert_eq!(c.len(), 1, "the producer runs first, and alone");
+        assert_eq!(c[0].name, "list");
+        mark_task_succeeded(
+            &pool,
+            &c[0].id,
+            "w1",
+            c[0].version + 1,
+            Some(r#"["x","y","z"]"#.into()),
+        )
+        .await
+        .unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+        let events = reconcile_fanouts(&pool).await.unwrap().done;
+        assert_eq!(
+            events[0].1,
+            crate::models::FanoutOutcome::Expanded { instances: 3 },
+            "expanded again over the producer's new output"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A run whole again asks its approval gates again, from nothing: the
+    /// decision it asked for last time is kept as the gate's attempt, and is
+    /// not left on the gate for an approver to read as this one's. Who asked
+    /// for the rerun is recorded on what it put back.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_rerun_of_a_run_whole_asks_its_gates_again() {
+        let _g = attempt_env();
+        set_attempt_env(None, None);
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: gate\ntasks:\n  - name: gate\n    type: approval\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let run_id = create_run(&pool, &dag, yaml).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+        let gate = list_tasks(&pool, &run_id).await.unwrap()[0].clone();
+        assert_eq!(gate.status, crate::models::TaskStatus::AwaitingApproval);
+        let decided = |by: &'static str| {
+            let (pool, run_id, gate) = (pool.clone(), run_id.clone(), gate.id.clone());
+            async move {
+                assert!(resolve_approval(
+                    &pool,
+                    &run_id,
+                    &gate,
+                    true,
+                    Some(by),
+                    Some("looks right")
+                )
+                .await
+                .unwrap());
+                reap_completed_runs(&pool).await.unwrap();
+                assert_eq!(
+                    get_run(&pool, &run_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status
+                        .to_string(),
+                    "succeeded"
+                );
+            }
+        };
+        // `(decided_by, decision_comment, reset_by)` of the gate.
+        let decision = |gate: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+                    "SELECT decided_by, decision_comment, reset_by FROM task_runs WHERE id = ?",
+                )
+                .bind(gate)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        decided("alice").await;
+
+        let mut tx = pool.begin().await.unwrap();
+        assert_eq!(
+            rerun_all_in(&mut tx, &run_id, Some("carol")).await.unwrap(),
+            Some(1)
+        );
+        tx.commit().await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+        let gate = list_tasks(&pool, &run_id).await.unwrap()[0].clone();
+        assert_eq!(
+            gate.status,
+            crate::models::TaskStatus::AwaitingApproval,
+            "asked again"
+        );
+        assert_eq!(
+            decision(gate.id.clone()).await,
+            (None, None, Some("carol".to_string())),
+            "last time's decision is not this one's"
+        );
+        assert!(claim_ready(&pool, "w", 10).await.unwrap().is_empty());
+
+        // Each decision it replaced is kept, numbered as an attempt.
+        decided("bob").await;
+        assert_eq!(rerun_all(&pool, &run_id).await.unwrap(), Some(1));
+        assert_eq!(decision(gate.id.clone()).await, (None, None, None));
+        assert_eq!(round(&pool, &gate.id).await, (0, 2, "pending".to_string()));
+        let kept = list_task_attempts(&pool, &gate.id).await.unwrap();
+        assert_eq!(
+            kept.iter()
+                .map(|k| (k.attempt, k.reason.as_str(), k.status.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "rerun", Some("succeeded")),
+                (2, "rerun", Some("succeeded"))
+            ]
+        );
+        let said = |k: &crate::models::TaskAttempt| k.output.clone().unwrap_or_default();
+        assert!(said(&kept[0]).contains("alice"), "{}", said(&kept[0]));
+        assert!(said(&kept[1]).contains("bob"), "{}", said(&kept[1]));
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A run set running again after it ended is held to its deadlines from
+    /// then, as a new run is from when it is made: a rerun of a run older
+    /// than its `run_timeout_secs` runs, where the deadline it was made with
+    /// would have failed it at the next sweep, and its SLA alert may fire
+    /// again. A rerun of every job is counted (`whole_reruns`).
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_run_set_running_again_counts_its_deadlines_from_then() {
+        let (pool, path) = temp_pool().await;
+        let head = "name: timed\nrun_timeout_secs: 60\ndeadline:\n  in: 30m\n";
+        // `(deadline_at, alert_deadline_at, alert_fired_at, whole_reruns)`.
+        let deadlines = |run: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>, i64)>(
+                    "SELECT deadline_at, alert_deadline_at, alert_fired_at, whole_reruns
+                     FROM workflow_runs WHERE id = ?",
+                )
+                .bind(run)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        // A run that ended a day ago, its deadlines long past and its alert fired.
+        let ended_long_ago = |run: String, status: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "UPDATE task_runs SET status = ?, attempt = 1, output = 'done',
+                         finished_at = '2026-01-01T00:00:05Z'
+                     WHERE run_id = ?",
+                )
+                .bind(status)
+                .bind(&run)
+                .execute(&pool)
+                .await
+                .unwrap();
+                sqlx::query(
+                    "UPDATE workflow_runs SET status = ?, finished_at = '2026-01-01T00:00:05Z',
+                         deadline_at = '2026-01-01T00:01:00+00:00',
+                         alert_deadline_at = '2026-01-01T00:30:00+00:00',
+                         alert_fired_at = '2026-01-01T00:30:01+00:00'
+                     WHERE id = ?",
+                )
+                .bind(status)
+                .bind(&run)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        let after = |at: Option<String>, secs: i64| {
+            let at =
+                chrono::DateTime::parse_from_rfc3339(at.as_deref().expect("a deadline")).unwrap();
+            let from_now = at.with_timezone(&chrono::Utc) - chrono::Utc::now();
+            assert!(
+                from_now > chrono::TimeDelta::seconds(secs - 10)
+                    && from_now <= chrono::TimeDelta::seconds(secs),
+                "{at} is not {secs} s from now"
+            );
+        };
+
+        let (run, a, _) = chain_run(&pool, head).await;
+        ended_long_ago(run.clone(), "succeeded").await;
+        assert_eq!(rerun_all(&pool, &run).await.unwrap(), Some(2));
+        assert!(
+            cancel_overdue_runs(&pool).await.unwrap().is_empty(),
+            "not overdue"
+        );
+        assert_eq!(
+            get_run(&pool, &run)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                .to_string(),
+            "running"
+        );
+        let (deadline, alert, fired, whole) = deadlines(run.clone()).await;
+        after(deadline, 60);
+        after(alert, 1800);
+        assert_eq!((fired, whole), (None, 1));
+
+        // The other three that set an ended run running again do the same.
+        ended_long_ago(run.clone(), "succeeded").await;
+        assert_eq!(
+            clear_task_with_downstream(&pool, &run, &a).await.unwrap(),
+            Some(2)
+        );
+        assert!(cancel_overdue_runs(&pool).await.unwrap().is_empty());
+        let (deadline, _, fired, whole) = deadlines(run.clone()).await;
+        after(deadline, 60);
+        assert_eq!(
+            (fired, whole),
+            (None, 1),
+            "a clear is no rerun of every job"
+        );
+        ended_long_ago(run.clone(), "failed").await;
+        assert_eq!(rerun_from_failed(&pool, &run).await.unwrap(), Some(2));
+        assert!(cancel_overdue_runs(&pool).await.unwrap().is_empty());
+        after(deadlines(run.clone()).await.0, 60);
+        ended_long_ago(run.clone(), "failed").await;
+        assert!(retry_task_from_ui(&pool, &a).await.unwrap());
+        assert!(cancel_overdue_runs(&pool).await.unwrap().is_empty());
+        after(deadlines(run.clone()).await.0, 60);
+
+        // A run with no deadline has none after it either.
+        let (plain, _, _) = chain_run(&pool, "name: plain\n").await;
+        ended_long_ago(plain.clone(), "succeeded").await;
+        sqlx::query(
+            "UPDATE workflow_runs SET deadline_at = NULL, alert_deadline_at = NULL WHERE id = ?",
+        )
+        .bind(&plain)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rerun_all(&pool, &plain).await.unwrap(), Some(2));
+        assert_eq!(deadlines(plain).await, (None, None, None, 1));
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A task put back is parked again from nothing. What parked it last
+    /// time (a child run, a time, a dataset) goes with the rest of its
+    /// result: left on the row, the sweeps would resolve the task from its
+    /// last child run or its last deadline in the time between its claim and
+    /// its park, and release what depends on it.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_task_put_back_is_parked_again_from_nothing() {
+        let (pool, path) = temp_pool().await;
+        // The child run the task waited on last time, which succeeded.
+        let (child, _, _) = chain_run(&pool, "name: child\n").await;
+        sqlx::query("UPDATE workflow_runs SET status = 'succeeded', output = 'old' WHERE id = ?")
+            .bind(&child)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (run, a, b) = chain_run(&pool, "name: parent\n").await;
+        sqlx::query(
+            "UPDATE task_runs SET status = 'succeeded', attempt = 1, output = 'done',
+                 sub_run_id = CASE WHEN id = ?2 THEN ?3 END,
+                 wake_at = CASE WHEN id = ?2 THEN '2026-01-01T00:00:00Z' END,
+                 wait_dataset = CASE WHEN id = ?2 THEN 'orders' END,
+                 wait_dataset_cursor = CASE WHEN id = ?2 THEN 0 END,
+                 cache_hit = 1
+             WHERE run_id = ?1",
+        )
+        .bind(&run)
+        .bind(&a)
+        .bind(&child)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE workflow_runs SET status = 'succeeded' WHERE id = ?")
+            .bind(&run)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(rerun_all(&pool, &run).await.unwrap(), Some(2));
+        let parks: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT sub_run_id, wake_at, wait_dataset, wait_dataset_cursor, cache_hit
+             FROM task_runs WHERE id = ?",
+        )
+        .bind(&a)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(parks, (None, None, None, None, 0));
+
+        // Claimed, and not yet parked again: no sweep takes it for parked.
+        advance_ready_tasks(&pool).await.unwrap();
+        let claimed = claim_ready(&pool, "w", 10).await.unwrap();
+        assert!(claimed.iter().any(|t| t.id == a), "a runs again");
+        assert!(reconcile_subworkflows(&pool).await.unwrap().done.is_empty());
+        assert!(reconcile_waits(&pool).await.unwrap().done.is_empty());
+        assert!(reconcile_dataset_waits(&pool)
+            .await
+            .unwrap()
+            .done
+            .is_empty());
+        assert_eq!(round(&pool, &a).await.2, "running");
+        assert_eq!(
+            round(&pool, &b).await.2,
+            "pending",
+            "nothing it holds back is released"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// A run that waits for its workflow's cap (`when_full`), and one that takes
+/// another's place.
+#[cfg(test)]
+mod wait_tests {
+    use super::*;
+    use crate::dag::DagGraph;
+    use crate::models::{trigger_kind, MaxActiveRunsReached, RunTrigger};
+
+    async fn temp_pool() -> (Pool, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("module54_wait_{}.db", Uuid::new_v4()));
+        let pool = init_pool(path.to_str().unwrap()).await.unwrap();
+        (pool, path)
+    }
+
+    /// A workflow `deploy` of one task, with `head` above its tasks.
+    fn spec(head: &str) -> String {
+        format!("name: deploy\n{head}tasks:\n  - name: a\n    command: [\"true\"]\n")
+    }
+
+    async fn make(pool: &Pool, yaml: &str) -> String {
+        create_run(pool, &DagGraph::from_yaml(yaml).unwrap(), yaml).await.unwrap()
+    }
+
+    async fn make_for(pool: &Pool, yaml: &str, by: &RunTrigger) -> String {
+        create_run_triggered(pool, &DagGraph::from_yaml(yaml).unwrap(), yaml, by).await.unwrap()
+    }
+
+    /// What a run reads: its status, whether it waits, and what it is to be.
+    async fn reads(pool: &Pool, run: &str) -> (String, bool, Option<String>) {
+        let (status, queued, admitted, stopping): (String, Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT status, queued_at, admitted_at, stopping_as FROM workflow_runs WHERE id = ?")
+                .bind(run)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let waits = status == "running" && queued.is_some() && admitted.is_none();
+        (status, waits, stopping)
+    }
+
+    fn waiting() -> (String, bool, Option<String>) {
+        ("running".to_string(), true, None)
+    }
+
+    fn running() -> (String, bool, Option<String>) {
+        ("running".to_string(), false, None)
+    }
+
+    fn ended(status: &str) -> (String, bool, Option<String>) {
+        (status.to_string(), false, None)
+    }
+
+    /// A run's tasks, by name: each one's status and what it still waits for.
+    async fn tasks(pool: &Pool, run: &str) -> Vec<(String, String, i64)> {
+        sqlx::query_as("SELECT name, status, remaining_deps FROM task_runs WHERE run_id = ? ORDER BY name")
+            .bind(run)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    /// End a run as one whose every task succeeded.
+    async fn finish(pool: &Pool, run: &str) {
+        sqlx::query(
+            "UPDATE task_runs SET status = 'succeeded', finished_at = ?, claimed_by = NULL,
+                    lease_expires_at = NULL, remaining_deps = 0
+             WHERE run_id = ?",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(run)
+        .execute(pool)
+        .await
+        .unwrap();
+        reap_completed_runs(pool).await.unwrap();
+        assert_eq!(reads(pool, run).await, ended("succeeded"));
+    }
+
+    /// Say when a run began to wait, so that an order does not hang on two
+    /// readings of a clock.
+    async fn queued_at(pool: &Pool, run: &str, at: &str) {
+        sqlx::query("UPDATE workflow_runs SET queued_at = ? WHERE id = ?")
+            .bind(at)
+            .bind(run)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn completed_events(pool: &Pool, run: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM event_outbox WHERE run_id = ? AND event_type = 'run.completed'")
+            .bind(run)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// A run that arrives at a full cap is made, and waits: it reads
+    /// `running`, nothing of it advances, and no deadline of its own ends it.
+    /// When the run before it has ended it is let in, its roots advance, and
+    /// its budget is counted from there.
+    #[tokio::test]
+    async fn a_run_over_its_cap_waits_and_is_let_in_when_the_one_before_has_ended() {
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: deploy\nmax_active_runs: 1\nwhen_full: queue\nrun_timeout_secs: 600\ntasks:\n  - name: a\n    command: [\"true\"]\n  - name: b\n    command: [\"true\"]\n    depends_on: [a]\n";
+        let first = make(&pool, yaml).await;
+        let second = make(&pool, yaml).await;
+        assert_eq!(reads(&pool, &first).await, running(), "the first has the cap to itself");
+        assert_eq!(reads(&pool, &second).await, waiting());
+
+        // Nothing of the one that waits advances, and nothing of it is claimed.
+        advance_ready_tasks(&pool).await.unwrap();
+        let held = [("a".to_string(), "pending".to_string(), 1), ("b".to_string(), "pending".to_string(), 2)];
+        assert_eq!(tasks(&pool, &second).await, held);
+        let claimed = claim_ready(&pool, "w", 10).await.unwrap();
+        assert_eq!(claimed.iter().map(|t| t.run_id.as_str()).collect::<Vec<_>>(), [first.as_str()]);
+        assert!(admit_waiting_runs(&pool).await.unwrap().is_empty(), "the first has not ended");
+
+        // Its budget is for what it runs. Say it has waited an hour, with ten
+        // minutes to run in: the deadline it was made with is long past, and
+        // ends nothing.
+        let hour_ago = chrono::Utc::now() - chrono::TimeDelta::hours(1);
+        sqlx::query("UPDATE workflow_runs SET queued_at = ?, deadline_at = ? WHERE id = ?")
+            .bind(hour_ago.to_rfc3339())
+            .bind((hour_ago + chrono::TimeDelta::seconds(600)).to_rfc3339())
+            .bind(&second)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(cancel_overdue_runs(&pool).await.unwrap().is_empty());
+        assert_eq!(reads(&pool, &second).await, waiting());
+
+        // A third waits behind the second, and is not let in ahead of it.
+        let third = make(&pool, yaml).await;
+        assert_eq!(reads(&pool, &third).await, waiting());
+
+        finish(&pool, &first).await;
+        assert_eq!(admit_waiting_runs(&pool).await.unwrap(), vec![second.clone()]);
+        assert_eq!(reads(&pool, &second).await, running());
+        assert_eq!(reads(&pool, &third).await, waiting());
+        let deadline: Option<String> = sqlx::query_scalar("SELECT deadline_at FROM workflow_runs WHERE id = ?")
+            .bind(&second)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let left = chrono::DateTime::parse_from_rfc3339(deadline.as_deref().unwrap()).unwrap()
+            - chrono::Utc::now().fixed_offset();
+        assert!(
+            (540..=600).contains(&left.num_seconds()),
+            "ten minutes from when it was let in, not from when it was made: {deadline:?}"
+        );
+        assert!(cancel_overdue_runs(&pool).await.unwrap().is_empty());
+        // And it is a deadline again: past it, the run fails.
+        sqlx::query("UPDATE workflow_runs SET deadline_at = '2020-01-01T00:00:00+00:00' WHERE id = ?")
+            .bind(&second)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            cancel_overdue_runs(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec![second.clone()]
+        );
+        assert_eq!(reads(&pool, &second).await, ended("failed"));
+        // The third's turn has come with that.
+        assert_eq!(admit_waiting_runs(&pool).await.unwrap(), vec![third.clone()]);
+        assert!(admit_waiting_runs(&pool).await.unwrap().is_empty(), "a run is let in once");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// What a run that is let in has is what a run that never waited has: its
+    /// roots advance and are claimed, and what depends on them waits for them.
+    #[tokio::test]
+    async fn a_run_that_is_let_in_runs_as_one_that_never_waited() {
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: deploy\nmax_active_runs: 1\nwhen_full: queue\ntasks:\n  - name: a\n    command: [\"true\"]\n  - name: b\n    command: [\"true\"]\n    depends_on: [a]\n";
+        let first = make(&pool, yaml).await;
+        let second = make(&pool, yaml).await;
+        finish(&pool, &first).await;
+        assert_eq!(admit_waiting_runs(&pool).await.unwrap(), vec![second.clone()]);
+        assert_eq!(
+            tasks(&pool, &second).await,
+            [("a".to_string(), "pending".to_string(), 0), ("b".to_string(), "pending".to_string(), 1)]
+        );
+
+        advance_ready_tasks(&pool).await.unwrap();
+        let a = claim_ready(&pool, "w", 10).await.unwrap().remove(0);
+        assert_eq!((a.run_id.as_str(), a.name.as_str()), (second.as_str(), "a"));
+        mark_task_succeeded(&pool, &a.id, "w", a.version + 1, None).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+        let b = claim_ready(&pool, "w", 10).await.unwrap().remove(0);
+        assert_eq!(b.name, "b");
+        mark_task_succeeded(&pool, &b.id, "w", b.version + 1, None).await.unwrap();
+        reap_completed_runs(&pool).await.unwrap();
+        assert_eq!(reads(&pool, &second).await, ended("succeeded"));
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A run its parameters leave no task in, that came to a full cap, waits
+    /// for its turn as any other: it ends once it is let in, and not before.
+    #[tokio::test]
+    async fn a_run_of_no_task_at_a_full_cap_ends_once_it_is_let_in() {
+        let (pool, path) = temp_pool().await;
+        let busy = make(&pool, &spec("max_active_runs: 1\nwhen_full: queue\n")).await;
+        let empty = make(
+            &pool,
+            "name: deploy\nmax_active_runs: 1\nwhen_full: queue\nparameters: { event: push }\n\
+             tasks:\n  - name: a\n    command: [\"true\"]\n    when: \"{{ event }} == tag\"\n",
+        )
+        .await;
+        assert!(tasks(&pool, &empty).await.is_empty(), "the when leaves its task out");
+        assert_eq!(reads(&pool, &empty).await, waiting());
+
+        assert!(reap_completed_runs(&pool).await.unwrap().is_empty());
+        assert_eq!(reads(&pool, &empty).await, waiting(), "not ended before its turn");
+
+        // The run before it ends (`finish` reaps it), and its turn comes.
+        finish(&pool, &busy).await;
+        assert_eq!(reads(&pool, &empty).await, waiting(), "until it is let in");
+        assert_eq!(admit_waiting_runs(&pool).await.unwrap(), vec![empty.clone()]);
+        let ended_now = reap_completed_runs(&pool).await.unwrap();
+        assert_eq!(ended_now.len(), 1);
+        assert_eq!(ended_now[0].0, empty);
+        assert_eq!(reads(&pool, &empty).await, ended("succeeded"));
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Runs are let in in the order they came, as many as the cap has room
+    /// for, and each key of a workflow has a queue of its own.
+    #[tokio::test]
+    async fn runs_are_let_in_oldest_first_and_as_many_as_the_cap_has_room_for() {
+        let (pool, path) = temp_pool().await;
+        let yaml = spec("max_active_runs: 2\nwhen_full: queue\n");
+        let one = make(&pool, &yaml).await;
+        let two = make(&pool, &yaml).await;
+        let mut behind = Vec::new();
+        // Made newest first, and said to have come in the other order.
+        for at in ["2026-10-13T10:00:03+00:00", "2026-10-13T10:00:02+00:00", "2026-10-13T10:00:01+00:00"] {
+            let run = make(&pool, &yaml).await;
+            assert_eq!(reads(&pool, &run).await, waiting());
+            queued_at(&pool, &run, at).await;
+            behind.push(run);
+        }
+        // Another key of the same workflow is not behind any of them.
+        let keyed = spec("max_active_runs: 2\nwhen_full: queue\nconcurrency_key: other\n");
+        assert_eq!(reads(&pool, &make(&pool, &keyed).await).await, running());
+
+        assert!(admit_waiting_runs(&pool).await.unwrap().is_empty(), "the cap is full");
+        finish(&pool, &one).await;
+        assert_eq!(admit_waiting_runs(&pool).await.unwrap(), vec![behind[2].clone()], "room for one");
+        finish(&pool, &two).await;
+        finish(&pool, &behind[2]).await;
+        assert_eq!(
+            admit_waiting_runs(&pool).await.unwrap(),
+            vec![behind[1].clone(), behind[0].clone()],
+            "room for two, in the order they came"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A workflow that says nothing of a full cap refuses, as it did, and one
+    /// that queues refuses once as many runs wait as may. A run that waits is
+    /// in the way of a workflow that refuses, as a run that runs is.
+    #[tokio::test]
+    async fn a_queue_is_no_longer_than_it_may_be() {
+        let (pool, path) = temp_pool().await;
+        let queues = spec("max_active_runs: 1\nwhen_full: queue\n");
+        let refuses = spec("max_active_runs: 1\n");
+        let refused = |e: anyhow::Error| e.downcast_ref::<MaxActiveRunsReached>().cloned().expect("a typed refusal");
+        let dag = |yaml: &str| DagGraph::from_yaml(yaml).unwrap();
+
+        let first = make(&pool, &queues).await;
+        let may = crate::dag::max_waiting_runs();
+        for _ in 0..may {
+            make(&pool, &queues).await;
+        }
+        let full = refused(create_run(&pool, &dag(&queues), &queues).await.unwrap_err());
+        assert_eq!((full.active, full.waiting, full.max), (may + 1, may, 1));
+        assert!(full.to_string().contains("no more may wait"), "{full}");
+        let said = refused(create_run(&pool, &dag(&refuses), &refuses).await.unwrap_err());
+        assert_eq!((said.active, said.waiting), (may + 1, 0), "a workflow that refuses says only that");
+        assert!(!said.to_string().contains("wait"), "{said}");
+
+        // With the first ended and nothing let in yet, the ones that wait are
+        // still before a new run: it is not made ahead of them.
+        finish(&pool, &first).await;
+        assert!(create_run(&pool, &dag(&refuses), &refuses).await.is_err());
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A run that supersedes cancels the runs of its key before it. One whose
+    /// work is still running holds the key until that is gone, and the new
+    /// run waits for it. One that waits ends at once, and is told as ended.
+    #[tokio::test]
+    async fn a_run_that_supersedes_cancels_what_is_before_it_and_waits_for_its_work_to_stop() {
+        let (pool, path) = temp_pool().await;
+        let yaml = spec("max_active_runs: 1\nwhen_full: supersede\n");
+        let first = make(&pool, &yaml).await;
+        advance_ready_tasks(&pool).await.unwrap();
+        let held = claim_ready(&pool, "w", 10).await.unwrap().remove(0);
+
+        // The first has work a worker holds: it is asked to stop, and the
+        // second waits for it.
+        let second = make(&pool, &yaml).await;
+        assert_eq!(reads(&pool, &first).await, ("running".to_string(), false, Some("cancelled".to_string())));
+        assert_eq!(reads(&pool, &second).await, waiting());
+        let output: Option<String> = sqlx::query_scalar("SELECT output FROM workflow_runs WHERE id = ?")
+            .bind(&first)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(output, Some(format!("superseded by run {second}")));
+        assert_eq!(completed_events(&pool, &first).await, 0, "it has not ended");
+
+        // A third takes the second's place too. The second had started
+        // nothing: it is over here, and its end is told.
+        let third = make(&pool, &yaml).await;
+        assert_eq!(reads(&pool, &second).await, ended("cancelled"));
+        assert_eq!(tasks(&pool, &second).await, [("a".to_string(), "cancelled".to_string(), 1)]);
+        assert_eq!(completed_events(&pool, &second).await, 1);
+        assert_eq!(reads(&pool, &third).await, waiting());
+        assert!(admit_waiting_runs(&pool).await.unwrap().is_empty(), "the first's work is still there");
+
+        // The first's work is gone: it ends, and the third is let in.
+        assert!(settle_stopped_task(&pool, &held.id, "w", held.version + 1).await.unwrap());
+        assert_eq!(reads(&pool, &first).await, ended("cancelled"));
+        assert_eq!(completed_events(&pool, &first).await, 1);
+        assert_eq!(admit_waiting_runs(&pool).await.unwrap(), vec![third.clone()]);
+        assert_eq!(reads(&pool, &third).await, running());
+
+        // Nothing of the third is held by a worker: a fourth ends it where it
+        // is made, and waits for nothing.
+        advance_ready_tasks(&pool).await.unwrap();
+        let fourth = make(&pool, &yaml).await;
+        assert_eq!(reads(&pool, &third).await, ended("cancelled"));
+        assert_eq!(reads(&pool, &fourth).await, running());
+        assert_eq!(tasks(&pool, &fourth).await, [("a".to_string(), "pending".to_string(), 0)]);
+
+        // Another key's run is none of its business.
+        let other = spec("max_active_runs: 1\nwhen_full: supersede\nconcurrency_key: other\n");
+        let beside = make(&pool, &other).await;
+        make(&pool, &yaml).await;
+        assert_eq!(reads(&pool, &beside).await, running());
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A run that is not trusted writes its own key, so it takes the place of
+    /// its own source's runs alone: another pull request's stays, and is in
+    /// its way. A trusted run of the same workflow and key is counted apart
+    /// from both.
+    #[tokio::test]
+    async fn a_run_that_is_not_trusted_supersedes_its_own_source_s_runs_alone() {
+        let (pool, path) = temp_pool().await;
+        let yaml = spec("max_active_runs: 1\nwhen_full: supersede\nconcurrency_key: pr-7\n");
+        let from = |pr: i64, trust: &str| RunTrigger {
+            kind: trigger_kind::CI.to_string(),
+            principal: "ci:svc@example.com".to_string(),
+            trust: Some(trust.to_string()),
+            forge_host: Some("github.com".to_string()),
+            repo: Some("acme/widgets".to_string()),
+            git_ref: Some(format!("refs/pull/{pr}/head")),
+            pr: Some(pr),
+            ..Default::default()
+        };
+
+        let theirs = make_for(&pool, &yaml, &from(7, "untrusted")).await;
+        // Pull request 8 names 7's key. It cancels nothing of 7's, and waits.
+        let intruder = make_for(&pool, &yaml, &from(8, "untrusted")).await;
+        assert_eq!(reads(&pool, &theirs).await, running());
+        assert_eq!(reads(&pool, &intruder).await, waiting());
+
+        // A trusted run of the same name and key is no confined run's to
+        // cancel, and none of them is in its way.
+        let trusted = make_for(&pool, &yaml, &from(7, "trusted")).await;
+        assert_eq!(reads(&pool, &trusted).await, running());
+        assert_eq!(reads(&pool, &theirs).await, running());
+
+        // Pull request 7's next push takes its own run's place, and leaves
+        // 8's, which is before it.
+        let next = make_for(&pool, &yaml, &from(7, "untrusted")).await;
+        assert_eq!(reads(&pool, &theirs).await, ended("cancelled"));
+        assert_eq!(reads(&pool, &intruder).await, waiting());
+        assert_eq!(reads(&pool, &next).await, waiting());
+        assert_eq!(reads(&pool, &trusted).await, running());
+        assert_eq!(admit_waiting_runs(&pool).await.unwrap(), vec![intruder.clone()], "oldest first");
+
+        // The same pull request on another forge, or under another ref, is
+        // another source.
+        let elsewhere = RunTrigger { forge_host: Some("git.example.com".to_string()), ..from(8, "untrusted") };
+        make_for(&pool, &yaml, &elsewhere).await;
+        assert_eq!(reads(&pool, &intruder).await, running());
+
+        let keys: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT DISTINCT concurrency_key FROM workflow_runs ORDER BY concurrency_key")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(keys, [Some("pr-7".to_string()), Some("untrusted:pr-7".to_string())]);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A run cancelled as it waits ends at once and is told as ended, and
+    /// nothing is let in for it. Run again, it does not wait: it asks its key
+    /// as a run that is set running again does, and its tasks have the
+    /// dependencies they have.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_run_cancelled_as_it_waits_is_over_and_run_again_does_not_wait() {
+        let (pool, path) = temp_pool().await;
+        let yaml = spec("max_active_runs: 1\nwhen_full: queue\n");
+        let first = make(&pool, &yaml).await;
+        let second = make(&pool, &yaml).await;
+
+        let did = cancel_run(&pool, &second).await.unwrap().expect("a run that waits is one to cancel");
+        assert_eq!((did.cancelled, did.stopping), (1, 0));
+        assert_eq!(reads(&pool, &second).await, ended("cancelled"));
+        assert_eq!(completed_events(&pool, &second).await, 1);
+        assert!(admit_waiting_runs(&pool).await.unwrap().is_empty());
+
+        // Its key is full while the first runs, and it is refused as any run
+        // set running again is: it does not go back to waiting.
+        let refused = rerun_from_failed(&pool, &second).await.unwrap_err();
+        assert!(refused.downcast_ref::<MaxActiveRunsReached>().is_some(), "{refused}");
+        assert_eq!(reads(&pool, &second).await, ended("cancelled"));
+
+        finish(&pool, &first).await;
+        assert_eq!(rerun_from_failed(&pool, &second).await.unwrap(), Some(1));
+        assert_eq!(reads(&pool, &second).await, running(), "it is let in by being run again");
+        assert_eq!(tasks(&pool, &second).await, [("a".to_string(), "pending".to_string(), 0)]);
+        assert!(admit_waiting_runs(&pool).await.unwrap().is_empty(), "and nothing is taken off it twice");
+        assert_eq!(tasks(&pool, &second).await, [("a".to_string(), "pending".to_string(), 0)]);
+        advance_ready_tasks(&pool).await.unwrap();
+        assert_eq!(claim_ready(&pool, "w", 10).await.unwrap().len(), 1);
+
+        // A run that waited and was let in keeps the record that it did.
+        let third = make(&pool, &yaml).await;
+        assert_eq!(reads(&pool, &third).await, waiting());
+        finish(&pool, &second).await;
+        assert_eq!(admit_waiting_runs(&pool).await.unwrap(), vec![third.clone()]);
+        let read = get_run(&pool, &third).await.unwrap().unwrap();
+        assert!(read.queued_at.is_some() && read.admitted_at.is_some() && !read.waits());
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+// ── Path caches ──────────────────────────────────────────────────────────────
+// The same as the Postgres backend's; see there.
+
+pub async fn path_cache_entries(
+    pool: &Pool,
+    scope: &str,
+    prefix: &str,
+    version: &str,
+    limit: i64,
+) -> Result<Vec<crate::models::PathCacheEntry>> {
+    let rows: Vec<(String, String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT id, cache_key, object_key, size_bytes FROM path_caches
+         WHERE scope = ? AND prefix = ? AND version = ? AND state = 'ready'
+         ORDER BY created_at DESC, id DESC LIMIT ?",
+    )
+    .bind(scope)
+    .bind(prefix)
+    .bind(version)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, cache_key, object_key, size_bytes)| crate::models::PathCacheEntry {
+                id,
+                cache_key,
+                object_key,
+                size_bytes,
+            },
+        )
+        .collect())
+}
+
+pub async fn path_cache_used(pool: &Pool, id: &str) -> Result<()> {
+    sqlx::query("UPDATE path_caches SET last_used_at = ? WHERE id = ? AND state = 'ready'")
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn path_cache_offered(pool: &Pool, entry: &crate::models::NewPathCache) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO path_caches
+           (id, repo, scope, prefix, version, object_key, state, task_id, created_at, last_used_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+    )
+    .bind(&entry.id)
+    .bind(&entry.repo)
+    .bind(&entry.scope)
+    .bind(&entry.prefix)
+    .bind(&entry.version)
+    .bind(&entry.object_key)
+    .bind(&entry.task_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn path_caches_settled(
+    pool: &Pool,
+    stale_before: &str,
+    limit: i64,
+) -> Result<Vec<crate::models::PendingPathCache>> {
+    let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT p.id, p.object_key, p.created_at, t.status
+         FROM path_caches p LEFT JOIN task_runs t ON t.id = p.task_id
+         WHERE p.state = 'pending'
+           AND (t.id IS NULL OR t.status IN ('succeeded', 'failed', 'skipped', 'cancelled')
+                OR p.created_at < ?)
+         ORDER BY p.created_at LIMIT ?",
+    )
+    .bind(stale_before)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, object_key, created_at, task_status)| crate::models::PendingPathCache {
+                id,
+                object_key,
+                created_at,
+                task_status,
+            },
+        )
+        .collect())
+}
+
+pub async fn path_cache_ready(
+    pool: &Pool,
+    id: &str,
+    cache_key: &str,
+    size_bytes: i64,
+) -> Result<Option<Vec<String>>> {
+    let mut tx = pool.begin().await?;
+    let row: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT scope, prefix, version FROM path_caches WHERE id = ? AND state = 'pending'",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((scope, prefix, version)) = row else {
+        return Ok(None);
+    };
+    let replaced: Vec<(String,)> = sqlx::query_as(
+        "DELETE FROM path_caches
+         WHERE scope = ? AND prefix = ? AND version = ? AND cache_key = ? AND state = 'ready'
+         RETURNING object_key",
+    )
+    .bind(&scope)
+    .bind(&prefix)
+    .bind(&version)
+    .bind(cache_key)
+    .fetch_all(&mut *tx)
+    .await?;
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE path_caches SET state = 'ready', cache_key = ?, size_bytes = ?, task_id = NULL,
+           created_at = ?, last_used_at = ?
+         WHERE id = ?",
+    )
+    .bind(cache_key)
+    .bind(size_bytes)
+    .bind(&now)
+    .bind(&now)
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some(replaced.into_iter().map(|(k,)| k).collect()))
+}
+
+pub async fn path_cache_drop(pool: &Pool, id: &str) -> Result<Option<String>> {
+    let row: Option<(String,)> =
+        sqlx::query_as("DELETE FROM path_caches WHERE id = ? RETURNING object_key")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(k,)| k))
+}
+
+pub async fn path_cache_victims(
+    pool: &Pool,
+    quota_bytes: i64,
+    unused_since: &str,
+    limit: i64,
+) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT id FROM (
+           SELECT id, last_used_at,
+                  SUM(COALESCE(size_bytes, 0)) OVER (
+                    PARTITION BY repo ORDER BY last_used_at DESC, id DESC ROWS UNBOUNDED PRECEDING
+                  ) AS kept
+           FROM path_caches WHERE state = 'ready'
+         ) r
+         WHERE r.kept > ? OR r.last_used_at < ?
+         ORDER BY r.last_used_at LIMIT ?",
+    )
+    .bind(quota_bytes)
+    .bind(unused_since)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+// ── Workflow artifacts ───────────────────────────────────────────────────────
+
+type ArtifactRow = (
+    String,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    Option<i64>,
+    Option<String>,
+    String,
+    String,
+);
+
+fn workflow_artifact(row: ArtifactRow) -> crate::models::WorkflowArtifact {
+    let (
+        id,
+        artifact_id,
+        run_id,
+        task_id,
+        name,
+        object_key,
+        size_bytes,
+        sha256,
+        created_at,
+        expires_at,
+    ) = row;
+    crate::models::WorkflowArtifact {
+        id,
+        artifact_id,
+        run_id,
+        task_id,
+        name,
+        object_key,
+        size_bytes,
+        sha256,
+        created_at,
+        expires_at,
+    }
+}
+
+/// A job asked to upload an artifact: its row, pending until the upload is
+/// said to be complete, and expiring as `artifact.expires_at` says.
+pub async fn workflow_artifact_begin(
+    pool: &Pool,
+    artifact: &crate::models::WorkflowArtifact,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO workflow_artifacts
+           (id, artifact_id, run_id, task_id, name, object_key, state, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+    )
+    .bind(&artifact.id)
+    .bind(artifact.artifact_id)
+    .bind(&artifact.run_id)
+    .bind(&artifact.task_id)
+    .bind(&artifact.name)
+    .bind(&artifact.object_key)
+    .bind(&artifact.created_at)
+    .bind(&artifact.expires_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// An upload is complete: the artifact is its run's, under its name, unless
+/// another of that name became so first. `false` then, or where the row is
+/// no longer pending.
+pub async fn workflow_artifact_ready(
+    pool: &Pool,
+    id: &str,
+    size_bytes: i64,
+    sha256: &str,
+    expires_at: &str,
+    provenance: Option<&str>,
+) -> Result<bool> {
+    let done = sqlx::query(
+        "UPDATE workflow_artifacts
+            SET state = 'ready', size_bytes = ?, sha256 = ?, expires_at = ?, created_at = ?,
+                provenance = ?
+          WHERE id = ? AND state = 'pending'
+            AND NOT EXISTS (
+                SELECT 1 FROM workflow_artifacts AS w
+                 WHERE w.run_id = workflow_artifacts.run_id
+                   AND w.name = workflow_artifacts.name
+                   AND w.state = 'ready')",
+    )
+    .bind(size_bytes)
+    .bind(sha256)
+    .bind(expires_at)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(provenance)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() == 1)
+}
+
+/// A run's artifacts whose uploads are complete, oldest first.
+pub async fn workflow_artifacts_of_run(
+    pool: &Pool,
+    run_id: &str,
+) -> Result<Vec<crate::models::WorkflowArtifact>> {
+    let rows: Vec<ArtifactRow> = sqlx::query_as(
+        "SELECT id, artifact_id, run_id, task_id, name, object_key, size_bytes, sha256,
+                created_at, expires_at
+           FROM workflow_artifacts WHERE run_id = ? AND state = 'ready'
+          ORDER BY created_at, artifact_id",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(workflow_artifact).collect())
+}
+
+/// When `task_id`'s attempt that runs now was queued (`scheduled_at`): what
+/// it uploaded is later than this, and what an earlier attempt of it uploaded,
+/// before a rerun, a clear or a retry queued this one, is not. `None` for a
+/// task that is not there.
+pub async fn task_queued_at(pool: &Pool, task_id: &str) -> Result<Option<String>> {
+    let at: Option<Option<String>> =
+        sqlx::query_scalar("SELECT scheduled_at FROM task_runs WHERE id = ?")
+            .bind(task_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(at.flatten())
+}
+
+/// Drop an artifact's row: its object key, to delete its bytes by; `None`
+/// when another had dropped it.
+pub async fn workflow_artifact_drop(pool: &Pool, id: &str) -> Result<Option<String>> {
+    let row: Option<(String,)> =
+        sqlx::query_as("DELETE FROM workflow_artifacts WHERE id = ? RETURNING object_key")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(k,)| k))
+}
+
+/// The artifacts that expired before `now`, pending ones too, soonest first:
+/// their ids and object keys. The rows stay until they are dropped, once
+/// their bytes are gone.
+pub async fn workflow_artifacts_expired(
+    pool: &Pool,
+    now: &str,
+    limit: i64,
+) -> Result<Vec<(String, String)>> {
+    Ok(sqlx::query_as(
+        "SELECT id, object_key FROM workflow_artifacts WHERE expires_at < ?
+          ORDER BY expires_at LIMIT ?",
+    )
+    .bind(now)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+#[cfg(test)]
+mod workflow_artifact_tests {
+    use super::*;
+    use crate::models::WorkflowArtifact;
+
+    fn artifact(
+        id: &str,
+        number: i64,
+        run: &str,
+        name: &str,
+        expires_at: &str,
+    ) -> WorkflowArtifact {
+        WorkflowArtifact {
+            id: id.into(),
+            artifact_id: number,
+            run_id: run.into(),
+            task_id: "t".into(),
+            name: name.into(),
+            object_key: format!("{run}/{id}"),
+            size_bytes: None,
+            sha256: None,
+            created_at: "2026-10-15T00:00:00+00:00".into(),
+            expires_at: expires_at.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_artifact_is_its_runs_by_name_once_complete_and_goes_when_it_expires() {
+        let path = std::env::temp_dir().join(format!("dagron-wa-{}.db", uuid::Uuid::new_v4()));
+        let pool = init_pool(path.to_str().unwrap()).await.unwrap();
+        let later = "2099-01-01T00:00:00+00:00";
+        workflow_artifact_begin(&pool, &artifact("a", 1, "r1", "dist", later))
+            .await
+            .unwrap();
+        workflow_artifact_begin(&pool, &artifact("b", 2, "r1", "dist", later))
+            .await
+            .unwrap();
+        workflow_artifact_begin(
+            &pool,
+            &artifact("c", 3, "r2", "dist", "2000-01-01T00:00:00+00:00"),
+        )
+        .await
+        .unwrap();
+        // Pending: not listed.
+        assert!(workflow_artifacts_of_run(&pool, "r1")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(workflow_artifact_ready(
+            &pool,
+            "a",
+            10,
+            "sha256:aa",
+            later,
+            Some("{\"payload\":\"\"}")
+        )
+        .await
+        .unwrap());
+        // Its provenance, where one was signed, with it.
+        let provenance: Option<String> =
+            sqlx::query_scalar("SELECT provenance FROM workflow_artifacts WHERE id = 'a'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(provenance.as_deref(), Some("{\"payload\":\"\"}"));
+        // A second of the name in the run is not made ready; one of another
+        // run is its own.
+        assert!(
+            !workflow_artifact_ready(&pool, "b", 11, "sha256:bb", later, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !workflow_artifact_ready(&pool, "a", 10, "sha256:aa", later, None)
+                .await
+                .unwrap()
+        );
+        let listed = workflow_artifacts_of_run(&pool, "r1").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            (
+                listed[0].artifact_id,
+                listed[0].size_bytes,
+                listed[0].sha256.as_deref()
+            ),
+            (1, Some(10), Some("sha256:aa"))
+        );
+        // What expired goes, pending or not.
+        let now = chrono::Utc::now().to_rfc3339();
+        assert_eq!(
+            workflow_artifacts_expired(&pool, &now, 10).await.unwrap(),
+            [("c".to_string(), "r2/c".to_string())]
+        );
+        assert_eq!(
+            workflow_artifact_drop(&pool, "c").await.unwrap().as_deref(),
+            Some("r2/c")
+        );
+        assert_eq!(workflow_artifact_drop(&pool, "c").await.unwrap(), None);
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod path_cache_tests {
+    use super::*;
+
+    async fn pool() -> (Pool, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("dagron-path-caches-{}.db", Uuid::new_v4()));
+        let pool = init_pool(path.to_str().unwrap()).await.unwrap();
+        (pool, path)
+    }
+
+    fn offered(id: &str, repo: &str, scope: &str) -> crate::models::NewPathCache {
+        crate::models::NewPathCache {
+            id: id.into(),
+            repo: repo.into(),
+            scope: scope.into(),
+            prefix: "cargo".into(),
+            version: "v1".into(),
+            object_key: format!("obj-{id}"),
+            task_id: format!("task-{id}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_entry_is_read_once_ready_and_takes_the_place_of_its_key() {
+        let (pool, path) = pool().await;
+        path_cache_offered(&pool, &offered("a", "r", "r@main"))
+            .await
+            .unwrap();
+        // Pending: nothing to restore yet, and its task's row is gone, so the
+        // sweep sees it.
+        assert!(path_cache_entries(&pool, "r@main", "cargo", "v1", 5)
+            .await
+            .unwrap()
+            .is_empty());
+        let settled = path_caches_settled(&pool, "0", 10).await.unwrap();
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0].task_status, None);
+        assert_eq!(
+            path_cache_ready(&pool, "a", "cargo-k1", 10).await.unwrap(),
+            Some(vec![])
+        );
+        // Twice: the second finds it no longer pending.
+        assert_eq!(
+            path_cache_ready(&pool, "a", "cargo-k1", 10).await.unwrap(),
+            None
+        );
+        let got = path_cache_entries(&pool, "r@main", "cargo", "v1", 5)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].cache_key, "cargo-k1");
+        // The same key saved again takes its place, and says what to forget.
+        path_cache_offered(&pool, &offered("b", "r", "r@main"))
+            .await
+            .unwrap();
+        assert_eq!(
+            path_cache_ready(&pool, "b", "cargo-k1", 12).await.unwrap(),
+            Some(vec!["obj-a".to_string()])
+        );
+        let got = path_cache_entries(&pool, "r@main", "cargo", "v1", 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            got.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["b"]
+        );
+        // Another scope, prefix or version reads nothing of it.
+        assert!(path_cache_entries(&pool, "r@dev", "cargo", "v1", 5)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(path_cache_entries(&pool, "r@main", "npm", "v1", 5)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(path_cache_entries(&pool, "r@main", "cargo", "v2", 5)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            path_cache_drop(&pool, "b").await.unwrap(),
+            Some("obj-b".to_string())
+        );
+        assert_eq!(path_cache_drop(&pool, "b").await.unwrap(), None);
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn the_least_recently_used_past_a_repositorys_quota_are_evicted() {
+        let (pool, path) = pool().await;
+        for (id, scope, size) in [
+            ("old", "r@main", 40),
+            ("mid", "r@dev", 40),
+            ("new", "r@main", 40),
+        ] {
+            path_cache_offered(&pool, &offered(id, "r", scope))
+                .await
+                .unwrap();
+            path_cache_ready(&pool, id, &format!("cargo-{id}"), size)
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        path_cache_offered(&pool, &offered("other", "s", "s@main"))
+            .await
+            .unwrap();
+        path_cache_ready(&pool, "other", "cargo-other", 100)
+            .await
+            .unwrap();
+        // 100 bytes a repository: r's newest two fit, its oldest does not;
+        // s's one entry fits alone.
+        assert_eq!(
+            path_cache_victims(&pool, 100, "0", 10).await.unwrap(),
+            vec!["old".to_string()]
+        );
+        // Reading the oldest makes it the newest, and the next one goes.
+        path_cache_used(&pool, "old").await.unwrap();
+        assert_eq!(
+            path_cache_victims(&pool, 100, "0", 10).await.unwrap(),
+            vec!["mid".to_string()]
+        );
+        // Unused since a time after all of them: every one goes.
+        let later = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        assert_eq!(
+            path_cache_victims(&pool, i64::MAX, &later, 10)
+                .await
+                .unwrap()
+                .len(),
+            4
+        );
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+// ── Task identity ────────────────────────────────────────────────────────────
+// The same as the Postgres backend's; see there.
+
+pub async fn oidc_request_offered(pool: &Pool, request: &crate::models::OidcRequest) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM oidc_requests WHERE task_id = ? OR expires_at < ?")
+        .bind(&request.task_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO oidc_requests
+           (token_sha256, run_id, task_id, task_name, attempt, audiences, environment, expires_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&request.token_sha256)
+    .bind(&request.run_id)
+    .bind(&request.task_id)
+    .bind(&request.task_name)
+    .bind(request.attempt)
+    .bind(serde_json::to_string(&request.audiences)?)
+    .bind(&request.environment)
+    .bind(&request.expires_at)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn oidc_request(
+    pool: &Pool,
+    token_sha256: &str,
+) -> Result<Option<(crate::models::OidcRequest, Option<String>)>> {
+    #[allow(clippy::type_complexity)]
+    let row: Option<(
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT r.token_sha256, r.run_id, r.task_id, r.task_name, r.attempt, r.audiences,
+                    r.environment, r.expires_at, t.status
+             FROM oidc_requests r LEFT JOIN task_runs t ON t.id = r.task_id
+             WHERE r.token_sha256 = ?",
+    )
+    .bind(token_sha256)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(
+        |(
+            token_sha256,
+            run_id,
+            task_id,
+            task_name,
+            attempt,
+            audiences,
+            environment,
+            expires_at,
+            status,
+        )| {
+            (
+                crate::models::OidcRequest {
+                    token_sha256,
+                    run_id,
+                    task_id,
+                    task_name,
+                    attempt,
+                    audiences: serde_json::from_str(&audiences).unwrap_or_default(),
+                    environment,
+                    expires_at,
+                },
+                status,
+            )
+        },
+    ))
+}
+
+#[cfg(test)]
+mod oidc_request_tests {
+    use super::*;
+
+    fn request(token: &str, task: &str, expires_at: &str) -> crate::models::OidcRequest {
+        crate::models::OidcRequest {
+            token_sha256: token.into(),
+            run_id: "run".into(),
+            task_id: task.into(),
+            task_name: "deploy".into(),
+            attempt: 1,
+            audiences: vec!["sts.amazonaws.com".into()],
+            environment: Some("production".into()),
+            expires_at: expires_at.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_task_has_the_credential_of_its_latest_attempt_and_none_past_its_time() {
+        let path = std::env::temp_dir().join(format!("dagron-oidc-{}.db", Uuid::new_v4()));
+        let pool = init_pool(path.to_str().unwrap()).await.unwrap();
+        let later = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        oidc_request_offered(&pool, &request("a", "t1", &later))
+            .await
+            .unwrap();
+        let (got, status) = oidc_request(&pool, "a").await.unwrap().unwrap();
+        assert_eq!(got, request("a", "t1", &later));
+        assert_eq!(status, None, "no task row here");
+        // A second attempt's credential takes the place of the first's.
+        oidc_request_offered(&pool, &request("b", "t1", &later))
+            .await
+            .unwrap();
+        assert!(oidc_request(&pool, "a").await.unwrap().is_none());
+        assert!(oidc_request(&pool, "b").await.unwrap().is_some());
+        // Another task's past its time goes when the next is written.
+        let earlier = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        oidc_request_offered(&pool, &request("c", "t2", &earlier))
+            .await
+            .unwrap();
+        oidc_request_offered(&pool, &request("d", "t3", &later))
+            .await
+            .unwrap();
+        assert!(oidc_request(&pool, "c").await.unwrap().is_none());
+        assert!(oidc_request(&pool, "zzz").await.unwrap().is_none());
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+// ── Remote runner sessions ────────────────────────────────────────────────────
+//
+// Runners dial dagron-api, which is Postgres's alone, so a SQLite engine never
+// has a session or a runner's result. These are its twins of the engine's two
+// calls (see db/postgres.rs), the same statements, so that the engine is one
+// loop on either backend.
+
+/// How long an engine that took a runner's result has to apply it before
+/// another may take it.
+const RUNNER_RESULT_RETAKE_SECS: i64 = 60;
+
+/// Take back the tasks of sessions whose lease has lapsed. See the Postgres
+/// twin.
+pub async fn recover_expired_sessions(pool: &Pool) -> Result<u64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    // Most sweeps find no lapsed session (and a SQLite engine never has one):
+    // a read, and nothing written.
+    let any: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM runner_sessions WHERE lease_expires_at < ?1)",
+    )
+    .bind(&now)
+    .fetch_one(pool)
+    .await?;
+    if !any {
+        return Ok(0);
+    }
+    const HELD_BY_EXPIRED: &str = "status = 'running' AND session_id IS NOT NULL
+           AND EXISTS (
+               SELECT 1 FROM runner_sessions s
+               WHERE s.id = task_runs.session_id AND s.holder = task_runs.claimed_by
+                 AND s.lease_expires_at < ?1
+           )
+           AND NOT EXISTS (SELECT 1 FROM runner_results r WHERE r.task_id = task_runs.id)";
+    let requeued = sqlx::query(&format!(
+        "UPDATE task_runs
+         SET status = 'ready', claimed_by = NULL, lease_expires_at = NULL, session_id = NULL
+         WHERE {HELD_BY_EXPIRED} AND stop_requested_at IS NULL"
+    ))
+    .bind(&now)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    let stopping: Vec<(String, String, i64)> = sqlx::query_as(&format!(
+        "SELECT id, claimed_by, version FROM task_runs
+         WHERE {HELD_BY_EXPIRED} AND stop_requested_at IS NOT NULL"
+    ))
+    .bind(&now)
+    .fetch_all(pool)
+    .await?;
+    let mut cancelled = 0u64;
+    for (task_id, holder, fence) in &stopping {
+        if settle_stopped_task(pool, task_id, holder, *fence).await? {
+            cancelled += 1;
+        }
+    }
+    sqlx::query(
+        "DELETE FROM runner_sessions
+         WHERE lease_expires_at < ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM task_runs t
+               WHERE t.session_id = runner_sessions.id AND t.status = 'running'
+                 AND t.claimed_by = runner_sessions.holder
+           )",
+    )
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(requeued + cancelled)
+}
+
+/// Take up to `limit` of what remote runners said of their tasks. See the
+/// Postgres twin.
+pub async fn take_runner_results(
+    pool: &Pool,
+    taker: &str,
+    limit: i64,
+) -> Result<Vec<crate::models::RunnerResult>> {
+    let now_dt = chrono::Utc::now();
+    let stale = (now_dt - chrono::TimeDelta::seconds(RUNNER_RESULT_RETAKE_SECS)).to_rfc3339();
+    let mut tx = pool.begin().await?;
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT task_id FROM runner_results
+         WHERE taken_at IS NULL OR taken_at < ?1
+         ORDER BY created_at
+         LIMIT ?2",
+    )
+    .bind(&stale)
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut taken = Vec::with_capacity(ids.len());
+    for id in &ids {
+        #[allow(clippy::type_complexity)]
+        let row: Option<(
+            String,
+            i64,
+            String,
+            String,
+            Option<i32>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "UPDATE runner_results SET taken_by = ?1, taken_at = ?2
+             WHERE task_id = ?3 AND (taken_at IS NULL OR taken_at < ?4)
+             RETURNING task_id, fence, claimed_by, status, exit_code, output,
+                       (SELECT run_id FROM task_runs WHERE id = ?3),
+                       (SELECT attempt FROM task_runs WHERE id = ?3),
+                       (SELECT input FROM task_runs WHERE id = ?3)",
+        )
+        .bind(taker)
+        .bind(now_dt.to_rfc3339())
+        .bind(id)
+        .bind(&stale)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((task_id, fence, claimed_by, outcome, exit_code, output, run_id, attempt, input)) =
+            row
+        {
+            taken.push(crate::models::RunnerResult {
+                task_id,
+                claimed_by,
+                fence,
+                outcome,
+                exit_code,
+                output,
+                run_id,
+                attempt: attempt.unwrap_or(1).saturating_sub(1).max(0),
+                input,
+            });
+        }
+    }
+    tx.commit().await?;
+    Ok(taken)
+}
+
+/// Drop runners' results an engine has applied, each by its task and fence.
+pub async fn drop_runner_results(pool: &Pool, applied: &[(String, i64)]) -> Result<()> {
+    for (task_id, fence) in applied {
+        sqlx::query("DELETE FROM runner_results WHERE task_id = ?1 AND fence = ?2")
+            .bind(task_id)
+            .bind(fence)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+/// The engine's two calls for remote runners, on SQLite: the same statements
+/// as Postgres's, so that one loop runs on either. A SQLite engine never has a
+/// session of its own; these stand one in by hand.
+#[cfg(test)]
+mod runner_session_tests {
+    use super::*;
+    use crate::dag::DagGraph;
+
+    async fn temp_pool() -> (Pool, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("module54_sessions_{}.db", Uuid::new_v4()));
+        let pool = init_pool(path.to_str().unwrap()).await.unwrap();
+        (pool, path)
+    }
+
+    /// A ready task claimed as a session claims it: under the session's holder,
+    /// pointing at the session. Returns its id and fence.
+    async fn held_by_session(pool: &Pool, session: &str, lease: &str) -> (String, i64) {
+        let yaml = "name: remote\ntasks:\n  - name: t\n    command: [\"true\"]\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        create_run(pool, &dag, yaml).await.unwrap();
+        advance_ready_tasks(pool).await.unwrap();
+        let holder = format!("runner:r1/{session}");
+        let claimed = claim_ready(pool, &holder, 1).await.unwrap();
+        let task = &claimed[0];
+        sqlx::query(
+            "INSERT INTO runner_sessions
+                 (id, runner_id, holder, labels, capacity, protocol, secrets, lease_expires_at, started_at)
+             VALUES (?1, 'r1', ?2, 'default', 1, 0, 'server', ?3, ?3)",
+        )
+        .bind(session)
+        .bind(&holder)
+        .bind(lease)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE task_runs SET session_id = ?1 WHERE id = ?2")
+            .bind(session)
+            .bind(&task.id)
+            .execute(pool)
+            .await
+            .unwrap();
+        (task.id.clone(), task.version + 1)
+    }
+
+    async fn status(pool: &Pool, id: &str) -> (String, Option<String>) {
+        sqlx::query_as("SELECT status, session_id FROM task_runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_expired_session_s_task_is_taken_back_and_a_live_one_s_is_left() {
+        let (pool, path) = temp_pool().await;
+        let past = "2000-01-01T00:00:00+00:00";
+        let future = "2999-01-01T00:00:00+00:00";
+        let (expired, _) = held_by_session(&pool, "s-expired", past).await;
+        let (live, _) = held_by_session(&pool, "s-live", future).await;
+        // The engine's own sweep passes a session's task by, however old the
+        // row's lease.
+        sqlx::query("UPDATE task_runs SET lease_expires_at = ?1")
+            .bind(past)
+            .execute(&pool)
+            .await
+            .unwrap();
+        recover_expired_leases(&pool).await.unwrap();
+        assert_eq!(status(&pool, &expired).await.0, "running");
+        assert_eq!(recover_expired_sessions(&pool).await.unwrap(), 1);
+        assert_eq!(status(&pool, &expired).await, ("ready".to_string(), None));
+        assert_eq!(status(&pool, &live).await.0, "running");
+        let left: Vec<String> = sqlx::query_scalar("SELECT id FROM runner_sessions ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, ["s-live"], "the expired session, holding nothing, is dropped");
+        // A claim of the engine's own clears what a session left on the row.
+        let claimed = claim_ready(&pool, "engine", 10).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(status(&pool, &expired).await, ("running".to_string(), None));
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_runner_s_word_is_taken_once_and_left_by_the_sweep_until_it_is_applied() {
+        let (pool, path) = temp_pool().await;
+        let past = "2000-01-01T00:00:00+00:00";
+        let (task, fence) = held_by_session(&pool, "s1", past).await;
+        sqlx::query(
+            "INSERT INTO runner_results (task_id, fence, claimed_by, status, output, created_at)
+             VALUES (?1, ?2, 'runner:r1/s1', 'succeeded', 'done', ?3)",
+        )
+        .bind(&task)
+        .bind(fence)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Expired, but its word waits: the sweep leaves it for the word.
+        assert_eq!(recover_expired_sessions(&pool).await.unwrap(), 0);
+        assert_eq!(status(&pool, &task).await.0, "running");
+        let taken = take_runner_results(&pool, "engine-1", 10).await.unwrap();
+        assert_eq!(taken.len(), 1);
+        let word = &taken[0];
+        assert_eq!((word.fence, word.attempt, word.outcome.as_str()), (fence, 0, "succeeded"));
+        assert_eq!(word.claimed_by, "runner:r1/s1");
+        assert!(word.run_id.is_some() && word.input.is_some());
+        assert!(take_runner_results(&pool, "engine-2", 10).await.unwrap().is_empty());
+        // Applied, as the engine's loop applies it.
+        assert!(mark_task_succeeded(&pool, &task, "runner:r1/s1", fence, word.output.clone())
+            .await
+            .unwrap());
+        drop_runner_results(&pool, &[(task.clone(), fence)]).await.unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runner_results")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
+        recover_expired_sessions(&pool).await.unwrap();
+        assert_eq!(status(&pool, &task).await.0, "succeeded");
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// The plans SQLite takes for the sweeps' reads, and for the reads beside
+/// them, on the SQLite this build bundles and with no statistics, which is
+/// how the engine runs (migrations/076).
+#[cfg(test)]
+mod sweep_plan_tests {
+    use super::*;
+
+    /// migrations/076's indexes.
+    const SWEEP_INDEXES: [&str; 7] = [
+        "idx_task_runs_running_lease_expires_at",
+        "idx_task_runs_fanout_parked",
+        "idx_task_runs_wake_due",
+        "idx_task_runs_wait_url_due",
+        "idx_task_runs_wait_dataset_parked",
+        "idx_task_runs_sub_run_parked",
+        "idx_task_runs_external_running",
+    ];
+
+    async fn temp_pool() -> (Pool, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("module54_plans_{}.db", Uuid::new_v4()));
+        let pool = init_pool(path.to_str().unwrap()).await.unwrap();
+        (pool, path)
+    }
+
+    /// Each line of the plan SQLite takes for `sql`. Unbound parameters are
+    /// NULL, which a plan does not depend on. Prepared afresh each time: a
+    /// plan is made when its statement is prepared, and a cached one would
+    /// keep it across a change of the indexes.
+    async fn plan(pool: &Pool, sql: &str) -> Vec<String> {
+        let rows: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .persistent(false)
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        rows.into_iter().map(|(_, _, _, detail)| detail).collect()
+    }
+
+    /// Whether a line of `plan` reads `index`, by its whole name: one name
+    /// can begin another's.
+    fn reads(plan: &[String], index: &str) -> bool {
+        plan.iter()
+            .any(|line| line.split_whitespace().any(|word| word == index))
+    }
+
+    /// Each sweep's read takes the index made for it, and none reads
+    /// idx_task_runs_status, which they all took before: every running row,
+    /// and a sort of them where the sweep orders.
+    #[tokio::test]
+    async fn sweep_reads_plan_on_their_partial_indexes() {
+        let (pool, path) = temp_pool().await;
+        for (sweep, sql, index) in [
+            (
+                "leases",
+                EXPIRED_LEASES,
+                "idx_task_runs_running_lease_expires_at",
+            ),
+            ("fanouts", PARKED_FANOUTS, "idx_task_runs_fanout_parked"),
+            ("waits", DUE_WAITS, "idx_task_runs_wake_due"),
+            ("url waits", DUE_URL_WAITS, "idx_task_runs_wait_url_due"),
+            (
+                "dataset waits",
+                PARKED_DATASET_WAITS,
+                "idx_task_runs_wait_dataset_parked",
+            ),
+            (
+                "subworkflows",
+                PARKED_SUBWORKFLOWS,
+                "idx_task_runs_sub_run_parked",
+            ),
+            (
+                "external polls",
+                DUE_EXTERNAL_POLLS,
+                "idx_task_runs_external_running",
+            ),
+            (
+                "teardowns",
+                DUE_TEARDOWNS,
+                "idx_task_runs_running_lease_expires_at",
+            ),
+        ] {
+            let plan = plan(&pool, sql).await;
+            assert!(reads(&plan, index), "{sweep} should read {index}: {plan:?}");
+            assert!(!reads(&plan, "idx_task_runs_status"), "{sweep}: {plan:?}");
+        }
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The reads beside the sweeps' plan as they did before migrations/076:
+    /// an index led by `status` and of running rows can match any read of
+    /// running rows, and must not take one from the index it has.
+    #[tokio::test]
+    async fn plans_that_must_not_move() {
+        let (pool, path) = temp_pool().await;
+        let reads_of = [
+            ("the claim", READY_CANDIDATES, None),
+            (
+                "a sub-workflow's parent",
+                SUB_RUN_PARENT,
+                Some("idx_task_runs_sub_run_id"),
+            ),
+            (
+                "a run's running tasks",
+                "SELECT name, status FROM task_runs WHERE run_id = ? AND status = 'running'",
+                Some("idx_task_runs_run_id_name"),
+            ),
+            (
+                "a pool's running tasks",
+                POOL_RUNNING_COUNT,
+                Some("idx_task_runs_pool_running"),
+            ),
+            (
+                "the external cancels",
+                DUE_EXTERNAL_CANCELS,
+                Some("idx_task_runs_external"),
+            ),
+        ];
+        let mut with_074 = Vec::new();
+        for (what, sql, index) in reads_of {
+            let plan = plan(&pool, sql).await;
+            if let Some(index) = index {
+                assert!(reads(&plan, index), "{what} should read {index}: {plan:?}");
+            }
+            with_074.push(plan);
+        }
+        for index in SWEEP_INDEXES {
+            sqlx::query(&format!("DROP INDEX {index}"))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        for ((what, sql, _), with_074) in reads_of.into_iter().zip(with_074) {
+            assert_eq!(plan(&pool, sql).await, with_074, "{what}'s plan moved");
+        }
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// migrations/080's index of the running runs, by their key.
+    const IN_FLIGHT_INDEX: &str = "idx_workflow_runs_in_flight";
+
+    /// The enterprise build's own indexes of every run, led by `status`.
+    const STATUS_INDEXES: [&str; 2] = [
+        "idx_workflow_runs_status_created_at",
+        "idx_workflow_runs_status_finished_at",
+    ];
+
+    /// migrations/078's six, led by `status`, and 079's index of the runs
+    /// the reap may end.
+    const RUN_SWEEP_INDEXES: [&str; 7] = [
+        "idx_workflow_runs_deadline",
+        "idx_workflow_runs_alert_deadline",
+        "idx_workflow_runs_stopping",
+        "idx_workflow_runs_waiting",
+        "idx_workflow_runs_start_pending",
+        "idx_workflow_runs_completion_pending",
+        "idx_workflow_runs_reapable",
+    ];
+
+    /// The six as 010, 015, 053, 054, 055 and 060 made them, before 078.
+    const OLD_RUN_SWEEP_INDEXES: [&str; 6] = [
+        "CREATE INDEX idx_workflow_runs_deadline ON workflow_runs(deadline_at)
+             WHERE deadline_at IS NOT NULL AND status = 'running'",
+        "CREATE INDEX idx_workflow_runs_alert_deadline ON workflow_runs(alert_deadline_at)
+             WHERE alert_deadline_at IS NOT NULL AND alert_fired_at IS NULL AND status = 'running'",
+        "CREATE INDEX idx_workflow_runs_completion_pending
+             ON workflow_runs (completion_pending_at) WHERE completion_pending_at IS NOT NULL",
+        "CREATE INDEX idx_workflow_runs_start_pending
+             ON workflow_runs (start_pending_at) WHERE start_pending_at IS NOT NULL",
+        "CREATE INDEX idx_workflow_runs_stopping ON workflow_runs (id) WHERE stopping_as IS NOT NULL",
+        "CREATE INDEX idx_workflow_runs_waiting ON workflow_runs (id)
+             WHERE queued_at IS NOT NULL AND admitted_at IS NULL AND status = 'running'",
+    ];
+
+    /// The line of `plan` that reads `table`, by its alias or its name.
+    fn line_of<'a>(plan: &'a [String], table: &str) -> &'a str {
+        plan.iter()
+            .find(|line| {
+                let mut words = line.split_whitespace();
+                matches!(words.next(), Some("SEARCH" | "SCAN")) && words.next() == Some(table)
+            })
+            .unwrap_or_else(|| panic!("no line reads {table}: {plan:?}"))
+    }
+
+    async fn exec(pool: &Pool, sql: &str) {
+        sqlx::query(sql)
+            .persistent(false)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    /// Drop each index and make it again from its own text, so that it is
+    /// the newest of the table's: with no statistics, SQLite takes the
+    /// newest of two loops that tie.
+    async fn make_newest(pool: &Pool, indexes: &[&str]) {
+        for index in indexes {
+            let sql: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            )
+            .bind(index)
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|e| panic!("{index}: {e}"));
+            exec(pool, &format!("DROP INDEX {index}")).await;
+            exec(pool, &sql).await;
+        }
+    }
+
+    /// Indexes of every run led by `status`, the newest of the table's: on
+    /// the enterprise build its own, made again; elsewhere two of the same
+    /// shape, by hand.
+    /// Their names.
+    async fn status_indexes_newest(pool: &Pool) -> [&'static str; 2] {
+        if cfg!(feature = "enterprise") {
+            make_newest(pool, &STATUS_INDEXES).await;
+            STATUS_INDEXES
+        } else {
+            exec(
+                pool,
+                "CREATE INDEX idx_test_status_created ON workflow_runs (status, created_at)",
+            )
+            .await;
+            exec(
+                pool,
+                "CREATE INDEX idx_test_status_finished ON workflow_runs (status, finished_at)",
+            )
+            .await;
+            ["idx_test_status_created", "idx_test_status_finished"]
+        }
+    }
+
+    /// The run-level sweeps and the reads beside them that read the same
+    /// indexes: each with its index, and the term of its second key that
+    /// the index's line carries.
+    fn run_sweeps() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
+        #[allow(unused_mut)]
+        let mut sweeps = vec![
+            (
+                "deadlines",
+                OVERDUE_RUNS,
+                "idx_workflow_runs_deadline",
+                "deadline_at<?",
+            ),
+            (
+                "alerts",
+                DUE_DEADLINE_ALERTS,
+                "idx_workflow_runs_alert_deadline",
+                "alert_deadline_at<?",
+            ),
+            (
+                "stopped runs",
+                STRANDED_STOPPED_RUNS,
+                "idx_workflow_runs_stopping",
+                "stopping_as>?",
+            ),
+            (
+                "admissions",
+                WAITING_RUN_KEYS,
+                "idx_workflow_runs_waiting",
+                "queued_at>?",
+            ),
+            (
+                "pending starts",
+                PENDING_STARTS,
+                "idx_workflow_runs_start_pending",
+                "start_pending_at>?",
+            ),
+            (
+                "pending completions",
+                PENDING_COMPLETIONS,
+                "idx_workflow_runs_completion_pending",
+                "completion_pending_at>?",
+            ),
+            // Its plan, on 3.46.0, reads the runs that wait in the order of
+            // `queued_at` and the definition by its key, with no sort, on
+            // either build.
+            (
+                "admission's next runs",
+                ADMISSION_NEXT,
+                "idx_workflow_runs_waiting",
+                "queued_at>?",
+            ),
+        ];
+        #[cfg(feature = "ops")]
+        sweeps.push((
+            "runs waiting",
+            RUNS_WAITING,
+            "idx_workflow_runs_waiting",
+            "queued_at>?",
+        ));
+        sweeps
+    }
+
+    /// Each run sweep reads its index, by `status` and its second key, and
+    /// reads none of `rivals`, nor migrations/080's index of the running
+    /// runs.
+    async fn assert_run_sweeps(pool: &Pool, rivals: &[&str], when: &str) {
+        for (sweep, sql, index, term) in run_sweeps() {
+            let plan = plan(pool, sql).await;
+            assert!(
+                reads(&plan, index),
+                "{when}: {sweep} should read {index}: {plan:?}"
+            );
+            let line = plan.iter().find(|l| l.contains(index)).unwrap();
+            assert!(
+                line.contains("status=?") && line.contains(term),
+                "{when}: {sweep} should read {index} by status and {term}: {plan:?}"
+            );
+            for rival in rivals.iter().chain(&[IN_FLIGHT_INDEX]) {
+                assert!(
+                    !reads(&plan, rival),
+                    "{when}: {sweep} reads {rival}: {plan:?}"
+                );
+            }
+            if sweep == "pending starts" {
+                assert!(
+                    !plan.iter().any(|l| l.starts_with("USE TEMP B-TREE")),
+                    "{when}: {sweep} sorts: {plan:?}"
+                );
+            }
+        }
+    }
+
+    /// The reap's reads: the slice by idx_workflow_runs_reapable from its
+    /// cursor, in its order; the named reads by the keys they are handed.
+    /// None reads `rivals`, but that the slice may read `slice_tie`, an
+    /// index of running runs led by (status, id) that its loop uses by the
+    /// same terms: the same walk, in the same order.
+    async fn assert_reap_reads(pool: &Pool, rivals: &[&str], slice_tie: Option<&str>, when: &str) {
+        let slice = plan(pool, &reap_slice_sql()).await;
+        let line = line_of(&slice, "workflow_runs");
+        let tied = slice_tie.is_some_and(|tie| reads(&slice, tie));
+        assert!(
+            (line.contains("USING INDEX idx_workflow_runs_reapable") || tied)
+                && line.contains("status=? AND id>?"),
+            "{when}: the slice: {slice:?}"
+        );
+        assert!(
+            !slice.iter().any(|l| l.starts_with("USE TEMP B-TREE")),
+            "{when}: the slice sorts: {slice:?}"
+        );
+        assert!(
+            !reads(&slice, "sqlite_autoindex_workflow_runs_1"),
+            "{when}: {slice:?}"
+        );
+        for (what, sql) in [
+            ("tasks", NAMED_REAP_TASKS),
+            ("empty runs", NAMED_REAP_EMPTY),
+        ] {
+            let plan = plan(pool, sql).await;
+            assert!(
+                plan[0].starts_with("SCAN j "),
+                "{when}: the named {what}: {plan:?}"
+            );
+            // By its key: through the primary key, or an index with `id` in
+            // its keys, which holds one row of each id.
+            let wr = line_of(&plan, "wr");
+            assert!(
+                wr.starts_with("SEARCH") && wr.contains("id=?"),
+                "{when}: the named {what} should find each run by its key: {plan:?}"
+            );
+            let tr = line_of(&plan, "tr");
+            assert!(
+                tr.contains("idx_task_runs_run_id_name") || tr.contains("idx_task_runs_run_id "),
+                "{when}: the named {what}: {plan:?}"
+            );
+            for rival in rivals.iter().chain(&[IN_FLIGHT_INDEX]) {
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|l| l.contains(rival) && !l.contains("id=?")),
+                    "{when}: the named {what} reads {rival}: {plan:?}"
+                );
+            }
+        }
+        for rival in rivals
+            .iter()
+            .chain(&[IN_FLIGHT_INDEX])
+            .filter(|r| Some(**r) != slice_tie)
+        {
+            assert!(
+                !reads(&slice, rival),
+                "{when}: the slice reads {rival}: {slice:?}"
+            );
+        }
+        // The deadline sweep carries the reapable WHERE, and keeps its own:
+        // its loop uses `deadline_at` besides.
+        let overdue = plan(pool, OVERDUE_RUNS).await;
+        assert!(
+            reads(&overdue, "idx_workflow_runs_deadline")
+                && !reads(&overdue, "idx_workflow_runs_reapable"),
+            "{when}: {overdue:?}"
+        );
+    }
+
+    /// The run-level sweeps read the partial indexes made for each, led by
+    /// `status` (migrations/078), on both builds. On the enterprise build,
+    /// before 078, its own index of (status, created_at) took them from the
+    /// partials, which were led by the column each compares: its loop uses
+    /// `status`, as theirs did not, and it read every running run. Checked
+    /// in the order of a fresh enterprise file (its own index the newest) and
+    /// of an upgraded one (078 the newest).
+    #[tokio::test]
+    async fn workflow_runs_sweeps_keep_their_partials() {
+        let (pool, path) = temp_pool().await;
+        assert_run_sweeps(&pool, &STATUS_INDEXES, "as migrated").await;
+        make_newest(&pool, &RUN_SWEEP_INDEXES).await;
+        assert_run_sweeps(&pool, &STATUS_INDEXES, "078 the newest").await;
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The run sweeps and the reap's reads keep their indexes beside an
+    /// index of every run led by `status`, the newer or the older: on OSS
+    /// too, made by hand, so a PR's own run proves what the enterprise
+    /// build's index would do.
+    #[tokio::test]
+    async fn run_sweeps_hold_against_a_status_index_of_either_age() {
+        let (pool, path) = temp_pool().await;
+        let rivals = status_indexes_newest(&pool).await;
+        assert_run_sweeps(&pool, &rivals, "a status index the newest").await;
+        assert_reap_reads(&pool, &rivals, None, "a status index the newest").await;
+        make_newest(&pool, &RUN_SWEEP_INDEXES).await;
+        assert_run_sweeps(&pool, &rivals, "ours the newest").await;
+        assert_reap_reads(&pool, &rivals, None, "ours the newest").await;
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The live reads (`/metrics`' live tier and dagron-api's health count)
+    /// read idx_workflow_runs_live, by `status`, and the recent runs by
+    /// `created_at` besides. On the enterprise build they tie with its own
+    /// index of (status, created_at), with the same terms and the same rows,
+    /// and the newer of the two is taken: so either, there, until the live index is made the
+    /// newest. `also` are the indexes that may tie so, each read with the
+    /// live read's own terms.
+    #[cfg(feature = "ops")]
+    async fn assert_live_reads(pool: &Pool, also: &[&str], when: &str) {
+        for (what, sql, term) in [
+            (
+                "the live runs by status",
+                live_runs_by_status_sql(),
+                "status=?",
+            ),
+            (
+                "the recent live runs",
+                recent_runs_sql(true),
+                "created_at>?",
+            ),
+            (
+                "the health count",
+                crate::db::LIVE_RUNS_COUNT.to_string(),
+                "status=?",
+            ),
+        ] {
+            let plan = plan(pool, &sql).await;
+            let line = line_of(
+                &plan,
+                if sql.contains(" wr") {
+                    "wr"
+                } else {
+                    "workflow_runs"
+                },
+            );
+            let index = line
+                .split_whitespace()
+                .skip_while(|w| *w != "INDEX")
+                .nth(1)
+                .unwrap_or("");
+            assert!(
+                index == "idx_workflow_runs_live" || also.contains(&index),
+                "{when}: {what} should read idx_workflow_runs_live: {plan:?}"
+            );
+            assert!(
+                line.contains("status=?") && line.contains(term),
+                "{when}: {what}: {plan:?}"
+            );
+        }
+        // What has finished is not the live index's to read.
+        for (what, sql) in [
+            ("the recent finished runs", recent_runs_sql(false)),
+            ("the finished runs by status", finished_runs_by_status_sql()),
+        ] {
+            let plan = plan(pool, &sql).await;
+            assert!(
+                !reads(&plan, "idx_workflow_runs_live"),
+                "{when}: {what}: {plan:?}"
+            );
+        }
+        // The list as LIVE_RUN_STATUSES would write it were it reordered:
+        // the index's WHERE is no longer carried as written, so it is not
+        // read. This is what holds the three to the index's text.
+        let reversed = plan(
+            pool,
+            "SELECT COUNT(*) FROM workflow_runs WHERE status IN ('running', 'pending')",
+        )
+        .await;
+        assert!(
+            !reads(&reversed, "idx_workflow_runs_live"),
+            "{when}: {reversed:?}"
+        );
+    }
+
+    #[cfg(feature = "ops")]
+    #[tokio::test]
+    async fn live_reads_plan_on_the_live_index() {
+        let (pool, path) = temp_pool().await;
+        let tie: &[&str] = if cfg!(feature = "enterprise") {
+            &STATUS_INDEXES[..1]
+        } else {
+            &[]
+        };
+        assert_live_reads(&pool, tie, "as migrated").await;
+        make_newest(&pool, &["idx_workflow_runs_live"]).await;
+        assert_live_reads(&pool, &[], "the live index the newest").await;
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The reap reads the runs it is handed by their keys and the slice by
+    /// its own index, on both builds and beside an index led by `status` of
+    /// either age.
+    #[tokio::test]
+    async fn reap_reads_plan_on_their_keys() {
+        let (pool, path) = temp_pool().await;
+        assert_reap_reads(&pool, &STATUS_INDEXES, None, "as migrated").await;
+        let rivals = status_indexes_newest(&pool).await;
+        assert_reap_reads(&pool, &rivals, None, "a status index the newest").await;
+        make_newest(&pool, &["idx_workflow_runs_reapable"]).await;
+        assert_reap_reads(&pool, &rivals, None, "the reapable index the newest").await;
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The reads of runs beside the sweeps: each its name and its text.
+    fn reads_beside_the_sweeps() -> Vec<(&'static str, String)> {
+        #[allow(unused_mut)]
+        let mut reads_of: Vec<(&str, String)> = vec![
+            ("the runs in flight", RUNS_IN_FLIGHT.to_string()),
+            ("the runs superseded", SUPERSEDED_RUNS.to_string()),
+            (
+                "the reclass near a deadline",
+                RECLASS_NEAR_DEADLINE.to_string(),
+            ),
+            ("the count of active runs", ACTIVE_RUNS_COUNT.to_string()),
+            ("the drift mark", CLOCK_DRIFTED.to_string()),
+            ("the parked sub-workflows", PARKED_SUBWORKFLOWS.to_string()),
+        ];
+        #[cfg(feature = "ops")]
+        {
+            let [deps, tasks, runs] = gc_old_runs_sql();
+            reads_of.extend([
+                // Planned with the status it is bound with: SQLite plans a
+                // bound statement again where a partial index could serve it.
+                (
+                    "the running runs listed",
+                    list_runs_sql(true).replace("wr.status = ?", "wr.status = 'running'"),
+                ),
+                ("the finished runs by status", finished_runs_by_status_sql()),
+                ("the recent finished runs", recent_runs_sql(false)),
+                ("the runs to archive", ARCHIVABLE_RUNS.to_string()),
+                ("GC's dependencies", deps),
+                ("GC's tasks", tasks),
+                ("GC's runs", runs),
+            ]);
+        }
+        #[cfg(feature = "enterprise")]
+        reads_of.extend([
+            ("the incomplete runs", INCOMPLETE_RUNS.to_string()),
+            (
+                "the failed runs to rerun",
+                FAILED_RUNS_FOR_RERUN.to_string(),
+            ),
+        ]);
+        reads_of
+    }
+
+    /// The reads of runs beside the sweeps plan as they did before
+    /// migrations/078 and 079, on either build: each is planned with them,
+    /// and again with the six as they were and without the live and
+    /// reapable indexes. What 078 moves on purpose (the sweeps, the waiting
+    /// gauge, admission's next runs, the live reads) is held by the tests
+    /// above instead. 080, there in both, is held by `what_080_moves` and
+    /// `in_flight_reads_plan_on_their_index`.
+    #[tokio::test]
+    async fn run_plans_that_must_not_move() {
+        let (pool, path) = temp_pool().await;
+        let reads_of = reads_beside_the_sweeps();
+        let mut with_078 = Vec::new();
+        for (_, sql) in &reads_of {
+            with_078.push(plan(&pool, sql).await);
+        }
+        for index in RUN_SWEEP_INDEXES.iter().chain(&["idx_workflow_runs_live"]) {
+            exec(&pool, &format!("DROP INDEX {index}")).await;
+        }
+        for sql in OLD_RUN_SWEEP_INDEXES {
+            exec(&pool, sql).await;
+        }
+        for ((what, sql), with_078) in reads_of.iter().zip(with_078) {
+            assert_eq!(plan(&pool, sql).await, with_078, "{what}'s plan moved");
+        }
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The index a line of a plan reads, by its name: the word after
+    /// `INDEX`, or "" for a line that reads none.
+    fn index_of(line: &str) -> &str {
+        line.split_whitespace()
+            .skip_while(|w| *w != "INDEX")
+            .nth(1)
+            .unwrap_or("")
+    }
+
+    /// The indexes of `workflow_runs` a read by `status = 'running'` alone
+    /// may use by that term alone: led by `status`, with no WHERE or with
+    /// that one. Each is a read of the running runs, the same rows.
+    async fn running_by_status_alone(pool: &Pool) -> Vec<String> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, sql FROM sqlite_master
+             WHERE type = 'index' AND tbl_name = 'workflow_runs' AND sql IS NOT NULL",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        rows.into_iter()
+            .filter(|(_, sql)| {
+                let sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+                let (head, partial) = sql.split_once(" WHERE ").unwrap_or((&sql, ""));
+                let columns = head
+                    .split_once(" ON workflow_runs")
+                    .map_or("", |(_, c)| c.trim());
+                columns.starts_with("(status") && matches!(partial, "" | "status = 'running'")
+            })
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// The reads 080 is for. The run cap's count and supersede's read take
+    /// idx_workflow_runs_in_flight by `status` and `concurrency_key`: a
+    /// strict superset of the terms of any index of `status` alone, so no
+    /// such index takes them, of either age; supersede's order is the
+    /// index's but for its last term. The count of active runs reads the
+    /// running runs by `status`, through 080's or through an index that
+    /// ties with it (`running_by_status_alone`): on the enterprise build,
+    /// its own.
+    async fn assert_in_flight_reads(pool: &Pool, when: &str) {
+        for (what, sql) in [
+            ("the runs in flight", RUNS_IN_FLIGHT),
+            ("the runs superseded", SUPERSEDED_RUNS),
+        ] {
+            let plan = plan(pool, sql).await;
+            let line = line_of(&plan, "wr");
+            assert!(
+                line.contains(&format!(
+                    "USING INDEX {IN_FLIGHT_INDEX} (status=? AND concurrency_key=?)"
+                )),
+                "{when}: {what} should read {IN_FLIGHT_INDEX} by status and key: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|l| l == "USE TEMP B-TREE FOR ORDER BY"),
+                "{when}: {what} sorts: {plan:?}"
+            );
+        }
+        let ties = running_by_status_alone(pool).await;
+        let plan = plan(pool, ACTIVE_RUNS_COUNT).await;
+        let line = line_of(&plan, "workflow_runs");
+        assert!(
+            line.starts_with("SEARCH workflow_runs USING COVERING INDEX")
+                && line.ends_with("(status=?)")
+                && ties.iter().any(|t| t == index_of(line)),
+            "{when}: the count of active runs should read the running runs alone ({ties:?}): {plan:?}"
+        );
+        assert!(
+            ties.iter().any(|t| t == IN_FLIGHT_INDEX),
+            "{when}: {IN_FLIGHT_INDEX} reads by status alone: {ties:?}"
+        );
+    }
+
+    /// The run cap's count, supersede's read and the count of active runs
+    /// read the running runs (migrations/080), where on OSS each read every
+    /// run kept: as migrated (on the enterprise build, its own index the
+    /// newest, a fresh file's order), beside an index of every run led by
+    /// `status` the newest, and with 080 the newest (an upgraded enterprise
+    /// file's order). And with 080 the newest,
+    /// the sweeps, the reap and the live reads keep theirs.
+    #[tokio::test]
+    async fn in_flight_reads_plan_on_their_index() {
+        let (pool, path) = temp_pool().await;
+        assert_in_flight_reads(&pool, "as migrated").await;
+        let rivals = status_indexes_newest(&pool).await;
+        assert_in_flight_reads(&pool, "a status index the newest").await;
+        make_newest(&pool, &[IN_FLIGHT_INDEX]).await;
+        assert_in_flight_reads(&pool, "080 the newest").await;
+        assert_run_sweeps(&pool, &rivals, "080 the newest").await;
+        assert_reap_reads(&pool, &rivals, None, "080 the newest").await;
+        #[cfg(feature = "ops")]
+        {
+            // The live index the newest, as an upgraded file has it, so
+            // that a tie with a rival led by `status` is not what is read.
+            make_newest(&pool, &["idx_workflow_runs_live"]).await;
+            make_newest(&pool, &[IN_FLIGHT_INDEX]).await;
+            assert_live_reads(&pool, &[], "080 the newest").await;
+        }
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// What 080 moves among the reads beside the sweeps, on either build and
+    /// in either order: each plans as it did without 080, or reads the
+    /// running runs by its index where it read them by an index of `status`
+    /// alone or read every run. Nothing else in its plan moves. On OSS that
+    /// is the reclass near a deadline, the drift mark and the running runs
+    /// listed; on the enterprise build, where 080 is the newer of it and the
+    /// build's own index, those it ties with that index for.
+    #[tokio::test]
+    async fn what_080_moves() {
+        let (pool, path) = temp_pool().await;
+        let ours = [
+            "the runs in flight",
+            "the runs superseded",
+            "the count of active runs",
+        ];
+        let reads_of: Vec<_> = reads_beside_the_sweeps()
+            .into_iter()
+            .filter(|(what, _)| !ours.contains(what))
+            .collect();
+        for when in ["as migrated", "080 the newest"] {
+            if when == "080 the newest" {
+                make_newest(&pool, &[IN_FLIGHT_INDEX]).await;
+            }
+            let ties = running_by_status_alone(&pool).await;
+            let mut with = Vec::new();
+            for (_, sql) in &reads_of {
+                with.push(plan(&pool, sql).await);
+            }
+            let made: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            )
+            .bind(IN_FLIGHT_INDEX)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            exec(&pool, &format!("DROP INDEX {IN_FLIGHT_INDEX}")).await;
+            let mut moved = Vec::new();
+            for ((what, sql), with) in reads_of.iter().zip(with) {
+                let without = plan(&pool, sql).await;
+                assert_eq!(
+                    with.len(),
+                    without.len(),
+                    "{when}: {what}: {with:?} {without:?}"
+                );
+                for (now, before) in with.iter().zip(&without) {
+                    if now == before {
+                        continue;
+                    }
+                    let table = now.split_whitespace().nth(1).unwrap_or("");
+                    let read_all = *before == format!("SCAN {table}");
+                    let by_status = before.ends_with("(status=?)")
+                        && ties.iter().any(|t| t == index_of(before));
+                    assert!(
+                        now.ends_with(&format!("INDEX {IN_FLIGHT_INDEX} (status=?)"))
+                            && before.split_whitespace().nth(1) == Some(table)
+                            && (read_all || by_status),
+                        "{when}: {what}: `{before}` became `{now}`"
+                    );
+                    moved.push(*what);
+                }
+            }
+            if cfg!(not(feature = "enterprise")) && when == "as migrated" {
+                let mut want = vec!["the reclass near a deadline", "the drift mark"];
+                if cfg!(feature = "ops") {
+                    want.push("the running runs listed");
+                }
+                assert_eq!(moved, want, "{when}: what 080 moves on OSS");
+            }
+            exec(&pool, &made).await;
+        }
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An index added later, of a shape that could take these reads, takes
+    /// none of them from its own: each made the newest in turn, and every
+    /// plan the tests above hold planned again. One led by `status`, with no
+    /// WHERE or the live index's own, may take a live read from it: its loop
+    /// has the same terms, ties, and the newer index is taken, which is the
+    /// same read of the same rows (`assert_live_reads` holds the terms).
+    /// That alone is let be, as is the enterprise build's own index, which
+    /// ties with the live index as migrated (`live_reads_plan_on_the_live_index`).
+    #[tokio::test]
+    async fn run_plans_hold_against_new_indexes() {
+        let (pool, path) = temp_pool().await;
+        for (name, columns, partial) in [
+            ("idx_test_status", "(status)", ""),
+            ("idx_test_status_created", "(status, created_at)", ""),
+            ("idx_test_status_id", "(status, id)", ""),
+            ("idx_test_running", "(status)", " WHERE status = 'running'"),
+            (
+                "idx_test_live",
+                "(status, created_at)",
+                " WHERE status IN ('pending', 'running')",
+            ),
+            (
+                "idx_test_running_id",
+                "(status, id)",
+                " WHERE status = 'running' AND stopping_as IS NULL",
+            ),
+            (
+                "idx_test_reapable_id",
+                "(id)",
+                &*format!(" WHERE {REAPABLE}"),
+            ),
+            ("idx_test_created", "(created_at)", ""),
+            ("idx_test_deadline", "(deadline_at)", ""),
+        ] {
+            exec(
+                &pool,
+                &format!("CREATE INDEX {name} ON workflow_runs {columns}{partial}"),
+            )
+            .await;
+            let when = format!("beside {name}");
+            let rivals = [name, STATUS_INDEXES[0], STATUS_INDEXES[1]];
+            assert_run_sweeps(&pool, &rivals, &when).await;
+            let tie = columns.starts_with("(status, id)").then_some(name);
+            assert_reap_reads(&pool, &rivals, tie, &when).await;
+            assert_in_flight_reads(&pool, &when).await;
+            #[cfg(feature = "ops")]
+            {
+                // Only a rival led by `status`, of no WHERE or the live
+                // index's own, may take a live read, and on the enterprise
+                // build its own index, which ties as migrated.
+                let live: String = sqlx::query_scalar(
+                    "SELECT sql FROM sqlite_master WHERE name = 'idx_workflow_runs_live'",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+                let live = words(&live);
+                let live_where = live.split_once(" WHERE ").expect("a partial index").1;
+                let mut tie = Vec::new();
+                if columns.starts_with("(status")
+                    && (partial.is_empty()
+                        || partial.strip_prefix(" WHERE ").map(words).as_deref()
+                            == Some(live_where))
+                {
+                    tie.push(name);
+                }
+                if cfg!(feature = "enterprise") {
+                    tie.push(STATUS_INDEXES[0]);
+                }
+                assert_live_reads(&pool, &tie, &when).await;
+            }
+            exec(&pool, &format!("DROP INDEX {name}")).await;
+        }
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The indexes of `workflow_runs`, as written. Each plan the tests
+    /// above hold was checked beside these: one added is to be checked
+    /// beside them too.
+    #[tokio::test]
+    async fn workflow_runs_indexes_are_known() {
+        let (pool, path) = temp_pool().await;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, sql FROM sqlite_master
+             WHERE type = 'index' AND tbl_name = 'workflow_runs' AND sql IS NOT NULL
+             ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let found: Vec<(String, String)> = rows
+            .into_iter()
+            .map(|(name, sql)| (name, sql.split_whitespace().collect::<Vec<_>>().join(" ")))
+            .collect();
+        #[allow(unused_mut)]
+        let mut known = vec![
+            ("idx_runs_untriaged", "CREATE INDEX idx_runs_untriaged ON workflow_runs(status, created_at) WHERE triage_state IS NULL"),
+            ("idx_workflow_runs_alert_deadline", "CREATE INDEX idx_workflow_runs_alert_deadline ON workflow_runs (status, alert_deadline_at) WHERE alert_deadline_at IS NOT NULL AND alert_fired_at IS NULL AND status = 'running'"),
+            ("idx_workflow_runs_completion_pending", "CREATE INDEX idx_workflow_runs_completion_pending ON workflow_runs (status, completion_pending_at) WHERE completion_pending_at IS NOT NULL"),
+            ("idx_workflow_runs_concurrency_key", "CREATE INDEX idx_workflow_runs_concurrency_key ON workflow_runs (concurrency_key) WHERE status = 'running' AND concurrency_key IS NOT NULL"),
+            ("idx_workflow_runs_deadline", "CREATE INDEX idx_workflow_runs_deadline ON workflow_runs (status, deadline_at) WHERE deadline_at IS NOT NULL AND status = 'running'"),
+            ("idx_workflow_runs_in_flight", "CREATE INDEX idx_workflow_runs_in_flight ON workflow_runs (status, concurrency_key, created_at) WHERE status = 'running'"),
+            ("idx_workflow_runs_live", "CREATE INDEX idx_workflow_runs_live ON workflow_runs (status, created_at) WHERE status IN ('pending', 'running')"),
+            ("idx_workflow_runs_reapable", "CREATE INDEX idx_workflow_runs_reapable ON workflow_runs (status, id) WHERE status = 'running' AND stopping_as IS NULL AND (queued_at IS NULL OR admitted_at IS NOT NULL)"),
+            ("idx_workflow_runs_schedule", "CREATE INDEX idx_workflow_runs_schedule ON workflow_runs(schedule_id) WHERE schedule_id IS NOT NULL"),
+            ("idx_workflow_runs_start_pending", "CREATE INDEX idx_workflow_runs_start_pending ON workflow_runs (status, start_pending_at) WHERE start_pending_at IS NOT NULL"),
+            ("idx_workflow_runs_stopping", "CREATE INDEX idx_workflow_runs_stopping ON workflow_runs (status, stopping_as) WHERE stopping_as IS NOT NULL"),
+            ("idx_workflow_runs_waiting", "CREATE INDEX idx_workflow_runs_waiting ON workflow_runs (status, queued_at, id) WHERE queued_at IS NOT NULL AND admitted_at IS NULL AND status = 'running'"),
+        ];
+        #[cfg(feature = "enterprise")]
+        known.extend([
+            ("idx_workflow_runs_status_created_at", "CREATE INDEX idx_workflow_runs_status_created_at ON workflow_runs (status, created_at)"),
+            ("idx_workflow_runs_status_finished_at", "CREATE INDEX idx_workflow_runs_status_finished_at ON workflow_runs (status, finished_at)"),
+        ]);
+        known.sort();
+        let known: Vec<(String, String)> = known
+            .into_iter()
+            .map(|(n, s)| (n.to_string(), s.to_string()))
+            .collect();
+        assert_eq!(
+            found, known,
+            "a new index on workflow_runs: re-run the plan tests above with it in place, and add it here"
+        );
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A file migrated before 078 and 079, on the enterprise build with its
+    /// own migrations applied beside it, takes them at its next open: sqlx
+    /// applies a version that is missing beneath one applied
+    /// (`ignore_missing`), as 076 and 077 reached enterprise files. Then
+    /// 078's indexes are the newest of the table's, as on any upgraded
+    /// enterprise file, and the plans hold.
+    #[tokio::test]
+    async fn a_file_from_before_078_takes_078_and_079() {
+        let (pool, path) = temp_pool().await;
+        for index in RUN_SWEEP_INDEXES.iter().chain(&["idx_workflow_runs_live"]) {
+            exec(&pool, &format!("DROP INDEX {index}")).await;
+        }
+        for sql in OLD_RUN_SWEEP_INDEXES {
+            exec(&pool, sql).await;
+        }
+        for trigger in [
+            "run_wakes_task_ended",
+            "run_wakes_task_made_over",
+            "run_wakes_task_gone",
+            "run_wakes_run_made",
+            "run_wakes_run_changed",
+        ] {
+            exec(&pool, &format!("DROP TRIGGER {trigger}")).await;
+        }
+        exec(&pool, "DROP TABLE run_wakes").await;
+        exec(
+            &pool,
+            "DELETE FROM _sqlx_migrations WHERE version IN (78, 79)",
+        )
+        .await;
+        pool.close().await;
+
+        let pool = init_pool(path.to_str().unwrap()).await.unwrap();
+        let applied: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM _sqlx_migrations WHERE version >= 76 AND success ORDER BY version",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let mut want = vec![76, 77, 78, 79, 80, 81];
+        if cfg!(feature = "enterprise") {
+            want.extend([900, 902, 903]);
+        }
+        assert_eq!(applied, want);
+        let triggers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'run_wakes_%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(triggers, 5);
+        assert_run_sweeps(&pool, &STATUS_INDEXES, "upgraded").await;
+        assert_reap_reads(&pool, &STATUS_INDEXES, None, "upgraded").await;
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A file migrated before 080 and 081, on the enterprise build with its
+    /// own migrations applied beside it, takes them at its next open, as 078
+    /// and 079 reached such files. 080's index is then the newer of it and
+    /// the build's own, and the plans hold.
+    #[tokio::test]
+    async fn a_file_from_before_080_takes_080_and_081() {
+        let (pool, path) = temp_pool().await;
+        exec(&pool, &format!("DROP INDEX {IN_FLIGHT_INDEX}")).await;
+        for trigger in [
+            "run_changes_run_made",
+            "run_changes_run_moved",
+            "run_changes_task_made",
+            "run_changes_task_moved",
+            "run_changes_task_gone",
+            "run_changes_bounded",
+        ] {
+            exec(&pool, &format!("DROP TRIGGER {trigger}")).await;
+        }
+        exec(&pool, "DROP TABLE run_changes").await;
+        exec(
+            &pool,
+            "DELETE FROM _sqlx_migrations WHERE version IN (80, 81)",
+        )
+        .await;
+        pool.close().await;
+
+        let pool = init_pool(path.to_str().unwrap()).await.unwrap();
+        let applied: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM _sqlx_migrations WHERE version >= 78 AND success ORDER BY version",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let mut want = vec![78, 79, 80, 81];
+        if cfg!(feature = "enterprise") {
+            want.extend([900, 902, 903]);
+        }
+        assert_eq!(applied, want);
+        let triggers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'run_changes_%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(triggers, 6);
+        assert_in_flight_reads(&pool, "upgraded").await;
+        assert_run_sweeps(&pool, &STATUS_INDEXES, "upgraded").await;
+        assert_reap_reads(&pool, &STATUS_INDEXES, None, "upgraded").await;
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// The sweeps' reads: the slots, which SQLite grants all, the claim of the
+/// HTTP sensors, the reads that leave out what has nothing due, the batches,
+/// the set-based clear of the dataset triggers, and the gauges in two tiers.
+#[cfg(test)]
+// `crate::env_lock` is held across awaits on purpose, as the fan-out tests
+// above hold it: no test that lowers DAGRON_MAX_TASKS_PER_RUN runs meanwhile.
+#[allow(clippy::await_holding_lock)]
+mod sweep_tests {
+    use super::*;
+
+    async fn temp_pool() -> (Pool, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("module54_sweeps_{}.db", Uuid::new_v4()));
+        let pool = init_pool(path.to_str().unwrap()).await.unwrap();
+        (pool, path)
+    }
+
+    /// SQLite is one engine: every slot asked for is granted, at turn 0 and
+    /// with no cursor, and there is nothing to write back.
+    #[tokio::test]
+    async fn sweep_slots_on_sqlite_grant_every_name() {
+        let (pool, path) = temp_pool().await;
+        let slots = claim_sweep_slots(&pool, "e1", &[("leases", 0.45), ("waits", 0.45)])
+            .await
+            .unwrap();
+        let names: Vec<&str> = slots.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["leases", "waits"]);
+        assert!(slots.iter().all(|s| s.turn == 0 && s.cursor.is_none()));
+        // A second engine would be granted them too: there is none.
+        let again = claim_sweep_slots(&pool, "e2", &[("leases", 0.45)])
+            .await
+            .unwrap();
+        assert_eq!(again.len(), 1);
+        assert!(claim_sweep_slots(&pool, "e1", &[])
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!set_sweep_cursor(&pool, "reap", 0, Some("r1"))
+            .await
+            .unwrap());
+        assert!(!hand_back_sweep_slot(&pool, "waits", 0).await.unwrap());
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A due HTTP sensor is claimed by one sweep: a second sweep of the same
+    /// moment takes nothing, its `next_poll_at` has moved to the claim's end,
+    /// and once that has passed it is due again.
+    #[tokio::test]
+    async fn a_due_url_wait_is_claimed_by_exactly_one_sweep() {
+        let (pool, path) = temp_pool().await;
+        let url = "https://example.com/ready";
+        let yaml = format!(
+            "name: p\ntasks:\n  - {{ name: probe, type: wait, wait: {{ url: \"{url}\" }} }}\n"
+        );
+        let dag = DagGraph::from_yaml(&yaml).unwrap();
+        create_run(&pool, &dag, &yaml).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+        let probe = claim_ready(&pool, "w", 10).await.unwrap().remove(0);
+        let due = "2026-01-01T00:00:00+00:00";
+        let parked = park_wait_url(&pool, &probe.id, probe.version + 1, url, due).await;
+        assert!(parked.unwrap());
+
+        let first = claim_due_url_waits(&pool, 32, 30).await.unwrap();
+        assert_eq!(
+            first,
+            vec![(probe.id.clone(), url.to_string(), due.to_string())]
+        );
+        assert!(
+            claim_due_url_waits(&pool, 32, 30).await.unwrap().is_empty(),
+            "a second sweep takes nothing: one GET per due sensor"
+        );
+        let until: String = sqlx::query_scalar("SELECT next_poll_at FROM task_runs WHERE id = ?")
+            .bind(&probe.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(until > chrono::Utc::now().to_rfc3339(), "{until}");
+
+        // The engine died mid-GET: once the claim's end has passed, it is due.
+        sqlx::query("UPDATE task_runs SET next_poll_at = ? WHERE id = ?")
+            .bind("2026-01-02T00:00:00+00:00")
+            .bind(&probe.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(claim_due_url_waits(&pool, 32, 30).await.unwrap().len(), 1);
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The barriers [`PARKED_FANOUTS`] reads, as the sweep binds it.
+    async fn barriers_read(pool: &Pool) -> Vec<String> {
+        let rows: Vec<ParkedFanout> = sqlx::query_as(PARKED_FANOUTS)
+            .bind(crate::db::SWEEP_BATCH)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        rows.into_iter().map(|row| row.0).collect()
+    }
+
+    /// The instances of a barrier: `(id, status, version)`, by name.
+    async fn instances(pool: &Pool, barrier: &str) -> Vec<(String, String, i64)> {
+        sqlx::query_as(
+            "SELECT id, status, version FROM task_runs WHERE fanout_parent = ? ORDER BY name",
+        )
+        .bind(barrier)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    fn expanded(barrier: &str, instances: usize) -> (String, crate::models::FanoutOutcome) {
+        let outcome = crate::models::FanoutOutcome::Expanded { instances };
+        (barrier.to_string(), outcome)
+    }
+
+    /// A barrier with no instances is read and expanded once; one whose
+    /// instances of its generation still run is not read at all, and its
+    /// rows are left as they were; once they have all ended it is read, and
+    /// joins once.
+    #[tokio::test]
+    async fn a_barrier_whose_instances_still_run_is_not_read() {
+        // `reconcile_fanouts` reads DAGRON_MAX_TASKS_PER_RUN.
+        let _g = crate::env_lock();
+        let (pool, path, _run, barrier) = super::tests::parked_fanout(r#"["a","b"]"#).await;
+
+        assert_eq!(barriers_read(&pool).await, vec![barrier.clone()]);
+        let pass = reconcile_fanouts(&pool).await.unwrap();
+        assert!(!pass.full);
+        assert_eq!(pass.done, vec![expanded(&barrier, 2)]);
+        assert!(barriers_read(&pool).await.is_empty(), "expanded once");
+
+        let claimed = claim_ready(&pool, "w1", 1).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        let before = instances(&pool, &barrier).await;
+        assert!(
+            barriers_read(&pool).await.is_empty(),
+            "one runs, one is ready"
+        );
+        assert!(reconcile_fanouts(&pool).await.unwrap().done.is_empty());
+        assert_eq!(
+            instances(&pool, &barrier).await,
+            before,
+            "its rows are untouched"
+        );
+
+        let fence = claimed[0].version + 1;
+        mark_task_succeeded(&pool, &claimed[0].id, "w1", fence, None)
+            .await
+            .unwrap();
+        let rest = claim_ready(&pool, "w1", 1).await.unwrap();
+        assert!(barriers_read(&pool).await.is_empty(), "one still runs");
+        let fence = rest[0].version + 1;
+        mark_task_succeeded(&pool, &rest[0].id, "w1", fence, None)
+            .await
+            .unwrap();
+        assert_eq!(barriers_read(&pool).await, vec![barrier.clone()]);
+        let joined = crate::models::FanoutOutcome::Joined {
+            succeeded: true,
+            instances: 2,
+        };
+        assert_eq!(
+            reconcile_fanouts(&pool).await.unwrap().done,
+            vec![(barrier.clone(), joined)]
+        );
+        assert!(barriers_read(&pool).await.is_empty(), "joined once");
+        assert!(reconcile_fanouts(&pool).await.unwrap().done.is_empty());
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A barrier a reset has moved past its instances is read: they are of a
+    /// generation before, and do not hold it. Through the reset the API makes
+    /// (the producer cleared, and the barrier with it, while the instances,
+    /// the barrier's dependencies, are left as they were), the sweep drops
+    /// them and expands the barrier again over the producer's new output,
+    /// once.
+    #[cfg(feature = "ops")]
+    #[tokio::test]
+    async fn a_barrier_reset_past_its_instances_is_cleaned_and_expanded_once() {
+        let _g = crate::env_lock();
+        let (pool, path, run, barrier) = super::tests::parked_fanout(r#"["a","b"]"#).await;
+        let producer: String =
+            sqlx::query_scalar("SELECT id FROM task_runs WHERE run_id = ? AND name = 'list'")
+                .bind(&run)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        reconcile_fanouts(&pool).await.unwrap();
+        let first = claim_ready(&pool, "w1", 10).await.unwrap();
+        assert_eq!(first.len(), 2);
+        let stale: Vec<String> = first.iter().map(|t| t.id.clone()).collect();
+        for t in &first {
+            mark_task_succeeded(&pool, &t.id, "w1", t.version + 1, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            reconcile_fanouts(&pool).await.unwrap().done.len(),
+            1,
+            "joined"
+        );
+
+        assert!(clear_task_with_downstream(&pool, &run, &producer)
+            .await
+            .unwrap()
+            .is_some());
+        advance_ready_tasks(&pool).await.unwrap();
+        let again = claim_ready(&pool, "w1", 10).await.unwrap();
+        let p = again
+            .iter()
+            .find(|t| t.id == producer)
+            .expect("the producer runs again");
+        let output = Some(r#"["x","y","z"]"#.to_string());
+        mark_task_succeeded(&pool, &p.id, "w1", p.version + 1, output)
+            .await
+            .unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+
+        assert_eq!(
+            barriers_read(&pool).await,
+            vec![barrier.clone()],
+            "the instances before do not hold it"
+        );
+        assert_eq!(
+            reconcile_fanouts(&pool).await.unwrap().done,
+            vec![expanded(&barrier, 3)]
+        );
+        let now = instances(&pool, &barrier).await;
+        assert_eq!(now.len(), 3, "{now:?}");
+        assert!(now
+            .iter()
+            .all(|(id, status, _)| !stale.contains(id) && status == "ready"));
+        assert!(barriers_read(&pool).await.is_empty());
+        assert!(
+            reconcile_fanouts(&pool).await.unwrap().done.is_empty(),
+            "expanded once"
+        );
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An instance of a generation before that still runs does not hold its
+    /// barrier either: the sweep drops it and expands the barrier again,
+    /// once. No reset leaves one under a parked barrier today (a reset
+    /// barrier waits for its instances, its dependencies, before it parks
+    /// again), but the read does not lean on that.
+    #[tokio::test]
+    async fn an_instance_of_a_generation_before_does_not_hold_its_barrier() {
+        let _g = crate::env_lock();
+        let (pool, path, _run, barrier) = super::tests::parked_fanout(r#"["a","b"]"#).await;
+        reconcile_fanouts(&pool).await.unwrap();
+        let running = claim_ready(&pool, "w1", 10).await.unwrap();
+        assert_eq!(running.len(), 2);
+        let stale: Vec<String> = running.iter().map(|t| t.id.clone()).collect();
+
+        // The barrier's version moves on, as a reset moves it.
+        sqlx::query("UPDATE task_runs SET version = version + 1 WHERE id = ?")
+            .bind(&barrier)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(barriers_read(&pool).await, vec![barrier.clone()]);
+        assert_eq!(
+            reconcile_fanouts(&pool).await.unwrap().done,
+            vec![expanded(&barrier, 2)]
+        );
+        let now = instances(&pool, &barrier).await;
+        assert_eq!(now.len(), 2, "{now:?}");
+        assert!(now
+            .iter()
+            .all(|(id, status, _)| !stale.contains(id) && status == "ready"));
+        assert!(barriers_read(&pool).await.is_empty());
+        assert!(
+            reconcile_fanouts(&pool).await.unwrap().done.is_empty(),
+            "expanded once"
+        );
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The triggers [`PARKED_SUBWORKFLOWS`] reads, as the sweep binds it.
+    async fn triggers_read(pool: &Pool) -> Vec<String> {
+        let rows: Vec<(String, String, String, Option<String>)> =
+            sqlx::query_as(PARKED_SUBWORKFLOWS)
+                .bind(crate::db::SWEEP_BATCH)
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        rows.into_iter().map(|row| row.0).collect()
+    }
+
+    /// The sub-workflow sweep reads a trigger only once its child has ended:
+    /// not while the child runs, not where the child is gone (the trigger
+    /// stays parked), and the trigger of an ended child is resolved once. A
+    /// `repeat:` trigger is read through the same join, and re-arms rather
+    /// than resolves: that case is
+    /// `a_repeating_sub_workflow_trigger_runs_one_child_per_iteration`.
+    #[tokio::test]
+    async fn a_trigger_is_read_only_once_its_child_has_ended() {
+        let (pool, path) = temp_pool().await;
+        let child_yaml = "name: child\ntasks:\n  - { name: c, command: [\"true\"] }\n";
+        let parent_yaml = "name: parent\ntasks:\n  \
+                           - { name: a, type: workflow, workflow: child }\n  \
+                           - { name: b, type: workflow, workflow: child }\n";
+        let dag = DagGraph::from_yaml(parent_yaml).unwrap();
+        create_run(&pool, &dag, parent_yaml).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+        let claimed = claim_ready(&pool, "w", 10).await.unwrap();
+        let by = |name: &str| claimed.iter().find(|t| t.name == name).unwrap().clone();
+        let (a, b) = (by("a"), by("b"));
+        let child_dag = DagGraph::from_yaml(child_yaml).unwrap();
+        let child = create_run(&pool, &child_dag, child_yaml).await.unwrap();
+        assert!(park_subworkflow(&pool, &a.id, a.version + 1, &child)
+            .await
+            .unwrap());
+        // `b`'s child is gone: it was never made, or it was purged.
+        assert!(park_subworkflow(&pool, &b.id, b.version + 1, "gone")
+            .await
+            .unwrap());
+
+        assert!(
+            triggers_read(&pool).await.is_empty(),
+            "a child runs, the other is gone"
+        );
+        assert!(reconcile_subworkflows(&pool).await.unwrap().done.is_empty());
+
+        sqlx::query("UPDATE workflow_runs SET status = 'succeeded' WHERE id = ?")
+            .bind(&child)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(triggers_read(&pool).await, vec![a.id.clone()]);
+        let pass = reconcile_subworkflows(&pool).await.unwrap();
+        assert_eq!(pass.done, vec![(a.id.clone(), true)]);
+        assert!(!pass.full);
+        let again = reconcile_subworkflows(&pool).await.unwrap();
+        assert!(again.done.is_empty(), "resolved once");
+
+        let (status, sub): (String, Option<String>) =
+            sqlx::query_as("SELECT status, sub_run_id FROM task_runs WHERE id = ?")
+                .bind(&b.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "running", "left parked");
+        assert_eq!(sub.as_deref(), Some("gone"));
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// More time sensors are due than a batch reads: the first pass resolves
+    /// a batch, the longest due first, and says it was full; the next takes
+    /// the rest.
+    #[tokio::test]
+    async fn waits_past_the_batch_are_taken_by_the_next_pass() {
+        // A run of 300 tasks: `create_run` reads DAGRON_MAX_TASKS_PER_RUN.
+        let _g = crate::env_lock();
+        let (pool, path) = temp_pool().await;
+        let mut yaml = String::from("name: many\ntasks:\n");
+        for i in 0..300 {
+            yaml.push_str(&format!(
+                "  - {{ name: w{i}, type: wait, wait: {{ for: 1h }} }}\n"
+            ));
+        }
+        let dag = DagGraph::from_yaml(&yaml).unwrap();
+        create_run(&pool, &dag, &yaml).await.unwrap();
+        advance_ready_tasks(&pool).await.unwrap();
+        let claimed = claim_ready(&pool, "w", 300).await.unwrap();
+        assert_eq!(claimed.len(), 300);
+        for (i, t) in claimed.iter().enumerate() {
+            // Due a second apart, the first the longest.
+            let wake_at = format!("2026-01-01T00:{:02}:{:02}+00:00", i / 60, i % 60);
+            assert!(park_wait(&pool, &t.id, t.version + 1, &wake_at)
+                .await
+                .unwrap());
+        }
+
+        let first = reconcile_waits(&pool).await.unwrap();
+        assert_eq!(first.done.len() as i64, crate::db::SWEEP_BATCH);
+        assert!(first.full, "a full batch says so");
+        assert_eq!(
+            first.done[0].1, "2026-01-01T00:00:00+00:00",
+            "the longest due first"
+        );
+        let second = reconcile_waits(&pool).await.unwrap();
+        assert_eq!(second.done.len(), 44);
+        assert!(!second.full);
+        assert!(reconcile_waits(&pool).await.unwrap().done.is_empty());
+        let left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_runs WHERE status = 'running'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(left, 0);
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The trigger rows of a workflow.
+    async fn trigger_rows(pool: &Pool, name: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM dataset_triggers WHERE workflow_name = ?")
+            .bind(name)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// A workflow whose spec no longer subscribes to a dataset has its trigger
+    /// rows cleared by name, whoever synced them and whenever: the engine
+    /// keeps nothing of who it synced. A workflow that still subscribes keeps
+    /// its own.
+    #[tokio::test]
+    async fn a_workflow_that_drops_on_datasets_is_cleared_by_any_engine() {
+        let (pool, path) = temp_pool().await;
+        let uris = vec!["s3://bucket/a".to_string(), "s3://bucket/b".to_string()];
+        sync_dataset_triggers(&pool, "dropped", &uris, "any")
+            .await
+            .unwrap();
+        sync_dataset_triggers(&pool, "kept", &uris[..1], "any")
+            .await
+            .unwrap();
+        assert_eq!(trigger_rows(&pool, "dropped").await, 2);
+
+        let names = ["dropped".to_string(), "never-synced".to_string()];
+        assert_eq!(clear_dataset_triggers(&pool, &names).await.unwrap(), 2);
+        assert_eq!(trigger_rows(&pool, "dropped").await, 0);
+        assert_eq!(
+            trigger_rows(&pool, "kept").await,
+            1,
+            "a subscribed workflow is untouched"
+        );
+        assert_eq!(clear_dataset_triggers(&pool, &[]).await.unwrap(), 0);
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Each status's count over a whole table, in one read.
+    #[cfg(feature = "ops")]
+    async fn whole(pool: &Pool, table: &str) -> Vec<(String, i64)> {
+        let mut rows: Vec<(String, i64)> = sqlx::query_as(&format!(
+            "SELECT status, COUNT(*) FROM {table} GROUP BY status"
+        ))
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        rows.sort();
+        rows
+    }
+
+    /// The gauges in two tiers add up to one read of the whole datastore, and
+    /// no status is in both.
+    #[cfg(feature = "ops")]
+    #[tokio::test]
+    async fn status_counts_is_live_plus_history() {
+        let (pool, path) = temp_pool().await;
+        let yaml = "name: mix\ntasks:\n  - { name: a, command: [\"true\"] }\n  \
+                    - { name: b, command: [\"true\"], depends_on: [a] }\n  \
+                    - { name: c, command: [\"true\"] }\n";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        for _ in 0..3 {
+            create_run(&pool, &dag, yaml).await.unwrap();
+        }
+        advance_ready_tasks(&pool).await.unwrap();
+        // Some tasks run, one finishes, one fails, and one run has ended.
+        let claimed = claim_ready(&pool, "w", 4).await.unwrap();
+        let fence = claimed[0].version + 1;
+        mark_task_succeeded(&pool, &claimed[0].id, "w", fence, None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE task_runs SET status = 'failed' WHERE id = ?")
+            .bind(&claimed[1].id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE workflow_runs SET status = 'succeeded'
+             WHERE id = (SELECT id FROM workflow_runs ORDER BY id LIMIT 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // And a run still to end that was made two days ago: no recent run.
+        let old = create_run(&pool, &dag, yaml).await.unwrap();
+        sqlx::query("UPDATE workflow_runs SET created_at = ? WHERE id = ?")
+            .bind((chrono::Utc::now() - chrono::TimeDelta::days(2)).to_rfc3339())
+            .bind(&old)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let live = status_counts_live(&pool).await.unwrap();
+        let history = status_counts_history(&pool).await.unwrap();
+        for (status, _) in &live.runs_by_status {
+            assert!(crate::models::LIVE_RUN_STATUSES.contains(&status.as_str()));
+            assert!(!history.runs_by_status.iter().any(|(s, _)| s == status));
+        }
+        for (status, _) in &live.tasks_by_status {
+            assert!(crate::models::LIVE_TASK_STATUSES.contains(&status.as_str()));
+            assert!(!history.tasks_by_status.iter().any(|(s, _)| s == status));
+        }
+        // The recent runs still to end are read for a scrape, the rest with
+        // the history, and the two are the one read of the last day's runs
+        // the history made before.
+        assert!(!live.recent_runs.is_empty() && !history.recent_runs.is_empty());
+        for row in &live.recent_runs {
+            assert!(
+                crate::models::LIVE_RUN_STATUSES.contains(&row.status.as_str()),
+                "{row:?}"
+            );
+        }
+        for row in &history.recent_runs {
+            assert!(
+                !crate::models::LIVE_RUN_STATUSES.contains(&row.status.as_str()),
+                "{row:?}"
+            );
+        }
+        let cells = |rows: &[crate::models::RecentRuns]| {
+            let mut cells: Vec<(String, Option<String>, String, i64)> = rows
+                .iter()
+                .map(|r| {
+                    (
+                        r.workflow.clone(),
+                        r.environment.clone(),
+                        r.status.clone(),
+                        r.count,
+                    )
+                })
+                .collect();
+            cells.sort();
+            cells
+        };
+        let since = (chrono::Utc::now()
+            - chrono::TimeDelta::seconds(crate::models::RECENT_RUNS_WINDOW_SECS))
+        .to_rfc3339();
+        let mut one_read: Vec<(String, Option<String>, String, i64)> = sqlx::query_as(
+            "SELECT wd.name, wr.environment, wr.status, COUNT(*)
+             FROM workflow_runs wr
+             JOIN workflow_definitions wd ON wd.id = wr.definition_id
+             WHERE wr.created_at >= ?
+             GROUP BY wd.name, wr.environment, wr.status",
+        )
+        .bind(&since)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        one_read.sort();
+        assert_eq!(
+            cells(&[live.recent_runs.clone(), history.recent_runs.clone()].concat()),
+            one_read
+        );
+        assert_eq!(
+            one_read.iter().map(|cell| cell.3).sum::<i64>(),
+            3,
+            "the run made two days ago is not a recent one"
+        );
+
+        let merged = status_counts(&pool).await.unwrap();
+        let (mut runs, mut tasks) = (
+            merged.runs_by_status.clone(),
+            merged.tasks_by_status.clone(),
+        );
+        runs.sort();
+        tasks.sort();
+        assert_eq!(runs, whole(&pool, "workflow_runs").await);
+        assert_eq!(tasks, whole(&pool, "task_runs").await);
+        assert!(tasks.iter().any(|(s, _)| s == "failed"));
+        assert!(runs.iter().any(|(s, _)| s == "succeeded"));
+        assert_eq!(cells(&merged.recent_runs), one_read);
+        assert_eq!(merged.history_age_secs, 0.0);
+
+        // dagron-api's two: the counts by status and the dead letters, as
+        // the whole tiers have them, and nothing else read.
+        let unfinished = status_counts_unfinished(&pool).await.unwrap();
+        assert_eq!(unfinished.runs_by_status, live.runs_by_status);
+        assert_eq!(unfinished.tasks_by_status, live.tasks_by_status);
+        assert_eq!(unfinished.dead_letters, live.dead_letters);
+        assert!(unfinished.active_tasks.is_empty() && !live.active_tasks.is_empty());
+        let finished = status_counts_finished(&pool).await.unwrap();
+        assert_eq!(finished.runs_by_status, history.runs_by_status);
+        assert_eq!(finished.tasks_by_status, history.tasks_by_status);
+        assert!(finished.recent_runs.is_empty());
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── The file's wakes ────────────────────────────────────────────────────
+
+    /// The runs `run_wakes` holds, in order.
+    async fn wakes(pool: &Pool) -> Vec<String> {
+        sqlx::query_scalar("SELECT run_id FROM run_wakes ORDER BY run_id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn clear_wakes(pool: &Pool) {
+        sqlx::query("DELETE FROM run_wakes")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn sql(pool: &Pool, text: &str, binds: &[&str]) {
+        let mut q = sqlx::query(text);
+        for b in binds {
+            q = q.bind(*b);
+        }
+        q.execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("{text}: {e}"));
+    }
+
+    /// A run of `yaml`, and its tasks by name.
+    async fn run_of(pool: &Pool, yaml: &str) -> (String, HashMap<String, String>) {
+        let run = create_run(pool, &DagGraph::from_yaml(yaml).unwrap(), yaml)
+            .await
+            .unwrap();
+        let tasks: Vec<(String, String)> =
+            sqlx::query_as("SELECT name, id FROM task_runs WHERE run_id = ?")
+                .bind(&run)
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        (run, tasks.into_iter().collect())
+    }
+
+    /// A waker past its first take, as the engine's is after its start.
+    async fn started(pool: &Pool) -> Waker {
+        let mut waker = Waker::connect(pool).await.unwrap();
+        assert_eq!(waker.take_woken().await, crate::db::Woken::All);
+        waker
+    }
+
+    /// Each write that can make a run over writes its wake, in its own
+    /// transaction; one that cannot writes none.
+    #[tokio::test]
+    async fn wakes_follow_the_writes_that_may_end_a_run() {
+        let (pool, path) = temp_pool().await;
+        let two = "name: w\ntasks:\n  - name: a\n    command: [\"true\"]\n  - name: b\n    command: [\"true\"]\n";
+        // A run made running and not waiting wakes; then the table is let be.
+        let (run, tasks) = run_of(&pool, two).await;
+        assert_eq!(wakes(&pool).await, std::slice::from_ref(&run), "a run made");
+        clear_wakes(&pool).await;
+
+        sql(
+            &pool,
+            "UPDATE task_runs SET status = 'ready' WHERE id = ?",
+            &[&tasks["a"]],
+        )
+        .await;
+        assert!(wakes(&pool).await.is_empty(), "pending to ready");
+        for status in ["succeeded", "failed", "skipped", "cancelled"] {
+            sql(
+                &pool,
+                "UPDATE task_runs SET status = 'running' WHERE id = ?",
+                &[&tasks["a"]],
+            )
+            .await;
+            sql(
+                &pool,
+                "UPDATE task_runs SET status = ? WHERE id = ?",
+                &[status, &tasks["a"]],
+            )
+            .await;
+            assert_eq!(
+                wakes(&pool).await,
+                std::slice::from_ref(&run),
+                "running to {status}"
+            );
+            clear_wakes(&pool).await;
+        }
+        sql(
+            &pool,
+            "UPDATE task_runs SET status = 'failed' WHERE id = ?",
+            &[&tasks["a"]],
+        )
+        .await;
+        assert!(wakes(&pool).await.is_empty(), "from one end to another");
+
+        // A task made already over.
+        sql(
+            &pool,
+            "INSERT INTO task_runs (id, run_id, name, status, remaining_deps, input)
+             VALUES ('t-over', ?, 'over', 'succeeded', 0, '{}')",
+            &[&run],
+        )
+        .await;
+        assert_eq!(
+            wakes(&pool).await,
+            std::slice::from_ref(&run),
+            "a task made over"
+        );
+        clear_wakes(&pool).await;
+
+        // A task not over taken from a running run; then the finished tasks
+        // of a finished run, as GC takes them, which wake nothing.
+        sql(&pool, "DELETE FROM task_runs WHERE id = ?", &[&tasks["b"]]).await;
+        assert_eq!(
+            wakes(&pool).await,
+            std::slice::from_ref(&run),
+            "an unfinished task gone"
+        );
+        clear_wakes(&pool).await;
+        sql(
+            &pool,
+            "UPDATE workflow_runs SET status = 'failed' WHERE id = ?",
+            &[&run],
+        )
+        .await;
+        sql(&pool, "DELETE FROM task_runs WHERE run_id = ?", &[&run]).await;
+        assert!(wakes(&pool).await.is_empty(), "a finished run's tasks gone");
+
+        // A finished run running again, its wait cleared, as a rerun does.
+        sql(
+            &pool,
+            "UPDATE workflow_runs SET status = 'running', queued_at = NULL WHERE id = ?",
+            &[&run],
+        )
+        .await;
+        assert_eq!(
+            wakes(&pool).await,
+            std::slice::from_ref(&run),
+            "running again"
+        );
+        clear_wakes(&pool).await;
+
+        // A stop asked for wakes nothing; a stop taken back wakes it.
+        sql(
+            &pool,
+            "UPDATE workflow_runs SET stopping_as = 'cancelled' WHERE id = ?",
+            &[&run],
+        )
+        .await;
+        assert!(wakes(&pool).await.is_empty(), "a stop asked for");
+        sql(
+            &pool,
+            "UPDATE workflow_runs SET stopping_as = NULL WHERE id = ?",
+            &[&run],
+        )
+        .await;
+        assert_eq!(
+            wakes(&pool).await,
+            std::slice::from_ref(&run),
+            "a stop taken back"
+        );
+        clear_wakes(&pool).await;
+
+        // The stamps of the other sweeps are not the reap's.
+        sql(
+            &pool,
+            "UPDATE workflow_runs SET alert_fired_at = 'now', start_pending_at = 'now' WHERE id = ?",
+            &[&run],
+        )
+        .await;
+        assert!(wakes(&pool).await.is_empty(), "a sweep's stamp");
+
+        // A run made waiting for its turn wakes nothing until it is let in.
+        let definition: String =
+            sqlx::query_scalar("SELECT definition_id FROM workflow_runs WHERE id = ?")
+                .bind(&run)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sql(
+            &pool,
+            "INSERT INTO workflow_runs (id, definition_id, status, created_at, queued_at)
+             VALUES ('r-queued', ?, 'running', 'now', 'now')",
+            &[&definition],
+        )
+        .await;
+        assert!(wakes(&pool).await.is_empty(), "a run made waiting");
+        sql(
+            &pool,
+            "UPDATE workflow_runs SET admitted_at = 'now' WHERE id = 'r-queued'",
+            &[],
+        )
+        .await;
+        assert_eq!(wakes(&pool).await, ["r-queued"], "let in");
+        clear_wakes(&pool).await;
+
+        // A wake rolls back with the write that made it.
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("UPDATE task_runs SET status = 'cancelled' WHERE id = 't-over'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE task_runs SET status = 'running' WHERE id = 't-over'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE task_runs SET status = 'succeeded' WHERE id = 't-over'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        assert!(wakes(&pool).await.is_empty(), "rolled back");
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The first take says `All` and empties the table, whatever an older
+    /// engine left there; the next names what changed since.
+    #[tokio::test]
+    async fn the_first_take_is_all_and_empties_the_table() {
+        let (pool, path) = temp_pool().await;
+        for left in ["left-1", "left-2", "left-3"] {
+            sql(&pool, "INSERT INTO run_wakes (run_id) VALUES (?)", &[left]).await;
+        }
+        let one = "name: w\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let (run, _) = run_of(&pool, one).await;
+        let mut waker = started(&pool).await;
+        assert!(wakes(&pool).await.is_empty());
+        assert_eq!(waker.take_woken().await, crate::db::Woken::Runs(Vec::new()));
+
+        advance_ready_tasks(&pool).await.unwrap();
+        let a = claim_ready(&pool, "w", 1).await.unwrap().remove(0);
+        assert!(mark_task_succeeded(&pool, &a.id, "w", a.version + 1, None)
+            .await
+            .unwrap());
+        assert_eq!(waker.take_woken().await, crate::db::Woken::Runs(vec![run]));
+        assert!(wakes(&pool).await.is_empty(), "taken is deleted");
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// One take names at most [`MAX_NAMED_RUNS`]; the rest are the next's.
+    #[tokio::test]
+    async fn a_take_is_bounded() {
+        let (pool, path) = temp_pool().await;
+        let mut waker = started(&pool).await;
+        sql(
+            &pool,
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 4097)
+             INSERT INTO run_wakes (run_id) SELECT printf('r-%05d', i) FROM n",
+            &[],
+        )
+        .await;
+        let crate::db::Woken::Runs(first) = waker.take_woken().await else {
+            panic!("a take that worked names its runs");
+        };
+        assert_eq!(first.len(), 4096);
+        let crate::db::Woken::Runs(second) = waker.take_woken().await else {
+            panic!("a take that worked names its runs");
+        };
+        assert_eq!(second.len(), 1);
+        assert!(!first.contains(&second[0]));
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A take that cannot read the table says `All`, and a reap of all is
+    /// what the tick then runs. Takes that go on failing are not logged
+    /// each tick, and one that succeeds ends the run of failures.
+    #[tokio::test]
+    async fn a_take_that_fails_says_all() {
+        let (pool, path) = temp_pool().await;
+        let mut waker = started(&pool).await;
+        sql(&pool, "ALTER TABLE run_wakes RENAME TO run_wakes_away", &[]).await;
+        assert_eq!(waker.take_woken().await, crate::db::Woken::All);
+        assert!(reap_woken(&pool, &crate::db::Woken::All)
+            .await
+            .unwrap()
+            .is_empty());
+        // Logged at the first failure; those after it, within the minute,
+        // are counted for the next line, not logged each tick.
+        let logged = waker.failing.expect("the failure is kept").0;
+        assert_eq!(waker.take_woken().await, crate::db::Woken::All);
+        assert_eq!(waker.take_woken().await, crate::db::Woken::All);
+        assert_eq!(waker.failing, Some((logged, 2)));
+        sql(&pool, "ALTER TABLE run_wakes_away RENAME TO run_wakes", &[]).await;
+        assert_eq!(waker.take_woken().await, crate::db::Woken::Runs(Vec::new()));
+        assert_eq!(waker.failing, None, "takes recovered");
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A take that finds nothing takes no write lock: it returns while
+    /// another process holds one, well inside the busy timeout. One that
+    /// finds a wake waits for the lock, as any write does, and a bare
+    /// `DELETE` of the empty table waits too.
+    #[tokio::test]
+    async fn the_idle_take_writes_nothing() {
+        let (pool, path) = temp_pool().await;
+        let other = init_pool(path.to_str().unwrap()).await.unwrap();
+        let mut waker = started(&pool).await;
+        let mut holder = other.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+
+        let idle = tokio::time::timeout(Duration::from_secs(1), waker.take_woken()).await;
+        assert_eq!(
+            idle.expect("an idle take waits for no lock"),
+            crate::db::Woken::Runs(Vec::new())
+        );
+        // A third process's DELETE of the empty table waits all the same.
+        let third = init_pool(path.to_str().unwrap()).await.unwrap();
+        let bare = {
+            let third = third.clone();
+            tokio::spawn(async move { sqlx::query("DELETE FROM run_wakes").execute(&third).await })
+        };
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !bare.is_finished(),
+            "a DELETE of nothing still takes the write lock"
+        );
+        sqlx::query("ROLLBACK").execute(&mut *holder).await.unwrap();
+        assert_eq!(bare.await.unwrap().unwrap().rows_affected(), 0);
+        third.close().await;
+
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO run_wakes (run_id) VALUES ('r-held')")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        sqlx::query("COMMIT").execute(&mut *holder).await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let take = tokio::spawn(async move { waker.take_woken().await });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!take.is_finished(), "a take of a wake waits for the lock");
+        sqlx::query("COMMIT").execute(&mut *holder).await.unwrap();
+        assert_eq!(
+            take.await.unwrap(),
+            crate::db::Woken::Runs(vec!["r-held".to_string()])
+        );
+        drop(holder);
+        other.close().await;
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A run's status as the reap left it.
+    async fn run_status(pool: &Pool, run: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM workflow_runs WHERE id = ?")
+            .bind(run)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Take what the file says and reap it, as a tick does: `run` is not
+    /// ended by it.
+    async fn tick_leaves(pool: &Pool, waker: &mut Waker, run: &str, case: &str) {
+        let woken = waker.take_woken().await;
+        assert!(
+            matches!(woken, crate::db::Woken::Runs(_)),
+            "{case}: {woken:?}"
+        );
+        let ended = reap_woken(pool, &woken).await.unwrap();
+        assert!(
+            !ended.iter().any(|(id, _)| id == run),
+            "{case}: ended early: {ended:?}"
+        );
+        assert_eq!(run_status(pool, run).await, "running", "{case}");
+    }
+
+    /// The take names `run`, and the reap of what it named ends it so.
+    async fn tick_ends(pool: &Pool, waker: &mut Waker, run: &str, status: RunStatus, case: &str) {
+        let woken = waker.take_woken().await;
+        let crate::db::Woken::Runs(named) = &woken else {
+            panic!("{case}: {woken:?}");
+        };
+        assert!(
+            named.iter().any(|id| id == run),
+            "{case}: {run} not named: {named:?}"
+        );
+        let ended = reap_woken(pool, &woken).await.unwrap();
+        assert!(
+            ended.iter().any(|(id, s)| id == run && *s == status),
+            "{case}: {run} should have ended {status}: {ended:?}"
+        );
+    }
+
+    /// Claim the one task of `run` named `name` that is ready, as worker `w`.
+    async fn claim_named(pool: &Pool, run: &str, name: &str) -> TaskRun {
+        advance_ready_tasks(pool).await.unwrap();
+        let claimed = claim_ready(pool, "w", 100).await.unwrap();
+        claimed
+            .into_iter()
+            .find(|t| t.run_id == run && t.name == name)
+            .unwrap_or_else(|| panic!("{name} of {run} is not ready"))
+    }
+
+    /// Every way a run ends today, each driven by the dagron-core function
+    /// that ends it, reaches the reap by its wake alone: no case reads a
+    /// slice or reaps every run. A path added later that ends a run joins
+    /// this list.
+    #[tokio::test]
+    async fn each_end_reaches_the_reap_through_its_wake() {
+        let _g = crate::env_lock();
+        let (pool, path) = temp_pool().await;
+        let mut waker = started(&pool).await;
+        let w = &mut waker;
+        let one = "name: one\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+
+        // A task's own end, through each mark.
+        for (case, mark, status) in [
+            ("succeeded", 0, RunStatus::Succeeded),
+            ("succeeded from cache", 1, RunStatus::Succeeded),
+            ("failed", 2, RunStatus::Failed),
+        ] {
+            let (run, _) = run_of(&pool, one).await;
+            tick_leaves(&pool, w, &run, case).await;
+            let a = claim_named(&pool, &run, "a").await;
+            let fence = a.version + 1;
+            let marked = match mark {
+                0 => mark_task_succeeded(&pool, &a.id, "w", fence, None).await,
+                1 => mark_task_succeeded_cached(&pool, &a.id, "w", fence, None).await,
+                _ => mark_task_failed(&pool, &a.id, "w", fence, Some("no".into())).await,
+            };
+            assert!(marked.unwrap(), "{case}");
+            tick_ends(&pool, w, &run, status, case).await;
+        }
+        {
+            let case = "failed, and allowed to";
+            let yaml = "name: lax\ntasks:\n  - name: a\n    command: [\"false\"]\n    allow_failure: true\n";
+            let (run, _) = run_of(&pool, yaml).await;
+            tick_leaves(&pool, w, &run, case).await;
+            let a = claim_named(&pool, &run, "a").await;
+            assert!(mark_task_failed(&pool, &a.id, "w", a.version + 1, None)
+                .await
+                .unwrap());
+            tick_ends(&pool, w, &run, RunStatus::Succeeded, case).await;
+        }
+        {
+            let case = "a runner's word";
+            let (run, _) = run_of(&pool, one).await;
+            tick_leaves(&pool, w, &run, case).await;
+            advance_ready_tasks(&pool).await.unwrap();
+            let a = claim_ready(&pool, "runner:r1/s1", 1)
+                .await
+                .unwrap()
+                .remove(0);
+            sql(
+                &pool,
+                "INSERT INTO runner_results (task_id, fence, claimed_by, status, output, created_at)
+                 VALUES (?, ?, 'runner:r1/s1', 'succeeded', 'done', 'now')",
+                &[&a.id, &(a.version + 1).to_string()],
+            )
+            .await;
+            let word = take_runner_results(&pool, "engine", 10)
+                .await
+                .unwrap()
+                .remove(0);
+            assert!(mark_task_succeeded(
+                &pool,
+                &word.task_id,
+                &word.claimed_by,
+                word.fence,
+                word.output
+            )
+            .await
+            .unwrap());
+            tick_ends(&pool, w, &run, RunStatus::Succeeded, case).await;
+        }
+        {
+            // On Postgres this end is the slice's: the skip sends no
+            // notification.
+            let case = "a dependent skipped after a failure";
+            let yaml = "name: chain\ntasks:\n  - name: a\n    command: [\"false\"]\n  - name: b\n    command: [\"true\"]\n    depends_on: [a]\n";
+            let (run, _) = run_of(&pool, yaml).await;
+            tick_leaves(&pool, w, &run, case).await;
+            let a = claim_named(&pool, &run, "a").await;
+            assert!(mark_task_failed(&pool, &a.id, "w", a.version + 1, None)
+                .await
+                .unwrap());
+            tick_leaves(&pool, w, &run, case).await;
+            advance_ready_tasks(&pool).await.unwrap();
+            tick_ends(&pool, w, &run, RunStatus::Failed, case).await;
+        }
+        {
+            let case = "a trigger rule's skip";
+            let yaml = "name: rule\ntasks:\n  - name: a\n    command: [\"true\"]\n  - name: c\n    command: [\"true\"]\n    depends_on: [a]\n    trigger_rule: one_failed\n";
+            let (run, _) = run_of(&pool, yaml).await;
+            tick_leaves(&pool, w, &run, case).await;
+            let a = claim_named(&pool, &run, "a").await;
+            assert!(mark_task_succeeded(&pool, &a.id, "w", a.version + 1, None)
+                .await
+                .unwrap());
+            tick_leaves(&pool, w, &run, case).await;
+            advance_ready_tasks(&pool).await.unwrap();
+            tick_ends(&pool, w, &run, RunStatus::Succeeded, case).await;
+        }
+        {
+            let case = "a gang's siblings";
+            let yaml = "name: g\ntasks:\n  - name: train\n    command: [\"true\"]\n    gang: { size: 2 }\n";
+            let (run, _) = run_of(&pool, yaml).await;
+            tick_leaves(&pool, w, &run, case).await;
+            advance_ready_tasks(&pool).await.unwrap();
+            let gang = claim_ready_gang(&pool, "w", 2, &[], &Default::default())
+                .await
+                .unwrap();
+            assert_eq!(gang.len(), 2);
+            let (victim, sibling) = (&gang[0], &gang[1]);
+            assert!(
+                mark_task_failed(&pool, &victim.id, "w", victim.version + 1, None)
+                    .await
+                    .unwrap()
+            );
+            tick_leaves(&pool, w, &run, case).await;
+            assert_eq!(cancel_gang_siblings(&pool, &victim.id).await.unwrap(), 1);
+            assert!(
+                settle_stopped_task(&pool, &sibling.id, "w", sibling.version + 1)
+                    .await
+                    .unwrap()
+            );
+            tick_ends(&pool, w, &run, RunStatus::Failed, case).await;
+        }
+        // A fan-out's barrier, of no instance and of some, and made again
+        // over a new output after its instances were.
+        let fan = "name: fan\ntasks:\n  - name: list\n    command: [\"true\"]\n  - name: process\n    command: [\"handle\", \"{{ item }}\"]\n    with_output_of: list\n    depends_on: [list]\n";
+        for (case, output) in [
+            ("a fan-out of nothing", "[]"),
+            ("a fan-out", r#"["x","y"]"#),
+        ] {
+            let (run, _) = run_of(&pool, fan).await;
+            tick_leaves(&pool, w, &run, case).await;
+            let list = claim_named(&pool, &run, "list").await;
+            assert!(mark_task_succeeded(
+                &pool,
+                &list.id,
+                "w",
+                list.version + 1,
+                Some(output.into())
+            )
+            .await
+            .unwrap());
+            advance_ready_tasks(&pool).await.unwrap();
+            tick_leaves(&pool, w, &run, case).await;
+            reconcile_fanouts(&pool).await.unwrap();
+            if output != "[]" {
+                tick_leaves(&pool, w, &run, case).await;
+                for t in claim_ready(&pool, "w", 10).await.unwrap() {
+                    assert!(mark_task_succeeded(&pool, &t.id, "w", t.version + 1, None)
+                        .await
+                        .unwrap());
+                }
+                tick_leaves(&pool, w, &run, case).await;
+                reconcile_fanouts(&pool).await.unwrap();
+            }
+            tick_ends(&pool, w, &run, RunStatus::Succeeded, case).await;
+        }
+        {
+            let case = "a fan-out made again";
+            let (run, tasks) = run_of(&pool, fan).await;
+            tick_leaves(&pool, w, &run, case).await;
+            let list = claim_named(&pool, &run, "list").await;
+            assert!(mark_task_succeeded(
+                &pool,
+                &list.id,
+                "w",
+                list.version + 1,
+                Some(r#"["x","y"]"#.into())
+            )
+            .await
+            .unwrap());
+            advance_ready_tasks(&pool).await.unwrap();
+            reconcile_fanouts(&pool).await.unwrap();
+            assert_eq!(claim_ready(&pool, "w", 10).await.unwrap().len(), 2);
+            tick_leaves(&pool, w, &run, case).await;
+            // The barrier's version moves on while its instances run, as a
+            // reset moves it: the next expansion takes them away, tasks not
+            // over, and that is the run's wake.
+            sql(
+                &pool,
+                "UPDATE task_runs SET version = version + 1 WHERE id = ?",
+                &[&tasks["process"]],
+            )
+            .await;
+            reconcile_fanouts(&pool).await.unwrap();
+            assert_eq!(
+                w.take_woken().await,
+                crate::db::Woken::Runs(vec![run.clone()]),
+                "{case}"
+            );
+            for t in claim_ready(&pool, "w", 10).await.unwrap() {
+                assert!(mark_task_succeeded(&pool, &t.id, "w", t.version + 1, None)
+                    .await
+                    .unwrap());
+            }
+            tick_leaves(&pool, w, &run, case).await;
+            reconcile_fanouts(&pool).await.unwrap();
+            tick_ends(&pool, w, &run, RunStatus::Succeeded, case).await;
+        }
+        // A gate's decision, an operator's and its timeout's.
+        let gate =
+            "name: gate\ntasks:\n  - { name: gate, type: approval, approval_timeout_secs: 60 }\n";
+        for (case, approve, status) in [
+            ("a gate approved", Some(true), RunStatus::Succeeded),
+            ("a gate rejected", Some(false), RunStatus::Failed),
+            ("a gate timed out", None, RunStatus::Failed),
+        ] {
+            let (run, tasks) = run_of(&pool, gate).await;
+            advance_ready_tasks(&pool).await.unwrap();
+            tick_leaves(&pool, w, &run, case).await;
+            match approve {
+                Some(approve) => assert!(resolve_approval(
+                    &pool,
+                    &run,
+                    &tasks["gate"],
+                    approve,
+                    Some("alice"),
+                    None
+                )
+                .await
+                .unwrap()),
+                None => {
+                    let past = (chrono::Utc::now() - chrono::TimeDelta::seconds(120)).to_rfc3339();
+                    sql(
+                        &pool,
+                        "UPDATE task_runs SET scheduled_at = ? WHERE id = ?",
+                        &[&past, &tasks["gate"]],
+                    )
+                    .await;
+                    assert_eq!(resolve_expired_approvals(&pool).await.unwrap().len(), 1);
+                }
+            }
+            tick_ends(&pool, w, &run, status, case).await;
+        }
+        // A sub-workflow's trigger: the parent ends at the take after its
+        // child's, and a trigger failed outright.
+        let child = "name: child\ntasks:\n  - { name: c, command: [\"true\"] }\n";
+        sql(
+            &pool,
+            "INSERT INTO workflows (id, name, spec, created_at, updated_at) VALUES ('wf-child', 'child', ?, 't', 't')",
+            &[child],
+        )
+        .await;
+        let parent =
+            "name: parent\ntasks:\n  - { name: trigger, type: workflow, workflow: child }\n";
+        for (case, fails) in [("a sub-workflow", false), ("a sub-workflow failed", true)] {
+            let (run, _) = run_of(&pool, parent).await;
+            tick_leaves(&pool, w, &run, case).await;
+            let trigger = claim_named(&pool, &run, "trigger").await;
+            let (child_run, _) = run_of(&pool, child).await;
+            assert!(
+                park_subworkflow(&pool, &trigger.id, trigger.version + 1, &child_run)
+                    .await
+                    .unwrap()
+            );
+            tick_leaves(&pool, w, &run, case).await;
+            if fails {
+                assert!(
+                    fail_parked_subworkflow(&pool, &trigger.id, &child_run, "gone")
+                        .await
+                        .unwrap()
+                );
+                tick_ends(&pool, w, &run, RunStatus::Failed, case).await;
+            } else {
+                let c = claim_named(&pool, &child_run, "c").await;
+                assert!(mark_task_succeeded(&pool, &c.id, "w", c.version + 1, None)
+                    .await
+                    .unwrap());
+                tick_ends(&pool, w, &child_run, RunStatus::Succeeded, case).await;
+                assert_eq!(reconcile_subworkflows(&pool).await.unwrap().done.len(), 1);
+                tick_ends(&pool, w, &run, RunStatus::Succeeded, case).await;
+            }
+        }
+        // The sensors: time, HTTP, an external job's two ends, a dataset.
+        for case in [
+            "a time sensor",
+            "an HTTP sensor",
+            "an external job",
+            "an external job failed",
+            "a dataset sensor",
+        ] {
+            let yaml = match case {
+                "a time sensor" => "name: s\ntasks:\n  - { name: s, type: wait, wait: { for: 1h } }\n",
+                "an HTTP sensor" => "name: s\ntasks:\n  - { name: s, type: wait, wait: { url: \"https://example.com/ready\" } }\n",
+                "a dataset sensor" => "name: s\ntasks:\n  - { name: s, type: wait, wait: { dataset: \"s3://lake/x\" } }\n",
+                _ => "name: s\ntasks:\n  - { name: s, command: [\"true\"] }\n",
+            };
+            let (run, _) = run_of(&pool, yaml).await;
+            tick_leaves(&pool, w, &run, case).await;
+            let s = claim_named(&pool, &run, "s").await;
+            let fence = s.version + 1;
+            let now = chrono::Utc::now().to_rfc3339();
+            let status = match case {
+                "a time sensor" => {
+                    assert!(park_wait(&pool, &s.id, fence, "2000-01-01T00:00:00+00:00")
+                        .await
+                        .unwrap());
+                    tick_leaves(&pool, w, &run, case).await;
+                    assert_eq!(reconcile_waits(&pool).await.unwrap().done.len(), 1);
+                    RunStatus::Succeeded
+                }
+                "an HTTP sensor" => {
+                    assert!(
+                        park_wait_url(&pool, &s.id, fence, "https://example.com/ready", &now)
+                            .await
+                            .unwrap()
+                    );
+                    tick_leaves(&pool, w, &run, case).await;
+                    assert!(resolve_url_wait(&pool, &s.id).await.unwrap());
+                    RunStatus::Succeeded
+                }
+                "a dataset sensor" => {
+                    assert!(park_wait_dataset(&pool, &s.id, fence, "s3://lake/x")
+                        .await
+                        .unwrap());
+                    tick_leaves(&pool, w, &run, case).await;
+                    record_external_dataset_event(&pool, "s3://lake/x")
+                        .await
+                        .unwrap();
+                    assert_eq!(reconcile_dataset_waits(&pool).await.unwrap().done.len(), 1);
+                    RunStatus::Succeeded
+                }
+                _ => {
+                    assert!(
+                        park_external(&pool, &s.id, fence, "http", "job-1", None, &now, None)
+                            .await
+                            .unwrap()
+                    );
+                    tick_leaves(&pool, w, &run, case).await;
+                    if case == "an external job" {
+                        assert!(resolve_external(&pool, &s.id, "job-1", Some("DONE"))
+                            .await
+                            .unwrap());
+                        RunStatus::Succeeded
+                    } else {
+                        assert!(fail_external(&pool, &s.id, "job-1", "OOM").await.unwrap());
+                        RunStatus::Failed
+                    }
+                }
+            };
+            tick_ends(&pool, w, &run, status, case).await;
+        }
+        {
+            // A run its parameters leave no task in, made, and one that
+            // waited at a full cap and was let in.
+            let case = "a run of no task";
+            let none = "name: tags\nparameters: { event: push }\ntasks:\n  - { name: release, command: [\"true\"], when: \"{{ event }} == tag\" }\n";
+            let dag = DagGraph::from_yaml_with_params(none, &Default::default()).unwrap();
+            let run = create_run(&pool, &dag, none).await.unwrap();
+            tick_ends(&pool, w, &run, RunStatus::Succeeded, case).await;
+
+            let case = "a run of no task let in at its cap";
+            let capped = "name: deploy\nmax_active_runs: 1\nwhen_full: queue\n";
+            let busy = format!("{capped}tasks:\n  - name: a\n    command: [\"true\"]\n");
+            let (first, _) = run_of(&pool, &busy).await;
+            let empty = format!(
+                "{capped}parameters: {{ event: push }}\ntasks:\n  - name: a\n    command: [\"true\"]\n    when: \"{{{{ event }}}} == tag\"\n"
+            );
+            let dag = DagGraph::from_yaml_with_params(&empty, &Default::default()).unwrap();
+            let waits = create_run(&pool, &dag, &empty).await.unwrap();
+            tick_leaves(&pool, w, &waits, case).await;
+            let a = claim_named(&pool, &first, "a").await;
+            assert!(mark_task_succeeded(&pool, &a.id, "w", a.version + 1, None)
+                .await
+                .unwrap());
+            tick_ends(&pool, w, &first, RunStatus::Succeeded, case).await;
+            assert_eq!(
+                admit_waiting_runs(&pool).await.unwrap(),
+                vec![waits.clone()]
+            );
+            tick_ends(&pool, w, &waits, RunStatus::Succeeded, case).await;
+        }
+        #[cfg(feature = "ops")]
+        {
+            let case = "a rerun";
+            let (run, _) = run_of(&pool, one).await;
+            tick_leaves(&pool, w, &run, case).await;
+            let a = claim_named(&pool, &run, "a").await;
+            assert!(mark_task_failed(&pool, &a.id, "w", a.version + 1, None)
+                .await
+                .unwrap());
+            tick_ends(&pool, w, &run, RunStatus::Failed, case).await;
+            assert!(rerun_from_failed(&pool, &run).await.unwrap().is_some());
+            tick_leaves(&pool, w, &run, case).await;
+            let a = claim_named(&pool, &run, "a").await;
+            assert!(mark_task_succeeded(&pool, &a.id, "w", a.version + 1, None)
+                .await
+                .unwrap());
+            tick_ends(&pool, w, &run, RunStatus::Succeeded, case).await;
+        }
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A wake is a reason to look, not an end: the reap of what it names
+    /// leaves a run with work to do, one being stopped (that end is
+    /// `end_stopped_runs`'), and one already ended as they were.
+    #[tokio::test]
+    async fn a_wake_does_not_end_what_is_not_over() {
+        let (pool, path) = temp_pool().await;
+        let mut waker = started(&pool).await;
+        let two = "name: w\ntasks:\n  - name: a\n    command: [\"true\"]\n  - name: b\n    command: [\"true\"]\n";
+        let (pending, _) = run_of(&pool, two).await;
+        let (stopping, _) = run_of(&pool, two).await;
+        let (cancelled, _) = run_of(&pool, two).await;
+        assert!(waker.take_woken().await != crate::db::Woken::All);
+        sql(
+            &pool,
+            "UPDATE workflow_runs SET stopping_as = 'cancelled' WHERE id = ?",
+            &[&stopping],
+        )
+        .await;
+        sql(
+            &pool,
+            "UPDATE task_runs SET status = 'cancelled' WHERE run_id = ?",
+            &[&stopping],
+        )
+        .await;
+        sql(
+            &pool,
+            "UPDATE workflow_runs SET status = 'cancelled' WHERE id = ?",
+            &[&cancelled],
+        )
+        .await;
+        sql(
+            &pool,
+            "UPDATE task_runs SET status = 'cancelled' WHERE run_id = ?",
+            &[&cancelled],
+        )
+        .await;
+        sql(
+            &pool,
+            "UPDATE task_runs SET status = 'succeeded' WHERE run_id = ? AND name = 'a'",
+            &[&pending],
+        )
+        .await;
+        let woken = waker.take_woken().await;
+        let crate::db::Woken::Runs(named) = &woken else {
+            panic!("{woken:?}");
+        };
+        let mut named = named.clone();
+        named.sort();
+        let mut all = vec![pending.clone(), stopping.clone(), cancelled.clone()];
+        all.sort();
+        assert_eq!(named, all);
+        assert!(reap_woken(&pool, &woken).await.unwrap().is_empty());
+        assert_eq!(run_status(&pool, &pending).await, "running");
+        assert_eq!(run_status(&pool, &stopping).await, "running");
+        assert_eq!(run_status(&pool, &cancelled).await, "cancelled");
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The slice is the net under a wake that is lost: slices from the
+    /// start end such a run, never name one that waits for its turn, walk
+    /// every reapable run, and say `None` at the end.
+    #[tokio::test]
+    async fn a_lost_wake_is_ended_by_the_slice() {
+        let (pool, path) = temp_pool().await;
+        let mut waker = started(&pool).await;
+        let one = "name: w\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let mut runs = Vec::new();
+        for _ in 0..5 {
+            runs.push(run_of(&pool, one).await.0);
+        }
+        let capped = "name: cap\nmax_active_runs: 1\nwhen_full: queue\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let (_holding, _) = run_of(&pool, capped).await;
+        let (waits, _) = run_of(&pool, capped).await;
+        assert!(waker.take_woken().await != crate::db::Woken::All);
+        // The last task of runs[2] ends, and its wake is lost.
+        sql(
+            &pool,
+            "UPDATE task_runs SET status = 'succeeded' WHERE run_id = ?",
+            &[&runs[2]],
+        )
+        .await;
+        clear_wakes(&pool).await;
+        assert_eq!(waker.take_woken().await, crate::db::Woken::Runs(Vec::new()));
+
+        let (mut after, mut walked, mut passes) = (None::<String>, 0, 0);
+        let mut ended = Vec::new();
+        loop {
+            let ids: Vec<String> = sqlx::query_scalar(&reap_slice_sql())
+                .bind(after.as_deref().unwrap_or(""))
+                .bind(2_i64)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            assert!(!ids.contains(&waits), "a run that waits is not the slice's");
+            walked += ids.len();
+            let (swept, next) = reap_slice(&pool, after.as_deref(), 2).await.unwrap();
+            ended.extend(swept);
+            passes += 1;
+            match next {
+                Some(n) => after = Some(n),
+                None => break,
+            }
+        }
+        // Five runs and the one holding the cap, two a slice, and a last
+        // slice that finds none and says so.
+        assert_eq!((walked, passes), (6, 4));
+        assert_eq!(ended, vec![(runs[2].clone(), RunStatus::Succeeded)]);
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Another process on the file, as dagron-api is, writes as it does:
+    /// the engine's waker hears each write that may end a run, and the reap
+    /// of what it names ends each.
+    #[tokio::test]
+    async fn writes_from_another_pool_are_heard() {
+        let (pool, path) = temp_pool().await;
+        let api = init_pool(path.to_str().unwrap()).await.unwrap();
+        let mut waker = started(&pool).await;
+
+        // A gate approved by control.rs's SQL, the run's last task.
+        let gate = "name: gate\ntasks:\n  - { name: gate, type: approval }\n";
+        let (gated, tasks) = run_of(&pool, gate).await;
+        advance_ready_tasks(&pool).await.unwrap();
+        // A run made by dagron-api's own insert, with no task.
+        let definition: String =
+            sqlx::query_scalar("SELECT definition_id FROM workflow_runs WHERE id = ?")
+                .bind(&gated)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        // A task ended by hand.
+        let one = "name: one\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let (by_hand, by_hand_tasks) = run_of(&pool, one).await;
+        assert!(waker.take_woken().await != crate::db::Woken::All);
+        assert!(reap_woken(
+            &pool,
+            &crate::db::Woken::Runs(vec![gated.clone(), by_hand.clone()])
+        )
+        .await
+        .unwrap()
+        .is_empty());
+
+        sql(
+            &api,
+            "UPDATE task_runs SET status = $1, finished_at = $2, output = $3,
+                    decided_by = $4, decision_comment = $5, log = $6
+             WHERE id = $7 AND run_id = $8 AND status = 'awaiting_approval'",
+            &[
+                "succeeded",
+                "now",
+                "approved",
+                "alice",
+                "ok",
+                "approved",
+                &tasks["gate"],
+                &gated,
+            ],
+        )
+        .await;
+        sql(
+            &api,
+            "INSERT INTO workflow_runs (id, definition_id, status, created_at, deadline_at, result_from, environment)
+             VALUES ('r-api', $1, 'running', 'now', NULL, NULL, NULL)",
+            &[&definition],
+        )
+        .await;
+        sql(
+            &api,
+            "UPDATE task_runs SET status = 'succeeded' WHERE id = ?",
+            &[&by_hand_tasks["a"]],
+        )
+        .await;
+
+        let woken = waker.take_woken().await;
+        let crate::db::Woken::Runs(named) = &woken else {
+            panic!("{woken:?}");
+        };
+        let mut named = named.clone();
+        named.sort();
+        let mut want = vec![gated.clone(), by_hand.clone(), "r-api".to_string()];
+        want.sort();
+        assert_eq!(named, want);
+        let mut ended = reap_woken(&pool, &woken).await.unwrap();
+        ended.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut ends = vec![
+            (gated, RunStatus::Succeeded),
+            (by_hand, RunStatus::Succeeded),
+            ("r-api".to_string(), RunStatus::Succeeded),
+        ];
+        ends.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(ended, ends);
+        api.close().await;
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// migrations/081's `run_changes`: what the file writes there for dagron-api's
+/// live stream, its bound, and the reads of it.
+#[cfg(all(test, feature = "ops"))]
+mod run_changes_tests {
+    use super::*;
+
+    const TWO: &str = "name: changes\ntasks:\n  - name: a\n    command: [\"true\"]\n  - name: b\n    command: [\"true\"]\n    depends_on: [a]\n";
+
+    async fn temp_pool() -> (Pool, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("module54_changes_{}.db", Uuid::new_v4()));
+        let pool = init_pool(path.to_str().unwrap()).await.unwrap();
+        (pool, path)
+    }
+
+    async fn sql(pool: &Pool, text: &str, binds: &[&str]) {
+        let mut q = sqlx::query(text).persistent(false);
+        for b in binds {
+            q = q.bind(*b);
+        }
+        q.execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("{text}: {e}"));
+    }
+
+    async fn newest(pool: &Pool) -> i64 {
+        sqlx::query_scalar(RUN_CHANGES_NEWEST)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The runs written past `after`, in order.
+    async fn past(pool: &Pool, after: i64) -> Vec<String> {
+        match run_changes_after(pool, after, 1_000_000).await.unwrap() {
+            RunChanges::Since(rows) => rows.into_iter().map(|(_, run)| run).collect(),
+            RunChanges::Behind { newest } => panic!("behind {newest}"),
+        }
+    }
+
+    /// Each change the stream compared before 081 writes its run, once
+    /// however often it is touched before it is read; a change it did not
+    /// compare writes nothing.
+    #[tokio::test]
+    async fn the_changes_the_stream_sends_are_written_and_no_others() {
+        let (pool, path) = temp_pool().await;
+        let at = newest(&pool).await;
+        let run = create_run(&pool, &DagGraph::from_yaml(TWO).unwrap(), TWO)
+            .await
+            .unwrap();
+        assert_eq!(
+            past(&pool, at).await,
+            vec![run.clone()],
+            "a run made, with its tasks"
+        );
+        let cases: [(&str, &str, bool); 9] = [
+            ("UPDATE task_runs SET output = 'x' WHERE run_id = ?1", "a task's output", false),
+            ("UPDATE task_runs SET status = status WHERE run_id = ?1", "a status written unchanged", false),
+            ("UPDATE workflow_runs SET output = 'x' WHERE id = ?1", "a run's output", false),
+            ("UPDATE task_runs SET status = 'ready' WHERE run_id = ?1 AND name = 'a'", "a task's status", true),
+            ("UPDATE task_runs SET attempt = attempt + 1 WHERE run_id = ?1 AND name = 'a'", "a task's attempt", true),
+            ("UPDATE OR IGNORE task_runs SET status = 'running' WHERE run_id = ?1 AND name = 'a'", "a move under OR IGNORE", true),
+            ("DELETE FROM task_runs WHERE run_id = ?1 AND name = 'b'", "a task not over taken away", true),
+            ("UPDATE workflow_runs SET status = 'succeeded' WHERE id = ?1", "a run's status", true),
+            ("DELETE FROM task_runs WHERE run_id = ?1", "a task over taken away (GC's)", false),
+        ];
+        for (i, (text, what, written)) in cases.into_iter().enumerate() {
+            if i == 6 {
+                // What a fan-out's re-expansion takes away first.
+                sql(
+                    &pool,
+                    "DELETE FROM task_dependencies
+                     WHERE dependent_id IN (SELECT id FROM task_runs WHERE run_id = ?1)",
+                    &[&run],
+                )
+                .await;
+            }
+            if i == 8 {
+                sql(
+                    &pool,
+                    "UPDATE task_runs SET status = 'succeeded' WHERE run_id = ?1",
+                    &[&run],
+                )
+                .await;
+            }
+            let at = newest(&pool).await;
+            sql(&pool, text, &[&run]).await;
+            let got = past(&pool, at).await;
+            if written {
+                assert_eq!(got, vec![run.clone()], "{what}");
+            } else {
+                assert!(got.is_empty(), "{what}: {got:?}");
+            }
+        }
+        // One row a run, at its latest change.
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM run_changes WHERE run_id = ?")
+            .bind(&run)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A change rolled back leaves nothing, and the next change's `seq` is
+    /// past every one a reader has read: what a reader reads in `seq` order
+    /// is what was committed, in order.
+    #[tokio::test]
+    async fn a_change_rolled_back_leaves_nothing_and_seq_stays_in_order() {
+        let (pool, path) = temp_pool().await;
+        let run = create_run(&pool, &DagGraph::from_yaml(TWO).unwrap(), TWO)
+            .await
+            .unwrap();
+        let at = newest(&pool).await;
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("UPDATE task_runs SET status = 'ready' WHERE run_id = ?")
+            .bind(&run)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        assert_eq!(newest(&pool).await, at);
+        assert!(past(&pool, at).await.is_empty());
+        sql(
+            &pool,
+            "UPDATE task_runs SET status = 'ready' WHERE run_id = ?1",
+            &[&run],
+        )
+        .await;
+        match run_changes_after(&pool, at, 10).await.unwrap() {
+            RunChanges::Since(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert!(rows[0].0 > at);
+            }
+            other => panic!("{other:?}"),
+        }
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The table is bounded, by the file alone: past RUN_CHANGES_KEPT
+    /// changes, each 1,024th takes away what is that far behind it, and
+    /// what is within it is all there. A cursor further behind is told so,
+    /// and one past the newest.
+    #[tokio::test]
+    async fn the_table_is_bounded_and_a_reader_far_behind_is_told() {
+        let (pool, path) = temp_pool().await;
+        sql(
+            &pool,
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200000)
+             INSERT INTO run_changes (run_id) SELECT 'r' || i FROM n",
+            &[],
+        )
+        .await;
+        let top = newest(&pool).await;
+        assert_eq!(top, 200_000);
+        let (rows, lowest): (i64, i64) =
+            sqlx::query_as("SELECT COUNT(*), MIN(seq) FROM run_changes")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(rows <= RUN_CHANGES_KEPT + 1024, "{rows} rows");
+        assert!(lowest <= top - RUN_CHANGES_KEPT + 1, "lowest {lowest}");
+        assert_eq!(
+            run_changes_after(&pool, top - RUN_CHANGES_KEPT - 1, 1)
+                .await
+                .unwrap(),
+            RunChanges::Behind { newest: top }
+        );
+        // A cursor past the newest: the file is older than what was read.
+        assert_eq!(
+            run_changes_after(&pool, top + 1, 1).await.unwrap(),
+            RunChanges::Behind { newest: top }
+        );
+        assert_eq!(
+            run_changes_after(&pool, top, 1).await.unwrap(),
+            RunChanges::Since(Vec::new())
+        );
+        let edge = top - RUN_CHANGES_KEPT;
+        match run_changes_after(&pool, edge, RUN_CHANGES_KEPT + 1)
+            .await
+            .unwrap()
+        {
+            RunChanges::Since(rows) => {
+                assert_eq!(
+                    rows.len() as i64,
+                    RUN_CHANGES_KEPT,
+                    "every change past the edge"
+                );
+                assert_eq!(rows[0].0, edge + 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The reads of it, and the triggers' own, by their keys: the pump's
+    /// read past its cursor never reads the table whole, and a change finds
+    /// the run's row by its unique key.
+    #[tokio::test]
+    async fn the_reads_of_run_changes_are_by_their_keys() {
+        let (pool, path) = temp_pool().await;
+        for (sql, want) in [
+            (RUN_CHANGES_SINCE, "USING INTEGER PRIMARY KEY (rowid>?)"),
+            (
+                "DELETE FROM run_changes WHERE run_id = ?",
+                "INDEX sqlite_autoindex_run_changes_1 (run_id=?)",
+            ),
+            (
+                "DELETE FROM run_changes WHERE seq <= ?",
+                "USING INTEGER PRIMARY KEY (rowid<?)",
+            ),
+        ] {
+            let plan: Vec<(i64, i64, i64, String)> =
+                sqlx::query_as(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .persistent(false)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            let plan: Vec<String> = plan.into_iter().map(|r| r.3).collect();
+            assert!(
+                plan.len() == 1
+                    && plan[0].starts_with("SEARCH run_changes ")
+                    && plan[0].ends_with(want),
+                "{sql}: {plan:?}"
+            );
+        }
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The read of every live run and its cursor are of one snapshot: a
+    /// change after it is past the cursor.
+    #[tokio::test]
+    async fn a_read_of_every_live_run_hands_a_cursor_past_which_is_what_came_after() {
+        let (pool, path) = temp_pool().await;
+        let run = create_run(&pool, &DagGraph::from_yaml(TWO).unwrap(), TWO)
+            .await
+            .unwrap();
+        let since = (chrono::Utc::now() - chrono::TimeDelta::seconds(30)).to_rfc3339();
+        let (cursor, live) = live_stream_runs(&pool, &since).await.unwrap();
+        assert_eq!(live, vec![run.clone()]);
+        assert_eq!(cursor, newest(&pool).await);
+        assert!(past(&pool, cursor).await.is_empty());
+        sql(
+            &pool,
+            "UPDATE task_runs SET status = 'ready' WHERE run_id = ?1",
+            &[&run],
+        )
+        .await;
+        assert_eq!(past(&pool, cursor).await, [run]);
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
 }

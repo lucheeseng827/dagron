@@ -1,0 +1,19 @@
+// What a step reads of the build.
+pipeline {
+    agent { docker { image 'debian:12-slim' } }
+    stages {
+        stage('Info') {
+            steps {
+                sh 'echo "$BRANCH_NAME at $GIT_COMMIT in $WORKSPACE, PR $CHANGE_ID into $CHANGE_TARGET"'
+                sh "echo build ${env.BUILD_NUMBER} of ${JOB_NAME}"
+                sh """#!/bin/bash
+                    set -euo pipefail
+                    if [[ "\$BRANCH_NAME" == main ]]; then echo main; fi
+                """
+                sh "echo '${env.GIT_COMMIT}' > commit.txt"
+                sh "echo ${currentBuild.number}"
+                sh 'echo $STAGE_NAME'
+            }
+        }
+    }
+}

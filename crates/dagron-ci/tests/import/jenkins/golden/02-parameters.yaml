@@ -1,0 +1,56 @@
+# Imported from a Jenkinsfile by dagron-import.
+#
+# Changed on the way (8):
+#   parameters: a parameter is a dispatch's input, and every other run is given its default: each job is given it as a variable of the same name
+#   on: a multibranch pipeline's builds are each branch and tag pushed, each pull request, and a run asked for (dispatch) here: say on: where it ran for fewer
+#   stage('E2E').when, stage('Deploy').when: its when is a test at the head of each of its steps, which end there where it is false: the job passes, where Jenkins skipped the stage
+#   stage('Deploy').steps[0]: what the string interpolated is a variable of the shell's here, which the shell fills in as it runs the script
+#   stage('Deploy').steps[0]: it reads $BRANCH_NAME: each is set at the head of its script
+#   stage('Install').steps[0]: Jenkins's variables a step reads are set at its head from dagron-ci's own (CI_SHA, CI_REF, …): a program it runs that reads one the step does not is not given it
+#   stage('Deploy').steps[0]: $BRANCH_NAME is a branch's or a tag's name, and PR-<number> for a pull request, as a multibranch pipeline has it
+#
+# Not carried over (1):
+#   parameters.REGION: its choices are not checked here: a run asked for may send any value
+name: 02-parameters
+on:
+  push: {}
+  pull_request: {}
+  dispatch:
+    inputs:
+      TARGET:
+        description: Where to deploy
+        default: staging
+      RUN_E2E:
+        description: Run the end-to-end tests
+        default: 'false'
+      REGION:
+        description: Region
+        default: eu-west-1
+parameters:
+  TARGET: staging
+  RUN_E2E: 'false'
+  REGION: eu-west-1
+tasks:
+- name: install
+  docker_image: node:22-bookworm-slim
+  env:
+  - name: TARGET
+    value: '{{ TARGET }}'
+  - name: RUN_E2E
+    value: '{{ RUN_E2E }}'
+  - name: REGION
+    value: '{{ REGION }}'
+  steps:
+  - name: Install
+    run: npm ci
+  - name: E2E
+    run: |-
+      # when { expression { return params.RUN_E2E } }
+      { [ "${RUN_E2E:-}" = 'true' ]; } || exit 0
+      npm run e2e
+  - name: Deploy
+    run: |-
+      case "$CI_EVENT" in pull_request) export BRANCH_NAME="PR-$CI_PR" ;; *) export BRANCH_NAME="${CI_REF#refs/*/}" ;; esac
+      # when { expression { params.TARGET == 'production' && env.BRANCH_NAME == 'main' } }
+      { { [ "${TARGET:-}" = 'production' ]; } && { [ "${BRANCH_NAME:-}" = 'main' ]; }; } || exit 0
+      ./deploy.sh ${TARGET} ${REGION}

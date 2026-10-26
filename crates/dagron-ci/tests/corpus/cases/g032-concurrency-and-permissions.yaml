@@ -1,0 +1,14 @@
+shows: A workflow's concurrency group is its runs' key, and what cannot be kept is said
+front: github
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on: push
+  concurrency:
+    group: deploy-${{ github.ref }}
+  permissions:
+    contents: read
+  jobs:
+    deploy:
+      runs-on: ubuntu-latest
+      steps:
+        - run: make deploy

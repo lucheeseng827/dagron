@@ -48,7 +48,7 @@ Set `SOURCE=dir` to make it a live inbox instead — every `*.yaml`/`*.yml` in t
 
 ## Configuration (env)
 
-Identical to [`mancube/dagron-engine`](https://hub.docker.com/r/mancube/dagron-engine); the two images differ only in base layer. Built with `FEATURES=postgres,ops,kubernetes`.
+Identical to [`mancube/dagron-engine`](https://hub.docker.com/r/mancube/dagron-engine); the two images differ only in base layer. Built with `FEATURES=postgres,ops,kubernetes`, and in releases after 0.11.0 with `otel,archive-s3,archive-gcs,archive-azure` as well, as that image is.
 
 | Var | Meaning |
 |---|---|

@@ -1,0 +1,10 @@
+shows: A concurrency that names no key is refused, since nothing would wait for anything
+source: |
+  name: deploy
+  on:
+    push: {}
+  concurrency: { cancel_superseded: true }
+  tasks:
+    - name: deploy
+      steps:
+        - run: make deploy

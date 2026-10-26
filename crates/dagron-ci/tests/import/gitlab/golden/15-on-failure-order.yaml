@@ -1,0 +1,57 @@
+# Imported from a GitLab CI pipeline by dagron-import.
+#
+# Changed on the way (5):
+#   image: the pipeline's image is each job's that does not set its own
+#   deploy_job.allow_failure: the job may fail: a step of it that fails does not end it (continue_on_error), and it ends as a success, as GitLab let it fail. The job's log says the step failed, where GitLab marked the job
+#   deploy_job.when: a manual job is run by a person's approval here (a gate before it), and the run waits for that decision where GitLab's pipeline ended without it
+#   build_job.script: a job's script ran under bash where its image had bash, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   on.dispatch: a pipeline run from GitLab's page or its API is a run asked for here (dispatch), through the run API
+name: 15-on-failure-order
+on:
+  push: {}
+  dispatch: {}
+tasks:
+- name: build_job
+  docker_image: alpine:3.20
+  steps:
+  - name: script
+    run: make build
+- name: cleanup_build_job
+  docker_image: alpine:3.20
+  depends_on:
+  - build_job
+  trigger_rule: one_failed
+  steps:
+  - name: script
+    run: make cleanup-build
+- name: test_job
+  docker_image: alpine:3.20
+  depends_on:
+  - build_job
+  steps:
+  - name: script
+    run: make test
+- name: approve-deploy_job
+  type: approval
+  depends_on:
+  - test_job
+  approval_message: Run deploy_job?
+- name: deploy_job
+  docker_image: alpine:3.20
+  depends_on:
+  - approve-deploy_job
+  environment: production
+  steps:
+  - name: script
+    run: make deploy
+    continue_on_error: true
+- name: cleanup_job
+  docker_image: alpine:3.20
+  depends_on:
+  - build_job
+  - cleanup_build_job
+  - test_job
+  trigger_rule: all_done
+  steps:
+  - name: script
+    run: make cleanup

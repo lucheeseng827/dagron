@@ -1,0 +1,16 @@
+# Campaign stage 0: today's engine, unchanged, with 100, then 500, then 1,000
+# jobs running at once, in one cell of three engines.
+#
+# Each job lasts two minutes. A step delivers pushes at the rate that keeps
+# its number of jobs running, lets them pile up for two minutes, and is
+# measured for the three minutes after. The first three steps' jobs write
+# nothing but their first and last lines; the last three write ten lines of
+# log a second each, so that what logs cost can be told from what jobs cost.
+#
+# NAME JOBS SECS HOLD [LPS] [KIB]
+quiet-100    100 120 180
+quiet-500    500 120 180
+quiet-1000  1000 120 180
+logs-100     100 120 180 10
+logs-500     500 120 180 10
+logs-1000   1000 120 180 10

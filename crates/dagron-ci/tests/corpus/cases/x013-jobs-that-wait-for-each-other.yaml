@@ -1,0 +1,18 @@
+shows: Jobs that depend on one another in a circle are refused
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: a
+      depends_on: [c]
+      steps:
+        - run: "true"
+    - name: b
+      depends_on: [a]
+      steps:
+        - run: "true"
+    - name: c
+      depends_on: [b]
+      steps:
+        - run: "true"

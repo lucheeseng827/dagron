@@ -1,0 +1,2 @@
+not a pipeline:
+  tasks: depends_on forms a cycle through a, b, c

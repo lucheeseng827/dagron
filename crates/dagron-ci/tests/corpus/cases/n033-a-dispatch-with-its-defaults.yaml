@@ -1,0 +1,14 @@
+shows: A dispatch that sends no input runs with each input's default
+event: { kind: dispatch }
+source: |
+  name: suite
+  on:
+    dispatch:
+      inputs:
+        suite: { default: quick, description: Which suite to run }
+        shards: { default: "4" }
+  tasks:
+    - name: run
+      steps:
+        - env: { SUITE: "{{ suite }}", SHARDS: "{{ shards }}" }
+          run: scripts/suite.sh "$SUITE" "$SHARDS"

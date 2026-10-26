@@ -1,0 +1,10 @@
+shows: A push to the branch a pipeline names runs it
+event: { kind: push, ref: refs/heads/main }
+source: |
+  name: ci
+  on:
+    push: { branches: [main] }
+  tasks:
+    - name: build
+      steps:
+        - run: make

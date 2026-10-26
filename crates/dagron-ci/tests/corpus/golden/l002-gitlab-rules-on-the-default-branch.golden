@@ -1,0 +1,127 @@
+runs
+
+parameters:
+  ci_base_ref: ""
+  ci_base_sha: ""
+  ci_event: "push"
+  ci_forge_host: "gitlab.example"
+  ci_group: "refs/heads/feature"
+  ci_pr: ""
+  ci_ref: "refs/heads/feature"
+  ci_repo: "group/app"
+  ci_sha: "4b4708e725f29891d22b4c96af9f0a403ff51c7c"
+  ci_trust: "trusted"
+
+workflow:
+name: gitlab-ci
+parameters:
+  ci_event: ''
+  ci_ref: ''
+  ci_sha: ''
+  ci_base_sha: ''
+  ci_base_ref: ''
+  ci_pr: ''
+  ci_repo: ''
+  ci_forge_host: ''
+  ci_group: ''
+  ci_trust: ''
+  ci_braces: '{{'
+tags:
+- ci
+task_defaults:
+  timeout_secs: 3600
+  env:
+  - name: CI_EVENT
+    value: '{{ ci_event }}'
+  - name: CI_REF
+    value: '{{ ci_ref }}'
+  - name: CI_SHA
+    value: '{{ ci_sha }}'
+  - name: CI_BASE_SHA
+    value: '{{ ci_base_sha }}'
+  - name: CI_BASE_REF
+    value: '{{ ci_base_ref }}'
+  - name: CI_PR
+    value: '{{ ci_pr }}'
+  - name: CI_REPO
+    value: '{{ ci_repo }}'
+  - name: CI_FORGE_HOST
+    value: '{{ ci_forge_host }}'
+  - name: CI_GROUP
+    value: '{{ ci_group }}'
+  - name: CI_TRUST
+    value: '{{ ci_trust }}'
+tasks:
+- name: test
+  docker_image: alpine:3.20
+  command:
+  - sh
+  - -c
+  - |
+    # dagron-ci: this task's steps, run by dagron-ci-exec (step protocol 2), at
+    # /dagron/bin or on PATH. They name what a shell alone cannot run for them.
+    for ci_exec in /dagron/bin/dagron-ci-exec "$(command -v dagron-ci-exec 2>/dev/null)"; do
+      if [ -x "$ci_exec" ] && "$ci_exec" --speaks 2 >/dev/null 2>&1; then
+        exec "$ci_exec"
+      fi
+    done
+    printf '%s\n' "::dagron-ci::error::this job's steps need dagron-ci-exec (step protocol 2), and none is at /dagron/bin or on PATH: the engine installs it where its operator set DAGRON_CI_EXEC_IMAGE" >&2
+    exit 125
+  workspace:
+    checkout:
+      commit: '{{ ci_sha }}'
+      repository: https://{{ ci_forge_host }}/{{ ci_repo }}.git
+  env:
+  - name: CI
+    value: 'true'
+  - name: CI_COMMIT_BEFORE_SHA
+    value: '0000000000000000000000000000000000000000'
+  - name: CI_COMMIT_BRANCH
+    value: feature
+  - name: CI_COMMIT_REF_NAME
+    value: feature
+  - name: CI_COMMIT_REF_SLUG
+    value: feature
+  - name: CI_COMMIT_SHA
+    value: 4b4708e725f29891d22b4c96af9f0a403ff51c7c
+  - name: CI_COMMIT_SHORT_SHA
+    value: 4b4708e7
+  - name: CI_DEFAULT_BRANCH
+    value: main
+  - name: CI_JOB_NAME
+    value: test
+  - name: CI_JOB_STAGE
+    value: test
+  - name: CI_PIPELINE_SOURCE
+    value: push
+  - name: CI_PROJECT_NAME
+    value: app
+  - name: CI_PROJECT_NAMESPACE
+    value: group
+  - name: CI_PROJECT_PATH
+    value: group/app
+  - name: CI_PROJECT_PATH_SLUG
+    value: group-app
+  - name: CI_PROJECT_URL
+    value: https://gitlab.example/group/app
+  - name: CI_SERVER_HOST
+    value: gitlab.example
+  - name: CI_SERVER_URL
+    value: https://gitlab.example
+  - name: GITLAB_CI
+    value: 'true'
+  - name: CI_STEP_PROTOCOL
+    value: '2'
+  - name: CI_STEP_COUNT
+    value: '1'
+  - name: CI_STEP_1_NAME
+    value: script
+  - name: CI_STEP_1_RUN
+    value: |
+      set -e
+      (set -o pipefail) 2>/dev/null && set -o pipefail
+      export CI_PROJECT_DIR="$PWD"
+      printf '$ %s\n' 'make test'
+      make test
+  - name: CI_STEP_1_SHELL
+    value: auto

@@ -35,6 +35,12 @@ pub struct GraphNode {
     /// Resolved from the memoization store rather than executed (#22) — the
     /// reason a node can be green with no runtime.
     pub cache_hit: bool,
+    /// Why a `ready` node is not being dispatched: its pod was refused by a
+    /// full Kubernetes namespace ResourceQuota and it is back in the queue.
+    /// Set only while it waits, and carried for the tooltip like the park
+    /// reasons above.
+    pub quota_wait_since: Option<String>,
+    pub quota_wait_detail: Option<String>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -56,9 +62,16 @@ pub async fn get_graph(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<GraphResponse>, StatusCode> {
+    // The quota-wait columns outlive the wait, so they are guarded the way
+    // `GET /api/runs/{id}` guards them: only a `ready` row whose `version` no
+    // claim has moved since is waiting.
     let nodes = sqlx::query_as::<_, GraphNode>(
         "SELECT id, name, status, attempt, scheduled_at, finished_at,
-                wake_at, wait_url, wait_dataset, sub_run_id, cache_hit
+                wake_at, wait_url, wait_dataset, sub_run_id, cache_hit,
+                CASE WHEN status = 'ready' AND quota_wait_version = version
+                     THEN quota_wait_since END AS quota_wait_since,
+                CASE WHEN status = 'ready' AND quota_wait_version = version
+                     THEN quota_wait_detail END AS quota_wait_detail
          FROM task_runs WHERE run_id = $1",
     )
     .bind(&id)

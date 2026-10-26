@@ -1,0 +1,10 @@
+shows: A pull request takes no tags filter, and a merge group no paths
+source: |
+  name: ci
+  on:
+    pull_request: { tags: ["v*"] }
+    merge_group: { paths: ["src/**"] }
+  tasks:
+    - name: build
+      steps:
+        - run: make

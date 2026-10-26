@@ -1,0 +1,11 @@
+shows: The checkout action is the job's own workspace, and no step of its
+front: github
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on: push
+  jobs:
+    build:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+        - run: make

@@ -65,7 +65,7 @@ Secrets resolve at dispatch and are masked in task output.
 
 Pin in production — pick the newest published tag rather than copying a version from this page, which ages.
 
-> First published in **0.10.0**. Earlier releases documented this step but shipped no image for it; build it from source with `podman build -f crates/dagron-step-mcp/Dockerfile .` if you are on one.
+> Tags exist from **0.9.3**; the repository has been public since 0.10.0. Releases before 0.9.3 documented this step but shipped no image for it; build it from source with `podman build -f crates/dagron-step-mcp/Dockerfile .` if you are on one.
 
 ## See also
 

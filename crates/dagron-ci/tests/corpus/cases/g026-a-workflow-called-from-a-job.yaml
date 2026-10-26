@@ -1,0 +1,9 @@
+shows: A job that calls another workflow is refused, since no workflow is called here
+front: github
+source: |
+  on: push
+  jobs:
+    call:
+      uses: acme/workflows/.github/workflows/build.yml@main
+      with:
+        target: release

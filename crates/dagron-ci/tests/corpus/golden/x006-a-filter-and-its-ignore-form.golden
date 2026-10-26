@@ -1,0 +1,2 @@
+not a pipeline:
+  on.push.branches_ignore: set branches or branches_ignore, not both; branches takes ! patterns

@@ -1,0 +1,39 @@
+// Expressions as Groovy takes them: a boolean parameter, a string, true
+// and false, and what cannot be read before the stage runs.
+pipeline {
+    agent { docker { image 'alpine:3.20' } }
+    parameters {
+        booleanParam(name: 'DEPLOY', defaultValue: false)
+        string(name: 'RELEASE_VERSION', defaultValue: '')
+    }
+    stages {
+        stage('Always') {
+            when { expression { return true } }
+            steps { sh './always.sh' }
+        }
+        stage('Deploy') {
+            when { expression { params.DEPLOY } }
+            steps { sh './deploy.sh' }
+        }
+        stage('Release') {
+            when { expression { params.RELEASE_VERSION } }
+            steps { sh './release.sh "$RELEASE_VERSION"' }
+        }
+        stage('Pull request') {
+            when { expression { env.CHANGE_ID } }
+            steps { sh './pr.sh' }
+        }
+        stage('Tagged') {
+            when { expression { env.TAG_NAME ==~ /v\d+\.\d+\.\d+/ } }
+            steps { sh './tagged.sh' }
+        }
+        stage('Not docs') {
+            when { not { changeset 'docs/**' } }
+            steps { sh './full-tests.sh' }
+        }
+        stage('Release branch') {
+            when { changeRequest target: 'release-\\d+', comparator: 'REGEXP' }
+            steps { sh './release-checks.sh' }
+        }
+    }
+}

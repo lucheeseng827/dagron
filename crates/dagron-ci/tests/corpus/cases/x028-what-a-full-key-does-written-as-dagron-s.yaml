@@ -1,0 +1,12 @@
+shows: What a full key does is said under concurrency, and dagron's own key for it is refused in a pipeline
+event: { kind: push }
+source: |
+  name: ci
+  on:
+    push: {}
+  concurrency: { key: "{{ ci_group }}" }
+  when_full: supersede
+  tasks:
+    - name: test
+      steps:
+        - run: make test

@@ -1,0 +1,10 @@
+shows: A workspace's size is asked of the engine, with the commit checked out in it
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: build
+      workspace: { size: 20Gi }
+      steps:
+        - run: make

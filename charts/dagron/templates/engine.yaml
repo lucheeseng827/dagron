@@ -1,3 +1,5 @@
+{{- /* dagron-ci as a container of this pod (ci.placement: engine). */}}
+{{- $ciHere := eq (include "dagron.ci.inEnginePod" .) "true" -}}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -5,6 +7,12 @@ metadata:
   labels:
     {{- include "dagron.labels" . | nindent 4 }}
     app.kubernetes.io/component: engine
+  {{- with .Values.engine.serviceAccount.annotations }}
+  # Workload identity: what the engine reaches its own cloud storage as
+  # (DAGRON_ARTIFACT_URL, GC_ARCHIVE_URL).
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 {{- if eq .Values.engine.executor "k8s" }}
 ---
 # EXECUTOR=k8s: the engine creates one-shot task Pods in this namespace.
@@ -18,12 +26,27 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "pods/log"]
     verbs: ["create", "get", "list", "watch", "delete"]
+  # A workflow's Docker action is a container added to its job's own pod,
+  # an ephemeral one, which shares the job's workspace.
+  - apiGroups: [""]
+    resources: ["pods/ephemeralcontainers"]
+    verbs: ["get", "patch"]
   # A task's secret env vars (`value_from`) reach its pod by secretKeyRef from a
   # per-task Secret rather than as plaintext in the Pod spec (DAGRON_TASK_SECRET_ENV;
   # `inline` needs none of this). The engine creates it, owns it by the pod, deletes it.
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["create", "patch", "delete"]
+  {{- if .Values.engine.taskNetworkPolicy }}
+  # The policy that takes the network from a task that asked for none
+  # (engine.taskNetworkPolicy). The engine reads the namespace's policies as
+  # it starts and before each such task: that one, to see that it is there
+  # and is what it is taken for, and the rest, since a pod has what any
+  # policy that selects it allows. It makes none of its own.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -56,19 +79,35 @@ spec:
       app.kubernetes.io/component: engine
   template:
     metadata:
+      {{- if $ciHere }}
+      {{- /* What dagron-ci reads once, as it starts: changed, it starts
+             this pod again. */}}
+      {{- with (include "dagron.ci.podAnnotations" . | trim) }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
+      {{- end }}
       labels:
         {{- include "dagron.labels" . | nindent 8 }}
         app.kubernetes.io/component: engine
+        {{- with .Values.engine.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       serviceAccountName: {{ include "dagron.fullname" . }}-engine
+      {{- if $ciHere }}
+      # dagron-ci shares this pod, takes a forge's webhooks, and asks the
+      # cluster for nothing. A pod's service-account token is given to every
+      # container of it, so it is not mounted by the pod: the engine's
+      # container mounts it alone (kube-api-access, below), where the engine
+      # has always read it.
+      automountServiceAccountToken: false
+      {{- end }}
       # The image's user (Dockerfile: USER 65532:65532, distroless's nonroot),
-      # who owns the /workflows the engine seeds on first start.
+      # who owns the /workflows the engine seeds on first start; on OpenShift,
+      # the uid its SCC gives, in group 0, which /workflows is open to.
       securityContext:
-        runAsNonRoot: true
-        runAsUser: 65532
-        fsGroup: 65532
-        seccompProfile:
-          type: RuntimeDefault
+        {{- include "dagron.podSecurityContext" (dict "root" $ "uid" 65532 "fsGroup" true) | nindent 8 }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -129,6 +168,20 @@ spec:
             - name: DAGRON_ORG_ID
               value: {{ .Values.orgId | quote }}
             {{- end }}
+            {{- if include "dagron.openshift" . }}
+            # OpenShift: a task pod names no fsGroup for its claim
+            # workspace, the SCC gives one, and its containers are given the
+            # envelope the restricted SCC holds them to, as non-root without a
+            # uid of their own.
+            - name: DAGRON_TASK_FS_GROUP
+              value: none
+            - name: DAGRON_TASK_RUN_AS_NON_ROOT
+              value: "1"
+            - name: DAGRON_TASK_DROP_ALL_CAPABILITIES
+              value: "1"
+            - name: DAGRON_TASK_SECCOMP_RUNTIME_DEFAULT
+              value: "1"
+            {{- end }}
             - name: API_ADDR
               value: "0.0.0.0:{{ .Values.engine.port }}"
             - name: EXECUTOR
@@ -148,6 +201,19 @@ spec:
               value: {{ .Values.engine.maxInflightRuns | quote }}
             - name: RUST_LOG
               value: {{ .Values.engine.rustLog | quote }}
+            {{- if and (eq .Values.engine.executor "k8s") .Values.engine.taskNetworkPolicy }}
+            # The operator's word that this cluster's CNI enforces
+            # NetworkPolicy: a task that asks for no network is then labelled
+            # for the policy the chart makes, and is refused without this.
+            - name: DAGRON_TASK_NETWORK_POLICY
+              value: enforced
+            {{- with (keys (.Values.engine.taskNetworkAllowlists | default dict) | sortAlpha) }}
+            # The allowlists made above, by name: a task may name one of
+            # these (isolation.network: allow:<name>) and no other.
+            - name: DAGRON_TASK_NETWORK_ALLOWLISTS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- end }}
             {{- with .Values.engine.taskPriorityClassName }}
             - name: DAGRON_TASK_PRIORITY_CLASS
               value: {{ . | quote }}
@@ -161,13 +227,63 @@ spec:
                   name: {{ include "dagron.envSecretName" . }}
                   key: {{ include "dagron.envSecretKeyName" . }}
             {{- end }}
+            {{- if and $ciHere .Values.ci.checkoutTokenSecret.name }}
+            # A private repository's checkout: the engine asks dagron-ci for
+            # its credential, with the secret both hold in a file. dagron-ci
+            # is in this pod, so the address is the pod's own, and plain http
+            # to it crosses no network: the engine takes no other over http.
+            - name: DAGRON_CHECKOUT_TOKEN_URL
+              value: "http://127.0.0.1:{{ .Values.ci.port }}/ci/v1/checkout-tokens"
+            - name: DAGRON_CHECKOUT_TOKEN_SECRET_FILE
+              value: /etc/dagron/checkout-secret/value
+            {{- end }}
             {{- with .Values.engine.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           ports:
             - containerPort: {{ .Values.engine.port }}
+          {{- if $ciHere }}
+          volumeMounts:
+            - name: kube-api-access
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+            {{- if .Values.ci.checkoutTokenSecret.name }}
+            - name: checkout-secret
+              mountPath: /etc/dagron/checkout-secret
+              readOnly: true
+            {{- end }}
+          {{- end }}
           resources:
             {{- toYaml .Values.engine.resources | nindent 12 }}
+        {{- if $ciHere }}
+        {{- include "dagron.ci.container" . | nindent 8 }}
+        {{- end }}
+      {{- if $ciHere }}
+      volumes:
+        # What a pod's automount would have given every container: the
+        # service account's token, the cluster's CA and the namespace.
+        - name: kube-api-access
+          projected:
+            defaultMode: 0444
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3607
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        apiVersion: v1
+                        fieldPath: metadata.namespace
+        {{- with (include "dagron.ci.volumes" . | trim) }}
+        {{- . | nindent 8 }}
+        {{- end }}
+      {{- end }}
 ---
 apiVersion: v1
 kind: Service

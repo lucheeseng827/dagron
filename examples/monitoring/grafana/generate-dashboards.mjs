@@ -634,7 +634,7 @@ const recentTotal = (status) => `sum(${ds("scheduler_workflow_recent_runs", "wor
       [8, stateTimeline("Engine up", "Whether Prometheus could scrape each engine.",
         [target(`up{${SEL}}`, "{{instance}}")], [{ type: "value", options: { 0: { text: "down", color: "red", index: 0 }, 1: { text: "up", color: "green", index: 1 } } }], [["red", null], ["green", 1]])],
       [8, timeseries("Engine uptime", "Seconds since each engine booted. A drop to zero is a restart.", [target(`scheduler_uptime_seconds{${SEL}}`, "{{instance}}")], { unit: "s", fill: 0, min: 0, legendCalcs: ["lastNotNull"] })],
-      [8, timeseries("Scrape duration", "How long /metrics takes to answer. The datastore gauges are queried on every scrape, so this follows datastore latency.",
+      [8, timeseries("Scrape duration", "How long /metrics takes to answer. The datastore gauges of what has not finished are re-queried once per METRICS_CACHE_SECS (10 s by default), so a spike here is a cache miss and follows datastore latency; scrapes in between are cheap. The history (the finished statuses and the recent runs that have finished) is read again once per METRICS_HISTORY_CACHE_SECS (300 s) behind the scrape that finds it stale, which is served the last one, so that read does not show here: the scrapes before a read of it has succeeded wait for it (the first after a start, and each after a first read that failed or was given up), and so does every scrape where its TTL is 0 (METRICS_HISTORY_CACHE_SECS=0, or METRICS_CACHE_SECS=0 with it unset).",
         [target(`scrape_duration_seconds{${SEL}}`, "{{instance}}")], { unit: "s", fill: 0, min: 0 })],
     ]),
   ];

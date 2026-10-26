@@ -1,0 +1,76 @@
+# Imported from a Jenkinsfile by dagron-import.
+#
+# To do by hand (2):
+#   stage('Docs changed').when: changeset, which reads what the build changed cannot be read before the stage runs: it is taken to hold, or not, whichever runs the stage, and the stage runs where it might have, which is more than it did. Test it in the stage's steps
+#   stage('Before agent').when: triggeredBy 'TimerTrigger', which reads what started the build cannot be read before the stage runs: it is taken to hold, or not, whichever runs the stage, and the stage runs where it might have, which is more than it did. Test it in the stage's steps
+#
+# Changed on the way (16):
+#   on: a multibranch pipeline's builds are each branch and tag pushed, each pull request, and a run asked for (dispatch) here: say on: where it ran for fewer
+#   stage('Release branch').when, stage('Tag').when, stage('Version tag').when, stage('Pull request into main').when, stage('Not main').when, stage('Either').when, stage('Docs changed').when, stage('Before agent').when: its when is a test at the head of each of its steps, which end there where it is false: the job passes, where Jenkins skipped the stage
+#   stage('Release branch').when, stage('Version tag').when: a `*` in a branch's or a tag's pattern is a shell's here, which takes a `/` too
+#   stage('Release branch').steps[0], stage('Not main').steps[0], stage('Either').steps[0]: it reads $BRANCH_NAME: each is set at the head of its script
+#   stage('Release branch').steps[0]: Jenkins's variables a step reads are set at its head from dagron-ci's own (CI_SHA, CI_REF, …): a program it runs that reads one the step does not is not given it
+#   stage('Release branch').steps[0]: $BRANCH_NAME is a branch's or a tag's name, and PR-<number> for a pull request, as a multibranch pipeline has it
+#
+# Not carried over (1):
+#   stage('Before agent').when.beforeAgent: a job's image is had before its steps, and its test is its first line
+name: 08-when
+on:
+  push: {}
+  pull_request: {}
+  dispatch: {}
+tasks:
+- name: release-branch
+  docker_image: alpine:3.20
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        stage('Docs changed').when: changeset, which reads what the build changed cannot be read before the stage runs: it is taken to hold, or not, whichever runs the stage, and the stage runs where it might have, which is more than it did. Test it in the stage's steps
+        stage('Before agent').when: triggeredBy 'TimerTrigger', which reads what started the build cannot be read before the stage runs: it is taken to hold, or not, whichever runs the stage, and the stage runs where it might have, which is more than it did. Test it in the stage's steps
+      DAGRON_IMPORT
+      exit 1
+  - name: Release branch
+    run: |-
+      case "$CI_EVENT" in pull_request) export BRANCH_NAME="PR-$CI_PR" ;; *) export BRANCH_NAME="${CI_REF#refs/*/}" ;; esac
+      # when { branch 'release/*' }
+      { case "$BRANCH_NAME" in 'release/'*) true ;; *) false ;; esac; } || exit 0
+      echo release
+  - name: Tag
+    run: |-
+      # when { buildingTag() }
+      { [ "$CI_EVENT" = tag ]; } || exit 0
+      echo tag
+  - name: Version tag
+    run: |-
+      # when { tag 'v*' }
+      { [ "$CI_EVENT" = tag ] && case "${CI_REF#refs/tags/}" in 'v'*) true ;; *) false ;; esac; } || exit 0
+      echo version
+  - name: Pull request into main
+    run: |-
+      # when { changeRequest target: 'main' }
+      { [ "$CI_EVENT" = pull_request ] && case "${CI_BASE_REF#refs/heads/}" in 'main') true ;; *) false ;; esac; } || exit 0
+      echo pr
+  - name: Not main
+    run: |-
+      case "$CI_EVENT" in pull_request) export BRANCH_NAME="PR-$CI_PR" ;; *) export BRANCH_NAME="${CI_REF#refs/*/}" ;; esac
+      # when { not { branch 'main' } }
+      { ! { case "$BRANCH_NAME" in 'main') true ;; *) false ;; esac; }; } || exit 0
+      echo not main
+  - name: Either
+    run: |-
+      case "$CI_EVENT" in pull_request) export BRANCH_NAME="PR-$CI_PR" ;; *) export BRANCH_NAME="${CI_REF#refs/*/}" ;; esac
+      # when { anyOf { branch 'main' environment name: 'FORCE', value: 'yes' } }
+      { { case "$BRANCH_NAME" in 'main') true ;; *) false ;; esac; } || { [ "${FORCE:-}" = 'yes' ]; }; } || exit 0
+      echo either
+  - name: Docs changed
+    run: |-
+      # when { allOf { changeset 'docs/**' not { changeRequest() } } }
+      { { true; } && { ! { [ "$CI_EVENT" = pull_request ]; }; }; } || exit 0
+      echo docs
+  - name: Before agent
+    run: |-
+      # when { beforeAgent true triggeredBy 'TimerTrigger' }
+      { true; } || exit 0
+      echo nightly

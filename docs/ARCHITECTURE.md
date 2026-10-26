@@ -73,7 +73,7 @@ flowchart LR
 
 | Backend | Feature | Claim mechanism | Loop wake |
 |---|---|---|---|
-| **SQLite** (default) | `--features sqlite` | read-then-CAS on `version` | fixed 500 ms timer |
+| **SQLite** (default) | `--features sqlite` | read-then-CAS on `version` | fixed 500 ms timer; the file's triggers name the runs to look at |
 | **Postgres** (v2) | `--features postgres` | `FOR UPDATE SKIP LOCKED` | `LISTEN/NOTIFY` + timer safety net |
 
 ---
@@ -95,9 +95,10 @@ compiles in exactly one backend. That single seam is where horizontal scale slot
 | `dagron-core` | `crates/dagron-core` | DAG model + validation, matrix/call expansion, the datastore facade (SQLite/Postgres + migrations), the metrics registry |
 | `dagron-executor` | `crates/dagron-executor` | the `Executor` trait + Local/Docker/Kube backends + the ractor worker pool |
 | `dagron-source` | `crates/dagron-source` | the `WorkflowSource` trait, the built-in File/Dir/Stream/Channel backends, the `source::build` factory, and the ingest actor — Redis/SQS/Kafka/NATS backends plug in via a `SourceFactory` seam |
-| `dagron-api` | `crates/dagron-api` | the authenticated public UI gateway (separate crate, Postgres-only) — see [§2a](#2a-two-http-surfaces--engine-ops-api-vs-ui-gateway) |
+| `dagron-api` | `crates/dagron-api` | the authenticated public UI gateway (separate crate; Postgres, or SQLite beside one engine: [ONE_NODE.md](ONE_NODE.md)) — see [§2a](#2a-two-http-surfaces--engine-ops-api-vs-ui-gateway) |
 | `dagron-mcp` | `crates/dagron-mcp` | the per-agent stdio MCP adapter fronting `dagron-api` — see [§5.8](#58-mcp-agent-event-call--submit--bounded-sse-event-poll) and [`docs/MCP.md`](MCP.md) |
 | `dagron-autopsy` | `crates/dagron-autopsy` | offline job autopsy, out of the run path entirely: reads `sacct` + DCGM + NCCL logs + IB counters off disk and emits a fault-attributed record. Shares the `dagron_core::fault` taxonomy with the engine's retry budgets so the tool and the scheduler cannot disagree about what a failure was — see [`docs/HPC_AUTOPSY.md`](HPC_AUTOPSY.md) |
+| `dagron-ci` | `crates/dagron-ci` | CI, a sidecar with its own `dagron_ci` schema (SQLite or Postgres): verifies forge webhook signatures, dedupes deliveries, decides each event's trust class and queues it; a poll sweep reads each repository's refs (git's ref listing over HTTPS) and open pull requests and queues what changed under the same commit keys; a run API (`POST /ci/v1/runs`) queues dispatches for callers the repository's `dagron-api` identifies; its workers claim the queue under a lease and run each trusted event's workflow through `dagron-api`, under an idempotency key derived from the commit. It never reads or writes the engine's tables — see [`crates/dagron-ci/README.md`](../crates/dagron-ci/README.md) |
 | seam crates | `crates/dagron-{identity,artifact,import,lineage,logging}` | `dagron-api`'s auth seam (argon2 local login, IdP-swappable) · artifact-store seam (local FS today) · Argo→dagron YAML importer · OpenLineage emitter (best-effort, on run finalization) · shared `tracing` bootstrap |
 
 Feature flags keep their original names on the bin but **forward** through `dagron-engine`
@@ -120,6 +121,7 @@ flowchart TB
         cronm["cron.rs<br/>cron-triggered create_run (leadership-gated)"]
         lead["leadership.rs<br/>leader_election lease · cluster singleton"]
         gcm["gc.rs<br/>retention sweep (leadership-gated)"]
+        logsweep["log_sweep.rs<br/>the log store's GC (every engine with a store)"]
         sched["schedule.rs<br/>DB-backed UI schedules (leadership-gated)"]
     end
 
@@ -183,10 +185,10 @@ flowchart TB
 | `dag.rs` (core) | `DagSpec`/`TaskSpec` deserialization, `DiGraph` build, `is_cyclic_directed`, `dep_count` (in-degree); `DagGraph::from_yaml` runs parse → expand → build → validate |
 | `expand.rs` (core) | matrix / call-task expansion into leaf tasks before the graph is built; `when` evaluation |
 | `db.rs` (core) | facade: feature-gates one backend, re-exports `Pool`, `Waker`, and the CRUD/claim/mark API |
-| `db/sqlite.rs` (core) | v0/v1 backend — optimistic CAS claim, timer `Waker` |
-| `db/postgres.rs` (core) | v2 backend — `FOR UPDATE SKIP LOCKED` claim, `pg_notify` + `PgListener` `Waker` |
+| `db/sqlite.rs` (core) | v0/v1 backend — optimistic CAS claim, timer `Waker` that takes the runs the file's triggers wrote to `run_wakes` |
+| `db/postgres.rs` (core) | v2 backend — `FOR UPDATE SKIP LOCKED` claim, `pg_notify` (a task's end by a trigger, `migrations_pg/107`) + `PgListener` `Waker` |
 | `models.rs` (core) | `TaskStatus`/`RunStatus` enums (+ `Display`/`FromStr`), `TaskRun`/`WorkflowRun` `FromRow` |
-| `metrics.rs` (core) | process-lifetime counters + Prometheus text exposition (datastore gauges read per scrape) |
+| `metrics.rs` (core) | process-lifetime counters + Prometheus text exposition (datastore gauges read from the DB, cached in two tiers by `gauges.rs`: `METRICS_CACHE_SECS`, `METRICS_HISTORY_CACHE_SECS`) |
 | `worker.rs` (executor) | `WorkerPool` of N ractor actors; `dispatch` round-robins; `TaskResult` returned on mpsc |
 | `executor.rs` (executor) | `Executor` trait, `LocalExecutor` (tokio subprocess), `run_command` helper |
 | `docker_executor.rs` (executor) | `DockerExecutor` — per-task container, hard timeout, log capture, force-remove |
@@ -198,6 +200,7 @@ flowchart TB
 | `cron.rs` (engine, v5) | cron-triggered `create_run`; only the leadership holder fires, followers track `next` to avoid backlog |
 | `leadership.rs` (engine, v5) | `leader_election` lease renew loop → shared `is_leader` flag; cluster-wide singleton for cron/GC/schedules |
 | `gc.rs` (engine, v6) | retention sweep calling `db::gc_old_runs`; leadership-gated |
+| `log_sweep.rs` (engine) | the log store's GC: removes from `DAGRON_LOG_STORE` what no task row names, from the records (`log_sweeps`) a trigger on a task row's deletion and a log's reset write; on every engine with a store, by lease, not leadership-gated ([`LOG_PIPELINE.md`](LOG_PIPELINE.md) §7.4) |
 | `schedule.rs` (engine) | DB-backed UI schedules (`DB_SCHEDULES=1`) — leadership-gated firing of first-class workflows |
 
 ---
@@ -222,7 +225,7 @@ console of its own** — one embedded HTML file on the ops API — for the deplo
 flowchart TB
     browser([Browser])
 
-    subgraph gw["dagron-api — authenticated UI edge (separate crate, Postgres-only)"]
+    subgraph gw["dagron-api — authenticated UI edge (separate crate, Postgres)"]
         direction TB
         gconsole["console (ServeDir fallback at /)<br/>DAGRON_CONSOLE_DIR · unmatched /api → 404 JSON"]
         gauth["auth.rs<br/>AuthUser · self-contained argon2 + HS256 session JWT"]
@@ -285,6 +288,7 @@ stateDiagram-v2
     ready --> running: claim_ready<br/>(CAS / SKIP LOCKED, lease +30s)
     running --> ready: recover_expired_leases<br/>(lease_expires_at < now)
     running --> ready: retry_task<br/>(failed and attempt < max, future scheduled_at)
+    running --> ready: requeue_quota_wait<br/>(pod refused by a full namespace quota,<br/>attempt given back, future scheduled_at)
     running --> succeeded: mark_task_succeeded<br/>(decrement dependents)
     running --> failed: mark_task_failed<br/>(decrement dependents)
     succeeded --> [*]
@@ -300,6 +304,14 @@ deps' outcomes: satisfied → `ready`, unsatisfied → `skipped` (which is itsel
 terminal and cascades). The default `all_success` rule skips a task when any
 dependency failed — so a failed task's downstream is skipped, not cancelled;
 `cancelled` now means only an operator cancel or a run-deadline sweep.
+
+`requeue_quota_wait` is the one transition that gives an attempt back. On
+Kubernetes, a pod refused because the namespace is at its `ResourceQuota`
+started nothing, so the row returns to `ready` with the `attempt` its claim
+added taken off again, under that claim's own fence. It adds no status: a row is
+waiting on quota while it is `ready` and no claim has touched it since. The wait
+is bounded by `DAGRON_QUOTA_WAIT_MAX_SECS`, on a clock kept on the row; past it
+the task is `failed`.
 
 Terminal states: `succeeded`, `failed`, `cancelled`, `skipped`. `is_run_complete` flips the
 `workflow_runs` row to `succeeded`/`failed` once every task is terminal.
@@ -327,7 +339,7 @@ flowchart TD
     ok --> s5
     rt --> s5
     ko --> s5
-    s5["5 · reap_completed_runs()<br/>finalize every all-terminal run"] --> s6{"6 · source exhausted and in_flight==0 and active_runs==0 ?"}
+    s5["5 · reap_woken()<br/>finalize the named runs that are all-terminal,<br/>and a slice of the running runs each REAP_INTERVAL_MS"] --> s6{"6 · source exhausted and in_flight==0 and active_runs==0 ?"}
     s6 -->|yes one-shot source| done(["break -> pool.close()"])
     s6 -->|no streaming queue| wait["7 · Waker.wait(500ms)<br/>Postgres: NOTIFY or timeout<br/>SQLite: full sleep"]
     wait --> start
@@ -369,6 +381,32 @@ sequenceDiagram
 The poll interval stops being the heartbeat: a worker (on *any* scheduler) finishing a task pushes
 the listening loop forward within milliseconds. NOTIFYs are buffered in-transaction and delivered
 only on commit, so a rolled-back mutation never wakes a peer for work that didn't happen.
+
+A wake takes every notification that is waiting. A pass of the loop looks at everything, whichever
+notification woke it, so a burst of them is answered by one pass and not by one each.
+
+**A task's end notifies its run, whoever ends it.** A trigger on `task_runs` (`migrations_pg/107`)
+sends the run on `task_events` when a task's status becomes a finished one, a
+task is made finished, or a task not finished is taken away, in the transaction of the change, as
+SQLite's triggers write `run_wakes`. Before it some ends sent nothing (the skips of an advance after a
+failure, a fan-out's barrier, the time, HTTP and dataset sensors, an external job's end, a
+sub-workflow's trigger), and such a run was ended by the reap's slice, up to `REAP_INTERVAL_MS`
+late. Postgres folds a transaction's equal notifications into one, so an end in a transaction that
+notifies already adds none, and a cancel of ten thousand tasks is one notification. A transaction
+that ends a task now always notifies, and so takes its turn at the notification queue's lock as it
+commits (below); the ends that did not notify before are few beside those that did.
+
+**What a notification costs where it is sent.** Postgres keeps its notification queue in commit
+order, and does it with one lock for the whole database: a transaction that has called
+`pg_notify` takes that lock as it commits and holds it until its commit is flushed. Transactions
+that notify are therefore committed one at a time, across every engine and every connection,
+however unrelated their rows. A transition notifies once and there are few of them, so that is
+cheap. Something that happens once a second for every running task is not: a log append used to
+notify in its own transaction, and with enough tasks writing, every notifying commit (a task's
+end among them) waited seconds in that line. So an append notifies nobody; the runs a pass's
+appends were made to are told of once, afterwards, in one statement (`db::append_task_outputs`,
+which ends with `db::notify_runs`). Anything added that notifies often should be told of the
+same way.
 
 ```mermaid
 sequenceDiagram
@@ -464,7 +502,8 @@ The `IngestActor` (ractor) consumes a `WorkflowSource` and turns each message in
 a run, but only admits work while `count_active_runs() < MAX_INFLIGHT_RUNS`. Under
 a large influx the overflow stays in the broker (SQS/Kafka/Redis) — the durable
 store holds the backlog, never the scheduler. The reconcile loop runs
-concurrently, draining all active runs and `reap_completed_runs()` finalizing each,
+concurrently, draining all active runs and `reap_woken()` finalizing each (the runs a
+notification or, on SQLite, the file's triggers named, and a slice of the rest),
 which frees admission slots.
 
 The built-in sources implement the same contract in-process, so the diagram below
@@ -502,7 +541,7 @@ sequenceDiagram
     end
     loop reconcile (concurrent)
         Lp->>DB: claim_ready then dispatch, all runs, one worker pool
-        Lp->>DB: reap_completed_runs, frees in-flight-run slots
+        Lp->>DB: reap_woken and its slice, frees in-flight-run slots
     end
 ```
 
@@ -648,9 +687,63 @@ stateDiagram-v2
   beside the first, and a scheduler crash left the first unreachable to any cleanup.
 
   Both backends now label every workload with the task row that owns it
-  (`dagron.dev/task-id`, `dagron.dev/run-id`, `dagron.dev/attempt`, `dagron.dev/managed-by`), and
-  **a dispatch deletes any workload for the same task from an earlier attempt before creating its
-  own**. So a reclaim no longer doubles the work.
+  (`dagron.dev/task-id`, `dagron.dev/run-id`, `dagron.dev/attempt`, `dagron.dev/fence`,
+  `dagron.dev/managed-by`), and **a dispatch deletes any workload for the same task from an
+  earlier claim before creating its own**. So a reclaim no longer doubles the work. "Earlier" is
+  by the fence, the row's version once claimed, which only rises: a rerun or a clear sets the
+  attempt back to 0, and by the attempt alone what a cancelled attempt left running passed for the
+  rerun's own and ran beside it. And the dispatch sees its predecessors gone before it creates
+  anything: one that is still stopping, a pod in its grace or a container the daemon has not
+  removed, hands the dispatch back to the queue with no attempt spent, to be tried again in a few
+  seconds. It used to start beside it.
+
+  **A cancel asks, and the run ends when its work has.** A run cancelled or past its
+  `run_timeout_secs`, and a gang sibling's failure, do not write `cancelled` on a task a worker
+  holds. They ask it to stop (`task_runs.stop_requested_at`): the row stays `running`, with its
+  claim, and its run stays `running` with the status it will take (`workflow_runs.stopping_as`).
+  A task nothing runs for (`pending`, `ready`, `awaiting_approval`, or parked) is `cancelled` at
+  once, as before. No new status, as for every parked shape: a reader that knows neither column
+  sees a run that is running, and then one that is cancelled.
+
+  - **The engine tells the work.** It keeps the stop signal of each execution it has out and asks
+    the datastore about them at every sweep (`SWEEP_INTERVAL_MS`): one asked to stop, or whose
+    claim is another's now, is signalled. So the stop does not wait for a lease renewal, a third
+    of `LEASE_SECS` later, and reaches the work with `TASK_LEASE_HEARTBEAT=false`, when nothing
+    used to. The executor stops and removes what that attempt made, by the names it made them
+    under: the container is told to stop and given the task's grace before it is killed, the pod
+    is deleted with that grace and seen gone. Until then the worker's slot is busy.
+  - **The worker's word ends it.** A result says whether work that was told to stop was seen
+    gone. Seen gone: the task is `cancelled`, and its run ends in the same statement if it was
+    the last one stopping. The run's `run.completed` event, its commit status and its run sink
+    follow from there, so they are written when the work is over and not when it was asked.
+    A task that was asked to stop takes no other result: one that ends by itself first is
+    cancelled where it would have succeeded, failed, been retried or handed back to its queue.
+  - **Work nobody is watching is looked for again.** A task that is asked to stop is given a
+    whole lease from then to answer in, whatever was left of its own, so that a worker which
+    renews nothing has the time to stop it. A worker that could not see its teardown through
+    says so, and its lease is cut short; a worker that died stops renewing. A stopping task
+    whose lease has lapsed is never put back to run. Nor is it claimed by the engine that still
+    has its execution out: that worker is watching, and will say. It is claimed anew, so that everything
+    it left is an earlier claim's, and dispatched for a teardown alone
+    (`Executor::teardown`): what the task's earlier claims left is stopped and seen gone, nothing
+    is run, and the task is settled or asked about again ten seconds later. A task whose workload
+    cannot be seen gone (a daemon that will not answer, a pod on a node that is not coming back)
+    reads as still stopping until it can be, and its run holds its concurrency key meanwhile.
+  - **Concurrency keys need no rule of their own.** `max_active_runs` counts running runs, and
+    a run whose work is stopping is one. The key used to be free from the cancel on, with the old
+    run's container still running beside the next run's.
+  - **A run that waits for its key is a run** (`when_full: queue`, `supersede`). It is made
+    `running`, with `workflow_runs.queued_at`, and counts in its key from then, so runs are let
+    in in the order they came. No new status: a run that has started nothing already read
+    `running`. Its tasks are held by a dependency none of them has (each is written with
+    `remaining_deps` one more than its own), so no statement that advances, claims or counts a
+    task reads a run's row to know whether it may; `admit_waiting_runs`, on every scheduler's
+    sweep and under the key's admission lock, takes the one away and writes `admitted_at`. A run
+    that supersedes cancels the runs before it in the transaction that makes it, as a cancel
+    does, and waits like any other for what they had running to stop.
+  - **Engines of two versions.** An engine from before the stop request does not ask, and
+    finishes a task under its claim as it always did. A sweep ends the run that leaves
+    (`end_stopped_runs`), and cancels a task such an engine had queued to run again.
 
   That reap only ever runs when the *same task* is dispatched again, so it cannot see a workload
   whose task never runs again — the run was cancelled while a scheduler was dying, the task

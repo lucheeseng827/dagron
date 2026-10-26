@@ -1,0 +1,12 @@
+shows: A report's path that leaves the workspace is refused
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: test
+      steps:
+        - run: make test
+      report:
+        junit: ../../etc/passwd
+        sarif: /tmp/lint.sarif

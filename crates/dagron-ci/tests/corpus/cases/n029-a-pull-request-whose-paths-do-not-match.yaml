@@ -1,0 +1,10 @@
+shows: A pull request that changes none of the paths named leaves the pipeline unrun
+event: { kind: pull_request, changed: [docs/guide.md] }
+source: |
+  name: ci
+  on:
+    pull_request: { paths: ["src/**"] }
+  tasks:
+    - name: test
+      steps:
+        - run: make test

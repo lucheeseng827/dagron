@@ -1,0 +1,106 @@
+# Imported from a GitLab CI pipeline by dagron-import.
+#
+# To do by hand (1):
+#   e2e.rules: $RUN_E2E (which a run asked for may set) cannot be read before a run: the job is written to run wherever it might have, which is more than it did. Test it in the job's script, or write the job's when: for what it should run for
+#
+# Changed on the way (8):
+#   image: the pipeline's image is each job's that does not set its own
+#   e2e.allow_failure: the job may fail with exit code 137 alone: its script runs in a subshell, and those codes end it as a success, which the jobs after it wait for, as on GitLab. The job's log says it failed, where GitLab marked the job
+#   deploy_prod.when: a manual job is run by a person's approval here (a gate before it)
+#   workflow.rules: $CI_OPEN_MERGE_REQUESTS is taken as unset: a branch's pipeline runs whether or not the branch has a merge request open, where GitLab left it out for one that had
+#   test.script: a job's script ran under bash where its image had bash, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   e2e.rules: $RUN_E2E is read as the file sets it, for a branch's, a tag's and a merge request's pipeline: where the project's CI/CD variables set it otherwise, the job is in pipelines here it was not in, or not in those it was. Write its when: for what it should run for
+#   on.pull_request: a merge request's pipeline is a pull request's here; GitLab's merged-results and merge-train pipelines are not told apart from it
+#   on.dispatch: a pipeline run from GitLab's page or its API is a run asked for here (dispatch), through the run API
+name: 17-workflow-rules-and-merge-requests
+on:
+  push: {}
+  pull_request: {}
+  dispatch: {}
+tasks:
+- name: test
+  docker_image: rust:1.86-bookworm
+  env:
+  - name: RUN_E2E
+    value: 'false'
+  steps:
+  - name: script
+    run: cargo test
+- name: lint
+  docker_image: rust:1.86-bookworm
+  when: '{{ ci_event }} in [push, pull_request, dispatch]'
+  env:
+  - name: RUN_E2E
+    value: 'false'
+  steps:
+  - name: script
+    run: cargo clippy
+- name: docs
+  docker_image: rust:1.86-bookworm
+  when: '{{ ci_event }} in [tag, pull_request]'
+  env:
+  - name: RUN_E2E
+    value: 'false'
+  steps:
+  - name: script
+    run: cargo doc
+- name: e2e
+  docker_image: rust:1.86-bookworm
+  when: '{{ ci_event }} == dispatch'
+  env:
+  - name: RUN_E2E
+    value: 'false'
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        e2e.rules: $RUN_E2E (which a run asked for may set) cannot be read before a run: the job is written to run wherever it might have, which is more than it did. Test it in the job's script, or write the job's when: for what it should run for
+      DAGRON_IMPORT
+      exit 1
+  - name: script
+    run: |-
+      set +e
+      (
+      set -e
+      ./e2e.sh
+      )
+      code=$?
+      set -e
+      case $code in
+        137) echo "the script failed with exit code $code, which the job may (allow_failure: exit_codes)" >&2 ;;
+        *) exit $code ;;
+      esac
+- name: approve-deploy_prod
+  type: approval
+  depends_on:
+  - test
+  - lint
+  - e2e
+  when: '{{ ci_event }} == push and {{ ci_group }} in [refs/heads/main] or {{ ci_event }} == dispatch and {{ ci_group }} in [refs/heads/main]'
+  approval_message: Run deploy_prod?
+- name: deploy_prod
+  docker_image: rust:1.86-bookworm
+  depends_on:
+  - approve-deploy_prod
+  when: '{{ ci_event }} == push and {{ ci_group }} in [refs/heads/main] or {{ ci_event }} == dispatch and {{ ci_group }} in [refs/heads/main]'
+  env:
+  - name: RUN_E2E
+    value: 'false'
+  steps:
+  - name: script
+    run: ./deploy.sh prod
+- name: verify_prod
+  docker_image: rust:1.86-bookworm
+  depends_on:
+  - test
+  - lint
+  - e2e
+  - deploy_prod
+  when: '{{ ci_event }} == push and {{ ci_group }} in [refs/heads/main] or {{ ci_event }} == dispatch and {{ ci_group }} in [refs/heads/main]'
+  env:
+  - name: RUN_E2E
+    value: 'false'
+  steps:
+  - name: script
+    run: ./smoke-test.sh prod

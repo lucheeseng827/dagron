@@ -6,7 +6,2357 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-26
+
 ### Added
+- **The engine and dagron-api read the connection limits they run under.** On Postgres each reads, as it starts and
+  every 5 minutes after, its database's `CONNECTION LIMIT`, its login's,
+  and the server's `max_connections` less its reserved slots, with the
+  sessions it may see under each. It says, once for each set of limits,
+  where its pool and its LISTEN session are past one (it will be refused
+  sessions) or past half of one (it will be while a rollout runs a second
+  pod beside it), and never stops on it. The engine publishes them as
+  `scheduler_db_connection_limit{scope}` and
+  `scheduler_db_connection_sessions{scope}` (`database`, `login`,
+  `server`; a scope with no limit has no limit sample), and dagron-api as
+  `db_connections` in `GET /api/metrics`. A build may add databases of its
+  own to the engine's look (`Seams::connection_checks`).
+- **dagron-ci's public proof, through the load harness.**
+  `loadtest/ci` measures webhook to job from the system's own timestamps
+  (the event received and its job claimed as the outbox's `task.started`
+  has it, both of one Postgres's clock, with the engine's run made, by
+  dagron-api's, between; then the job's first line), and what the cell's
+  own parts cost per 1,000 jobs
+  on compute you bring (the CPU and memory of Postgres, dagron-api,
+  dagron-ci and the engines' processes, at a stated list price; the jobs'
+  own compute shown apart). `run.sh durable` is the durability demo: it
+  kills an engine, every engine, dagron-ci or dagron-api with SIGKILL at
+  intake or mid-pipeline, starts it again, and checks twelve things of
+  what the databases, the forge and the jobs wrote down, a failed one
+  failing the step. On one machine, in fresh cells, as measured on
+  2026-10-24:
+  23 to 34 ms from the event to its job's claim at the median and 78 ms
+  at most at the 99th percentile, to 1,000 jobs at once; every pipeline
+  finished, and each job's last status was posted once, whichever of
+  those was killed (Postgres and the forge were not), a job
+  cut short running again from its start once the lease lapsed (24 to
+  30 s); $0.0018 to $0.0054 per 1,000 jobs at AWS Fargate's on-demand
+  price, Postgres most of it. The harness now reads dagron-api's and
+  dagron-ci's CPU too (`peek.mjs`, from the runtime's cgroup tree; their
+  images have no shell), and its forge serves a repository its own
+  pipelines.
+- **dagron-ci: GitLab's merge trains**. A GitLab
+  project's `Pipeline Hook` of a merge train's pipeline
+  (`refs/merge-requests/{iid}/train`, which the hook does not say: it names
+  the merge request's source branch for each of the request's pipelines, so
+  GitLab's pipelines API is asked, with the host's token, by the pipeline's
+  id, for 5 seconds at most) that has yet to end, as GitLab says too, is a
+  merge group's
+  event, as GitHub's `merge_group` is: the pipelines that take
+  `on.merge_group` run at the train's commit, trusted, once a commit however
+  many of its steps GitLab tells, and their statuses go to that commit under
+  the train's ref, named `(merge_request)`, so GitLab counts them in the
+  train's pipeline and merges on them. A train pipeline cancelled has its
+  runs cancelled. The project's webhook needs Pipeline events, and the
+  train's pipeline is GitLab's own: until dagron-ci's first status is in, it
+  holds the project's `.gitlab-ci.yml` jobs alone, so a job for the train
+  that ends first lets the request merge without dagron-ci's checks
+  (the README says how to give it one that outlasts them).
+- **dagron-ci: how a repository is served, and the repository by its id**. `dagron-ci repo add|set … --mode native|compat|fleet`,
+  and `mode` on `PUT /ci/v1/repos/…` (migration 0035, `ci_repos.mode`):
+  `native` runs the repository's `.dagron/ci` pipelines; `compat` those and
+  the forge's own files its `.dagron/ci.yaml` names, and a GitHub workflow's
+  schedules; `fleet` none, as its forge runs them: its pushes and merge
+  requests are answered and dropped (a merge group let go of still cancels
+  its runs from before), it is not swept, and a run asked of it, or asked
+  again, is refused (409). A job that asks for a fleet label is served in every
+  mode. Each change of mode is recorded with who made it, and one out of
+  `fleet` sweeps from a baseline. `GET`, `PUT` and `DELETE
+  /ci/v1/repos/{id}` take the id dagron-ci gave a repository in its name's
+  place; a `PUT` of a disconnected one's id connects it again, on the forge
+  it was on, as a `PUT` of its name and `dagron-ci repo add` now do too.
+- **dagron-ci: admission by caller**. A build's
+  `Admission` may count the runs in flight by caller as well
+  (`Admission::admit_caller`, asked with the run's caller, the actor its event
+  names, and its trust class, where `by_caller` asks for `Load::by_caller`).
+  A slot keeps its caller (`ci_admissions.actor`, migration 0034), and a run
+  counts for its event's actor. A build whose admission says nothing of
+  callers is asked as before.
+- **A run's artifacts from a container: `artifact_api: true`**. A task in a container, a pod or on a remote runner, which
+  does not see `DAGRON_ARTIFACT_DIR`, is given `DAGRON_ARTIFACTS_API` and a
+  credential of its attempt's own, `DAGRON_ARTIFACTS_TOKEN`, with which,
+  while it runs, it reads its run's artifacts and writes its own task's
+  through dagron-api (`GET`/`PUT /task/v1/artifacts/{task}/{name}`), in the
+  store an approval's `binds` is checked against. The engine's operator
+  offers it with `DAGRON_ARTIFACT_API_URL` (`https://`, or
+  `DAGRON_ARTIFACT_API_INSECURE=allow`); a remote runner uses
+  `DAGRON_RUNNER_ARTIFACTS_URL`, else its dagron-api's. The fix agent's
+  jobs use it, so its patch and the approval of it no longer need the
+  store's directory mounted into their containers.
+- **What a model call spent, said by the task**. A
+  task that prints a line `dagron::tokens=<n>` has every such line taken out
+  of the output the engine keeps, so `{{ tasks.X.output }}`, `when:`,
+  `repeat.until` and `env_from` read what it printed and not its report; the
+  fix agent prints each turn's. `tokens:` on a command task says what it may
+  spend, which it reserves of a token budget where one is kept: 1 to 2^48.
+  `budget: { tokens }` is refused by this build, which keeps no meter, with
+  a pointer to what bounds a run here (signpost gate `token_budget`).
+- **The fix agent's model reached with its run's identity**, not a key (`examples/ci/agents/fix.yaml`). Its `fix` job sends
+  the OIDC token of its run for a gateway's audience where the task is given
+  `identity`, and the environment's `model_api_key` where not, which is now
+  optional; eggrd checks the token against dagron's issuer, injects the key
+  its claims choose, and holds each run to a budget of its own
+  (`claim:run_id`). The agents README shows both halves set up.
+- **An environment's policy gives an agent's run an identity, and can
+  protect the environment**. `allowed_identity:
+  ["agent"]` lets an agent's task in the environment hold an identity (OIDC
+  tokens saying `"trust": "agent"`), asked at dispatch and again by the
+  issuer at each token; `agent` alone may be named. `approvers` makes it a
+  protected environment: each task of a run that is not trusted that names
+  it waits on a gate of those approvers (`<task>.environment`), put in as
+  the run is made and rejected after a day with no answer. A trusted run
+  is not asked. Two columns on `environment_policies` (a migration).
+- **dagron-ci: an issue of a job that keeps flaking** (`CI_FLAKE_ISSUES=N`,
+  `CI_FLAKE_DAYS`). Off by default. A job of a trusted
+  run that passed only after an attempt of it failed is kept once a run,
+  and at its Nth such flake within the days (14 unset) its repository is
+  filed one issue of it, which lists each, and is written again in place
+  as it flakes again. A `repeat:` task's passes are not flakes. A person
+  closes the issue, and the job's flakes are counted again from then. The
+  App writes it with a token for `issues: write` alone (an App without the
+  permission files none, and the rest goes on), or the GitLab host's token.
+- **dagron-ci: an agent fixes a failure in CI, up to an approval of the
+  exact patch** (`examples/ci/agents/fix.yaml`). When
+  `ci` fails on main, a job asks a model for a patch, runs `ci` on it as
+  the agent (a patch bundle), and does so again, up to four turns, until a
+  run of it passes. A maintainer then approves the patch's bytes
+  (`binds: [fix/patch.diff]`), and a last job checks the approved digest,
+  pushes the patch to a branch and opens a pull request. It needs dagron's
+  artifact store where the job runs, which holds the patch the approval
+  binds.
+- **dagron-ci: a run of a working tree's change, not pushed**
+  (`dagron-ci run --remote --bundle-from DIR`). It
+  makes the patch bundle of the git working tree at DIR since `--sha` or
+  its `HEAD` (commits since, staged, changed and untracked files), uploads
+  it, and runs it. The same change makes the same bytes. dagron-mcp's
+  `dagron_ci_run` takes `bundle_from`, for a tree under the directory it
+  was started in (or `DAGRON_MCP_WORKTREE`). `GET /ci/v1/runs/{id}` says the
+  bundle a run is of and its SHA-256 (`bundle: {id, sha256}`).
+- **dagron-ci: a pipeline's job asks for a forge token**
+  (`forge_token: { permissions: { contents: write } }`), as a workflow's
+  job is given its `GITHUB_TOKEN`: by a GitHub App's names, each `read` or
+  `write`, read alone for a run that is not trusted, and refused for a job
+  that checks out nothing. It was refused as reserved. `dagron-ci compile`
+  takes `--event failed`, and `validate` names `schedule` and `failed`
+  among what a pipeline runs on.
+- **dagron-ci: `on: failed`**. A pipeline runs when a
+  run of another of the repository's fails: `failed: [ci]`, or `failed: {
+  pipelines: [ci], branches: [main] }`. The reporter raises the `failed`
+  event in the write that records the run's end, once for each failure, at
+  the failed run's commit, ref, actor and trust, and the run gets the failed
+  run's id, pipeline, first failed job, fault class and disposition as
+  `CI_FAILED_*`. Only a trusted run's failure raises one: a fork's, an
+  agent's and a patch bundle's raise nothing, and a failure's own run none.
+- **Sweeps that scale.** Each of the reconcile
+  loop's sweeps of parked tasks reads an index of its own: the fan-out
+  barriers, the time, HTTP and dataset sensors and the sub-workflow
+  triggers, of running rows alone and led by `status` (Postgres 101 to 105,
+  each `CREATE INDEX CONCURRENTLY` in a migration of its own; SQLite 076,
+  with the lease index SQLite never had and one for the external polls), so
+  a sweep of parked tasks no longer reads the jobs running beside them.
+  Measured on one machine with `loadtest/ci`'s `campaigns/sweeps`, the
+  images before and after in one session:
+  with jobs alone, nothing parked, the fan-out and sensor sweeps read one
+  buffer a pass at 500, 1,000 and 2,000 jobs, where they had read 135 to
+  510, and each shared sweep ran a third as often; beside 5,000 parked time
+  sensors and 50 fan-outs, none of them due, the time and fan-out sweeps
+  read 43 and 163 buffers a pass, where they had read 1,119 and with
+  nothing parked read 1: what is parked still adds to both, the fan-out
+  sweep's by probing each barrier, the time sweep's by what the
+  measurement does not name. New settings: `SWEEP_INTERVALS`
+  (`name:ms,…`, each at most a day: one longer stops the start),
+  `SWEEP_SHARE` (`on`), `METRICS_HISTORY_CACHE_SECS` (300, or 0 where it
+  is not set and `METRICS_CACHE_SECS` is 0), and dagron-api's
+  `DAGRON_METRICS_CACHE_SECS` (2) and `DAGRON_METRICS_HISTORY_CACHE_SECS`
+  (300, or 0 where it is not set and the first is 0). `SWEEP_INTERVAL_MS`
+  and `REAP_INTERVAL_MS` above a day are a day, where a sweep so set ran
+  only at the start: a slot far longer is one Postgres cannot write. New
+  metrics:
+  `scheduler_sweep_passes_total{sweep,outcome}`,
+  `scheduler_sweep_seconds_total`, `scheduler_sweep_rows_total`,
+  `scheduler_sweep_last_pass_timestamp_seconds`,
+  `scheduler_sweep_interval_seconds`, `scheduler_sweep_lateness_seconds`,
+  `scheduler_metrics_history_age_seconds` and
+  `scheduler_db_invalid_indexes`. A sweep records its last pass whether or
+  not it found anything to do, and one switched off on an engine shows an
+  interval of 0 there, so the alert on a sweep that has stopped
+  (`docs/METRICS.md`) is quiet on an idle or a stock engine; it looks at
+  one installation at a time, and waits five minutes at the least, so that
+  the age of the last scrape does not set it off. An index a cut-short
+  build left INVALID, which `IF NOT EXISTS` takes for built when its
+  migration runs again, is looked for as the engine starts and every five
+  minutes after, logged with the `REINDEX INDEX CONCURRENTLY` that
+  rebuilds it, and gone from the gauge at the next look once it is
+  rebuilt.
+
+  **Upgrading.** On Postgres, migrations 101 to 105 build five indexes of
+  `task_runs` concurrently, each a scan of the table twice that waits out
+  older transactions; the first engine to take the migration lock
+  migrates while the others wait for it, on a direct connection. Through a
+  pooler in transaction mode the lock keeps no two engines apart, and two
+  that build one of these indexes at once deadlock (Fixed, above): there,
+  upgrade with one engine. 106 adds the table `sweep_slots`
+  and sets any HTTP sensor parked with no next poll due now. On SQLite,
+  076 builds seven indexes of `task_runs` (the five, the lease index and
+  one for the external polls) in its own transaction, and 077 sets those
+  HTTP sensors due as 106 does. Engines from before this ignore the slots
+  and sweep every window themselves, which is safe: every shared sweep may
+  run on two engines at once. Set `SWEEP_INTERVALS` the same on every
+  engine: the engine that takes a slot sets the cadence for the window. A
+  role granted table by table needs `SELECT`, `INSERT` and `UPDATE` on
+  `sweep_slots` for the engine.
+- **What the log store keeps leaves it once nothing reads it: the store's GC.** With `DAGRON_LOG_STORE`, every
+  engine with the store removes from it what no task row names: the logs of
+  a task whose row was deleted (by the retention GC, an archive's purge, the
+  engine's or dagron-api's, a rerun's or a fan-out's drop, or by hand),
+  about a minute after it went, and a writing of a log a later one took the
+  place of (a seal, a retry, a rerun, a clear) at once. Each is recorded in
+  `log_sweeps` in the statement that deletes the row (a trigger) or in the
+  reset's transaction, and taken by lease, so engines sweep side by side,
+  leader or not, and the row decides what stays. A record is let go once a
+  look finds nothing left, and looked at again 15 minutes after one that
+  removed something; a removal that fails is tried again, backing off to six
+  hours. `DAGRON_LOG_SWEEP_SECS` (30; `0`, this engine removes nothing). New
+  metrics: `scheduler_log_store_removed_objects_total`,
+  `scheduler_log_store_removed_bytes_total`,
+  `scheduler_log_sweep_failures_total`, `scheduler_log_sweeps_waiting`,
+  `scheduler_log_sweeps_failing`, `scheduler_log_sweeps_oldest_age_seconds`.
+  The engine's log batch no longer removes the writing before on the
+  reconcile loop: a seal's `HEAD` and `DELETE` calls are off it, and a
+  removal that failed no longer loses the new writing's first text; and an
+  engine that had not written a task whose row is gone no longer makes a
+  file of it. Not built: an attempt's last part closed into the store as
+  the attempt ends (on `file://`, a finished writing's duplicate `.open`
+  parts stay until the writing is superseded or its task deleted).
+
+  **Upgrading.** The migrations (Postgres 098, SQLite 073) add
+  `task_runs.log_writings` (nullable with no default, so no table rewrite;
+  a row with closed segments is marked), the table `log_sweeps`, and a
+  row-level trigger on the deletion of a `task_runs` row. It writes only
+  for a row whose log the store holds: an install with no store pays next
+  to nothing. With one, a large purge (`gc_old_runs` is one transaction)
+  writes a record for each such task, and takes longer for it: deleting
+  200,000 task rows on Postgres 16 in a container here took 21.7 s with no
+  trigger, 22.0 s with it and no row marked, and 30.5 s with every row
+  marked. Not recorded, and left in the store until cleared by inserting a
+  record for each (`docs/BACKUP_RECOVERY.md` §6.9): tasks deleted before
+  the upgrade, `file://` tasks written before it that never closed a
+  segment, and tasks an older engine began during a rolling upgrade (an
+  older engine also goes on removing a seal's writing before itself, which
+  is safe beside a new one). A role granted table by table needs `SELECT`,
+  `INSERT` and `UPDATE` on `log_sweeps` for every process that deletes
+  runs (the trigger's upsert reads the record it updates): dagron-api's
+  archive route, and the engine, which also needs `DELETE` for its sweeper. Every engine and dagron-api must
+  name one store, and an engine that sweeps must never be run against a
+  copy of the database that names the production store.
+- **A log past its cap keeps its end: head and tail.** A task's log was kept up to `DAGRON_LOG_TASK_CAP_BYTES`
+  and ended there, on a line that said it stopped: a job that wrote much and
+  then failed lost the lines that said why, and dagron-ci the marker of its
+  last step's end. Now the log is held at the cap while the task runs, and
+  once the attempt is over its last `DAGRON_LOG_TAIL_BYTES` (a quarter of
+  the cap by default, on top of it and no more than it; `0`, the beginning
+  alone, as before) are added, from a line's start and never from inside a
+  secret, masked as one text, under a line that says how much of what the
+  task wrote was left out, in bytes and lines counted before masking
+  (`[dagron] 1.2 GiB of this attempt's output (1288490189 bytes and 3456789
+  lines, counted before masking) is left out here; what follows is its
+  end`, a form `docs/LOG_PIPELINE.md` §7.4 gives). A seal that writes the
+  log again writes its end in the same text; a log no executor sealed says
+  its end was not kept, a cancelled one among them; one whose claim went
+  to another ends where it was held. The log stops at an exact byte of what the task wrote, so the
+  counts add up, and the sink no longer masks what it does not send. New
+  metrics: `scheduler_task_logs_capped_total`,
+  `scheduler_task_log_bytes_omitted_total`, and an info line for each
+  attempt past its cap. dagron-api keeps a runner's log up to twice the cap
+  and 1 MiB (`dagron_core::runner::session_log_most`), where it kept the
+  cap alone and refused the segment that carried the line a capped log
+  ended on, and with it the attempt's notes; and a runner sends a task's
+  last segments and then its result from a task of their own, trying a
+  segment whose answer was lost again for about four seconds, so that a
+  long end holds up no other task's log or result and one lost answer no
+  longer drops it. No migration.
+
+  **Upgrading.** The line a capped log is held at now reads `[dagron] this
+  attempt's log reached 64 MiB (DAGRON_LOG_TASK_CAP_BYTES): what the task
+  writes from here is held back, and the last 16 MiB of it
+  (DAGRON_LOG_TAIL_BYTES) is added below when it ends`, and its twin for a
+  task with secrets (`… counted before masking, passed …`) likewise: an
+  alert or a script that matches `and stops here` must change, or set
+  `DAGRON_LOG_TAIL_BYTES=0`, which keeps the old lines and the old log (but
+  that a log of a task with secrets, written again by its seal, now ends
+  where it stopped, a few bytes before where it did). A
+  capped log is now up to 1.25 times the cap by default, and twice it at
+  most: in its task row with no log store, in a remote runner's row, in the
+  log store, in an archive, and in what a one-shot log view puts together.
+  Upgrade dagron-api before its remote runners: an older dagron-api keeps a
+  runner's log up to its cap alone, and answers a newer runner's segments
+  of a log's end `409`, which loses that end and the notes after it, as it
+  lost the cap's line before. Older runners against a newer dagron-api, and
+  going back, need nothing.
+- **dagron-ci's seams for a build's own rules and audit trail.** A build
+  that composes dagron-ci (its binary is `dagron_ci::cli::run` with its own
+  `Seams`) can now pass:
+  - `governance`: pipelines it requires of a repository, run beside the
+    repository's own as `.dagron/required/<name>.yaml` (a file of the
+    repository's of that name is refused); its word on each run once it is
+    compiled, before it is submitted, which refuses the run as a refused
+    pipeline is refused, on the event and on the commit; and the person a
+    forge login is, which the run's trigger record names in place of the
+    login.
+  - `audit`: told of each act dagron-ci records, where it is done: a
+    delivery refused for its signature or token, a run submitted, a pipeline
+    refused, a cancel and a rerun through dagron-ci's doors with their
+    caller, a repository connected, changed or disconnected through the API,
+    and each checkout credential, by its SHA-256.
+  - An admission that reads the runs in flight by repository
+    (`Admission::admit_run`, `by_repository`). Admission slots name their
+    repository (migration 0030, on both databases).
+
+  The open build passes none, and none of this changes what it does.
+- **Docker and Kubernetes task logs followed as a task writes them.** The Docker executor attaches to a
+  task's container before it starts and reads its stdout and stderr as the
+  task writes them, whole lines into its log, so the live relay follows a
+  Docker job's log as it runs. A task's own log no longer depends on the
+  container's log driver: the journal's rate limit, `local`'s 100 MB, a
+  daemon's rotation and `mode=non-blocking` no longer cost it lines. What
+  is read back from the driver once a container has stopped still does: a
+  Docker action's step output, the words of a container that failed before
+  its task started, and a task's log where its container could not be
+  attached to or the follow of it was cut, which is read back after what
+  was followed, and says so where it cannot be placed. The engine's warning
+  of such a driver now begins `what is read back of a container may not be
+  whole`. A task that runs out of time keeps what it wrote, before the line
+  that says it timed out. The Kubernetes executor follows a task
+  container's log from when the container has started (with each line's
+  time, so that a follow cut while the pod runs is opened again from where
+  it got to, no line twice but where a line was written across a rotation
+  of the kubelet's), where a Kubernetes task had no log and its
+  output was one read of the kubelet's current file once the pod had ended;
+  why its pod failed is in its log too. What either executor holds of a
+  running task's output is bounded, where the Docker executor held all of
+  it: of its beginning, `DAGRON_LOG_TASK_CAP_BYTES` and a few hundred KiB
+  more, for its log; of its end, up to twice `DAGRON_LOG_TASK_CAP_BYTES`
+  and a few hundred KiB, for its output (whose line that says what is not
+  kept counts what the executor did not keep as the task wrote it, and is
+  masked from past a secret that end begins in); more of each with a
+  secret over 64 KiB. So that the first is bounded as the task wrote it, **a log of a
+  task with secrets also stops once what the task wrote, counted before it
+  is masked, is past the cap by 64 KiB** (or by its longest secret), on a
+  line that says so (`… counted before masking, passed 64 MiB …, and its
+  log stops here`): masks shorten a text, and a log of a secret printed
+  again and again would reach its cap only far past it. A log's last
+  masking, of the whole, ends where the log stopped, on that line or the
+  cap's; before, it went on to the cap with what the task wrote after,
+  and could end in part of a secret. **A
+  Kubernetes task's log view now shows its log**, kept from its
+  beginning up to `DAGRON_LOG_TASK_CAP_BYTES`, where it showed its
+  output's end. What waits to be written of a log waits a second more for
+  each whole MiB its append would rewrite, up to 30 s, so that a long log
+  is not rewritten whole every second. In a log, which is masked a line
+  at a time as it is written, each line of a secret of several lines that
+  could be secret is masked on its own too: a line of 8 characters or
+  more, or, where it is a `key: value` (or `key = value`), one whose value
+  is (so not `password: hunter2`); not a key with no value, an INI file's
+  section, nor a PEM key's armour alone on its line. An output is masked
+  with whole values, as before. And in either, **the value of a line of a
+  secret of several lines whose key names a secret**, as a sensitive env
+  var's name does (`token: …`, `password = …`, `AWS_SECRET_ACCESS_KEY=…`,
+  `DAGRON_SENSITIVE_ENV_PATTERNS`), or is one that holds a secret in such
+  files (a kubeconfig's `client-key-data`, a Docker config's `auth`, a
+  `passphrase`), is masked on its own, where it is of 8
+  characters or more: a task that reads it out of the whole may print it
+  alone. Not yet: retention and the store's
+  clean-up, the console following a log in place of polling it.
+- **`dagron-ci login` and `logout`, and `dagron-ci import`.**
+  - **login:** `dagron-ci login [--server URL]` reads the caller's
+    dagron-api token from `--token-file`, `DAGRON_CI_TOKEN_FILE` or
+    `DAGRON_CI_TOKEN`, else from standard input (typed at a terminal, which
+    does not show it, or piped in); never from an argument. The server is
+    held to the rule every command speaks to it by (`https://`, or `http://`
+    to this machine), and asked whose the token is (the new `GET
+    /ci/v1/me`) before anything is kept. A token it refuses is not kept,
+    and nor is one it answers 200 for without naming a subject (a page
+    served for every path, say), or naming one, or an email, of more than
+    256 bytes or with a control character in it. The token is kept in
+    `$XDG_CONFIG_HOME/dagron-ci/credentials.json` (else `~/.config/…`), for
+    that server alone: the directory 0700, the file 0600, written whole and
+    renamed into place, and read again under a lock (`credentials.lock`)
+    once the server has answered, so a login or logout that finished
+    meanwhile is not undone. A file others may read, or another user's, is
+    refused, as ssh refuses a key. Ctrl-C at the prompt gives the terminal
+    back as it was, showing what is typed. `run --remote`, `rerun`,
+    `cancel` and `logs` then need no flag or variable: the server is the
+    one logged in to last, and a token from a flag or a variable still
+    comes first. `dagron-ci logout [--server URL]` forgets the token (of
+    `--server`, `DAGRON_CI_URL` or the one logged in to last); it works
+    until it is revoked in dagron-api, where it was made.
+  - **`GET /ci/v1/me`:** who the `default` cell's dagron-api says presents
+    the credential, `{sub, email, groups, trust}`; 401 for one it refuses,
+    404 where no cell is configured, 503 where dagron-api cannot be asked.
+  - **import:** `dagron-ci import [FILE]...` runs the importers of
+    `dagron-import` (GitHub Actions, GitLab CI, Jenkins Declarative
+    Pipelines), now a library of dagron-ci's, and holds each result to
+    dagron-ci's own reader and compiler, for every kind of event, before it
+    says ok. With no file it imports what the checkout holds:
+    `.github/workflows/*`, `.gitlab-ci.yml` (or the file `.dagron/ci.yaml`
+    names) and `Jenkinsfile`. Without `--write` it prints the one file's
+    pipeline under its report, as `dagron-import` does; with it, it writes
+    each to `.dagron/ci/<name>.yaml`, never over a file that is there unless
+    `--force`, and two files that would be one pipeline are refused before
+    anything is written. A `.dagron` or `.dagron/ci` that is a link out of
+    the checkout is not written into, and nothing is made in it. A GitLab
+    pipeline's includes are read from the checkout alone: a path up out of
+    it, or a link that leads out, is not read, and is left to do. As
+    GitLab, at most 150 are read, each path as it is written, and none over
+    2 MiB. The images `.dagron/ci.yaml` gives a label or a tag are the
+    importer's, under those `--image` gives.
+  - `dagron-ci validate` reads a GitLab pipeline's includes from the
+    checkout alone too: a link in it that leads out is not followed.
+  - `dagron-import`'s library gives what its command and `dagron-ci import`
+    share: `gitlab::read_included` and `pipeline_name`. Its note for an
+    include it did not read says `--root` is `dagron-import`'s.
+    `read_included` reads at most 150 files, none over 2 MiB, so
+    `dagron-import gitlab` is held to GitLab's bounds too.
+- **A run is run again whole.** A rerun
+  was from a run's failed jobs alone, and a run that succeeded was run
+  again only by a new dispatch: new engine runs, under checks of their own.
+  - **dagron-ci:** `POST /ci/v1/runs/{id}/rerun?failed=false`, refused
+    before, and `dagron-ci rerun ID --all` run each of an event's runs that
+    is over, one that succeeded too, whole: every job. They are the same
+    engine runs, so the same checks on the same commit, followed again as
+    any rerun is, under a build's limit like a new run. Where a build counts
+    runs, each is counted as the run run again: an end is told to the meter
+    with how many times its run was rerun whole (`whole_reruns`, which
+    dagron-api's `GET /api/runs/{id}/wait` now says, and dagron-ci keeps in
+    its migration 0029). A cell whose dagron-api is older than this answers
+    400, and that run is left with why: the door answers 409, not 503. The
+    default, `?failed=true`, and GitHub's "Re-run" and "Re-run all checks",
+    are from the failed jobs as before. A `failed` that is neither `true`
+    nor `false` is refused with a problem document (400), where it was a
+    bare text 400 the API's metric did not count.
+  - **dagron-api and the engine:** `POST /api/runs/{id}/rerun` (in the
+    Postgres and the SQLite build) and the engine's own `POST
+    /runs/{id}/rerun` take `{"from": "all"}`, one implementation behind
+    both (`db::rerun_all`). Every task of a run that succeeded, failed or
+    was cancelled is put back as a clear puts one back, its checkpoint
+    dropped. The attempts it replaces are kept under `rerun`, its
+    `run.rerun` event says `"from": "all"`, and a full concurrency key is a
+    429. A runtime fan-out's instances are deleted, and made again from
+    what its producer prints this time: their kept attempts and logs go
+    with them. An approval gate asks again. It is counted on the run
+    (`workflow_runs.whole_reruns`). A run with a task that still owes the
+    teardown of a remote job (a deferred task cancelled while its job ran)
+    is a 409, with nothing written, until the engine has torn the job down
+    or given up on it, as `gc_old_runs` will not collect such a run: the
+    rerun would have dropped the handle the teardown sweep had still to
+    reach, and the job would have run on uncounted.
+- **A paths filter lists a change larger than the forge's compare API.** GitHub's compare lists at most 300
+  files of a change and GitLab's 1000, and a change past that (or a
+  comparison over 16 MiB, or one GitLab timed out on) ran every
+  paths-filtered pipeline. dagron-ci now fetches the two commits itself, at
+  depth 1 over git's protocol v2 with the repository's own credential and
+  without their files' contents where the server can leave them out
+  (`filter blob:none`), reads the pack in its own process (the image has
+  no git) and compares the two trees, as `git diff --name-only` does, from
+  the merge base the compare API compared from: GitHub's, named by the
+  comparison or by a page of it that lists no files, and GitLab's
+  `repository/merge_base`. So a push forced after a rebase still lists its
+  branch's own files, which its old tip and its new have alike. The fetch
+  is bounded (32 MiB of pack, 64 MiB inflated, 200,000 objects, 256
+  directories deep, 64 MiB of trees read, 200,000 paths of at most 4,096
+  bytes and 16 MiB in all, 20 s or a third of `CI_EVENT_LEASE_SECS`, one at
+  a time in a replica), which keeps a fetch to about 160 MiB, inside the
+  charts' 256 MiB for dagron-ci. Where it cannot list the change either,
+  the pipeline still runs, and the event's reason names both failures; a
+  new branch, two commits the forge cannot compare, and a change whose
+  merge base the forge does not name run as before. A `pack` fuzz target
+  reads what the fetch is answered with.
+- **dagron-ci asks a token service for its App's tokens**
+  (`CI_GITHUB_APP_TOKEN_URL`). One App's private key mints for every
+  installation of it, so where one App serves many dagron-ci instances, each
+  holding the key is each able to read every installation's repositories.
+  The key may now be held by one service, which dagron-ci asks, under
+  `CI_GITHUB_APP_TOKEN_SECRET_FILE`'s secret, for each installation token it
+  needs: GitHub's own request by repository (`{repository, permissions,
+  one_repository}`), answered with GitHub's own `{token, expires_at}`, and
+  404 where the App is not installed for the asker, which dagron-ci reads as
+  an App that is not installed there. Such a dagron-ci holds no key and signs
+  nothing; it still revokes a token as itself. `https://`, or `http://` to
+  this machine; `CI_GITHUB_APP_TOKEN_URL_INSECURE=allow` for plain http on a
+  closed network. `CI_GITHUB_APP_KEY_FILE` and the URL are one or the other.
+- **dagron-ci takes a cell over plain http where its operator says so**
+  (`CI_CELLS_INSECURE=allow`), on a closed network where that is accepted:
+  a dagron-api beside dagron-ci, behind a network policy, as one
+  installation's are. Unset, a cell over plain http to another host stops
+  start-up as before, and the error now names the setting.
+- **dagron-ci's own OpenTelemetry.** A build
+  with the `otel` feature, which the dagron-ci image now
+  is, sends dagron-ci's log records and what its `/metrics` serves (as OTLP
+  sums, gauges and histograms, each `OTEL_METRIC_EXPORT_INTERVAL`), as the
+  engine does: to the collector `OTEL_EXPORTER_OTLP_ENDPOINT` names, or a
+  signal's own `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` /
+  `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` for that signal alone. It opens no
+  spans of its own yet. A binary whose name begins `dagron-` is now
+  `service.name` by that name (`dagron-ci`, `dagron-step-sql`), where it was `dagron-dagron-…`.
+- **Task logs followed live.**
+  `GET /api/runs/{id}/logs/stream` and `GET /api/runs/{id}/tasks/{tid}/logs/stream`
+  send a run's task logs as server-sent events: each task read from a
+  cursor (`<task>:<fence>:<gen>:<byte>`), its start, its end, or its last
+  256 KiB, and then followed as it is written, every line once; `start`,
+  `log`, `end` and `eof` events, the log filter's line predicates server
+  side, `Last-Event-ID` on the one-task stream. One reader for each watched
+  run, whatever the number of watchers, woken by the run's notification and
+  on `DAGRON_LOG_STREAM_POLL_MS`, let go `DAGRON_LOG_STREAM_LINGER_MS` after
+  its last watcher; `DAGRON_LOG_MAX_TAILS` runs at most (`429` past it) and
+  `DAGRON_LOG_RELAY_BYTES` of text held, `DAGRON_LOG_MAX_STREAMS` streams; a
+  slow client is read from the store at its own pace, one that takes nothing
+  for 60 s is let go, and a stream lasts 10 minutes at most before it is
+  resumed (its caller asked again who they are). `/api/health` says how many runs are followed
+  (`log_tails`); the task view gives a `cursor` to go on from. dagron-ci's
+  `GET /ci/v1/runs/{id}/logs?follow=true` passes one run's stream on as the
+  caller, and `dagron-ci logs ID --follow [--from-start]` follows every run of
+  an event, new ones as they come, going on from its cursors after a drop.
+  Not yet: Docker's and Kubernetes' logs followed as a task writes them (a
+  Docker job's log comes whole at its container's end), retention and the
+  store's clean-up, the console following a log in place of polling it.
+- **Task logs kept out of the scheduling database.** With `DAGRON_LOG_STORE` (`file:///DIR`, which the engine
+  and dagron-api share, or an object store's `s3://`, `gs://`, `az://`), a
+  task attempt's log is kept as zstd segments of `DAGRON_LOG_SEGMENT_BYTES`
+  (8 MiB) with a row of `log_segments` each, and an open part: a file, or,
+  with an object store, the task row's `log`, never larger than a segment.
+  dagron-api's log routes and the engine's log views read a task's segments
+  and open part; a log from before, and a remote runner's, from its row as
+  before. Unset, nothing changes. **The upgrade's migrations add
+  `log_segments`.** Not yet: the live relay, Docker and Kubernetes logs
+  followed as they are written, retention and the store's clean-up.
+- **The image cache.** `DAGRON_REGISTRY_MIRRORS` pulls each
+  image through its registry's mirror (`docker.io=mirror.local:5000/hub`, `*`
+  for every other registry), on Docker and Kubernetes, with no fallback.
+  `DAGRON_REGISTRY_AUTH_FILE` (Docker, a `config.json`'s `auths`) and
+  `DAGRON_IMAGE_PULL_SECRETS` (Kubernetes) are the engine's credentials, sent
+  with a trusted run's pulls alone: a run that is not trusted pulls as no one.
+  The Docker executor pulls one image once at a time on a host, pins a run's
+  tag to the digest it first had it at for the run's later tasks, and fetches a
+  run's images side by side as its first task is dispatched. New metrics:
+  `scheduler_image_pulls_total`, `scheduler_image_pull_failures_total`,
+  `scheduler_image_cache_hits_total`, `scheduler_image_pull_seconds`.
+- **A privileged task, on a dedicated pool: `privileged: true`.** A
+  job that runs a daemon or a cluster inside itself has its own container
+  privileged, where the engine's operator allows it
+  (`DAGRON_TASK_PRIVILEGED=allow`), and nowhere else.
+  - **A dedicated pool alone.** An engine that allows it does not start
+    unless it claims its own runner classes (`RUNNER_CLASSES`, without
+    `default`), runs no work that is not trusted, and has no floor that
+    drops capabilities, forbids new privileges or names a runtime class or
+    seccomp's default profile. On Kubernetes it also needs task pods on
+    nodes of their own (`DAGRON_TASK_NODE_SELECTOR`), and a namespace that
+    admits a privileged pod: it asks the API server, as a dry run, and one
+    whose Pod Security refuses stops it.
+  - **The task's container alone**: on Docker the container is privileged,
+    on Kubernetes its security context; what installs its tools, fetches
+    its checkout, its services and its steps are not. A read-only root asked
+    of it stays.
+  - A task that asks where it is not allowed, or is held to what
+    contradicts it, is failed once with the reason; a remote runner is
+    given none; a run that is not trusted is refused the key.
+  - **Pod Security**: the pool's task namespace is labelled
+    `pod-security.kubernetes.io/enforce: privileged`, and is a namespace of
+    the pool's own; the others keep theirs.
+  - In `dagron-core`, a module `privileged` and `TaskSpec::privileged`; in
+    `dagron-executor`, `ExecContext::privileged`,
+    `DockerExecutor::with_privileged` and `KubeExecutor::with_privileged`.
+  - Not run: a cluster, its Pod Security admission included.
+- **An allowlist on Docker, and a list by hostname on either executor.** A
+  task's `isolation: { network: allow:<name> }` was refused on Docker.
+  - **On Docker a list is a network of the operator's**,
+    `dagron-task-allow-<name>`, made `--internal` and with no address of
+    the host's on it (`-o com.docker.network.bridge.inhibit_ipv4=true`: on
+    an internal bridge the host has one, and a task would reach what the
+    host serves there), with on it what the list allows.
+    `DAGRON_TASK_NETWORK_ALLOWLISTS` names them, as on Kubernetes. The
+    engine (and `dagron-runner`) reads each as it starts and does not start
+    where one is missing, has a way out, or gives the host an address, and reads it again before
+    each task held to it: one removed since has its task refused before
+    anything is made. The task's container, its services, its steps and its
+    daemon are on that network alone; its checkout, tools and actions are
+    fetched first, on `DAGRON_DOCKER_NETWORK`. A floor may name one there too.
+  - **A list by hostname is a proxy of the operator's.** A network's label,
+    or a NetworkPolicy's annotation, `dagron.dev/proxy` says which:
+    `http://` or `https://`, a host and a port, no user and no path. A task
+    held to the list is told `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`,
+    `https_proxy`, and `NO_PROXY`/`no_proxy` for itself and its services,
+    each unless it set it itself; so are its services (its daemon among
+    them), each under its own setting, its steps, and on Kubernetes its
+    checkout's and actions' fetches. The chart
+    writes the annotation from `engine.taskNetworkAllowlists.<name>.proxy`.
+    What the proxy lets through is the proxy's: dagron runs none.
+  - In `dagron-core`, `isolation` has `ENV_NETWORK_ALLOWLISTS`,
+    `parse_allowlists`, `allowlist_object_name`, `ALLOWLIST_PROXY`,
+    `parse_allowlist_proxy` and `proxy_env`; `Enforcer::allowlists` is now
+    held by the Docker executor as well. `DockerExecutor` has
+    `with_network_allowlists`.
+  - Not run: Calico or Cilium, whose own policy kinds have rules by name.
+- **A run on a patch bundle.** dagron-ci's `POST /ci/v1/bundles` keeps a
+  tar of the files a change touched since a base commit (and a
+  `.dagron-deleted` of those it deletes), up to 32 MiB as the body or 256 MiB
+  through an upload link the object store signs, for seven days; and
+  `POST /ci/v1/runs` with `bundle` runs the repository's pipelines on the
+  base with the bundle laid over it, the bundle's own pipelines where it
+  changes them. Such a run is untrusted whoever asks, its uploader's alone,
+  and tells the forge nothing. A job's checkout lays the patch over the
+  base from a link of an hour the checkout credential door gives each
+  attempt, at `CI_URL_FOR_JOBS` (new: https://, or http:// to this machine,
+  or plain http with `CI_URL_FOR_JOBS_INSECURE=allow`; the engine likewise
+  takes a plain http link to another host only with
+  `DAGRON_CHECKOUT_PATCH_INSECURE=allow`); the checkout's image needs `tar`,
+  and `curl` or `wget`. The engine's `workspace.checkout` takes `patched`.
+  **The upgrade's migrations add `ci_bundles` and `ci_events.bundle_id`.**
+- **Fleet mode tells a fork's job apart.** A job of a workflow run
+  whose head is in another repository is given what its label's
+  `untrusted:` says: no runner (`refuse`, unless said), a runner submitted
+  as a run that is not trusted and held to the engine's floor for such runs
+  (`floor`, in an environment of its own, `CI_FLEET_UNTRUSTED_ENVIRONMENT`,
+  with `untrusted_runner_class`), or a runner as any job's (`serve`). A
+  trusted runner GitHub gives a fork's job is stopped as dagron-ci hears of
+  it, and so is one whose job could not be told apart within thirty
+  seconds. A job that asks for `self-hosted` alone, taken by a runner of the
+  fleet's, is kept as a job of that runner's label.
+  [`crates/dagron-ci/README.md`](crates/dagron-ci/README.md#fleet-mode).
+- **Fleet mode's organization runners, quotas and Docker daemon.**
+  `scope: organization` registers a label's runner for the repository's
+  owner, in its `runner_group`, with a token of its own for the
+  organization's **Self-hosted runners** permission. `max_runners` and
+  `max_per_repository` hold a label's runners out; the count and the row
+  are one statement, so two replicas cannot both take the last place.
+  `docker: true` gives the runner a Docker daemon beside it. A job that has
+  waited a minute, and one whose runner has been over a minute with no end
+  of it heard, is asked of GitHub (`GET …/actions/jobs/{id}`).
+- **Fleet mode keeps runners warm.** A label's `warm` runners are
+  kept out beyond the jobs that wait, for a repository that has had a job of
+  the label within its `warm_for_secs` (an hour unless said), counted
+  against its quota and started anew once they have waited half an hour,
+  or a quarter of the label's time where that is less. A warm runner is an
+  idle trusted run, which GitHub would give a fork's job: a label keeps
+  runners warm only where it says `untrusted: serve`, or names a
+  `runner_group` restricted to selected workflows. On the chart,
+  `ci.fleet.prepull` pulls each label's image onto each node a runner may
+  start on, before one does.
+- **GitLab's fleet.** With `CI_GITLAB_FLEET_FILE`, a GitLab
+  project's job whose `tags` name one of the operator's labels is given
+  GitLab's own runner, `gitlab-runner run-single`, made for the project or
+  its group just before it starts and removed once it is over, as a dagron
+  run of one task. A job is heard of by its Job Hook, and the project's
+  jobs that wait are asked of GitLab; a merge request's job from a fork is
+  told apart as GitHub's is, and one a runner took before a look listed it
+  by its pipeline's ref. A runner running a job is not removed.
+  [`crates/dagron-ci/README.md`](crates/dagron-ci/README.md#gitlabs-fleet).
+- **A fleet job whose runner died is run again, once.** A job that
+  failed on a runner whose run did not succeed is run again through the
+  forge's API: GitHub's as a new attempt of its workflow run, asked each
+  minute for an hour until the run is over; GitLab's at once. Not for a
+  runner that had its label's whole time or that dagron-ci stopped, and
+  never twice for a job of one name of a run. Whether the runner died is
+  its run's to say, whichever of GitHub and the look heard first; a job of
+  which a later attempt is heard of is not asked for again. `retry: false`
+  turns it off for a label. On GitHub it needs **Actions: Read and
+  write**.
+- **Fleet mode's showback.** `GET /ci/v1/fleet/usage` (an admin's)
+  and `dagron-ci fleet usage` say what the fleet's runners did over whole
+  days, by repository, team or label: the jobs that started on them and how
+  long they ran, the runners submitted and how long they were out. It is
+  for showing who used the capacity, never to charge for it. `/metrics` gains
+  `dagron_ci_fleet_jobs_waiting{label}` and
+  `dagron_ci_fleet_runners{label,state}`; `CI_RECORD_DAYS` clears a fleet's
+  ended jobs and runners as it clears runs. dagron-ci's schema gains
+  columns of `ci_fleet_jobs`, `ci_fleet_runners` and `ci_repos`, and
+  indexes, which it adds when it starts.
+  [`crates/dagron-ci/README.md`](crates/dagron-ci/README.md#showback).
+- **A smoke test for a managed Postgres.**
+  `scripts/managed-postgres-smoke.sh <url>` runs dagron on scratch databases
+  of a server you name: RDS, Cloud SQL, Azure Flexible Server, or your own.
+  It checks the server is Postgres 14 or later and the connection is
+  encrypted. It applies the migrations and runs workflows, has two engines
+  share one queue through the provider's endpoint, and restores a `pg_dump`
+  of the database with the restore drill. It exits 0 only on a pass. CI runs
+  it once a quarter on the services whose servers are configured.
+- **dagron on GKE, AKS and any Kubernetes.** Three
+  terraform modules install the chart beside the EKS path: `terraform/gke`
+  (a regional cluster with Workload Identity and Dataplane V2, a tainted
+  task pool, Spot if asked, an artifacts bucket and a versioned backups
+  bucket each reached by a Google service account of its own, Cloud SQL on a
+  private IP), `terraform/aks` (Workload Identity, Azure CNI with Cilium, a
+  storage account with no shared key, Flexible Server on a private network)
+  and `terraform/kubernetes` (the chart on a cluster you already have, with
+  your database, object store, backup target and task pool). Each has a
+  `terraform test` suite with every provider mocked. `docs/CLOUDS.md` says
+  what each makes. The chart takes `engine.serviceAccount.annotations` and
+  `engine.podLabels`, which is what GKE's and AKS's workload identity need.
+- **Azure Blob URLs as artifact stores.** `DAGRON_ARTIFACT_URL` (and a
+  backup target) may be `https://<account>.blob.core.windows.net/<container>/…`
+  as well as `az://<container>/…`. That form names its account, so it needs no
+  `AZURE_STORAGE_ACCOUNT_NAME`.
+- **`DAGRON_TASK_SERVICE_ACCOUNT_POD_LABELS`.** Labels for every task pod
+  that runs as a ServiceAccount, and for no other pod. This is for a cloud
+  whose workload-identity webhook acts only on labelled pods, as AKS's does
+  (`azure.workload.identity/use=true`). A malformed value, or one of the
+  engine's own label keys, stops the engine at start.
+- **Backups to S3, GCS, Azure or a directory, and a restore drill.** `dagron backup put|list|get|prune` moves a database's dumps
+  to a target and back: `s3://` (MinIO, Ceph and R2 through
+  `AWS_ENDPOINT_URL`), `gs://`, `az://` or `file:///dir`, each with its own
+  credentials or the pod's workload identity, in every published engine
+  image. `put` streams and checks the bytes landed, `get` renames a dump
+  into place once whole, and `--keep N` keeps the newest N and never none.
+  The chart's `backup.enabled` makes a nightly CronJob: `pg_dump` (custom
+  format, no owners) and `dagron backup put`, of whichever database the
+  engine uses; a `file://` target names its claim. `scripts/restore-drill.sh`
+  is the restore rehearsal as a command: the newest dump from a target,
+  restored into a scratch database, held to the live one, an engine started
+  on it. `scripts/backup-e2e.sh` runs it on a directory, an S3 store, a GCS
+  emulator and Azurite, after three nights' dumps were sent to each: all
+  four passed. `docs/BACKUP_ONPREM.md` is the runbook with no cloud: NFS,
+  MinIO, off-site copies, an alert, the drill on a schedule.
+- **dagron-api on SQLite, for one node.** Built
+  `--no-default-features --features sqlite`, dagron-api is one process beside
+  one engine on the same SQLite file, with no Postgres: sign-in, users,
+  tokens, workflows (stored, versioned, run), runs (submitted, listed, read,
+  cancelled, rerun), approvals, logs and live updates, and the console at
+  `/`. Live updates are polled, every `DAGRON_SQLITE_POLL_MS` (500 ms). What
+  only the Postgres build serves (search, schedules, artifacts, datasets,
+  runners, the fleet and the rest) answers `501` saying so, as does
+  approving a gate bound to artifacts. Its tables are the engine's migration
+  069, so either process may start first; a process that meets the other
+  opening the file or applying the same migration tries again, where it
+  used to stop. The
+  Postgres build is unchanged and remains the default. Seen in
+  `scripts/one-node-e2e.sh`, which `dagron-one-node-e2e.yml` runs in each
+  pull request that touches it; [docs/ONE_NODE.md](docs/ONE_NODE.md). No
+  published image of it yet.
+- **The chart installs on OpenShift.** Under
+  `restricted-v2`, the SCC an ordinary project's pods get, with no `anyuid`
+  and no SCC of its own. `global.openshift` (`auto`: when the cluster
+  serves `security.openshift.io/v1`; `true`; `false`) leaves each pod's uid
+  and fsGroup to the SCC, which refuses a pod that names its own: every pod
+  stays `runAsNonRoot` under `RuntimeDefault`, every container escalates
+  nothing and drops every capability, and the bundled Postgres is held to
+  the same. The engine gives its task pods the same envelope there, through
+  two new knobs: `DAGRON_TASK_FS_GROUP` (`none`: a workspace volume names
+  no fsGroup; a number: that one; unset: 65532, as before) and
+  `DAGRON_TASK_RUN_AS_NON_ROOT` (non-root without a uid). The images run as
+  a uid no passwd names, in group 0: the engine's `/workflows` and
+  `/artifacts`, dagron-api's `/artifacts` and the runner's state directory
+  are group 0's with the owner's rights, and dagron-gitops gives such a uid
+  a name through `nss_wrapper`, which OpenSSH needs to clone over `ssh://`.
+  Off OpenShift every pod renders as it did. `scripts/openshift-k3s.sh`
+  checks the render, then installs the chart on k3s under Pod Security
+  `restricted` with each pod given a uid and an fsGroup as the SCC would:
+  Postgres, the engine and dagron-api start, and a task pod runs as a
+  non-root uid in group 0 to success. Not run on OpenShift itself
+  ([docs/OPENSHIFT.md](docs/OPENSHIFT.md)).
+- **CloudEvents on every webhook dagron sends.** A
+  `notify.webhook` post, the workflow's or the instance's, is a CloudEvent
+  1.0 in the HTTP binding's binary mode: the body is the JSON it always was,
+  and `ce-specversion`, `ce-id`, `ce-source`, `ce-type`
+  (`dev.dagron.notify.<event>`), `ce-subject` (the run) and `ce-time` ride
+  in headers, so a receiver that knows nothing of CloudEvents reads what it
+  read before and one built on an SDK reads an event. One occurrence has
+  one id at every target. `DAGRON_EVENTS_SOURCE` names the installation
+  (`/dagron` by default). The settings' test notification is one too
+  (`dagron_core::cloudevents`).
+- **OTLP logs and metrics.** With the `otel` feature
+  the published images carry, the endpoint that sends spans now sends log
+  records and the engine's metrics as well. Each event the log filter lets
+  through is also an OTLP log record, with its trace and span. The engine
+  sends what `GET /metrics` serves every `OTEL_METRIC_EXPORT_INTERVAL`
+  (60 s): counters as monotonic sums, gauges, histograms with their bounds,
+  read through the same cache a scrape uses, with or without `API_ADDR`. A
+  signal's own `OTEL_EXPORTER_OTLP_<SIGNAL>_ENDPOINT` and
+  `OTEL_<SIGNAL>_EXPORTER=none` are honoured for each of the three. Seen
+  against an OpenTelemetry Collector 0.111.0: 59 metric families, the run's
+  log records and 22 spans from one run. dagron-api sends logs and spans;
+  it has no metrics. dagron-ci has no `otel` build yet.
+- **Signed provenance of each build output.** Where the
+  engine is given a key (`DAGRON_PROVENANCE_KEY`, an ECDSA P-256 private key
+  of the operator's), each workflow artifact the results service finalizes
+  (`actions/upload-artifact`, a GitLab job's `artifacts:`) is made its run's
+  with its SLSA v1 provenance, signed: the zip's SHA-256, and the
+  repository, ref, commit, trigger and trust class of the run's record, the
+  workflow, the job and its attempt, said by the engine and not by the job.
+  - **Its shape is cosign's**: an in-toto Statement v1 in a DSSE envelope,
+    ECDSA P-256 over SHA-256. `cosign verify-blob-attestation --key … --type
+    slsaprovenance1 --insecure-ignore-tlog` checks it against the zip, with
+    nothing written to Sigstore's public log, so an air-gapped installation
+    signs all the same.
+  - **Signed or not kept**: an artifact whose provenance could not be signed
+    is refused, and the job's upload fails saying so.
+  - `GET /api/runs/{run_id}/workflow-artifacts/{name}/provenance` serves the
+    envelope; a listing says `provenance: true` of an artifact that has one.
+    `DAGRON_PROVENANCE_BUILDER_ID` names the builder a verifier's policy
+    trusts. Migrations: `093_workflow_artifact_provenance` (Postgres),
+    `068_workflow_artifact_provenance` (SQLite), a nullable column.
+- **A remote runner's task may have an identity.** A task with
+  `identity: { oidc: … }` in a runner class that a remote runner serves was
+  failed; dagron-api now mints its request credential as an engine does,
+  and the runner gives the task `DAGRON_OIDC_REQUEST_URL` (its
+  `DAGRON_RUNNER_URL` + `/oidc/token`, or `DAGRON_RUNNER_OIDC_REQUEST_URL`),
+  `_TOKEN` and `_AUDIENCE`. A dagron-api that is no issuer fails the task
+  saying so. A job carries it as `identity: {token, audience}` (protocol 0,
+  an optional field).
+- **A remote runner: `dagron-runner`.** A task can now run
+  where no engine runs: a Mac, a Windows host, a GPU box, a team's own
+  cluster, a host behind NAT. The runner dials dagron-api over HTTPS
+  (`/runner/v1`, protocol 0), holds no database credentials, and takes the
+  ready tasks of the runner classes it serves.
+  - **The claim is the engine's own**, made by dagron-api for the runner's
+    session: the same priorities, pools (`POOLS`, now read by dagron-api as
+    well) and fences. An engine whose `RUNNER_CLASSES` leaves a class out
+    leaves it to the runners.
+  - **Session leases.** A runner process opens a session, and
+    one heartbeat statement renews it and every task it holds; a task row is
+    not written by it. A runner that dies (`kill -9`) loses only what it ran:
+    once its session's lease (`DAGRON_SESSION_LEASE_SECS`, 90 s) lapses, the
+    engine's sweep takes its tasks back to `ready`, and another runner
+    completes them. A word it says late is refused (409).
+  - **A result is kept, not applied, by dagron-api**: an engine takes it
+    and applies it as it applies its own workers', so retries, `repeat:`,
+    `defer:`, the cache, `produces:` and dead letters are the same for a
+    remote task as for a local one.
+  - **Executors**: `local`, `docker`, and `k8s` (the runner as an
+    in-cluster controller, each task a pod), as the engine makes them, with
+    its isolation floor (`DAGRON_TASK_ISOLATION_FLOOR`) applied on the
+    runner's host. Release assets for Linux x86_64 and arm64 (static),
+    macOS arm64 and Windows x86_64, and an image.
+  - **Secrets stay home**: with `DAGRON_RUNNER_SECRETS=home` dagron-api
+    sends a secret's name alone and the runner reads it from its own store;
+    by default dagron-api sends the values from the run's environment, by
+    its policy. Either way they are masked in what the runner sends back.
+  - **Version negotiation and drain**: a session speaks the newest
+    protocol both ends do (426 where none, or a release older than
+    `DAGRON_RUNNER_MIN_VERSION`); SIGTERM, or `POST /api/runners/{id}/drain`,
+    lets running tasks finish and ends the runner.
+  - **Autoscaling**: `dagron-runner scale` sizes Kubernetes
+    Deployments of runners by their label's ready and running tasks
+    (`GET /runner/v1/queue`).
+  - Admins mint join tokens (`POST /api/runners/join-tokens`) and list,
+    drain and revoke runners (`/api/runners`). What protocol 0 does not carry
+    is refused, the task failed saying so: a run that is not trusted, a
+    `workflow` or `wait` task, a gang's member, an `identity` or a
+    `forge_token`.
+  - The engine's environment-secret policy and decryption, `env_from` and
+    the `POOLS` parser moved into dagron-core, which dagron-api shares: one
+    copy of who may read which secret.
+  - `scripts/runner-e2e.sh` runs the engine, dagron-api and runners end to
+    end against Postgres.
+  - **Upgrade:** two engine migrations (Postgres 091 and 092, which builds
+    an index concurrently; SQLite 067) add `runner_sessions`,
+    `runner_results`, `task_runs.session_id`, and dagron-api's `runners` and
+    `runner_join_tokens`. Every engine claim now clears `session_id`.
+- **dagron-ci's reporter is told of a run's changes.** A task's start and
+  end are events in the engine's outbox (`task.started`, `task.finished`),
+  written by a trigger on `task_runs` only while a sink that asks for them
+  claims, so a deployment without dagron-ci writes none. dagron-api hands a
+  service (a user in `ci:trigger`) its own sink of the outbox, the events of
+  the runs it submitted alone (`POST /api/outbox/ci/claim`, `/ack`). dagron-ci
+  follows each cell's and looks at a run when it changed; while a cell's
+  outbox answers, a running run with nothing new is looked at once a minute,
+  where it was every five seconds. A dagron-api of an earlier release has no
+  outbox to hand, and its runs are looked at as before. **The upgrade's
+  migrations add a trigger to `task_runs` and a column to `ci_runs`.**
+- **`dagron-import gitlab` and `dagron-import jenkins` write a dagron-ci
+  pipeline for a GitLab CI pipeline and a Jenkins Declarative Pipeline**,
+  under the report `dagron-import github` writes: what was
+  changed on the way, what was not carried over, and what is left to do by
+  hand, with a job that has something left starting with a step that
+  fails and says what.
+  - `gitlab` reads a `.gitlab-ci.yml` with the files it includes from the
+    project (`--root`), its templates, references and anchors written out
+    in each job. Stages and `needs` are the order, a job a run leaves out
+    taking its place in it with it; `workflow:rules` is the
+    pipeline's `on:` and a job's `rules` (or `only` and `except`) its
+    `when:`, read for every event at once, exactly where a rule names the
+    event's kind, a branch, a tag or a merge request's target, and wider,
+    left to do, where it reads what is not known before a run. GitLab's
+    variables a script reads are set at its head from dagron-ci's own;
+    services, caches, matrices, manual jobs (a gate before them), jobs
+    that may fail (steps that go on past a failure, waited for as on
+    GitLab) and `docker:dind` (a daemon of the job's own) are carried
+    over. A pipeline for schedules alone is a run asked for.
+  - `jenkins` reads the Groovy of a `Jenkinsfile` as far as its structure.
+    The stages of one agent are the steps of one job, as they shared a
+    workspace; a stage with an agent of its own is a job of its own; a
+    matrix is one job over its instances; an `input` is a gate. A stage's
+    `when` is a test at the head of its steps and its `post`'s,
+    credentials are an environment's secrets (a stage's held by names of
+    their own, which its steps set the stage's names from), a `catchError`
+    block is one step that may fail, and `parameters` a dispatch's inputs.
+    Groovy (`script`, shared libraries) and plugins' steps are left to do;
+    a Scripted Pipeline is refused by name.
+  - The shared report and the rules a pipeline is written by are the
+    importers' own module. The GitHub importer writes what it wrote
+    before, but for a thing left to do said twice of one place: the report
+    and the job's first step now say it once.
+  - `make import-gitlab` and `make import-jenkins`, beside
+    `make import-github`
+    ([`docs/CI_MIGRATING.md`](docs/CI_MIGRATING.md#from-jenkins)).
+- **A run's end as CDEvents.** With `DAGRON_CDEVENTS_URL`, the engine sends
+  each run's end as CDEvents v0.5.1, CloudEvents in HTTP binary mode: a
+  `taskrun.finished` for each task that ran, then the run's
+  `pipelinerun.finished`, with the times they happened, through the outbox
+  as a part of the run's end-of-run work, retried with ids that stay the
+  same. `DAGRON_CDEVENTS_SOURCE` names the events' source (default
+  `dagron`). A run's queued and started events are not sent yet.
+- **Every consumer of the outbox is handed every event.** The transactional
+  outbox kept one delivery state an event, so the first consumer to claim
+  one decided that no other saw it, and `dagron-ee` and `dagron-unit`
+  refused to start with both `DAGRON_WEBHOOK_URL` and `DAGRON_FLEET_URL`.
+  Each consumer is now a sink with its own state of each event (new tables
+  `outbox_sinks` and `outbox_deliveries`): the webhook and the fleet uplink
+  run side by side, a dead letter or a shed event is one sink's, and the
+  fleet spool's budgets are the uplink's alone. A sink is handed the events
+  written after it was first configured; the webhook and the uplink, which
+  drained the old outbox, also those it still held pending when the upgrade
+  ran, and never one it delivered. `event_outbox.status` is no longer written. **The upgrade's
+  Postgres migration builds an index on `event_outbox (created_at)`
+  concurrently.**
+- **A run's end-of-run work leaves the reconcile loop.** The run sink,
+  OpenLineage's terminal event, the `notify.git` commit status and
+  `notify.webhook` / `notify.slack` are each done from the run's
+  `run.completed` event by a worker of their own, so a forge or lineage
+  backend that is down or slow no longer holds back runs ending and tasks
+  being dispatched. Each is retried with backoff (eight tries, as the
+  webhook's), where it was tried once; none is lost to a crash between a
+  run's end and its work; an end superseded before it was done (a cancelled
+  run rerun) is not done; and one older than a day when its part first
+  reaches it is let go. The lineage post has a 15-second timeout, where it
+  had none. A `RunSink` is now called at least once for each end, and may
+  be called twice for one after a crash. A cancel no longer stamps
+  `completion_pending_at`; a run a release before this one stamped has its
+  end done once, as before.
+- **dagron-ci keeps its records by day, writes them out, and says what it
+  posted.** On Postgres, `ci_events` is partitioned by day; the upgrade's
+  migration rebuilds the table as a partitioned one and copies every event
+  into the partition of its day, in one transaction that holds `ci_events`
+  locked until it commits: the queue and the API wait for it, for as long as
+  copying the table takes, so a large queue upgrades in a maintenance window. `CI_RECORD_DAYS` drops the days older than
+  it each hour, with their runs' rows, run API requests, report log,
+  deliveries and stored payloads; unset, as by default, every record is
+  kept, as before. With `CI_OBJECT_STORE_URL` (`s3://`, `gs://`, `az://` or a
+  directory), a day is first written there as zstd segments, a table each,
+  read back and checked before it leaves the database, and kept
+  `CI_SEGMENT_DAYS` (or for good); and a webhook payload over 64 KiB is kept
+  there, where it was not kept at all, so a workflow's `github.event` has it.
+  Each status dagron-ci posts is a row of a new report log with what the
+  forge answered, which `GET /ci/v1/runs/{id}/statuses` reads, from the
+  database or from the segments.
+- **dagron-ci's reporter writes in batches, and dagron-api knows a service
+  token from a short cache.** The reporter looks at up to eight due runs at
+  once, and writes the looks that have ended in one statement, with their
+  posts in one more, so a
+  burst of run ends is a few statements; new metrics say how many wait and
+  for how long. dagron-api answers who a `ci:trigger` user's token is (such
+  as dagron-ci's own, which asks on every call) from a cache of ten seconds,
+  forgotten when a token is revoked through it; a person's and an agent's
+  tokens are read every call, as before.
+- **A GitLab merge request shows dagron-ci's run as a pipeline, and can
+  have a note.** Each job's commit status names its ref (the branch or tag,
+  a merge request's source branch), so GitLab keeps a run's statuses as one
+  external pipeline of that ref, which the merge request shows and
+  "Pipelines must succeed" waits for; a status names a merge request's
+  event `merge_request`, as GitLab does. With `CI_GITLAB_MR_NOTES=on`, a
+  merge request has one note that says how its latest commit's runs went,
+  written again in place as they change, with the host's token: what a pull
+  request's comment is on GitHub.
+- **A `.gitlab-ci.yml` runs as it is.** Where the operator turns it on
+  (`CI_GITLAB_PIPELINES=on`) and a GitLab project names the file in its
+  `.dagron/ci.yaml` (`gitlab: pipeline: .gitlab-ci.yml`), dagron-ci reads it,
+  with the files it includes from the project, and runs it as one pipeline,
+  `gitlab-ci`. As GitLab makes a pipeline:
+  - stages, `needs` and `dependencies`;
+  - `rules` (GitLab's expression language, `changes`, `when`, `variables`)
+    and `workflow:rules`;
+  - `parallel` and its matrix, and a manual job as an approval;
+  - `variables`, expanded with each other and with the predefined
+    `CI_COMMIT_*`, `CI_MERGE_REQUEST_*`, `CI_PIPELINE_SOURCE` and their like;
+  - `services`, `cache`, `environment`, `timeout`, `retry`;
+  - `default`, `extends`, `!reference` and anchors;
+  - a job's image, or the one its runner tag is given (`gitlab: tags:`).
+
+  A job's `artifacts:paths` are packed into a zip and uploaded by the step
+  runner through the engine's artifact service when its scripts are over,
+  and fetched into the workspace of the jobs after it that take them.
+  `dagron-ci validate` checks one. What is not taken is refused with what
+  it is ([docs/CI_GITLAB.md](docs/CI_GITLAB.md)).
+  A job with artifacts, or that may fail, is handed on in step protocol 5,
+  which this release's dagron-ci-exec speaks: **an engine whose
+  `DAGRON_CI_EXEC_IMAGE` is older refuses such a job**, rather than run it
+  without them. A job that may fail, and fails, ends as succeeded, with a
+  warning that says it failed, so that the stages after it run.
+- **GitLab as a forge.** dagron-ci serves a GitLab project, gitlab.com's
+  or a self-managed one's (`dagron-ci repo add … --forge gitlab`), as it
+  serves a GitHub repository: `POST /hooks/gitlab` takes its pushes, tags
+  and merge requests (`X-Gitlab-Token` compared in constant time with
+  `CI_GITLAB_WEBHOOK_SECRET_FILE`'s, deduped on `webhook-id`), the
+  poll sweep reads its open merge requests, its `.dagron/ci` pipelines and
+  changed files are read through GitLab's REST API, and each job's outcome
+  goes back as a commit status. A merge request is a pull request's event
+  at `refs/merge-requests/{iid}/head`, trusted from the project's own
+  branch and not from a fork. A private project is read with the token
+  `CI_GITLAB_TOKENS_DIR` keeps for its host, a file per host, which goes to
+  that host alone and to no job. A checkout is given a project access token
+  of its own, minted with the host's token for that project alone (Reporter,
+  `read_repository`, lapsing within two days) and revoked by its id once the
+  attempt is over; its id is kept with the credential's row
+  (`ci_checkout_credentials.forge_token_id`, a migration). Minting one
+  needs the host's token to be a personal access token, a user's or a
+  service account's, that is the project's Maintainer: GitLab lets no group
+  or project access token mint another. A `.gitlab-ci.yml`
+  is not read yet.
+  `dagron_ci_webhook_deliveries_total` counts GitLab's deliveries under
+  `forge="gitlab"`.
+- **The rest of a GitHub workflow's `github.event`, and its artifacts.** On
+  dagron-ci's GitHub front-end, `github.event` is the forge's own payload
+  as its webhook delivered it (a pull request's title, labels and author, a
+  push's commits), where dagron-ci kept it (at most 64 KiB), with
+  dagron-ci's own fields over it; read as an outsider's, as before.
+  `actions/upload-artifact/merge` runs against the engine's artifact
+  service. `download-artifact`'s `run-id` reads a run of dagron's through
+  dagron-ci's new GitHub API door, where the operator serves one
+  (`CI_GITHUB_API_FOR_JOBS`): it answers GitHub's two calls for the job's
+  own repository and `GITHUB_TOKEN`, in a trusted run, and passes every
+  other call on to GitHub. The console lists a run's workflow artifacts and
+  downloads each one's zip, which dagron-api streams from the cache store
+  (`GET /api/runs/{run_id}/workflow-artifacts`, `…/{name}`,
+  `GET /api/workflow-artifacts/{id}`), given `DAGRON_CACHE_URL` as the
+  engine is.
+- **A private action of the repository's own owner's.** On dagron-ci's
+  GitHub front-end, a step of a trusted run that uses an action of the
+  repository's owner's (`acme/tools@v1` in a workflow of `acme/widgets`)
+  has it fetched with a credential of dagron-ci's GitHub App, minted for
+  that one attempt and that one repository, to read it, and revoked after,
+  as a checkout's is; dagron-ci reads its `action.yml` with the App too. A
+  workspace's `actions[]` takes `credential: true` for it, and the engine
+  asks its token service (`"action": true`) for one; dagron-ci gives one
+  for a trusted run and the owner's own repository alone, and only where
+  that repository's Actions access shares its actions, as GitHub has it:
+  the App needs the new repository permission **Administration: Read** to
+  ask. Another owner's private action, a run that is not trusted, and a
+  mirror get none, as before.
+- **A Docker action whose image is a Dockerfile.** On dagron-ci's GitHub
+  front-end, an action of `runs.using: docker` whose `runs.image` is a
+  Dockerfile of its directory has its image built first, as on GitHub: the
+  step runner sends the Dockerfile's directory to the engine's results
+  service (`POST /dagron/v1/steps/images`, at most 64 MiB), and the Docker
+  executor builds it on its daemon, named for a digest of what it was
+  built from, so that it is built once. Only for a trusted run, and only
+  where the operator says so with the new `DAGRON_DOCKER_BUILD_ACTIONS=allow`;
+  on Kubernetes and the local executor such a step fails, and says so, as
+  it did before everywhere.
+- **A composite action's own actions.** On dagron-ci's GitHub front-end, a
+  composite action's step may use an action of another repository, a
+  local one or an image, as on GitHub: dagron-ci reads each action a
+  job's steps use as it handles the event, and fetches the actions of
+  other repositories theirs use with the job's own, held to the same
+  allow-list and pins, ten deep and 32 in all. An action's file is read
+  from github.com's raw files, or from a mirror's where the new
+  `CI_ACTIONS_MIRROR_RAW` says. Such a step failed before.
+- **A GitHub workflow's `on.schedule`.** dagron-ci's scheduler reads each
+  GitHub repository's default branch (what `HEAD` names, from git's ref
+  listing) and the crons of the workflow files `.dagron/ci.yaml` lists at
+  its head, and queues a `schedule` event at that head as each cron fires:
+  five fields in UTC as POSIX reads them, at most every five minutes, a
+  missed fire not made up, and once however many replicas run.
+  `github.event.schedule` is the cron. It runs where workflow files are
+  read (`CI_GITHUB_WORKFLOWS=on`). dagron-ci's database gains
+  `ci_schedules` and the scheduler's columns of `ci_repos` (migration
+  0019), and its ref listing asks for `HEAD`.
+- **More of a workflow's `github` context, and `secrets` in a job's
+  `env:`.** On dagron-ci's GitHub front-end, `github.run_id` and
+  `github.run_number` are the run's own numbers, which dagron-ci gives a
+  workflow as it makes its run (so a concurrency group of
+  `github.head_ref || github.run_id` is no longer one group for every
+  push), and `github.actor`, `triggering_actor`, `head_ref` (a pull
+  request's head branch, now kept with its event), `run_attempt`,
+  `api_url` and `graphql_url` are there, each a step's `GITHUB_*` variable
+  too. A job's or the workflow's `env:` may read `secrets.NAME`: the step
+  runner reads the variable as the job starts. `::debug::` lines are
+  printed only where `ACTIONS_STEP_DEBUG` is `true` (`RUNNER_DEBUG=1`), and
+  the console folds a log's `::group::` lines. **A step's `::debug::` lines,
+  printed before, are now not printed by default.** dagron-ci's database
+  gains `ci_events.head_ref` and the table `ci_run_numbers` (migration
+  0018).
+- **A repository's secrets in its workflow files.** On dagron-ci's GitHub
+  front-end, `${{ secrets.NAME }}` in a step (its script, `env:` or
+  `with:`) is a secret of the repository's environment, named by its
+  address (`github.com/acme/widgets`), which an admin makes and fills
+  through dagron-api: the engine decrypts each one the job's steps read as
+  it is dispatched, a missing one reads as empty, as on GitHub, and a run
+  that is not trusted is given none. The engine gives such an environment
+  to that repository's runs alone, and the step runner takes the secrets
+  out of its environment, so a step sees one only where its workflow reads
+  it. It is masked in the job's log. A workflow that read one was refused
+  before. dagron-api takes an environment named for a repository, and a
+  task's secret reference may be `optional: true`: its environment's
+  alone, and empty where it holds none, never the engine's own store.
+- **GitHub's workflow commands in a workflow's steps.** The step runner
+  reads what a step prints before it reaches the job's log:
+  `::add-mask::VALUE` has the value printed `***` from then on, and the
+  job's own credentials (`GITHUB_TOKEN`, the results service's token, the
+  OIDC request token) are masked from the start; `::error::`,
+  `::warning::` and `::notice::` are annotations on the job's check run,
+  with `file`, `line`, `endLine` and `title`; and `::stop-commands::`
+  stops both until its token. They were lines of the log before, and
+  masked nothing. **A job that prints its `GITHUB_TOKEN` now prints
+  `***`, and a job output that holds a masked value is no longer handed
+  on to the jobs after it**, as on GitHub (the job warns that it is not).
+- **`hashFiles(…)` in a workflow's steps.** On dagron-ci's GitHub
+  front-end, a step's script, `with:`, `env:` and `if:` may call it, as a
+  cache's key most often does (`hashFiles('**/Cargo.lock')`): the SHA-256
+  of each matched file's SHA-256, in their paths' order, of the job's
+  workspace, with its patterns read as GitHub's runner reads them (a
+  directory's name is all of it, `!` leaves out, links to files are
+  hashed), and empty where nothing matched. It failed the step before. The
+  glob matcher `on:` filters use moved to dagron-ci-expr, which the step
+  runner reads the patterns with.
+- **A Docker daemon of a task's own** (`docker_daemon: true`): a task that
+  runs `docker build` or `docker run` is given a daemon beside it, Docker
+  in Docker, as a service named `docker` that it reaches as
+  `DOCKER_HOST=tcp://127.0.0.1:2375`, with its workspace and the operator's
+  mounts at their own paths (but where a daemon keeps its own), and
+  removed with the attempt. Its container is privileged, so the engine's
+  operator offers it (`DAGRON_DOCKER_DAEMON=dind`, with
+  `DAGRON_DOCKER_DAEMON_IMAGE`), on the Docker executor only, and an engine
+  that offers it runs no work that is not trusted; a run that is not
+  trusted is refused it. A repository's workflow jobs ask for one with
+  `github.docker: true` in `.dagron/ci.yaml`, where dagron-ci's operator
+  lists the repository (`CI_GITHUB_DOCKER`), and `dagron-ci run` gives one
+  with `--docker-daemon`. Where the operator names Sysbox's runtime for it
+  (`DAGRON_DOCKER_DAEMON_RUNTIME=sysbox-runc`, Sysbox installed on the
+  host; `dagron-ci run` passes the variable on), the daemon runs
+  unprivileged, in a user namespace of its own, as the task's first
+  service.
+- **The conformance suite** (`conformance/`): GitHub's workflow templates
+  for Rust, Go, Node.js, Python and a Docker image, each with
+  a small project, run on dagron-ci (`conformance/run.sh`) and on GitHub
+  (a workflow dispatched by hand), and their
+  jobs' conclusions compared (`conformance/score.py`). The first score was
+  4 of 5 jobs agreeing (80%): the Docker template's `docker build` had no
+  daemon on dagron-ci. With a job's own daemon, all five succeed on both:
+  5 of 5 (100%).
+- **`dagron-ci run` runs workflow files.** A file of `.github/workflows`
+  named, or listed in `.dagron/ci.yaml` (`github.workflows`), is read as the
+  event workers read one, with the repository's `runs_on` and `provided`.
+  Its actions of other repositories are not fetched here: a step that uses
+  one fails unless `provided` lists it.
+- **`dagron-ci run --report FILE`** writes each pipeline's result, and each
+  of its jobs', as JSON. (`uses: docker://image`, and an
+  action of `runs.using: docker` whose image is one), on the Docker
+  executor, in a container of the image the engine starts beside the job.
+  - It has the job's workspace at `/github/workspace`, where it starts, the
+    job's network and user, and what the job is held to; a run that is not
+    trusted names an image of `DAGRON_UNTRUSTED_IMAGES`.
+  - It has the step's variables, each input as `INPUT_<NAME>`, and runner
+    files of its own, which are the job's once it has ended; an action's
+    `runs.args` are read against its inputs, and its `pre-entrypoint` and
+    `post-entrypoint` run.
+  - The step runner asks the engine's results service for it
+    (`dagron-ci-exec container`), so it needs `DAGRON_ACTIONS_CACHE_LISTEN`.
+  - On Kubernetes too, as an ephemeral container of the job's own pod,
+    with its workspace, its network and its job's container's security
+    context. A run that is not trusted runs none there: Kubernetes holds
+    an ephemeral container to no limit. **The chart's engine Role gains
+    `get` and `patch` on `pods/ephemeralcontainers`;** an engine whose
+    Role is its operator's own needs them granted.
+  - Not yet: an action whose image is a Dockerfile; its step fails, and
+    says so.
+- **A workflow's `actions/upload-artifact` and `actions/download-artifact`
+  work** (v4). The engine's results service, the one `actions/cache`
+  speaks, is GitHub's artifact service too.
+  - An artifact is its run's, by its name: any job of the run lists and
+    downloads it, no job of another run sees it, and a name already in
+    the run is refused, as on GitHub.
+  - Its bytes are in the cache store (`DAGRON_CACHE_URL`) under
+    `workflow-artifacts/`, with their SHA-256; the index is the engine's
+    table `workflow_artifacts`. A download reads the store directly.
+  - It is kept as long as the job asks and no longer than
+    `DAGRON_ACTIONS_ARTIFACT_RETENTION_DAYS` (90), and may be as large as
+    `DAGRON_ACTIONS_ARTIFACT_MAX_BYTES` (5 GiB).
+  - **`DAGRON_ACTIONS_CACHE_URL` may no longer have a path**: the artifact
+    actions keep only its origin. And `ACTIONS_RUNTIME_TOKEN` is now a JWT,
+    whose `scp` names the run and the job, as GitHub's does.
+- **A workflow's `actions/cache` works.** The engine answers GitHub's cache
+  service, version 2, which `actions/cache` v4.2 and later speak, where the
+  operator sets `DAGRON_ACTIONS_CACHE_LISTEN` and `DAGRON_ACTIONS_CACHE_URL`
+  (`https://`, unless `DAGRON_ACTIONS_CACHE_INSECURE=allow`), beside the
+  path caches' store (`DAGRON_CACHE_URL`).
+  - Entries are path caches: their quota, eviction and scopes. A job
+    restores from its own ref, then from the branch a pull request merges
+    into. A run that is not trusted saves nothing.
+  - A restore reads the store at a URL the engine signs. A save is uploaded
+    to the engine, kept in `DAGRON_ACTIONS_CACHE_DIR`, and put in the store
+    as the action finalizes it.
+  - A job is given `ACTIONS_RESULTS_URL`, `ACTIONS_CACHE_SERVICE_V2` and a
+    credential of its own, `ACTIONS_RUNTIME_TOKEN`, signed by the engine.
+    dagron-ci gives a job that uses actions the ref it restores from after
+    its own, `DAGRON_ACTIONS_CACHE_RESTORE_FROM`, which a workflow or a
+    pipeline may not set.
+- **A workflow's job is given a `GITHUB_TOKEN`.** Where the operator sets
+  `CI_GITHUB_TOKEN=on`, the engine asks dagron-ci's token service for one
+  as each attempt starts, and has it revoked once the attempt is over.
+  - It is an installation token of dagron-ci's GitHub App, for the job's
+    repository alone.
+  - It may do what the job's `permissions` grant, by the App's names,
+    `contents: read` where nothing says. A run that is not trusted is given
+    read alone.
+  - A step reads it as `secrets.GITHUB_TOKEN` or `github.token`. It is
+    masked in the log, and on Kubernetes it is in the task's Secret.
+  - dagron's task key is `forge_token: { permissions }`. The token
+    service's credential row records the permissions each token was given.
+- **A workflow's job may ask for an OIDC token.** Where the operator sets
+  `CI_GITHUB_OIDC=on`, a job whose `permissions` give it `id-token: write`
+  (or `write-all`) is given the identity the engine gives a task, and
+  GitHub's `ACTIONS_ID_TOKEN_REQUEST_URL` and `ACTIONS_ID_TOKEN_REQUEST_TOKEN`
+  for it.
+  - Its audiences are the forge's own (`https://github.com/<owner>`, as
+    GitHub's), then those the repository names in `.dagron/ci.yaml`
+    (`github.oidc_audiences`).
+  - A run that is not trusted is given none, as GitHub gives a fork's pull
+    request none.
+  - No step may set `ACTIONS_*` for the steps after it through
+    `GITHUB_ENV`.
+- **A JavaScript action runs.** On dagron-ci's GitHub front-end, an
+  action of `runs.using: node20` or `node24`, local or of another
+  repository, now runs, as GitHub's runner runs one.
+  - Its `pre`, its `main` (inputs as `INPUT_<NAME>`, its outputs the
+    step's) and its `post`, when the job's steps are over, the last first,
+    with `GITHUB_STATE` carried between them.
+  - It runs on Node.js 24, which the engine installs beside the step
+    runner for a job whose steps use an action (`workspace.tools: [node]`,
+    `dagron-ci-exec install DIR --with node`). It is one build that runs
+    in a job image of any libc: Alpine's, with its loader and C++
+    libraries beside it.
+  - The step runner's image (`DAGRON_CI_EXEC_IMAGE`) holds it, and is
+    some 130 MB larger for it. A job that uses no action is not given it.
+  - What a JavaScript action leans on is not there yet: no cache or
+    artifact service, no token. `actions/cache` warns and goes on.
+- **A workflow step may use an action of another repository.** On
+  dagron-ci's GitHub front-end, `uses: owner/repo@ref` (and
+  `owner/repo/dir@ref`) is no longer refused. A composite action runs as a
+  local one does.
+  - The engine fetches each repository a job's steps use before the job
+    starts, once for that ref, with `DAGRON_CHECKOUT_IMAGE` and no
+    credential. It goes into a directory the job reads at `/dagron/actions`
+    and cannot change. A task's `workspace.actions` names them; dagron-ci
+    writes it for a workflow.
+  - `CI_ACTIONS_MIRROR` fetches actions from a mirror in place of
+    github.com. `CI_ACTIONS_ALLOW` lists the actions that may be used,
+    `owner/*` or `owner/repo`; where it is set, each must be pinned to a
+    commit's full id.
+  - Not run yet, and each fails its step saying so: an action of
+    JavaScript or of a Docker image (the repository is fetched, and the
+    step fails as it starts), and an action that a composite action's own
+    step uses. A Docker action (`docker://…`) is refused when the file is
+    read.
+- **A workflow step may use a local action.** On dagron-ci's GitHub
+  front-end, a step with `uses: ./dir` and its `with:` is no longer
+  refused. The step runner reads the composite action from the job's
+  workspace as the step starts, `action.yml` or `action.yaml`, and runs
+  its steps in the step's place.
+  - Its inputs are what the step gives it, and its defaults; its outputs
+    are the step's.
+  - Its steps have a `steps` context of their own, and may use another
+    local action, ten deep at most.
+  - An input reaches a script of it as a variable, never as the script's
+    text.
+  - A job with such a step is handed on in a fourth step protocol, which
+    only a dagron-ci-exec of this release speaks. A job without one is
+    handed on as before.
+  - An action of JavaScript or of a Docker image still fails its step,
+    and says so. `docs/CI_GITHUB.md` has the details.
+- **dagron's Postgres-backed tests run against Postgres 14 to 17.** A
+  scheduled matrix runs dagron-api's, dagron-gitops' and dagron-ci's tests
+  against each of 14, 15, 16 and 17 when the schema, the queries or those
+  crates change; a pull request still runs them against 16.
+  `docs/CONFIG.md` says so.
+- **A merge-queue group that is let go of has its runs cancelled.** When
+  GitHub's merge queue drops a group without merging it (`merge_group`
+  `destroyed`, invalidated by a group ahead of it, or dequeued), dagron-ci
+  cancels that group's runs still going, through each run's cell, and
+  withdraws its events still waiting; the group's checks then read
+  cancelled. A group that merged is left alone. The event is
+  `merge_group_destroyed`.
+- **Agents in CI: three recipes, `examples/ci/agents`.**
+  - **Review**: `review.yaml` sends a pull request's diff to any endpoint
+    that answers OpenAI's chat completions API. It keeps the findings that
+    name a line the pull request adds, and writes them as SARIF:
+    annotations on those lines where jobs are check runs. It is advisory: a
+    finding fails nothing, a model that cannot be asked fails the job. The
+    model's address and key are an environment's (`agent-review`), whose
+    policy says which runs are given the key: by default, trusted runs alone.
+  - **Triage**: `retry_budgets` by what broke a job. A run's failure summary
+    (`GET /api/runs/{id}`, `/wait`) now says what broke its failed task and
+    what another attempt is worth (`fault_class`, `disposition`), and each
+    task row its `fault_class`.
+  - **Fix on failure**: a coding agent runs the pipelines through
+    dagron-mcp with an agent's token, reads what failed, and pushes a fix.
+  - Not yet: a pipeline that starts when another fails, and the loop run
+    inside CI.
+- **An agent has a token of its own, and dagron-ci can run its work as the
+  `agent` class.**
+  - A person signed in mints one in dagron-api: `POST /api/tokens` with
+    `agent: "<name>"`. It presents as `agent:<name>`, never as the person,
+    with the person's groups less `admin` and `ci:trigger`. It reads, and
+    reruns or cancels the runs whose trigger names it; any other change is a
+    `403`. An agent's name stays its first owner's (`agent_names`,
+    migrations 086 pg and 063 sqlite), so its runs never pass to another
+    person's agent.
+  - dagron-ci runs an agent's dispatch where `CI_AGENT_RUNS=untrusted`, on a
+    cell that takes the trigger record, as an `agent` run: confined as an
+    untrusted run is (the floor and the limits, no approval, no identity, no
+    cache written), reading an environment only where its policy names
+    `agent`. The agent reruns and cancels the events it asked for, and no
+    other. Nothing of an agent's dispatch that did not run is said on the
+    commit; why is on its event. `refuse`, the default, keeps the class
+    refused.
+  - Not yet: a run of a patch bundle, and an approval that an agent's run
+    waits on before a deploy.
+- **dagron-mcp drives CI: four `dagron_ci_*` tools.** With `DAGRON_CI_URL`
+  set, an agent runs a repository's pipelines at a ref (`dagron_ci_run`,
+  with an idempotency key), waits for them up to ten minutes and is told the
+  outcome and the first failed job's last lines (`dagron_ci_wait`), reads
+  their logs failures first within a byte budget (`dagron_ci_logs`), and runs
+  the failed jobs again (`dagron_ci_rerun_failed`). They call dagron-ci's run
+  API with the server's own token, under the same rule for plaintext `http://`
+  as dagron-api's; the two writes are reviewed in `docs/MCP.md`. With an
+  agent's token (below), the runs are the agent's.
+- **A job can be given an identity a cloud trusts: `identity: { oidc: {
+  audience } }`.** It asks dagron-api's issuer for an OpenID Connect token
+  and trades it with AWS, GCP or Azure for credentials, holding no secret of
+  the cloud's.
+  - dagron-api is the issuer where `DAGRON_OIDC_ISSUER` is set:
+    `/.well-known/openid-configuration` and `/.well-known/jwks` at its path,
+    RS256 keys from `DAGRON_OIDC_KEYS` (a PEM file or a directory of them; the
+    newest signs, every one is published, so a key is rotated by adding
+    one), and tokens of `DAGRON_OIDC_TOKEN_SECS` (600).
+  - The engine gives such a task, as it dispatches it, where to ask
+    (`DAGRON_OIDC_REQUEST_URL`, the engine's own setting), a request
+    credential of its own (`DAGRON_OIDC_REQUEST_TOKEN`) and its first
+    audience. `GET /oidc/token?audience=…` takes the credential while the task
+    runs and answers `{"value": "<jwt>"}`, as GitHub's request endpoint does.
+    Only the credential's SHA-256 is kept (`oidc_requests`, migrations 085 pg
+    / 062 sqlite).
+  - The claims are the run record's: `sub` is `repo:<host>/<owner>/<name>`
+    and `:environment:<name>`, `:pull_request` or `:ref:<ref>`; beside it the
+    repository, ref, commit, pull request, trust, pipeline, run, task,
+    attempt, environment and actor.
+  - Only a trusted run's task is given one. A run that is not trusted has the
+    task refused (`identity` is among what such a run may not use), and the
+    issuer refuses it too; a run that may not use the task's environment is
+    refused the identity, since a token names the environment. An engine
+    with no `DAGRON_OIDC_REQUEST_URL` refuses such a task and says why.
+  - dagron-ci takes `identity:` on a job, checked as dagron checks it, where
+    it was a reserved key that was refused.
+- **A job keeps directories between runs: `workspace.cache`.** A cache is a
+  prefix, the files of the workspace that make its key (`key_files`, globs),
+  and the directories it keeps (`paths`). It is restored before the job's
+  steps (the entry of its key, else the newest of the prefix, of the run's
+  own ref and then of the branch a pull request or merge group merges into)
+  and saved after they succeed, unless the job restored that very key.
+  - The store is the engine's: `DAGRON_CACHE_URL` (`s3://`, `gs://`, `az://`),
+    an object store that signs URLs. The engine signs them as it dispatches a
+    job with caches (`DAGRON_CACHE`) and never moves the bytes; a store that
+    cannot sign is refused at start. A repository's entries are kept to
+    `DAGRON_CACHE_QUOTA_BYTES` (10 GiB), the least recently read going first,
+    and an entry unread for `DAGRON_CACHE_UNUSED_DAYS` (7) goes. The index is
+    a table of the engine's (`path_caches`, migrations 084 pg / 061 sqlite).
+  - Only a trusted run is given a URL to save with. A run that is not trusted
+    (a fork's pull request) restores and never writes what a later run reads,
+    and where a job restores from is dagron-ci's to say, not its pipeline's.
+  - `dagron-ci-cache`, a static tool in the tools image beside
+    `dagron-ci-exec`, restores and saves from inside the job, which must
+    reach the store's host. `dagron-ci-exec install` copies it too; the
+    release's `dagron-ci-exec` archive carries both.
+  - A job's steps are told `CI_BASE_REF`: the branch a pull request or merge
+    group merges into, as a ref. Every compiled pipeline declares
+    `ci_base_ref`.
+  - `dagron-import github` writes a cache from `actions/cache` (the prefix
+    from the key's own words, its files from `hashFiles(…)`),
+    `Swatinem/rust-cache`, and setup-node's, setup-python's, setup-go's and
+    setup-java's `cache:`.
+  - A cache never fails a job: one not restored or saved says why in the
+    job's log. Not built: a store behind a private certificate authority;
+    GitHub's cache service for a workflow's jobs.
+- **`dagron-import github` writes a dagron-ci pipeline for a GitHub Actions
+  workflow.** Its triggers and their filters, its jobs as tasks, `needs`,
+  `run:` steps, a matrix written out as a task's items, services, timeouts
+  and conditions of the kinds a pipeline can hold. A label GitHub hosts and
+  an action that installs a toolchain become the job's image; an
+  expression in a script becomes the variable a step reads here. Whatever
+  has no place is named in a report at the head of the file, as changed,
+  not carried over, or left to do by hand, and a job with something left
+  to do starts with a step that fails and says what, so that what is
+  written is a pipeline `dagron-ci validate` takes and nobody takes for
+  finished. What is left of the workflow as a whole is every job's to
+  say; a pattern GitHub reads another way (`+`, `?`) is written wider and
+  left to do; and no `{{` of the workflow's is read as a template
+  ([`docs/CI_MIGRATING.md`](docs/CI_MIGRATING.md#a-workflow-as-a-pipeline)).
+- **A golden corpus and fuzz targets for dagron-ci's compiler.**
+  `crates/dagron-ci/tests/corpus` holds 141 cases, a pipeline or a workflow
+  file with an event, each beside a file with all of what came of it; a
+  change to the compiler shows there to be read. Twenty workflows hold
+  the importer the same way. `crates/dagron-ci/fuzz` has a `cargo fuzz`
+  target for each parser that reads something written outside dagron-ci
+  ([its README](crates/dagron-ci/fuzz/README.md)).
+- **A run over its workflow's cap can wait its turn, or take the older
+  run's place (`when_full`).** A workflow with `max_active_runs` refused a
+  run that arrived while that many were in flight, and still does unless it
+  says otherwise. With `when_full: queue` the run is made instead, and
+  waits: the submit answers `201`, the run reads `running` with `queued_at`
+  set, none of its tasks advances, and it is let in when a run before it
+  has ended, oldest first. With `when_full: supersede` (and a cap of 1) the
+  run is made and the runs of its key before it are cancelled, as a
+  person's cancel would: a newer data refresh, or a newer push, takes the
+  place of the older one, and starts when what that one had running has
+  stopped. A superseded run ends `cancelled`, is reported as any ended run
+  is, and says which run took its place.
+  - A run that waits is a run. It is cancelled as any other, it holds its
+    place in its `concurrency_key`, and its `run_timeout_secs` is counted
+    from when it is let in. The console (its runs list and the run's page,
+    where a duration would be), the engine's own page and both
+    APIs say that it is queued (`queued_at`, `admitted_at`).
+  - At most `DAGRON_MAX_WAITING_RUNS` (100) runs wait for one workflow, or
+    one key of it. A run past that is refused, as before.
+  - A rerun, a retry or a clear of a run that has ended does not wait, and
+    takes nobody's place: while its key is full it is refused, as before.
+  - A run that is not trusted, a pull request from a fork, supersedes the
+    runs of its own pull request alone, whatever key its workflow writes.
+  - `scheduler_runs_waiting`, `scheduler_runs_waiting_oldest_age_seconds`
+    and `scheduler_runs_admitted_total` ([docs/METRICS.md](docs/METRICS.md)).
+  - Two columns and a partial index on `workflow_runs` (migrations 082 and
+    083 on Postgres, 060 on SQLite). Upgrade every engine before a
+    workflow says `when_full`: an older engine lets no waiting run in
+    ([docs/UPGRADING.md](docs/UPGRADING.md)).
+- **A pipeline's newer run can cancel the older one: `concurrency:
+  { cancel_superseded: true }`.** dagron-ci refused it, and takes it now:
+  a push to a pull request cancels the run of the push before, whose
+  checks say so, and starts when its jobs have stopped. A workflow file's
+  `cancel-in-progress: true` is read the same way. Without it a run over
+  its key still waits its turn, and now waits **in the engine**: the run
+  is made at once, its jobs show on the commit as queued, and its page
+  says so, where the event used to wait in dagron-ci with nothing to see
+  ([docs/CI_PIPELINES.md](docs/CI_PIPELINES.md#concurrency)).
+- **A pull request is given one comment that says how its runs went.**
+  With `CI_GITHUB_PR_COMMENT=on`, dagron-ci keeps one comment on each pull
+  request of a repository the App is installed on: each pipeline that ran
+  for the pull request's latest commit, linked to its run's page, each of
+  its jobs with how it ended, what a job said of its tests, and the tests
+  that failed by name. It is written again in place as the runs change (at
+  most once in twenty seconds), a new commit's runs take the place of the
+  last one's, and one that was deleted is made again. It is written with
+  a token of the App's for `pull requests: write` alone: an App without
+  the permission writes none, and its statuses and check runs go on. Names
+  a pull request's author may have chosen go in as code, and are not read
+  as Markdown. Off unless asked for. dagron-ci's schema gains a table,
+  `ci_pr_comments`, a column of `ci_runs` and an index of `ci_events`,
+  which it adds when it starts
+  ([README](crates/dagron-ci/README.md#a-pull-requests-comment)).
+- **The chart takes fleet mode's label map as a value.** `ci.fleet.labels`
+  is the map a file named by `CI_GITHUB_FLEET_FILE` holds: the chart writes
+  it to a ConfigMap, mounts that in dagron-ci's container in either place
+  it runs, and names the file to it. Until now the chart mounted no file of
+  an operator's, so the map had to be in dagron-ci's image. dagron-ci reads
+  the map once, as it starts, so its pod is annotated with the map's
+  checksum and a map that changed starts it again. The render fails on what
+  dagron-ci would not start on: a fleet with no cell and token or no App,
+  and a map it would refuse (a key a label does not take, a label GitHub
+  gives every runner, a label with no image). It fails on a fleet with no
+  `ci.webhookSecret` too: a job is heard of by its delivery alone, and a
+  release's replicas are all set alike.
+- **Three documents for dagron-ci, and a starter for a dbt project.**
+  [`docs/CI_MIGRATING.md`](docs/CI_MIGRATING.md) maps a GitHub Actions
+  workflow, a `Jenkinsfile` and a `.gitlab-ci.yml` to a pipeline, key by
+  key, with what has no place to go yet.
+  [`docs/CI_SECURITY.md`](docs/CI_SECURITY.md) says whose word dagron-ci
+  takes for what, what an untrusted run is held to, what each of its
+  credentials can do, and what is not held.
+  [`docs/CI_RUNNERS.md`](docs/CI_RUNNERS.md) is an operator's notes on what
+  runs CI jobs: setting up, bounding, watching and repairing it, fleet
+  mode's runners among it. [`examples/ci/dbt.yaml`](examples/ci/dbt.yaml)
+  builds a
+  dbt project against a Postgres of the job's own. The pipeline reference
+  now says two things it left out: a job that its own `when:` skips does
+  not hold back the jobs after it, and a job with steps hands its status,
+  and no value it printed, to a later job.
+- **The console shows a repository's branches and pull requests, and a CI
+  job's log by step.** A **Repositories** page lists each repository a CI
+  service has run for, and a repository's page lists its pull requests,
+  branches and tags, each with the runs for its latest commit, one a
+  pipeline. A run's page gains a **Jobs** view, where a job that ran as
+  several instances (a matrix, a fan-out) is a row of them. Its task's
+  drawer shows a CI job's log by step, the failed and running steps open,
+  with what the job said of its tests (`report:`) and its steps' summaries
+  above it. Its header links the repository's page and the same event's
+  other pipelines. All of it reads dagron-api, over the trigger record
+  every run is made with: `GET /api/runs/sources`,
+  `GET /api/runs/refs?repo=`, and `?event=` on the run list. Not built: a
+  job's log is still read whole on each poll, a matrix's values are not
+  shown beyond an instance's name, and nothing is annotated beside the
+  source. [`docs/CI.md`](docs/CI.md#in-the-console).
+- **Starter pipelines for Go and for Java**, beside Rust, Node and Python.
+  The Python one says what its tests found: pytest's JUnit file, named
+  with `report:`. A suite that pytest names for itself counts a test's
+  line from 0, and its lines are read as one more.
+  [`examples/ci`](examples/ci).
+- **Releases are signed.** The release workflows sign what they publish,
+  with cosign and no key: the workflow's own identity, which GitHub
+  vouches for, recorded in a public log. Each image and the chart is
+  signed by its digest, and each image carries an SBOM (SPDX) and SLSA
+  provenance from BuildKit for each platform. The binaries' `SHA256SUMS`
+  is signed, each release file has a signed statement of where it was
+  built, and each binary has an SBOM (CycloneDX). Each workflow verifies
+  what it signed before it is done. Nothing published before this is
+  signed, and the first release cut with these workflows is what proves
+  them. [`docs/VERIFY.md`](docs/VERIFY.md).
+- **Artifacts are indexed, and go straight to the store where it can take
+  them.** dagron-api records each artifact put through it (its size, its
+  sha256, when it expires), lists a run's
+  (`GET /api/runs/{id}/artifacts`), deletes one (`DELETE` on its
+  route), and deletes those whose time is up
+  (`DAGRON_ARTIFACT_RETENTION_DAYS`, or `?retention_days=` on an upload).
+  `POST …/upload` and `GET …/download` answer with a URL the store signs
+  for the one object (S3 and what speaks it, GCS, Azure Blob), so the
+  bytes need not pass through the API or under its 128 MiB cap; a store
+  with none to give (a directory, one that seals what it keeps, a tiered
+  one) is relayed as before, and a client is written for both
+  (`DAGRON_ARTIFACT_PRESIGN`). Not built: a direct upload in parts,
+  quotas, a tiered store's delete. A file a task writes for itself is not
+  in the index until `POST …/complete` records it.
+  [`docs/API.md`](docs/API.md#artifacts-encrypted-at-rest--g-c2).
+- **Fleet mode: dagron-ci runs GitHub Actions' own jobs on your
+  capacity.** With `CI_GITHUB_FLEET_FILE`, a job whose `runs-on` asks for
+  one of an operator's labels is given GitHub's own runner, registered
+  just in time and started as a dagron run of one task, with the label's
+  image, runner class, pool and priority. The runner's configuration is
+  kept as a secret of an environment of the cell, and is in nothing a
+  reader of the run sees. A runner nothing waits for is taken back, its
+  registration first. A fork's job, an organization's runners, quotas and
+  warm capacity are the entries above.
+  [`crates/dagron-ci/README.md`](crates/dagron-ci/README.md#fleet-mode).
+- **dagron-ci reports a job as a check run, where it is told to.**
+  `CI_GITHUB_CHECKS=on` posts each job of a repository the App is installed
+  on, with `checks: write`, as a check run and not a commit status, under
+  the name its status had. It is posted with a token of the App's that is
+  for check runs alone, brought up to date as the job moves, and reads
+  cancelled when its run is. A check's "Re-run" on GitHub reruns its run
+  from its failed jobs, and "Re-run all checks" each run of the commit
+  that was reported as check runs. An App without the permission, and any
+  other repository, keeps its statuses.
+  [`crates/dagron-ci/README.md`](crates/dagron-ci/README.md#check-runs).
+- **A job's test report and its steps' summaries go on its check run.** A
+  pipeline's task names the files its steps write of its tests
+  (`report: { junit: …, sarif: … }`), and dagron-ci-exec reads them when
+  the steps are over, whatever became of them. Where a repository's jobs
+  are check runs, each failed test and each SARIF result that names a
+  file of the repository is an annotation on that line of the commit, up
+  to 50, and the check's page has the counts, each failure by name, and
+  what the steps wrote to their summaries (`CI_STEP_SUMMARY`;
+  `GITHUB_STEP_SUMMARY` in a job that came from a GitHub workflow). They
+  are the job's own word, read from its log, and never how it ended.
+  `dagron-ci run` prints a report's counts, places and failures as the
+  job ends. `report` on a task was refused until now. Not built:
+  annotations from a workflow's commands, and a report for a workflow's
+  job.
+  [`docs/CI_PIPELINES.md`](docs/CI_PIPELINES.md#report).
+- **dagron-ci's repositories are connected through its API, and each
+  change says who made it.** `GET`, `PUT` and `DELETE
+  /ci/v1/repos/{host}/{owner}/{name}`, and `GET /ci/v1/repos`, for an
+  admin with a dagron-api credential. A change is recorded with its caller,
+  and one made with `dagron-ci repo` with the operator's name;
+  `dagron-ci repo show` prints them.
+  [`crates/dagron-ci/README.md`](crates/dagron-ci/README.md#connecting-a-repository).
+- **A checkout may come with its history: `workspace.checkout.depth`.**
+  Unset or 1 is the commit alone, as before. 0 is every branch's history
+  and the tags, for a task that asks git what changed. A dagron-ci job
+  says `workspace: { checkout: { depth: 0 } }`, and a workflow's checkout
+  step its `fetch-depth`.
+- **A task is given what an earlier task came to: `env_from:`.** A
+  variable holds an earlier task's status, or the last line it printed
+  (`env_from: [{ name: TARGET, task: decide, read: last_line }]`), read
+  when the task is claimed. The task named is one it depends on. The value
+  is a variable's whole value and is never filled into a text; a line over
+  32 KiB fails the task that asked for it. [`docs/HOWTO.md`](docs/HOWTO.md)
+  §11.
+- **A workflow's matrix may be what an earlier job computed.** An axis
+  that is one expression (`module: ${{ fromJSON(needs.find.outputs.list) }}`),
+  or the whole matrix. A task plans the job's instances from what the jobs
+  it needs came to, and the engine makes a task of each as the run goes.
+  A checkout step's `fetch-depth` is taken, and the `github` context has
+  a push's `event.before` and `event.after`.
+- **A workflow's jobs hand each other values.** dagron-ci's GitHub
+  front-end takes a job's `outputs:`, and `needs` in a job's `if:`, its
+  steps and its outputs. A job whose `if:` reads `needs` is decided as it
+  starts, by the step runner, which speaks a third step protocol for it: a
+  job says its result and outputs on its last line, and writes everything
+  to one stream.
+- **dagron-ci reads a `.github/workflows` file, at level 1.** A workflow
+  file a repository lists runs as a pipeline, beside its native ones: its
+  triggers, its jobs, their matrices, containers and services, and their
+  `run:` steps. Off unless an operator sets `CI_GITHUB_WORKFLOWS=on`, and
+  then only for the files a repository lists in its `.dagron/ci.yaml`.
+  - **Level 1 is the file itself.** An action (`uses:`) is not run. The
+    checkout is answered by the job's own workspace, an action the
+    repository says its image provides is left out, and any other is
+    refused by name, with a job's `outputs`, `needs` in an expression,
+    `secrets`, a matrix that is an expression and `cancel-in-progress`.
+  - **Expressions** are read by GitHub's documented grammar, in a crate of
+    their own (`dagron-ci-expr`).
+  - **A job's `if:`** is decided when the run is made. A job it leaves out
+    gets a passing status that says it was skipped.
+  - **A step is the step runner's**: dagron-ci-exec speaks a second step
+    protocol, for a step's `if:`, its shell and directory, and the files
+    it writes for the steps after it (`GITHUB_ENV`, `GITHUB_PATH`,
+    `GITHUB_OUTPUT`).
+  - **An expression in a script** is pasted where no outsider chooses its
+    value, and is a shell variable where one may: a branch's name or a pull
+    request's title is a value, and never part of a command.
+  - **A `{{` in a workflow file is text.** dagron fills `{{ name }}` in a
+    native pipeline's text; nothing of a workflow file, or of what a caller
+    sends it as an input, is read so.
+  - **`dagron-ci validate`** checks a workflow file and the settings file.
+  - Not here: most of the `github` context beyond what an event tells.
+    (`hashFiles`, `GITHUB_TOKEN` and workflow commands came later, above.)
+  ([docs/CI_GITHUB.md](docs/CI_GITHUB.md))
+- **A service beside a task: `services:`.** A task names the containers it
+  wants beside it while it runs, a database for a test or a proxy for a
+  data task, each from an image of its own. The executor starts each before
+  the task and sees it ready (`ready`, a command run in the service's own
+  container until it exits 0), and removes it when the task ends, however
+  it ends. The task reaches a service at its name (`db:5432`) and at
+  `localhost`: it and its services share one network.
+  - **On Kubernetes** a service is a sidecar container of the task's pod,
+    with `ready` as its startup probe. It needs Kubernetes 1.29 or later,
+    and a task with services is refused on an older cluster. The task has
+    ended when its own container has: its pod is not waited for while its
+    services stop.
+  - **On Docker** a service is a container made for the attempt, and the
+    task's container is made in its first service's network.
+  - **An engine that runs tasks as its own processes** (`EXECUTOR=local`)
+    fails a task with services once, with the reason.
+  - **A service that is not ready fails the attempt**, with the service's
+    name and the last it wrote, and the task never starts.
+  - **A service is held as its task is**: its isolation, and in a run that
+    is not trusted the same limits and the same list of images.
+    `DAGRON_UNTRUSTED_LIMITS` takes `services`, the most such a task may
+    have (4 by default, 0 for none).
+  - **In a dagron-ci pipeline** a job's `services:` was refused as not
+    built. It is taken now, and `dagron-ci validate` checks it as dagron
+    does.
+  - Not here: a secret in a service's environment, which is plain values;
+    a service's own log, which is kept only for why it was not ready; and
+    on Podman, a service's name for a task that asked for no network, which
+    reaches it at `localhost`.
+  ([docs/HOWTO.md](docs/HOWTO.md), "A container beside a task")
+- **What an untrusted run may spend is the operator's to say.** A fork's
+  pull request, run as untrusted, wrote its own timeouts, its attempts and
+  how many jobs it has, took a place in line by naming itself as one of the
+  installation's pipelines, and could name any image its host can run. Each
+  was found by having such a pull request try it.
+  - **Time, attempts and tasks.** `DAGRON_UNTRUSTED_LIMITS` takes three
+    more: `timeout` (a task's longest, 3600 s by default, and what a task
+    that names none has), `attempts` (3) and `tasks` (256 a run). A task's
+    own numbers stand where they are less. A run with more tasks than it
+    may have has none of them run, and such a run is the size it was made:
+    a fan-out over what a task printed (`with_output_of`) is refused, since
+    it grows a run after its first tasks have run.
+  - **A pool of their own.** Every task of such a run draws from the pool
+    `untrusted`, whatever pool it named: `POOLS=untrusted:4` caps how many
+    run at once on an engine. A task's own `pool` was dropped before.
+  - **A line of their own.** `max_active_runs` counts by a workflow's name
+    and its `concurrency_key`, which its author writes. Such a run's cap is
+    now counted among such runs: it holds no slot of a workflow named as
+    one of the installation's, and is still capped among its own kind.
+  - **The images it may name** (`DAGRON_UNTRUSTED_IMAGES`, patterns such as
+    `docker.io/library/*`). On Docker a private image is one the host
+    already holds, and a task that named it would read it. Unset, any
+    image, as before.
+  - **A loop is refused** (`repeat`): how often it goes round is its
+    author's to write. So is `with_output_of`, for the same reason.
+  - What is still its author's: a pod's `resources` and a workspace's size
+    on Kubernetes, which are its namespace's to cap.
+  ([docs/HOWTO.md](docs/HOWTO.md), "Runs that are not trusted")
+- **dagron-ci's run API checks the commit it is given against the ref.**
+  `POST /ci/v1/runs` with a `sha` ran that commit as the ref's, whatever
+  commit it was: any commit of a fork is reachable in the repository it
+  forks, so a person who may ask for runs could have one of their own run
+  as main's, and read what an environment's policy keeps for main. The
+  commit is now the ref's own, or one the ref has behind it, or the run is
+  not made (`422`, "the commit is not on the ref"). A GitHub repository is
+  asked through its API; on another forge only the ref's own commit is
+  taken. A request that names a commit now needs the forge, where it
+  needed none.
+- **A pull request from a fork can be run, as an untrusted run.** It was
+  refused, and still is unless an operator says otherwise
+  (`CI_FORK_PRS=untrusted` on dagron-ci, and a floor for such runs on the
+  engine). A fork's pipeline is its author's to write, so what holds its
+  run is the run's record, which says `untrusted`, and never the pipeline.
+  - **The engine does nothing on such a run's word but run its containers.**
+    A run that is not trusted may not use `notify`, `on_datasets`, or a
+    task's `produces`, `defer`, `service_account`, `gang`, or a `type:`
+    other than an ordinary task's: each has the engine post, call, start
+    or ask something for the workflow. Such a run is not made (`403`, with
+    the reason), and a task that names one is failed at dispatch. Every key
+    a workflow may write is sorted into what such a run may use, may not,
+    and is not given; a test fails when a key is added to a workflow and to
+    none of the three.
+  - **It is not given what other runs share.** A task's `cache` (an output
+    kept under a workflow's and a task's name was every run's of those
+    names), a slot of a `pool`, a `priority` above the default, and the
+    attempts a failure's class gives, which is read off what the task
+    printed.
+  - **An engine runs such work only where it is told to, and can hold it.**
+    `DAGRON_UNTRUSTED_ISOLATION_FLOOR` is a second floor, for those runs'
+    tasks. An engine with none fails each of their tasks with the reason.
+    One with a floor does not start with `EXECUTOR=local`, on Docker
+    without `DAGRON_DOCKER_NETWORK`, or on Kubernetes with a floor that
+    does not say what the pod may reach. Such a task is given no
+    service-account token.
+  - **On Docker** such a task is given none of `DAGRON_DOCKER_MOUNTS` and
+    not `DAGRON_DOCKER_WORKDIR`, and each container made for it has a limit
+    on memory, processes and CPUs (`DAGRON_UNTRUSTED_LIMITS`, default
+    `memory=4g,pids=2048,cpus=2`). The Docker executor set none before.
+  - **A first contribution waits for an approval** (`CI_FORK_APPROVAL`:
+    `first-time`, `always` or `never`; `CI_FORK_APPROVERS`). No pipeline of
+    the pull request is submitted until it is given. The approval is a run
+    of its own, of one task that dagron-ci writes, which carries the pull
+    request's number and its commit and nothing its author wrote. It is not
+    a task in front of the pipeline's: a rejected task skips what needed it
+    and runs what a pipeline wrote to follow a failure, and the pipeline is
+    the pull request's. One commit has one approval, whichever of a
+    delivery and a sweep saw it.
+  - **It is never run without its record.** dagron-ci sends the record with
+    every submit of such an event, and refuses the pull request on a cell
+    whose dagron-api would not take it (the `ci:trigger` group): a run with
+    no record reads as a person's own.
+  - **A resubmit keeps the class.** `POST /api/runs/{id}/resubmit` of a run
+    that was not trusted makes a run of that class, for the same commit,
+    whoever asks. It made the caller's own, which is trusted.
+  - dagron-ci keeps what the forge says a pull request's author is to the
+    repository (migration 0013, one column).
+  - What it does not hold: the host's kernel, unless the floor names a
+    sandbox runtime; and a pod's limits on Kubernetes, which are its
+    namespace's. (How long such a run takes, how often it is tried and
+    whose place in line it takes are held by the entry above.) An approval
+    is not withdrawn when its pull request is closed. Not shown: any of it
+    on Kubernetes, or against github.com.
+  ([docs/HOWTO.md](docs/HOWTO.md), "Runs that are not trusted";
+  [docs/CI_PIPELINES.md](docs/CI_PIPELINES.md), "Pull requests from forks")
+- **An environment has a policy: which runs may use it.** Any run that named
+  an environment had its variables and its secrets. That was right while
+  every run was written by someone who could read the environment anyway.
+  It is also all that would stand between a pull request and every secret a
+  cell holds, once a pull request from outside can run.
+  - A policy admits runs by **trust class** (`allowed_trust`), by **ref**
+    (`allowed_refs`, patterns such as `refs/tags/v*`) and by **pipeline**
+    (`allowed_pipelines`). A run is admitted when it passes every part that
+    is set. `PUT` and `DELETE /api/environments/{id}/policy`, for an admin
+    alone; an environment's view has it as `policy`.
+  - **An environment with no policy admits `trusted` runs and no others.**
+    Every run an installation makes for itself is `trusted`, so nothing
+    changes for one that has no CI. A run a CI service makes carries the
+    class and the ref of the event it verified, and one whose record names
+    no class is read as `untrusted`. A run that a `type: workflow` task
+    starts is of the class of the run that called it.
+  - **Asked when a run is made.** A run that names an environment that does
+    not admit it is refused (`403`, with the reason) before its variables
+    are put into anything stored. dagron-ci says the refusal on the commit,
+    under the pipeline's name.
+  - **Asked when a task's secrets are resolved**, which is the check that
+    holds however the run was made: the task fails with the reason, and is
+    not started. It is asked before a task's `cache:` is looked in. A task
+    served from the cache had never reached it, so what one run printed
+    with a secret would have been handed to a run that may not read it.
+  - **The engine's own store is a `trusted` run's alone.**
+    `DAGRON_SECRET_<NAME>` and the secrets directory belong to no
+    environment, so no policy speaks for them. A run of another class reads
+    what an environment that admits it holds, and nothing else.
+  - A deferred job's headers are asked for when its task is dispatched, as
+    well as when the job is polled, so a task that may not have them is not
+    started.
+  - Migrations: SQLite 058, Postgres 078 (one table,
+    `environment_policies`). dagron-api makes the table itself where it
+    starts before an engine of this release.
+  - A policy by ref holds a person who may ask for runs as it holds a pull
+    request: a run asked for through dagron-ci's run API is of a commit
+    that is on the ref it names (the entry above).
+  - Not in this change: an approval before a protected environment is read;
+    a page for a policy in the console, which shows none yet; and anything
+    that runs a pull request from a fork, which is still refused. No run
+    is `untrusted` yet, so the classes other than `trusted` are held by
+    tests alone.
+  ([docs/HOWTO.md](docs/HOWTO.md), "Who may use an environment")
+- **A task may name an environment of its own** (`environment:` on a task).
+  Its `value_from` secrets are resolved from that one in place of the
+  workflow's, where its policy admits the run. A pipeline's job may too:
+  dagron-ci refused the key until dagron took it. The workflow's
+  `{{ env.NAME }}` variables are still the workflow's own environment's.
+  Neither name is ever filled in from a parameter.
+- **On the Helm chart, a private repository is checked out: dagron-ci runs
+  in the engine's pod.** The engine asks dagron-ci for each checkout's
+  credential, and takes no address for that over plain http but its own
+  machine's. With the two in separate pods the chart had no way to give a
+  private repository's checkout one, and its jobs failed there.
+  `ci.enabled` now puts dagron-ci in the engine's pod (`ci.placement:
+  engine`, the default), as `compose.ci.yaml` has the two in one network
+  namespace. With `ci.checkoutTokenSecret` named, the chart sets the
+  engine's `DAGRON_CHECKOUT_TOKEN_URL` to the pod's own address and mounts
+  the secret in both containers.
+  - dagron-ci then has the engine's replicas and its place on a node, and
+    the pod is ready when both are. `ci.replicas` and its node settings are
+    for `ci.placement: deployment`, a Deployment of its own, and the render
+    fails where one is set and would not be used. With a Deployment of its
+    own the engine is not told to ask, and a private checkout fails.
+  - The pod mounts no service-account token. The engine's container mounts
+    its own, and dagron-ci, which takes a forge's webhooks, has none. The
+    two do share an address, so dagron-ci reaches the engine's API on it,
+    which no NetworkPolicy closes inside a pod (`docs/HARDENING.md`).
+  - With `networkPolicy.enabled` the engine's policy admits dagron-ci's
+    port, and the engine's own stays closed.
+  - `crates/dagron-ci/tests/k3s.sh` checks that pod on k3s: the policy,
+    which container holds the token, where the engine is told to ask, and
+    that the door takes the secret named and no other. Not shown: a
+    private repository checked out on a cluster, from end to end.
+- **CI can be learnt: a quickstart, a pipeline reference, what it refuses,
+  and three pipelines to start from.**
+  - **`docs/CI_QUICKSTART.md`** goes from a GitHub App to a first green
+    check on one machine, with **`compose.ci.yaml`**: Postgres, the engine
+    on the Docker executor, dagron-api and dagron-ci from published images.
+    The three share one network namespace, as a pod does, so that each
+    reaches the next on loopback: dagron-ci and the engine start on no
+    plain-http address that is not their own machine. It finds a push by
+    looking, so nothing has to reach the machine. A section says what the
+    Helm chart needs.
+    **`compose.ci.build.yaml`** beside it builds the images from a
+    checkout, for use before a release has published them.
+  - **`docs/CI_PIPELINES.md`** is the reference for a pipeline: `on:`,
+    jobs and steps, the workspace, `concurrency:`, what a step knows of its
+    event, secrets, and how to check and run one before it is pushed.
+  - **`docs/CI.md`** says what dagron-ci does, each thing it refuses with
+    why and where it says so, and what this release does not do.
+  - **`examples/ci`** has a starter for Rust, for Node and for Python. A
+    test compiles each and has dagron read the result
+    (`crates/dagron-ci/tests/starters.rs`), so a starter dagron would
+    refuse does not ship.
+- **A run can be acted on through dagron-ci: stopped, read, and asked for
+  from a terminal.**
+  - **`POST /ci/v1/runs/{id}/cancel`** stops an event's runs. Each is asked
+    of its cell's dagron-api with the caller's own credential, as a rerun
+    is, and dagron-ci's record follows the run to its end. An event that
+    still waits to be dispatched is withdrawn: it ends `skipped`, with
+    who cancelled it, and no worker takes it. One a worker is dispatching
+    says so, for the caller to ask again.
+  - **`GET /ci/v1/runs/{id}/logs`** is what an event's runs wrote.
+    dagron-ci keeps no log: each run's is read from its cell as the caller,
+    narrowed by `job`, `status`, `q`, `limit` and `tail`. It is not
+    followed, and `follow` is refused so that nobody waits on a stream
+    that is not there.
+  - **A run's own id.** Each of the run API's doors takes an engine run's id
+    in place of an event's. It is the id a commit status links to
+    (`CI_RUN_URL`), and so the one a person looking at a failed check has.
+    It means that run of its event and no other.
+  - **`dagron-ci run --remote`, `rerun`, `cancel` and `logs`** ask those
+    doors from a terminal. `run --remote --wait` waits for what it queued
+    and exits by how it ended. The server (`--server`, `DAGRON_CI_URL`) is
+    `https://`, or `http://` to this machine. The token comes from a file
+    or the environment (`--token-file`, `DAGRON_CI_TOKEN_FILE`,
+    `DAGRON_CI_TOKEN`), never from a flag, and is stored nowhere: there is
+    no login. A redirect from the server is not followed.
+  - Not built: a rerun of every job (`failed=false` is still refused; a
+    dispatch of the commit runs a pipeline whole again, under checks of its
+    own), and a log that is followed.
+- **A check that is skipped says so.** A pipeline that takes an event, and
+  whose `paths:` name none of the files it changed, does not run, and said
+  nothing: a branch that required one of its checks waited for ever. Each
+  of its jobs now gets a `success` status under the context its own would
+  have had, reading "skipped: no changed file matches on.push.paths" (or
+  `on.pull_request.paths`), once the event is settled. A pipeline whose
+  `on:` does not take the event says nothing, as before. Nor does one with
+  a run of its own at the commit, from another event of it: a passing
+  "skipped" is not put over what that run's jobs came to. A run recorded
+  while the "skipped" is on its way posts its own statuses again after it.
+- **A row for each checkout credential dagron-ci mints.** What said a
+  credential had been minted, and revoked, was a log line and two counters.
+  `ci_checkout_credentials` now has a row for each: the run, the task and
+  the attempt it was for, its repository and commit, the cell that asked,
+  when it was minted, when GitHub says it lapses, and when it was revoked.
+  - The row is written before the credential is handed over. One that
+    cannot be recorded is revoked, and the attempt fails saying so (503).
+  - It holds the credential's SHA-256, by which the revoke finds it, and
+    never the credential.
+  - Nothing drops these rows yet, and no command reads them: they are read
+    with SQL.
+- **A task can name an allowlist, on Kubernetes: `isolation: { network:
+  allow:<name> }`.** Between a task that reaches everything and one that
+  reaches nothing: one that reaches what a list lets it, and nothing else.
+  - **A task names a list and cannot write one.** What a name allows is the
+    operator's, a NetworkPolicy of theirs: `dagron-task-allow-<name>`, the
+    pods labelled `dagron.dev/network=allow-<name>`, nothing in, and out only
+    its egress rules. `DAGRON_TASK_NETWORK_ALLOWLISTS` names the lists there
+    are, and the chart makes them and sets it
+    (`engine.taskNetworkAllowlists`). A task that names another is refused.
+  - It rests on what `network: none` rests on: `DAGRON_TASK_NETWORK_POLICY`,
+    each list's policy read as the engine starts, the namespace's other
+    policies read then and before each such task, and a gate before the
+    task. A policy with an egress rule that names no `to` is not taken for a
+    list: that is every address.
+  - **The gate** is `dagron-ci-exec wait-allowlist`. It asks the cluster's
+    API server alone, since a list may well allow a name server. So **an
+    allowlist must not allow the API server**: tasks under one that did fail
+    unstarted, saying so. It needs an exec image of this release or later.
+  - A task with a `checkout:` may name a list, which then has to allow the
+    forge. A floor may name one (`network=allow:<name>`): `none` is over any
+    list, a list is over the executor's own network, and a floor's list is
+    pinned as its runtime class is.
+  - The Docker executor and the local one refuse it. It was run on k3s, and
+    on no other CNI. `docs/FAMILIES.md` says what it does not do: it does
+    not judge what a list allows, and it has no rule for a hostname.
+  - In `dagron-core`, `isolation::Network` has a third value,
+    `Allow(String)`, and is no longer `Copy` or ordered; an `Enforcer`
+    carries the lists its operator named. Its spelling in a spec, a floor
+    and an attested envelope is one: `allow:<name>`.
+- **A task can ask for no network on Kubernetes, and is not started until its
+  pod has none.** `isolation: { network: none }` was refused there: a pod has
+  no switch for its network, and the executor made no NetworkPolicy.
+  - **`DAGRON_TASK_NETWORK_POLICY=enforced`** is the operator's word that the
+    cluster's CNI enforces NetworkPolicy, which nothing in the API says. With
+    it, such a task's pod is labelled `dagron.dev/network=none`, and the
+    standing policy `dagron-task-no-network` of the task namespace allows a
+    labelled pod nothing in and nothing out. The chart makes the policy and
+    sets the engine (`engine.taskNetworkPolicy`). The engine makes none: it
+    reads the policy as it starts, and does not start where it is missing,
+    selects other pods or allows anything.
+  - **No other policy may give some of it back.** A pod has what *any*
+    NetworkPolicy that selects it allows, so a namespace's "every pod may
+    reach the name server" would leave such a task resolving names, and the
+    gate would not see it. The engine reads every policy of the namespace, as
+    it starts and again before each such task is made (`get` and `list` on
+    `networkpolicies`), and refuses beside one that selects the task's pod and
+    has a rule in either direction. It names the policy; keep it from these
+    pods with `{key: dagron.dev/network, operator: DoesNotExist}` in its
+    `podSelector`.
+  - **The gate.** The task's pod gets one more init container, last, from the
+    `dagron-ci-exec` image: `dagron-ci-exec wait-no-network`. It asks for a
+    connection at the cluster's API server and at the pod's name servers, and
+    goes on once none is made at any of them three times running. A pod that
+    still has a network after 30 s fails, and its task is not started. So
+    this needs `DAGRON_CI_EXEC_IMAGE`, and an image of this release or later.
+    A gate that ended any other way (killed, not started, unable to ask) says
+    so, and is not reported as a cluster that enforces nothing.
+  - The chart keeps the policy through an uninstall or an upgrade without it
+    (`helm.sh/resource-policy: keep`): the tasks it holds are no part of the
+    release and go on running. `engine.taskNetworkPolicyCreate: false` leaves
+    the policy to whoever applies the namespace's.
+  - Why a gate: on k3s, whose own controller applies a policy a second or two
+    after a pod starts, a labelled pod reached the API server and another pod
+    as it began. A task held by the gate reaches nothing from its first
+    instant there.
+  - A task with a `checkout:` cannot ask for no network on Kubernetes: the
+    checkout is fetched in the same pod. The Docker executor takes both.
+  - It was run on k3s, and on no other CNI. `docs/FAMILIES.md` says what the
+    gate checks and what it does not: it cannot tell a held pod from an
+    outage of every address it asks.
+- **The Docker executor puts a task's containers on a network the operator
+  names, and holds a task to its `isolation:`.** A container was made with no
+  network named and no envelope asked for. So a job was on the daemon's
+  default network, beside every other container on the host that named
+  none, and a task that declared `isolation:` was refused on Docker, since
+  nothing there could hold it to one.
+  - **`DAGRON_DOCKER_NETWORK`** is the network every container the executor
+    makes is on: a task's, the one that installs its tools, and the one that
+    fetches its checkout. One made with `docker network create --internal`
+    has no route off the host. It is asked of the daemon at startup, and one
+    the daemon does not have stops the engine. `host` is refused. Unset, a
+    container is made as it always was.
+  - **`isolation: { network: none }`** gives a task's own container a
+    loopback interface and nothing else. What is run for it first keeps the
+    operator's network, since a checkout is fetched over it. A floor can ask
+    it of every task (`network=none`); the `hardened` preset does not.
+    On Kubernetes it needs the operator's word and a gate: the entry above.
+  - **The envelope is asked of the daemon.** `read_only_root_fs`,
+    `drop_all_capabilities` and `no_new_privileges` are asked of every
+    container made for the task, `run_as_user` of the task's own, and
+    `seccomp: unconfined` where a task opts out of the runtime's profile.
+    `run_as_non_root` is held as a kubelet holds it: a task that names no
+    uid is refused unless its image's `USER` is a number other than 0.
+    `runtime_class` is still refused on Docker.
+  - So `DAGRON_TASK_ISOLATION_FLOOR=hardened` starts on the Docker executor,
+    where it was a startup error, and a task whose image runs as root is then
+    refused with what to change.
+  - It is what the daemon was asked for, and a container shares its host's
+    kernel: `docs/FAMILIES.md` says what each field becomes and what it does
+    not give. Tested against a daemon by a task that reads its own
+    `/proc`.
+- **A load harness for CI.** `loadtest/ci` loads one cell the way CI does:
+  pushes arrive at dagron-ci's webhook door, each becomes a run, and each
+  run's job holds an engine slot for minutes and writes a log. It needs a
+  container runtime and nothing else.
+  - **A synthetic forge** answers the part of GitHub's API that dagron-ci
+    calls for a push, for any commit, and takes the commit statuses.
+  - **A driver** signs and sends pushes at the rate that keeps a set number
+    of jobs running, and reads each engine's `/metrics`. **A reporter** puts
+    one step's figures together: how long a delivery, an event and a run
+    each waited, the reconcile loop's ticks, each container's CPU, and every
+    statement the databases ran, named by what it is for.
+  - `run.sh` builds the images from the checkout, stands up Postgres, three
+    engines, dagron-api and dagron-ci, runs a step or a file of them, and
+    can start a Prometheus and a Grafana beside the cell with the harness's
+    dashboard loaded.
+  - A step ends when the engines' loops are idle again, not only when
+    nothing is left to run: a step begun with the loops still busy on the
+    one before it would be measured with that in it.
+  - Jobs run on the engines' local executor, as processes. So it loads the
+    control plane and nothing of what a job costs on Kubernetes or Docker,
+    and what it prints is a measurement of the machine it ran on, not a
+    capacity figure. Its README says what each figure is and is not.
+  - Nothing in CI runs it.
+  ([loadtest/ci/README.md](loadtest/ci/README.md))
+- **The published engine and dagron-api images carry the object stores and
+  OpenTelemetry.** Both were cargo features that only a source build had: an
+  operator who wanted archived runs or artifacts in a bucket, or spans at a
+  collector, had to build an image of their own.
+  - **The engine images** (`dagron-engine`, `dagron-engine-localdev`) are
+    built with `otel`, `archive-s3`, `archive-gcs` and `archive-azure` beside
+    `postgres,ops,kubernetes`. `GC_ARCHIVE_URL` takes `s3://`, `gs://`,
+    `az://` and `azure://`, and `OTEL_EXPORTER_OTLP_ENDPOINT` turns span
+    delivery on.
+  - **The dagron-api image** is built with the same three stores, for
+    archived runs (`GC_ARCHIVE_URL`) and for the artifact store
+    (`DAGRON_ARTIFACT_URL`), and with a new `otel` feature of its own under
+    the same variable. It sends the spans it opens, which today are its HTTP
+    requests at `debug`: at the default log level it sends nothing, and
+    `RUST_LOG=info,tower_http=debug` sends them. What it holds when it is
+    stopped is sent as it shuts down.
+  - **Each binary says what it was built with** as it starts, on its
+    `configuration resolved` line (`features=…`). A part an image lacked
+    was found only by the setting that needs it, when it was refused.
+  - **The engine binary can be built with a store by name.** `cargo build -p
+    dagron --features archive-s3` failed: the features were the engine
+    library's, and the binary crate forwarded none of them. It forwards the
+    three stores and `archive-parquet` now.
+  - **CI compiles what a release will build.** The two feature sets are
+    written once, in the release workflow. `scripts/published-features.sh`
+    reads them from there, compiles both binaries that way and runs the
+    tests those features gate. A release tag was the first build of them
+    before.
+  - Not in any published image: `mqtt` and `archive-parquet`. A source build
+    with default features is as it was.
+  ([docs/CONFIG.md](docs/CONFIG.md))
+- **An engine on Docker says what the host's log driver loses of a task's
+  log, and can keep each container's log in a file.** The Docker executor
+  reads a task's log back from the daemon once the container has exited, so
+  the log is what the container's log driver kept. Its containers name no
+  driver and get the daemon's own default. On Podman that is the journal,
+  which drops lines past a rate limit (10,000 in 30 seconds by default)
+  that all of a user's containers share: a job that wrote 30,000 lines in a
+  second had fewer than 10,000 of them in its log and its output, which
+  ended as a whole one does, with nothing to say so.
+  - **A warning at startup.** The engine asks the daemon which driver its
+    containers get and says what it costs a task's log: the journal's rate
+    limit, the 100 MB that Docker's `local` keeps by default, or that a
+    driver which sends logs elsewhere may keep no copy to read back. A
+    driver that keeps none at all (`none`, `passthrough`) stops the engine,
+    where every task's log and output were silently empty. Podman's daemon
+    does not say which driver it gives, so there the engine reads it off the
+    first container it makes and says the same then. And no daemon says what
+    options it gives a driver. Two of them cost a log: a rotation
+    (`max-size`, `max-file`) keeps the end of a long one, and
+    `mode=non-blocking` has the daemon drop what a container writes while
+    its buffer is full, whichever driver keeps the rest. Both are read off
+    the first container, and each is warned of once, with its figures.
+  - **`DAGRON_DOCKER_LOG_DRIVER`** names the log driver for every container
+    the executor makes: a task's, and the ones that install its tools and
+    fetch its checkout. `json-file` keeps each one's whole log in a file
+    the daemon reads back (Podman takes the name for its own file driver).
+    Unset, nothing changes: each container gets the daemon's own.
+  - **Why it is not the default.** Nothing bounds that file but the
+    daemon's own options for the driver, until the container is removed when
+    its task ends. On a host whose own driver is bounded, the bound may be
+    what keeps a task that writes without end from filling the disk.
+  - Not changed: on Kubernetes the log is still read once the pod has
+    exited, from what the kubelet kept, which rotates at
+    `containerLogMaxSize`; [docs/OPERATIONS.md](docs/OPERATIONS.md) says
+    what to raise. Reading a task's output as it is written, which would
+    end the dependence on either runtime's log, is not built.
+  ([docs/CONFIG.md](docs/CONFIG.md))
+- **Every run says what started it, and `not_triggerer` reads who caused
+  it.** A run a CI service submitted carried a trigger record. Every other
+  run's trigger was decided when it was read, from a backfill's ledger row
+  or a schedule's stamp, and anything else read `manual`: a cron entry's
+  fire, a dataset's update, a sub-workflow, a message from a queue, a call on
+  the engine's own API.
+  - Every run is now made with a record (`run_triggers`, in the run's own
+    transaction, never updated), on SQLite as on Postgres:
+    `{kind, principal, actor, trust, source, forge_host, repo, ref, sha,
+    base_sha, pr, event_id}`. `kind` is `manual`, `api`, `schedule`,
+    `backfill`, `dataset`, `workflow`, `source` or `ci`. `principal` is what
+    submitted the run (`user:<caller>`, `ci:<service>`, `engine`, or
+    `ops-api` for the engine's API, which has no login). `source`, which is
+    new, is what the run came from where that is no repository
+    (`schedule:<id>`, `cron:<name>`, `dataset:<uri>`,
+    `run:<parent run>/<task>`, `source:<name>`, `dead-letter:<id>`,
+    `resubmit:<run>`), and `event_id` is the fire's time, the backfill's
+    date or the source's position.
+  - `trigger_kind` and `?trigger=` read the record first. A run from before
+    it is decided as it was. `GET /api/runs/{id}` returns the record as
+    `trigger` for every run, where it was `null` for all but CI's, and the
+    engine's own `GET /runs/{id}` returns it too. The console's Runs filter
+    and badge know the new kinds.
+  - **A sub-workflow's run keeps where its parent's work came from.** A run a
+    `type: workflow` task starts is recorded as that task's, and takes its
+    parent's `actor`, `trust`, repository, commit and `event_id`.
+  - **`not_triggerer` compares an approver with the record's `actor`.** It
+    read the run's submitter. For a run a CI service submits, that is the
+    service's own token, so the rule never barred the person who asked for
+    the run; and a sub-workflow's run had no submitter, so a gate in one
+    barred nobody, whoever had started its parent. A record with no actor
+    (a schedule's fire) bars nobody, as before, and a run from before the
+    record is its submitter's, as before.
+  - **What changes for a caller:** `trigger` is no longer `null` on a run a
+    person submitted; a run that read `manual` only because nothing knew
+    better reads `schedule` (a cron entry's fire), `dataset`, `workflow`,
+    `source` or `api`; and a person who starts a workflow can no longer
+    approve a `not_triggerer` gate in a workflow it calls. A backfill a
+    person asks for through `POST /api/schedules/{id}/backfill` is recorded
+    as theirs, so that rule now applies to them in its runs as well.
+  - **For an upgrade:** the record's table and its new column are made by
+    the engine's migrations (SQLite 057, Postgres 077), and a dagron-api of
+    this release writes to them with every run it makes. So an engine of
+    this release starts first, as [docs/UPGRADING.md](docs/UPGRADING.md) has
+    it for every release: a dagron-api upgraded ahead of it refuses submits
+    until one has.
+  - Not done: no kind for an agent (a run an agent submits is its token's
+    user's, `manual`); a forge login in `actor` is compared as text, with
+    no mapping to a dagron-api user; and nothing reads the record when an
+    ordinary task is dispatched.
+  ([docs/API.md](docs/API.md))
+- **A task's log is written once a second, not once a line, and an attempt
+  keeps so much of it and no more.** Each line a task wrote was a statement
+  of its own against the scheduling database: an append to its row's log,
+  which rewrites what the log already holds, and on Postgres a notification
+  to every subscriber. The engine made them one after another inside its
+  reconcile loop, so a task that wrote a great deal held up scheduling for
+  every other; and nothing bounded how much one could write, into a row on
+  the scheduler's disk.
+  - The engine now holds a task's lines and writes them together: one append
+    for each task once a second at most, and one when the task ends, before
+    its status changes, so a task that ended by itself has its whole log. A
+    tail of a running task is about a second behind it, where it was a tick
+    of the loop (`POLL_INTERVAL_MS`). What waits is lost with the engine, and
+    to a task cancelled before it is written: up to that second of its log.
+  - `DAGRON_LOG_TASK_CAP_BYTES` (default `67108864`, 64 MiB) is how much is
+    kept of one attempt's log, and of its output, each. A log that reaches it
+    keeps its beginning and ends on a line that says so; what the task writes
+    after that is dropped before it is queued for the loop. An output over it
+    keeps its end, under a first line that says how much of its beginning is
+    gone. The cap counts what the task wrote: those two lines, and a line
+    dagron adds itself, such as why the attempt failed, come on top of it,
+    and a capped log is given them all the same. There was no cap before: a
+    deployment with a task that writes more than 64 MiB in one attempt, and
+    reads all of it, sets this higher.
+  - Not changed: the log is still a value in the scheduling database, each
+    append still rewrites it, and an executor still holds a running task's
+    output in memory.
+  ([docs/CONFIG.md](docs/CONFIG.md))
+- **Every binary answers `--version`, with the release it was built for.**
+  Only `dagron-ci` and `dagron-ci-exec` answered, with their crate's
+  `0.1.0`, which is the same for every release. `dagron --version` took the
+  flag for a workflow's path and started an engine, and `dagron-api` ignored
+  it and served.
+  - `--version` (or `-V`), alone, now prints one line from every binary, its
+    name and the release, and nothing is read or started:
+    `dagron 0.11.0`. That is `dagron`, `dagron-api`, `dagron-ci`,
+    `dagron-ci-exec`, `dagron-gitops`, `dagron-mcp`, the three steps, and
+    the `dagron-plan`, `dagron-state`, `dagron-import` and
+    `dagron-autopsy` tools.
+  - The release is what the build was told: `APP_VERSION`, which the image
+    workflow now passes to every image and the binaries workflow sets for
+    each build. A build no release made says `dev`, as the console does. It
+    is not a crate's version, which no release changes.
+  - `dagron_ci_build_info{version}` and what `dagron-mcp` tells a client it
+    is carry the same.
+  - A release binary is now checked to say its release before it is
+    attached.
+- **dagron-ci ships as an image, and the chart can deploy it.** Nothing
+  packaged dagron-ci: it was a binary to build and a service to start by hand.
+  - **`mancube/dagron-ci`** is built with the other images at a release, for
+    `linux/amd64` and `linux/arm64`: the binary on distroless, as nonroot,
+    with no shell and no `git` (it speaks git's protocol itself). Its
+    entrypoint serves; `repo add`, `repo list` and the rest run from the
+    same image.
+  - **The Helm chart deploys it with `ci.enabled`**, off by default: a
+    Deployment and a Service on 8090, with startup and readiness probes on
+    `/readyz` and a liveness probe on `/healthz`. It keeps its queue in the
+    release's database, in its own schema, or in one named by
+    `ci.databaseSecret`.
+  - Each secret is a Secret you name (`ci.apiTokenSecret`,
+    `ci.webhookSecret`, `ci.githubApp.keySecret`, `ci.githubTokenSecret`,
+    `ci.checkoutTokenSecret`), its key mounted as a file. dagron-ci reads no
+    secret from its environment, and the chart keeps none in its values.
+  - What dagron-ci refuses to start on fails the render instead: an App id
+    without its key, cells without a token.
+  - With `ci.enabled`, the chart's NetworkPolicy lets dagron-ci reach the
+    bundled Postgres. With a webhook secret and the ingress, `/hooks/github`
+    is routed to it, and no other path of dagron-ci's.
+  - A default install renders what it rendered before.
+  - Not in it: the engine's side. Pipelines whose jobs have a workspace need
+    `DAGRON_CI_EXEC_IMAGE` and `DAGRON_CHECKOUT_IMAGE` on the engine
+    (`engine.extraEnv`).
+  - `crates/dagron-ci/tests/k3s.sh` builds the image, installs the chart in
+    k3s and checks that the pod turns ready, that its commands run in it, and
+    that a named Secret is the webhook's secret. CI runs it.
+- **dagron-ci makes its own calls to github.com as the App.** dagron-ci's App
+  (`CI_GITHUB_APP_ID`) minted each checkout's credential and nothing else:
+  the refs, pull requests, pipelines and changed files dagron-ci itself reads,
+  and the statuses it posts, all went out under one static token for every
+  repository (`CI_GITHUB_TOKEN_FILE`).
+  - Where the App is installed on a repository, those calls are now made
+    with an installation token minted for **that repository alone**: contents
+    and pull requests to read, commit statuses to write, and nothing else.
+    GitHub refuses it for any other repository.
+  - A token is used for fifty minutes and minted again. One GitHub answers
+    401 to is dropped at once, and a status posted with one held a minute or
+    more is tried again with another.
+  - `CI_GITHUB_TOKEN_FILE` is the fallback: where the App is not installed
+    on a repository (asked again every five minutes), where GitHub will not
+    mint the token (said in the log, asked again in a minute), and where
+    there is no App. So a dagron-ci with the App and no token reads a private
+    repository's pipelines and posts its statuses.
+  - Where GitHub does not answer the request for a token (it is not reached,
+    it fails, or it is limiting requests), the fallback makes the call. With
+    no fallback the call fails and is tried again, and is not made as nobody:
+    GitHub answers an anonymous caller as if a private repository held
+    nothing, which would be taken for a commit with no pipelines.
+  - **The App needs two more permissions for this**: pull requests, read, and
+    commit statuses, read and write, beside contents, read. An App with
+    contents alone goes on minting checkouts' credentials, and dagron-ci's
+    own calls fall back to the token.
+  - The hint on a refused read names the App beside the token, and is of
+    what the call carried.
+  - Not changed: a repository on GitHub Enterprise or another forge is still
+    read without credentials. These tokens are not revoked when dagron-ci
+    stops; GitHub expires them within the hour.
+  - Also here, from the review of the change before it: with two pipelines
+    of an event that cannot run, a status that could not be posted for one
+    no longer keeps the other from being said.
+- **A run a CI service submitted says so, and a list can be narrowed to
+  CI's.** A run's trigger was derived when it was read: a backfill, a
+  schedule, and otherwise manual. So every run dagron-ci submitted read
+  "manual", nothing on it said which repository or commit it was for, and no
+  list of runs or workflows could be narrowed to CI's.
+  - **The trigger record** (`run_triggers`, Postgres migration 072).
+    `POST /api/runs` and `POST /api/workflows/{id}/run` take
+    `trigger: {kind: "ci", actor, trust, forge_host, repo, ref, sha, base_sha,
+    pr, event_id}`. It is written in the run's own transaction and never
+    updated, and dagron-api sets its `principal` from the caller it
+    authenticated. The engine's migrator makes the table and dagron-api's run
+    list reads it: upgrade the engine with dagron-api, or before it.
+  - **Who may write one:** a caller in the new `ci:trigger` group, and no
+    other. Anyone else's submit that names a trigger is refused with `403`
+    and makes no run, because what reads the record believes it. `422` for a
+    kind other than `ci`, or a field that is too long or unprintable.
+  - **What reads it.** `trigger_kind` is `ci` in the run list, a run's detail
+    and a workflow's history; `GET /api/runs?trigger=ci` returns such runs and
+    no other, and `?repo=<host/owner/name>` those for one repository; a run's
+    detail carries the record as `trigger`. The record is no
+    part of an `Idempotency-Key`'s request: two events for one commit replay
+    one run, whose record is the first event's.
+  - **dagron-ci sends it** with every run, for a compiled pipeline and for a
+    bound workflow, where the cell's dagron-api takes one from its token. It
+    asks first (`GET /api/me`, every five minutes) and sends none where the
+    token's user is not in the group, so an install that has not been given
+    the group goes on running, unmarked, with one warning in the log. To mark
+    runs, create dagron-ci's user with `groups: ["ci:trigger"]`.
+  - **Every compiled workflow is tagged `ci`,** beside its author's own tags
+    (`dagron_ci::pipeline::compile::CI_TAG`). `dagron-ci compile` prints two
+    more lines.
+  - **`GET /api/workflows?include=ci`** lists, after the stored workflows, the
+    pipelines CI compiled: a read-only row for each repository and pipeline
+    name (`source: "ci"`), with the usual run digest. Two repositories may
+    each have a pipeline of one name, so a row's runs are its name's and its
+    repository's (`?name=&repo=`). The list without it is unchanged.
+  - **Console.** Runs has a CI trigger filter and badge, and takes `?trigger=`
+    and `?name=` from its address. A run's page shows the repository, the pull
+    request or ref, and the commit it was for. Workflows has a CI filter, and
+    lists a compiled pipeline as a row that leads to its runs, with nothing to
+    edit, run, pause or delete: it is changed in its repository.
+  - **Not in this change**, and done by a later one in this release ("Every
+    run says what started it", above): a record for the other kinds, a record
+    on SQLite, and `not_triggerer` reading who caused the run. Still
+    derived: an agent's.
+- **dagron-ci: a limit on runs in flight, for a build that sets one.**
+  `dagron_ci::Seams` gains `admission` (`dagron_ci::Admission`), asked before
+  each run a worker submits with the runs dagron-ci submitted that have not
+  ended. The count and a slot for the run (`ci_admissions`, migration 0008)
+  are taken in one transaction, under a table lock on Postgres and SQLite's
+  one writer, so runs asking at once never pass the limit. Recording the run
+  lets its slot go; the reporter seeing it end frees its place. Over the limit
+  the event waits like one behind a full concurrency key: no attempt spent,
+  asked again every 30 s, never failed for it. The open build sets no limit
+  and is unchanged.
+- **dagron-ci: a checkout secret per cell.** `CI_CHECKOUT_TOKEN_SECRETS_DIR`
+  holds one file per cell, named as the cell, the way a Kubernetes Secret with
+  a key per cell mounts. An engine presenting a cell's secret is answered for
+  the runs dagron-ci submitted to that cell alone; a run on another cell is
+  refused with 403. Where cells are tenants, one tenant's engine can no longer
+  mint a checkout credential for another's run. `CI_CHECKOUT_TOKEN_SECRET_FILE`
+  still answers for every cell. Start-up refuses a file for a cell `CI_CELLS`
+  does not name, one secret shared by two cells, and a cell's secret equal to
+  every cell's.
+- **dagron-ci: a run meter, for a build that counts runs.**
+  `dagron_ci::Seams` gains `run_meter` (`dagron_ci::RunMeter`), told each run
+  once dagron-ci has recorded it, and each run's end once the reporter has:
+  its status, or `gone`, and whether any of its jobs started (a job's
+  `attempt` above 0). Recording an end marks it due in the same write
+  (`ci_runs.meter_due_at`, migration 0009, which also keeps `started`), and
+  the reporter tells each due end, again a minute later while the meter
+  refuses it, so no end is lost to a meter that is down. The open build sets
+  none and marks nothing due.
+- **`dagron-ci`, the start of CI on dagron: intake.** A new sidecar crate
+  (`crates/dagron-ci`, binary `dagron-ci`) receives forge events and queues
+  them for pipelines that run as ordinary dagron runs. The engine learns
+  nothing about CI. This entry is its intake; the entries below run what it
+  queues and post how it went.
+  - `POST /hooks/github` checks `X-Hub-Signature-256` over the raw body, in
+    constant time, before it parses anything. It dedupes on
+    `X-GitHub-Delivery` in the same transaction as the event, so a redelivery
+    or a replayed capture never queues a second event. It queues pushes,
+    tags, deletions, pull requests (opened, updated, reopened, closed) and
+    merge-queue groups, and answers 202.
+  - Each event carries a trust class decided from fields GitHub vouches for.
+    A pull request is trusted only when its head is a branch of the
+    repository itself and its author is an owner, member or collaborator. A
+    fork's, or anyone else's, is untrusted.
+  - Each event also carries a commit-level key, so a webhook and a later poll
+    of the same commit will make one run.
+  - It keeps its own `dagron_ci` schema on SQLite or Postgres. On Postgres it
+    uses a schema of its own, migration history included, so it can share
+    dagron-api's database.
+  - `/healthz`, `/readyz` and `/metrics`: deliveries by outcome, queue depth,
+    age of the oldest pending event.
+  - `dagron-ci repo add|list|rm` connects the repositories it serves.
+
+  Tests run on both databases: the receiver's contract (a replay writes
+  nothing, a bad signature gets 401 and writes nothing, an unconnected
+  repository gets 404) and each trust rule. Eight replicas starting together
+  each create the schema and migrate. Without the guard for that race the test
+  fails in most runs.
 - **`docs/UPGRADING.md` — how to upgrade, and what each release asks first.**
   The README's upgrade note covered only 0.8.x, so moving to 0.10.0 had no
   guide at all, though it asks for a ServiceAccount allow-list, `secrets`
@@ -17,6 +2367,1539 @@ All notable changes to this project are documented here. The format is based on
   migrations each starting version runs, the one mixed-version hazard
   (`defer:`), and how to roll back. `HARDENING.md` joins the mirror so its link
   resolves.
+- **dagron-ci runs what it queues: event workers.** Each replica runs
+  `CI_EVENT_WORKERS` workers (8) once `CI_CELLS` names the dagron-api to run
+  on and `CI_API_TOKEN_FILE` holds a token for it.
+  - A worker claims the oldest due event under a lease (`FOR UPDATE SKIP
+    LOCKED` on Postgres, so replicas share the queue). A trusted event runs
+    the workflow bound to its repository, stored in dagron-api, through
+    `POST /api/workflows/{id}/run`, with the event as parameters (`ci_sha`,
+    `ci_ref`, `ci_event`, `ci_pr`, `ci_group`, …).
+  - What cannot run is skipped, with the reason: a pull request from a fork
+    or a non-member (`CI_FORK_PRS=refuse`, the only value until the untrusted
+    floor exists), a deleted ref, a closed pull request, a repository with no
+    workflow bound. What dagron-api refuses fails, with its answer. An
+    unreachable or busy dagron-api is retried with backoff (5 s doubling to
+    10 min) until `CI_EVENT_MAX_ATTEMPTS` (8).
+  - Nothing is lost and nothing runs twice. A worker that stops mid-event
+    loses nothing: its lease lapses (`CI_EVENT_LEASE_SECS`, 60) and the next
+    claim takes the event over. Each run is submitted under an
+    `Idempotency-Key` derived from the event's commit key and the workflow,
+    and recorded in `ci_runs`. A second event for the same commit finds the
+    record and submits nothing. A worker that died between submitting and
+    recording gets the same run back.
+  - `dagron-ci repo add … --workflow ID [--cell NAME]` binds a repository;
+    `dagron-ci repo set` changes it; `dagron-ci events [--state S]` lists
+    what became of each event. `/metrics` adds the worker count and events
+    finished by outcome.
+  - The bound workflow is what runs for a commit without pipelines
+    (`.dagron/ci`, below). With its `notify.git` (`sha: "{{ ci_sha }}"`), a
+    push shows on its commit as `pending`, then its result.
+  - Tested on both databases (the claim, the lease takeover, the fenced
+    finish, retries), against a stub dagron-api (every answer it can give),
+    and through the shipped binary: a signed push runs the workflow once, a
+    replay and a second event for the commit run nothing more, and SIGTERM
+    stops the server and its workers cleanly.
+- **dagron-ci polls for what a webhook missed.** Each repository is swept
+  every `CI_POLL_SECS` (300; `dagron-ci repo set … --poll-secs N` gives it
+  its own interval, `0` never polls it), and what changed since its last
+  sweep is queued, as a webhook would have queued it. No inbound path is
+  needed, so the sweep also serves a forge that cannot reach dagron-ci.
+  - Branches and tags come from git's own ref listing over HTTPS, the request
+    `git ls-remote --heads --tags` makes. dagron-ci speaks the protocol itself
+    (v2, or v0 from an older server), so it needs no git binary, a token never
+    reaches a command line, and any forge that serves git over HTTPS works.
+  - On GitHub, open pull requests come from the API, under a conditional
+    request while they fit on one page: an unchanged list answers 304, which
+    the rate limit does not count. Their trust is decided as for a webhook's.
+    A spent rate limit holds the repository's next sweep until it resets.
+  - A moved branch queues a `push`, a moved tag a `tag`, a ref gone a
+    `delete`, and a pull request opened or pushed to a `pull_request`. The
+    first sweep of a repository records what it finds and queues nothing, so
+    connecting one does not run every branch it has.
+  - A polled event carries the commit key a webhook's would, so a commit both
+    doors see runs once. Tested end to end on both databases, webhook first
+    and poll first, against a stub forge and a stub dagron-api.
+  - Replicas share the sweeps (`FOR UPDATE SKIP LOCKED` on Postgres). A sweep
+    commits its events and what it saw in one transaction, fenced on its
+    claim. `dagron-ci repo list` shows when each repository was last polled
+    and why a sweep failed; `/metrics` adds sweeps by outcome and the events
+    they queued.
+  - `CI_GITHUB_TOKEN_FILE` reads private github.com repositories and is sent
+    to no other host. Repositories elsewhere are polled without credentials
+    until per-repository credentials exist.
+- **dagron-ci's run API: `POST /ci/v1/runs`.** A developer, a script or a
+  release job asks for a run instead of pushing for one:
+  `{"repo": "github.com/acme/widgets", "ref": "refs/heads/main", "inputs": {…}}`
+  queues a `dispatch` of the repository's bound workflow, which runs with
+  `ci_event=dispatch` and the inputs as parameters. `sha` pins the commit;
+  without it, the ref is read from the forge and its commit pinned.
+  `GET /ci/v1/runs/{id}` reads any event back, with the engine run it
+  submitted.
+  - dagron-ci keeps no users. The caller's dagron-api session or API token
+    goes to the dagron-api of the repository's cell, the one its runs go to,
+    which says who the caller is (`GET /api/me`). A viewer may read and run
+    nothing; anyone else may run. The credential is never stored, and a
+    caller dagron-api has not identified learns nothing about a repository.
+  - An `Idempotency-Key`, scoped to the caller, makes a repeat answer with the
+    first request's run, even after the branch moved; the same key with
+    another request is a 409. Without a key, every request is a new run.
+  - A caller whose subject is `agent:<name>` is recorded with the `agent`
+    trust class, and its runs are refused until that class has its floor.
+  - Tested on both databases (who may call, every refusal, the key's
+    replays and conflicts, ref resolution, the workers running a dispatch
+    with its inputs), and through the shipped binary.
+- **dagron-ci-exec, the step runner (`crates/dagron-ci-exec`).** A static
+  binary (musl; x86_64 and arm64; under 1 MB, nothing needed at run time but
+  `sh`) that runs a compiled task's steps. dagron-ci hands steps over as
+  environment variables, step protocol 1 (`CI_STEP_PROTOCOL`,
+  `CI_STEP_COUNT`, `CI_STEP_<n>_{RUN,NAME,TIMEOUT_SECS,CONTINUE_ON_ERROR,ENV_*}`),
+  and the compiled command hands them to `dagron-ci-exec` where the image has
+  one that answers `--speaks 1` (at `/dagron/bin/dagron-ci-exec`, or on
+  `PATH`), and runs them itself, the POSIX `sh` script it carried, where it
+  does not. A conformance test runs compiled tasks both ways and holds them to
+  the same stdout, stderr and exit code.
+  - Each step runs as `sh -ec` in its own process group, with stdin closed.
+    A timeout sends SIGTERM, then SIGKILL after `CI_STEP_GRACE_SECS` (10),
+    with `timeout(1)`'s codes (124; 137 when killed), in images without
+    `timeout(1)` as well.
+  - A cancelled task's SIGTERM, SIGINT, SIGHUP or SIGQUIT reaches the
+    running step; no further step starts; the task exits 128 plus the signal.
+  - On Linux it is a child subreaper: what a step leaves running lives on
+    through the later steps and is killed when the task ends, so a leftover
+    no longer holds the task's output open. A step's shell dies with a runner
+    killed outright (parent-death signal).
+  - Each step's outcome, as GitHub reports one (`outcome` and `conclusion`),
+    is logged as the last line, `::dagron-ci::result::{…}`, and written to
+    `CI_RESULT_FILE` when set. Its own failures exit 125.
+  - `dagron-ci-exec install DIR` copies it into a volume, what an init
+    container will run from an image that holds nothing else.
+  - Release assets carry it for both Linux musl targets, smoke-tested on
+    native runners; CI checks the build stays static.
+  - The validator refuses a task of more than 1000 steps, or whose steps
+    carry more than 512 KiB of scripts and variables: they travel in the
+    task's environment, which the kernel caps for an exec and Kubernetes
+    for a pod, so such a task would fail to start, late and obscurely.
+- **Step markers go to stderr.** Before, the step script printed them to
+  stdout, so a task with `steps:` could not feed `with_output_of` or a
+  `when:` that reads its output: the markers were in it. Now a task's output
+  is its steps' stdout, on the local executor. (The Docker and Kubernetes
+  executors still store stderr in a task's output.)
+- **A task's workspace: `workspace:`.** A directory a task starts in, empty
+  at the start of each attempt and removed after it, for the files a task's
+  later commands read: a build's `target/`, a download it unpacks. On
+  Kubernetes an `emptyDir` at `/workspace`, with `size` (`20Gi`) as its
+  `sizeLimit`, or, from `DAGRON_WORKSPACE_PVC_FROM` up, a generic ephemeral
+  volume of that size (`DAGRON_WORKSPACE_STORAGE_CLASS`). On Docker an
+  anonymous volume at `/workspace`, removed with its container on every path,
+  the predecessor reap and the fleet sweep included. Locally a new temporary
+  directory, removed after the attempt even where a Go module cache made it
+  read-only. Where the operator chose where tasks work (`DAGRON_DOCKER_WORKDIR`,
+  a mount at `/workspace`, the new `DAGRON_LOCAL_WORKDIR`), a workspace task
+  works there instead. Command tasks only; a size is checked at validation.
+- **`dagron-ci-exec` in every workspace task, from an init container.** With
+  `DAGRON_CI_EXEC_IMAGE` set, the Kubernetes and Docker executors start each
+  task that has a workspace with an init container from that image, which
+  runs `dagron-ci-exec install /dagron/bin` into a volume of its own; the task
+  mounts it read-only at `/dagron/bin`, where a compiled dagron-ci task looks
+  first, so the step runner is in every image whatever the image is. On
+  Kubernetes the init container is held to the task's hardening and asks for
+  its cpu and memory, which costs the pod nothing; one that fails fails the
+  task in its own words. On Docker the image is pulled at startup, and one
+  that cannot be had stops the engine. The new `dagron-ci-exec` image (the
+  static binary on scratch, uid 65532) is published with the others.
+  - dagron-ci gives every task with `steps:` a workspace unless it sets its
+    own (`{ size: … }`, or `null` for none); a pipeline's `workspace:` is now
+    dagron's key rather than a reserved one, and `workspace.cache` is refused
+    until workspace caches exist. `dagron-ci run` keeps every task in the
+    working tree, as before.
+  - Tested on a real Docker daemon (the volume, the read-only tools, a failed
+    install, nothing left behind), with the real static binary from a scratch
+    image under a compiled pipeline, and against a real apiserver, which
+    admits each pod shape in a dry run.
+- **dagron-ci posts commit statuses itself.** One per job, under
+  `dagron-ci/<pipeline>/<job> (<event>)`, so a later run of a pipeline on the
+  same kind of event updates the same checks and a push and a pull request on
+  one commit keep their own (a merge group reports under its pull requests'
+  names, which is what a merge queue waits for): `pending` while a job waits,
+  awaits approval or runs, then `success`, `failure`, or `error` for a
+  cancelled job (GitHub's statuses have no cancelled) and for one the run left
+  unfinished. A skipped job stays pending until the run ends, then passes only
+  if the run did, since dagron skips a job whose upstream failed as it skips
+  one whose `when:` is false. Each replica's reporter claims a recorded run as
+  a worker claims an event, reads its jobs from dagron-api's graph (no
+  outputs), and posts only what changed; a refusal is recorded once and not
+  retried, GitHub's rate limit is waited out, and other failures are retried
+  in 30 s. `CI_RUN_URL` links each status to the run's page;
+  `dagron_ci_commit_statuses_total` counts them. Statuses go to github.com
+  repositories with `CI_GITHUB_TOKEN_FILE`'s token, which needs
+  `statuses: write`. Tested on both databases against stubs of dagron-api and
+  GitHub, and through the shipped binary.
+- **A workspace can start with a commit: `workspace.checkout`.**
+  `checkout: { repository, commit }` on a task's `workspace:` fetches that one
+  commit by its id (depth 1, no tags) into the workspace before the task runs,
+  and checks it out detached, so a branch that moved on changes nothing. Both
+  may name the run's parameters (`{{ ci_sha }}`) and are checked once those
+  are filled in: an `https://` repository (`http://` only for one fetched
+  without a credential), with no user, query or `..` in it, and a full commit
+  id. On Kubernetes an init container from the new `DAGRON_CHECKOUT_IMAGE`
+  (any image with `git` and `sh`) fetches it, after the one that installs
+  `dagron-ci-exec`; on Docker a container from that image fetches it into the
+  task's workspace volume before the task starts; locally, the engine's own
+  `git`. A fetch that fails fails the attempt with git's words, and a Docker
+  or Kubernetes engine without `DAGRON_CHECKOUT_IMAGE` refuses such a task
+  rather than run it without its code. Git in the task works on the checkout
+  as it is: the task's environment marks the workspace a safe directory.
+  - **A credential for each attempt.** With `DAGRON_CHECKOUT_TOKEN_URL` and
+    `DAGRON_CHECKOUT_TOKEN_SECRET_FILE`, the engine asks that service for a
+    credential before each attempt with a checkout, and tells it to revoke
+    the credential once the attempt is over. The credential reaches git as an
+    HTTP header in git's environment, never the task's environment, the
+    repository's config or a URL. On Kubernetes it goes in the task's Secret,
+    which only the checkout's init container reads. It is redacted from the
+    task's log, and sent over `https://` only (or to the engine's own
+    machine). The fetch that carries it follows no redirect, since git sends
+    the header on to wherever a redirect moved the fetch: a repository that
+    answers with one fails its checkout instead.
+  - Tested against a git smart-HTTP server that asks for basic auth: locally
+    (the credential reaches the server, and neither the task nor
+    `.git/config`), on a real Docker daemon (a task image that runs as
+    non-root included), and on k3s (below).
+- **dagron-ci: each job starts with its commit, and a token for that attempt
+  alone.** The compiler gives every workspace a checkout of the event's
+  repository at its commit (`https://{{ ci_forge_host }}/{{ ci_repo }}.git` at
+  `{{ ci_sha }}`) unless the pipeline's `workspace:` says `checkout: false`.
+  `dagron-ci run` gives none, since its tasks work in the working tree.
+  `POST /ci/v1/checkout-tokens` is the token service an engine asks. It
+  answers an engine holding `CI_CHECKOUT_TOKEN_SECRET_FILE`'s secret, and only
+  for a run dagron-ci submitted that is not over, that run's own repository
+  and its own commit, so the secret cannot be spent on anything else. A run
+  is over once the reporter, which follows every run to its end whether or
+  not its commit takes statuses, has seen it end; a run dagron-api no longer
+  has is over too (`gone`). It mints an installation token of the GitHub App
+  named by `CI_GITHUB_APP_ID` and `CI_GITHUB_APP_KEY_FILE`, for that one
+  repository with `contents: read`, and `DELETE` revokes it. Without an App,
+  or for a repository the App does not cover, it answers 204 and the commit is
+  fetched without a credential, which is all a public repository needs.
+  `dagron_ci_checkout_tokens_total{outcome}` counts the requests. Tested
+  through the router against a stub GitHub that checks the App's RS256 token
+  and the scope it asks for (each refusal, the mint, the revoke, GitHub
+  failing), and the run lookup on both databases.
+- **Workspace tasks run on a real Kubernetes in CI.** The new `kubernetes`
+  job runs `crates/dagron-executor/tests/k3s.sh`: k3s in Docker, the
+  `dagron-ci-exec` image built from its Dockerfile and loaded into it, and
+  `tests/kube_workspace.rs` against it. Steps share a workspace with the
+  binary installed beside them; an install that fails fails its task in the
+  installer's words; a workspace past its size is evicted and its task says
+  so; a large workspace is a volume claim of its own; and a workspace starts
+  with its checkout, fetched by an init container from a git server on the
+  runner, or fails in git's words. Where the kernel refuses a negative
+  `oom_score_adj` (some sandboxed hosts), the script restricts containerd's,
+  without which no pod starts there.
+- **`dagron-ci run`: a checkout's pipelines, on this machine.** The run a
+  push would start, here and now. The event is read from the checkout: a push
+  of the branch HEAD is on, at HEAD, for `origin`'s repository, with
+  `compile`'s flags to change any of it. Each pipeline compiles as the event
+  workers compile it, and each one that runs goes to a `dagron` engine started
+  for it alone: a one-shot run on a SQLite file of its own. dagron-ci drives
+  the engine binary (`--engine`, else beside `dagron-ci`, else on `PATH`)
+  rather than linking it, and reads the database it writes.
+  - On Docker, the default, each task runs in its image, pulled first if it
+    is not here, with the working tree mounted read-write at the path it has
+    on the host, as its working directory, and a `dagron-ci-exec` found
+    beside `dagron-ci` mounted at `/dagron/bin`. With `--executor local`,
+    each task is a process in the working tree, with dagron-ci-exec first on
+    its `PATH`.
+  - A paths filter reads the files the working tree changed since it parted
+    from its upstream (or `--base-ref`, or `--base-sha`), committed or not,
+    untracked files included. A branch with nothing to compare with lets the
+    pipeline run, and says so.
+  - The engine runs without its own settings: every name `dagron config`
+    lists, and every `DAGRON_` variable, is removed from its environment, so
+    a shell's `API_ADDR`, `RUNNER_CLASSES`, `DAGRON_CONFIG`, `GITHUB_TOKEN` or
+    `DAGRON_INSTALLATION` can neither keep a run from ending nor reach past
+    it.
+  - Each task's log is printed as it comes, split by step. It exits 0 when
+    every pipeline that ran succeeded, 3 when none runs, 1 when one failed or
+    the engine refused it (with the engine's reason), and keeps a failed
+    run's workflow, database and engine log. ctrl-c stops the engine and
+    every task it runs, removes the run's containers, and exits 130.
+  - Tested through the binaries on a real engine: a run on each executor,
+    a failure, a skip, a paths filter against an upstream, a workflow the
+    engine refuses, the settings kept out, and ctrl-c leaving no step,
+    engine or container behind.
+- **The Docker executor gives every task the operator's mounts.**
+  `DAGRON_DOCKER_MOUNTS` (`SOURCE:TARGET[:ro|rw]`, comma separated: an
+  absolute host path, bound as it is, or a volume's name) and
+  `DAGRON_DOCKER_WORKDIR` (where each task container starts). They are the
+  engine's settings, never a workflow's, since a workflow that could name a
+  host path could read the host, and a bad one is a startup error, since
+  every task gets them. `dagron-ci run` sets both to put the working tree into
+  every task.
+- **A dispatch may name the one pipeline it runs.** `POST /ci/v1/runs` takes
+  `pipeline`, a file in `.dagron/ci` (`deploy` or `deploy.yaml`); without it,
+  every pipeline whose `on:` takes `dispatch` runs. A name the commit does
+  not hold, or a pipeline that does not take `dispatch`, fails the event, and
+  the bound workflow never runs in its place. The name is part of the
+  request an `Idempotency-Key` repeats, and `GET /ci/v1/runs/{id}` shows it.
+- **dagron-ci runs a repository's own pipelines.** For each trusted event, a
+  worker reads `.dagron/ci/*.yaml` at the event's commit, decides each
+  pipeline's `on:`, and submits each that runs as its own dagron run
+  (`POST /api/runs`), compiled. A commit without pipelines runs the workflow
+  bound to the repository, as before.
+  - Pipelines are read through GitHub's contents API (github.com,
+    `*.ghe.com`, Enterprise Server). A repository on another forge runs its
+    bound workflow until dagron-ci reads that forge's files.
+  - A paths filter is decided with the files the event changed, asked of
+    GitHub's compare API once per event and only when a pipeline needs them.
+    A pull request is compared with its base; a push with where its branch
+    was (a webhook's `before`, or what the last poll saw), so pushes now
+    carry `ci_base_sha`. When the files cannot be listed (a new branch, a
+    change past GitHub's 300 files), the pipeline runs, and the event says
+    why.
+  - Events carry the branch a pull request or merge group merges into, so
+    `on.pull_request.branches` and `on.merge_group.branches` decide.
+  - One run per pipeline per commit: each run's `Idempotency-Key` derives
+    from the commit key and the pipeline's path, so a webhook and a poll of
+    one commit still run each pipeline once.
+  - An event whose run's concurrency key is full waits (dagron-api's 429)
+    and asks again every 30 s without spending an attempt, as it does for a
+    forge's spent rate limit; `dagron_ci_events_finished_total` counts these
+    `waited`. A pipeline that cannot run fails the event once every other has
+    run; one dagron-api cannot take now retries it first.
+  - A compiled `concurrency_key` is prefixed with the repository, and a
+    `max_active_runs` set alone gets the repository as its key: dagron counts
+    a cap per workflow name and key, so two repositories' pipelines called
+    `ci` on one cell would otherwise wait on each other. `concurrency:` beside
+    a `max_active_runs` under 1 is refused, as dagron would refuse it.
+  - `GET /ci/v1/runs/{id}` lists every engine run an event submitted
+    (`engine_runs`, each with its pipeline) in place of `engine_run`.
+  - `CI_GITHUB_API_URL` reaches github.com's API through a proxy or a cache.
+  - Tested on both databases, and through the shipped binary against a stub
+    GitHub: a pushed commit's pipeline reaches dagron-api compiled.
+- **dagron-ci compiles pipelines: `dagron-ci compile`.** A pipeline and an
+  event in; out, the dagron workflow a run submits and its parameters, or why
+  the pipeline does not run. A pure function: the same inputs give the same
+  bytes, and a golden file pins them.
+  - `on:` decides by event kind, then branch, tag or base branch, then the
+    files the event changed. A paths filter never guesses: without the
+    changed files, `compile` asks for them.
+  - Event data reaches tasks as `CI_*` variables, which dagron fills in from
+    the run's parameters; the workflow itself holds no event text and is the
+    same for every event that runs it. Tested through dagron's own expander:
+    a branch named `x;rm -rf /$(curl evil)` ends up in `CI_REF` and in no
+    command.
+  - A task's `steps:` become one POSIX `sh` script, the compiler's alone,
+    running each step in its own `sh -e`, its script, name and `env:` passed
+    as variables. A failing step ends the task unless `continue_on_error`;
+    `timeout_secs` is kept by `timeout(1)` where the image has one; step
+    markers split the log. The script is tested under a real `sh`.
+  - Every task gets a timeout (`task_defaults.timeout_secs`, else the new
+    `CI_DEFAULT_TIMEOUT_SECS`, 3600). `concurrency.key` becomes
+    `concurrency_key` with `max_active_runs: 1`. A dispatch's inputs are taken
+    only when declared, required ones must be sent, defaults fill the rest.
+  - `dagron-ci compile FILE --event … --ref …` prints the workflow, or with
+    `--json` the body `POST /api/runs` takes; it exits 3 when the pipeline
+    does not run. The validator now also refuses `cancel_superseded: true`
+    (the engine cannot cancel the older run yet), `steps:` beside a template
+    or an approval, `CI_` names in dagron's own `env:` lists, `ci_` pipeline
+    parameters, and `tasks.X.output` outside `when:`, where dagron reads it.
+- **dagron-ci reads pipelines: `.dagron/ci/*.yaml` and `dagron-ci validate`.**
+  A pipeline is a dagron workflow with `on:` (which events run it: `push`,
+  branches and tags, `pull_request`, `merge_group`, `dispatch`, each with
+  branch, tag and path globs) and `steps:` (commands run in order inside a
+  task), and `concurrency:` for dagron's `concurrency_key`.
+  - `dagron-ci validate [FILE|DIR]…` (`.dagron/ci` by default) needs no
+    database: it prints `ok`, or every problem with where it is, and exits 1.
+    `dagron-ci schema` prints the format's JSON Schema (draft 2020-12) for
+    editors.
+  - dagron's own keys pass through as written. A key that is neither
+    dagron's nor the pipeline's is refused, with the nearest known key, since
+    dagron would drop it without a word; a test reads dagron-core's own
+    structs so the list cannot fall behind.
+  - A command names nothing an outsider chose: a `{{ … }}` in a `run:`, a
+    `command:` or a `when:` may name only values dagron-ci or the pipeline
+    decides (`ci_sha`, `ci_event`, the pipeline's parameters, a matrix's
+    `item`, …). A branch name is refused there, and read as `$CI_REF`
+    instead.
+- **`POST /api/workflows/{id}/run` takes an `Idempotency-Key`**, as
+  `POST /api/runs` does: a repeat with the same workflow and parameters
+  answers `200` with the first run, and the same key with other parameters is
+  a `409`. dagron-ci's workers run workflows through it.
+- **`notify.git` posts `pending` when a run starts.** A run created with a
+  `notify.git` block is stamped (`workflow_runs.start_pending_at`), and the
+  next tick of an engine holding a forge token posts `pending`, so the check
+  shows on the commit from the moment the run exists. That covers runs
+  submitted through dagron-api, which holds no forge token. A run that ends
+  before any tick announces it gets its terminal status alone. If the run ends
+  while the `pending` post is in flight, the engine posts the end again, so
+  the check always finishes on the run's result. The `pending` check reads
+  "dagron run in progress", whatever `description:` says, since a run that has
+  just started has produced nothing.
+- **Runs keep the parameters they were created with** (`workflow_runs.parameters`):
+  the spec's defaults with the caller's overrides merged over them, exactly
+  what the tasks were expanded with. `notify.git`, `notify.webhook` and
+  `notify.slack` resolve their templates against them when the run ends. The
+  README promised that `sha: "{{ commit_sha }}"` picks up the SHA a CI caller
+  submits. It did not: the end resolved against the stored YAML, whose
+  `parameters:` block holds only defaults, so the SHA came out empty and the
+  status was skipped. Runs created before this change resolve against their
+  defaults, as before.
+
+### Changed
+- **On Postgres a task's end wakes its run, whoever ends it.** The skips of an advance after a failure, a fan-out's
+  barrier, the time, HTTP and dataset sensors, an external job's end and a
+  sub-workflow's trigger sent no notification, so such a run was ended by
+  the reap's slice, up to `REAP_INTERVAL_MS` (5 s) for each 500 running
+  runs late, and counted in `scheduler_runs_reaped_by_sweep_total`. A
+  trigger on `task_runs` (migration `migrations_pg/107`) now sends the run
+  on `task_events` when a task ends, is made ended, or is taken away not
+  ended, in the transaction of the change: through the binary, such runs
+  ended 11 to 16 ms after their last task, where they ended 4.2 to 5.3 s
+  after it, and the slice's count stayed 0. Postgres folds a transaction's
+  equal notifications into one, so a cancel of 10,000 tasks is one
+  notification, 18 ms dearer (1.8 µs a task); an end whose function also
+  notifies after its commit (a `repeat:` sub-workflow failed) is heard
+  twice, in one tick.
+- **SQLite's count of active runs, the run cap and supersede read the
+  running runs alone.** The `MAX_INFLIGHT_RUNS`
+  gate of each `POST /runs`, the count of a capped workflow's runs at each
+  run it makes, and supersede's read of the runs a new one takes the place
+  of each scanned every run kept on OSS: 70 to 73 ms at a million runs.
+  Migration 080 makes a partial index of the running runs by their
+  concurrency key: 0.13 to 0.98 ms at every size, and on an enterprise
+  build the cap and supersede of a key read only its runs. The drift mark and the running
+  runs listed read it too. It moves none of the plans 078 and 079 made.
+- **dagron-api's live stream on SQLite reads what changed, not every run.** Every `DAGRON_SQLITE_POLL_MS` (500 ms) it read
+  each run not finished or finished in the last 30 s with its tasks, on its
+  one connection: 85 ms at a million runs kept. Now the file's triggers
+  (migration 081) write each run a change touched to `run_changes`, with a
+  sequence, and the stream reads past a cursor of its own: 0.5 to 0.8 ms
+  at every size. It sends what it sent but in three cases: a change undone
+  between two polls, and one to a run finished more than 30 s ago, are
+  each sent now; a finished task taken away from a live run is no longer
+  a change on its own (another change follows it in practice). It writes
+  nothing, so two dagron-api processes on one file each see every change;
+  the file keeps the last 65,536 changes, and a stream at its start,
+  further behind, or past the file's newest change (the file put back from
+  an older copy), reads every live run once, as before. The triggers
+  cost a cancel of 10,000 tasks 8 to 17 ms. **Upgrade note:** 080 builds
+  an index at start-up, 71 ms at a million runs; 081 scans nothing.
+- **SQLite's run sweeps, its reap and its live counts read indexes of
+  their own.** On an enterprise build's SQLite file the deadline,
+  alert, stopped-run, admission, start and completion sweeps read its
+  `(status, created_at)` index, so each pass read every running run, and
+  the completion sweep, every tick, every finished one: 235 ms a tick at a
+  million runs kept. They now read the partial indexes made for them, led
+  by `status` (migration 078); the completion sweep 0.4 ms. Each tick of
+  a SQLite engine joined every running run to its tasks, so on OSS its
+  cost grew with every run ever kept: 165 ms at a million runs, on the one
+  connection the API and the workers wait for. Now triggers on the file
+  (migration 079) record each run a change may have ended, whoever made
+  the change, dagron-api included, in `run_wakes`; a tick looks at those
+  runs alone, 0.3 ms when there are none, and a slice of the running runs
+  each `REAP_INTERVAL_MS` is the net under them, as on Postgres.
+  `REAP_INTERVAL_MS=0` walks every slice each tick, which is dearer than
+  the join was on a small file and on an enterprise build. The live run count, the recent
+  unfinished runs and dagron-api's `/api/health` read a partial index of
+  the live runs: 0.14 to 0.72 ms at a million runs, where they scanned
+  every run (74 to 75 ms). `scheduler_runs_reaped_by_sweep_total` now
+  counts on SQLite too: a run that ended with no wake written, the case
+  to alert on, and now and then one whose wake came between a take and
+  the slice. **Upgrade note:** 078 and 079 rebuild six indexes and
+  build two, at start-up, about one scan of `workflow_runs` each (0.55 s
+  together at a million runs); on a large file, start the engine before
+  dagron-api. Run no `ANALYZE` on the file
+  ([docs/ONE_NODE.md](docs/ONE_NODE.md)).
+- **dagron-ci reads a repository's forge files in compat mode alone.** A
+  repository has a mode now (below): a GitHub workflow file or a
+  `.gitlab-ci.yml` its `.dagron/ci.yaml` names is run where the repository is
+  in `compat` mode, as well as where `CI_GITHUB_WORKFLOWS` or
+  `CI_GITLAB_PIPELINES` is on. Every repository connected before this is in
+  `compat`, and runs as it did; **one connected after it is `native` unless
+  it is connected with `--mode compat`** (`"mode": "compat"`).
+- **A merge-queue group is its ref and its head.** A group let go of has the
+  runs and waiting events of that ref at that commit cancelled, and no
+  others: a GitLab train's ref names each pipeline the train makes of its
+  merge request.
+- **The maintenance sweeps run once an installation a window, each at an
+  interval of its own.** Every engine ran every
+  sweep: lease recovery, run deadlines and soft deadlines, approval
+  timeouts, the runs that wait for their cap, the time, HTTP and dataset
+  sensors, sub-workflows, fan-outs, dataset triggers and the slow reap of
+  running runs. Each ran once each sweep interval (`SWEEP_INTERVAL_MS`, by
+  default the poll interval), the last two every 5 s; with N engines each
+  sweep ran N times an interval, and a due row could be read by more than
+  one of them. Now each sweep runs once its own interval has passed
+  (`SWEEP_INTERVALS`; every default is the cadence it had), and on Postgres
+  the installation's sweeps are run by one engine a window: a tick asks, in
+  one statement on the database's clock, for the slots (`sweep_slots`) of
+  those due but the reap, which asks for its own in a second statement at
+  the tick's end; it runs those it took, and the rest wait a whole interval.
+  A slot is taken for nine tenths of the interval, a pass that read a full
+  batch hands it back, and the first tick after a start runs every sweep. A
+  claim also takes a slot whose `due_at` is later than the claim's own
+  window would end (the database's clock as the row is locked, plus nine
+  tenths of the interval), which no engine of the same interval can have
+  set: so a step back of the database's clock, which leaves every slot due
+  that much later, does not stop the sweeps until the clock catches up. The
+  sweeps of an engine's own state (its leftover workloads, its stops, its
+  teardowns, its quota summary and gang check) stay on every engine, and so
+  do those that claim each row before a remote call: the HTTP sensors, and
+  the polls and cancels of `defer:` jobs. So the HTTP sensors' read is not
+  shared, and a due one may be read by more than one engine (about 1.4 times
+  with three, as before); only its GET is made once (below). Schedules and
+  cron stay on the leadership lease. With three engines the average wait
+  before a shared sweep picks up a due row grows from about a quarter of the
+  interval to about half. The worst case was not measured, and by the code
+  it is longer: a slot is held for nine tenths of an interval, and an engine
+  that finds it taken waits a whole interval, so a holder that stalls after
+  its claim delays that sweep by up to nearly two intervals, where before
+  the other engines' passes covered it. **`SWEEP_SHARE=off` restores every
+  engine running every sweep.** The slow reap of running runs is walked once
+  an installation, from where the engine before left off. The reasons for
+  slots over run-id sharding and the leader's lease are in
+  [docs/HA.md](docs/HA.md) §2.
+- **A `wait.url` sensor is polled once per due time, where each engine
+  could poll it.**
+  A due HTTP sensor is claimed before its GET, as a deferred job's poll is,
+  for `WAIT_POLL_SECS` or 11 s, whichever is more (longer than the GET's
+  timeout); an engine that dies mid-GET leaves the sensor due again when the
+  claim lapses, up to 15 s later by default. Each engine still reads the
+  sensors that are due and claims each one it read, and the claim is a
+  write: with three engines on one machine, the sensors' read, claim and
+  repark cost Postgres 12.1 ms a second, where their read and repark had
+  cost 10.8, while their GETs fell by a quarter.
+  The sweeps' reads take only what is due: a fan-out barrier whose
+  instances still run, a trigger whose child has not ended, and a sensor
+  not yet due are left out of what a sweep takes, though the database
+  still looks at the parked barriers, triggers and dataset sensors to
+  leave them out. The time and dataset sensors, fan-outs and sub-workflows
+  are read 256 at a time.
+- **The terminal-status gauges on `/metrics` can be 5 minutes old, and
+  more.** The engine's datastore gauges are cached in two tiers: what has
+  not finished (runs `pending` and `running`, those of the last 24 hours
+  by workflow and environment included, tasks still to end, the queue, the
+  dead letters, the waits) for `METRICS_CACHE_SECS` as before, and the
+  history, `scheduler_runs` and `scheduler_tasks` of the finished statuses
+  and the runs of the last 24 hours that have finished, for
+  `METRICS_HISTORY_CACHE_SECS` (300 s): they grow with every run, and
+  reading them was most of what a scrape cost. A scrape that finds the
+  history stale is served the last one at once, and the history is read
+  again behind it, so no scrape waits for it once a read of it has
+  succeeded: the first after a start does, and each after a first read
+  that failed or was given up. A scrape that times out while it waits
+  leaves the read to go on and be cached for the next. So the history can
+  be as old as its TTL, plus the time until the scrape that finds it
+  stale, plus the read, and older while reads of it fail: the last is
+  served until one succeeds
+  (`scheduler_metrics_history_age_seconds` says how old). A sum over every
+  status moves at each refresh.
+  **`METRICS_HISTORY_CACHE_SECS=0` reads the history with every scrape, as
+  before, and so does `METRICS_CACHE_SECS=0` where the history's is not
+  set.** A read that does not return is given up, after 30 s for what has
+  not finished and after the history's TTL or 60 s, whichever is longer,
+  for the history: a scrape that waited for it answers `500`, as for a
+  read that failed. The OTLP export now reads the API's cache instead of a
+  second one of its own, and skips an export whose read has not ended in
+  its interval or 30 s, whichever is longer. dagron-api's
+  `GET /api/metrics`, which ran its counts over the whole run tables on
+  every call of every open Metrics page, is cached the same way
+  (`DAGRON_METRICS_CACHE_SECS`, 2 s; `DAGRON_METRICS_HISTORY_CACHE_SECS`,
+  300 s, or 0 where it is not set and the first is 0), reads the three
+  counts it answers and nothing more, and its answer gains
+  `history_age_secs`.
+- **Fleet mode refuses a fork's job unless its label says otherwise.** A
+  label's runner was started for any job that asked for it. A job of a
+  fork's pull request is now given none, unless the label says
+  `untrusted: floor` or `untrusted: serve`, and telling a fork's job apart
+  needs the App's **Actions: Read**: with an App without it, every job of
+  such a label is taken for a fork's. A label for a repository whose forks
+  are all its own people's says `untrusted: serve` to keep things as they
+  were.
+- **The engine's OIDC request URL is `https://`.** A task sends its request
+  credential to `DAGRON_OIDC_REQUEST_URL` from its own container, and with it
+  a cloud's tokens are had, so the engine no longer starts with a plain
+  `http://` one, nor one that carries a user. An operator whose network may
+  carry it in the clear sets `DAGRON_OIDC_REQUEST_INSECURE=allow`, and the
+  engine warns at start. **An engine set up with an `http://` request URL
+  needs one of the two.**
+- **The engine's `/metrics` DB gauges are cached for 10 seconds**
+  (SCALE_ROADMAP 0.3). `status_counts` ran its aggregate queries on every
+  scrape; the handler now serves the snapshot from a short TTL cache
+  (`db_gauges`), so a fleet of Prometheus pollers costs one DB round-trip
+  per 10 seconds instead of one per scrape. Process counters and pool
+  stats stay live and exact; only the DB gauges may lag by up to the TTL, and each
+  engine caches on its own, so two engines can differ by that much. `METRICS_CACHE_SECS`
+  sets the TTL (default `10`); **`0` reads the datastore on every scrape**, as before,
+  and a failed read is never answered from the cache (`/metrics` still returns `500`).
+  The e2e rig and the load-test harness run with `0`, because they scrape right after
+  they change state. The gauge descriptions in `openapi.yaml`, `docs/METRICS.md`, and
+  the Grafana "Scrape duration" panel no longer say the gauges are read on every scrape.
+- **dagron-ci says when a fleet's replica takes no delivery.** With
+  `CI_GITHUB_FLEET_FILE` set and no `CI_GITHUB_WEBHOOK_SECRET_FILE` it
+  starts as before, and now warns: a job is heard of by its delivery
+  alone, so that replica serves only the jobs another replica takes, and
+  none where no replica has the secret.
+- **On Kubernetes a task is told that its pod has changed, where it
+  asked.** The engine keeps one watch of its task pods, and a task waits
+  on it for its own. Each task asked the API server for its pod twice a
+  second for as long as it ran. A task still asks until the watch has
+  first seen its pod, and whenever the watch is not following the
+  namespace, which it says once in the log. `DAGRON_TASK_POD_WATCH=off`
+  is the executor as it was. The watch needs `list` and `watch` on pods,
+  which the chart's Role has.
+- **The engine looks for ended runs among the runs it was told of.** On
+  Postgres a notification names the run a task changed state in. The
+  reconcile loop keeps those names, and each tick ends the named runs
+  whose tasks are all over, by their keys, where every tick of every
+  replica joined every running run to all its tasks. The rest of what is
+  running is covered by a slow sweep, 500 runs a pass in turn
+  (`REAP_INTERVAL_MS`, 5 s; `0` is the loop as it was), and
+  `scheduler_runs_reaped_by_sweep_total` counts what that ends. A replica
+  that has just started, or whose listener lost its connection, looks at
+  every run once. SQLite is unchanged: nothing notifies there.
+- **A disconnected repository keeps its events and runs.**
+  `dagron-ci repo rm` deleted the repository's row, and its events and
+  runs with it. It now marks the repository disconnected: they stay to be
+  read, the events that waited end `skipped` with the reason, and no
+  checkout credential is minted for the repository. A run already going is
+  not stopped. Connected again, the repository is the one it was, set to
+  what that connect names, and its next sweep runs nothing.
+- **The engine starts on no checkout token service over plain http, unless
+  it is this machine.** `DAGRON_CHECKOUT_TOKEN_URL` as `http://` to another
+  host was taken with a warning. The engine's secret goes there and every
+  credential comes back from there, so the engine now stops at startup and
+  says why. `https://`, or `http://` to `localhost` or a loopback address,
+  is taken as before. **An engine configured so no longer starts:** put TLS
+  before the service, as before a cell's dagron-api. And the engine no
+  longer follows a redirect from the service: a revoke carries the
+  credential in its body, and would have taken it wherever one led.
+- **What is sent to an address of this machine goes by no proxy.** Plain
+  http is taken for an address of the machine itself alone: a cell
+  (`CI_CELLS`), GitHub's API behind a sidecar (`CI_GITHUB_API_URL`), the
+  engine's token service (`DAGRON_CHECKOUT_TOKEN_URL`), a server named to
+  the commands. A proxy named in the environment (`HTTP_PROXY`,
+  `ALL_PROXY`) was still used for such a request, and would have been
+  handed it, with the token or the secret in it, to carry off the machine
+  in the clear. Each client now uses no proxy for a plain-http address. An
+  https request keeps the environment's proxy: it is TLS to its end.
+- **dagron-ci starts on no every-cell checkout secret where it has two
+  cells.** `CI_CHECKOUT_TOKEN_SECRET_FILE`'s secret answers for a run on any
+  cell. With one cell that is the cell's own. With two, an engine of either
+  could ask for the credential of the other's run, so dagron-ci now stops
+  at startup and says why. Each cell takes its own secret, a file in
+  `CI_CHECKOUT_TOKEN_SECRETS_DIR`. The chart refuses the same at render
+  (`ci.checkoutTokenSecret` with more than one cell in `ci.cells`); it
+  mounts the one secret, and not yet a directory of them.
+- **A task's log append no longer notifies, and a tick's appends are made
+  side by side.** On Postgres, each append to a running task's log was a
+  transaction that also notified, so that a browser's tail of the task
+  updates promptly. A transaction that has notified takes one lock for the
+  whole database as it commits, which Postgres keeps its notification queue
+  in order by, and holds it until its commit is flushed. So the appends of
+  every engine were committed one at a time, and whatever else notifies, a
+  task's end or a run's making, waited in the same line. With enough tasks
+  writing at once the line was seconds long, and the reconcile loop of every
+  engine stood in it.
+  - An append is one statement, and notifies nobody. The runs a tick's
+    appends were made to are told of afterwards, each once, in one
+    statement: a tail is told as soon as it was, and the lock is taken once
+    a tick where it was taken once an append.
+  - The appends of one tick are made up to four at a time, and with no more
+    than half of the pool's connections (`DB_MAX_CONNECTIONS`).
+  - In `dagron-core`, `db::append_task_outputs` makes a batch of appends
+    and tells of their runs, and is what the engine calls.
+    `db::append_task_output` returns the run it appended to and no longer
+    notifies, and `db::notify_runs` tells of several. SQLite has no
+    notifications, and makes its appends one at a time as before.
+  - `docs/ARCHITECTURE.md` (the event-driven wake) says what a notification
+    costs at commit, for whoever adds one.
+- **A burst of notifications is one pass of the reconcile loop.** On
+  Postgres every engine is notified of each change that can make work
+  ready and of each append to a task's log, and an engine ran one pass of
+  its loop for each notification it was sent. A pass looks at everything,
+  whichever notification woke it, so a pass for each of a burst found
+  nothing the first had not. And when notifications arrived faster than the
+  loop ran, as with many jobs writing logs at once, an engine went on
+  running passes through what was left of them after the work was over.
+  - The loop takes every notification that is waiting, and runs once. What
+    it runs in a second is bounded by how long a pass takes, and it is idle
+    when the work is.
+  - `scheduler_notifications_total` counts the notifications taken. Over
+    `scheduler_reconcile_tick_seconds_count` it is how many a pass answered
+    (`docs/METRICS.md`).
+  - Nothing else about a wake changes. There is one channel, every engine
+    is woken by every change, and a pass costs what it did. SQLite has no
+    notifications, and its loop is as it was.
+- **A task run by a published engine image has a `TRACEPARENT` in its
+  environment.** The images are built with `otel` now (under Added), and an
+  engine built with it hands each task a W3C trace context, whether or not
+  a collector is named, and logs a line as it does. A source build with
+  default features does neither.
+  - **A task that names its own keeps it.** A workflow that gives a task a
+    `TRACEPARENT`, to carry its caller's trace into it, had the engine's
+    added after it in an `otel` build, and the engine's is the one the
+    task saw. The engine adds none to such a task now.
+- **A pod refused by a full namespace ResourceQuota waits instead of failing.**
+  On the Kubernetes executor, a pod the apiserver refused with `exceeded quota:
+  tenant-quota, requested: limits.cpu=550m, used: limits.cpu=3750m, limited:
+  limits.cpu=4` was a failed attempt, so a task refused on every attempt failed
+  its run though its command had never started. That refusal is now
+  back-pressure: the task goes back to `ready` with a future `scheduled_at`, its
+  attempt is given back, and it is dispatched again about 5 s later, then at
+  doubling intervals up to about a minute, until a pod is admitted. Nothing is
+  counted as a retry, a failure or a fault while it waits, and no attempt log is
+  written. The refusal is read from the typed `403` of the pod create (code,
+  reason, and the `pods "<name>" is forbidden: exceeded quota:` sentence for the
+  pod that call named), never from task output. A request above the quota's hard
+  limit can never fit, so it still fails the attempt, as do LimitRange, RBAC,
+  PodSecurity and admission-webhook denials.
+  `DAGRON_QUOTA_WAIT_MAX_SECS` (default `21600`, 6 h) bounds one wait. Its clock
+  starts at the first refusal and is stored on the task row, so for a task at
+  rest in the queue it survives a restart or a hand-over to another replica. A
+  task whose probe was in flight when its engine stopped starts a new wait when
+  its lease is recovered, and, as with any lease recovery, that dispatch's
+  attempt is not given back. Past the bound the task fails for good, whatever
+  its `max_attempts`, with the last refusal in its output. Four metrics, each
+  emitted at zero from the first scrape: `scheduler_quota_refusals_total`,
+  `scheduler_quota_wait_expired_total`, `scheduler_tasks_waiting_on_quota` and
+  `scheduler_quota_wait_oldest_age_seconds`. A waiting task's row carries
+  `quota_wait_since`, `quota_wait_detail` and `quota_waits`, and the console
+  shows it as **Waiting on quota**. Migrations 051 (SQLite) and 066 (Postgres)
+  add four columns to `task_runs`. **Behaviour change:** for Kubernetes users,
+  attempt counts and time-to-failure change. A quota refusal no longer uses an
+  attempt, and a task that failed once `max_attempts` dispatches had been
+  refused now waits up to the bound before it fails. Two paths do not wait:
+  `gang:` members under `RUNNER_GANGS`, where a refusal still fails the member
+  and cancels its siblings, and `DAGRON_QUOTA_WAIT_MAX_SECS=0`, which makes a
+  refusal a failed attempt again. On both, the failure text is now `not started:
+  pod refused by namespace ResourceQuota 'tenant-quota' (requested: …, used: …,
+  limited: …)` instead of `create pod '…': … exceeded quota: …`, so anything
+  matching the old text needs updating. A dispatch refused by a full quota
+  records no sample in the task-duration histogram, whether or not the task
+  waits. During a rolling
+  upgrade, an engine not yet upgraded still fails a refusal the old way. The
+  sentence is what a Kubernetes 1.36 apiserver sends, for one resource over and
+  for several; the tests carry both as it sent them. A request that fits the
+  hard limit but not what other long-lived pods in the namespace leave free
+  (the engine's own pod, where it runs under the same quota) still reads as a
+  full quota, and waits until the bound. A quota refusal that does not qualify
+  fails the
+  attempt and logs the WARN `quota refusal not treated as back-pressure`: one
+  whose request can never fit, one whose lists do not parse, and any other `403`
+  that says `exceeded quota`, such as one that does not start with the sentence
+  above, which is where an apiserver that words it differently would show. See
+  [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+
+### Fixed
+- **dagron-ci acknowledges a GitLab pipeline hook of no merge request,
+  however little it carries.** The merge-train reading of `Pipeline Hook`
+  deliveries read the whole payload before it looked for a merge request,
+  so a delivery without `object_attributes` or `project` was refused with
+  400, where a pipeline of no merge request is dropped with 202. Whether it
+  names a merge request is now read first, and alone.
+- **A workflow that drops its `on_datasets:` has its dataset triggers
+  cleared by any engine.** An engine cleared a workflow's subscriptions only
+  where it had synced them itself since it started, so one that dropped
+  `on_datasets:` while every engine restarted kept firing on its old
+  datasets. Every registered workflow that declares none now has its rows
+  cleared, in one statement, by whichever engine sweeps the triggers. A
+  spec an engine cannot read (in a rolling upgrade, one a newer engine
+  reads) is neither synced nor cleared by it, and a fire of it that it
+  claims is rolled back for an engine that can read it. The first such
+  fire of each workflow an engine rolls back is logged as a warning, with
+  why the spec cannot be read; where no engine can read it (a spec that is
+  broken, not newer), its fires are rolled back on every pass, and wait,
+  until it is fixed. A pass that could not list the workflows claims no
+  fire, as it cannot tell which specs it reads.
+- **On a direct connection, an engine or dagron-ci that waits to migrate no
+  longer deadlocks another engine's concurrent index build.** An engine that
+  found another migrating waited for the migration lock inside a statement,
+  which holds a snapshot, and `CREATE INDEX CONCURRENTLY` waits out older
+  snapshots. So the build of the engine that held the lock waited for the
+  engine that waited for the lock, and Postgres failed one of them as a
+  deadlock: the waiter, which exited, when the build came to wait for it
+  within a second (`deadlock_timeout`) of the waiter's own wait; else the
+  build, as over a populated table, whose index was left INVALID, and the
+  engine that ran it exited. The next engine to take the lock found the
+  index there, took it for built (`IF NOT EXISTS`), and recorded the
+  migration as applied. It could hit any migration marked
+  `-- no-transaction` (the concurrent index builds) whenever an engine
+  started while another migrated: two that a Helm install with
+  `engine.replicas` above 1 starts at once, the next one an upgrade's
+  rollout starts while the one before still migrates, or one that restarts.
+  dagron-ci met it too: where it shares the engine's database, as it does by
+  default (the chart's `ci.placement: engine` starts it in each engine's
+  pod, and the compose stack points it at `workflow`), its migrator takes
+  the same lock, whose key is the database's whatever the schema. An engine
+  and dagron-ci now wait for the migration lock without holding a snapshot:
+  each polls for the same advisory lock that earlier releases take. The lock
+  is a session's, so through a pooler in transaction mode (a cell's
+  PgBouncer, which a workspace engine's `DATABASE_URL` names) it keeps no
+  two migrators apart, as it never did, and two engines that come to the
+  same index build through it still deadlock: there, run an upgrade that
+  builds indexes with one engine, or give the engines the direct endpoint.
+  An engine or a dagron-ci of an earlier release still waits the old way, so
+  one started beside this release's index builds (an old container restarted
+  during the upgrade, a rollback, or a `ci.image` pinned to an earlier tag)
+  still meets the deadlock. An index left INVALID this way is found by the
+  engine's check, as it starts and every 5 minutes
+  (`scheduler_db_invalid_indexes`), which logs at error level the `REINDEX
+  INDEX CONCURRENTLY` that rebuilds it; nothing runs that for you.
+- **dagron-api's start no longer breaks an engine's concurrent index build
+  of `workflow_runs`.** Each start added `workflow_runs`' `environment`
+  column if it was missing, with an `ALTER TABLE` that takes the table's
+  exclusive lock even when the column is there. Started while an engine
+  built an index of `workflow_runs` concurrently (migrations 047 to 083
+  build six, which an upgrade from a release before them runs), the ALTER
+  queued behind the build and the build waited out the ALTER; over a
+  populated table Postgres failed the build as the deadlock's victim, which
+  left its index INVALID, and the next engine recorded the migration as
+  applied. The ALTER now runs only where the column is missing, as it is
+  only before the engine's migration 026. A dagron-api of an earlier
+  release still runs it at every start, so one started beside such a build
+  (restarted during the upgrade, or on a rollback) still meets the
+  deadlock; an index left INVALID so is found, and its `REINDEX` logged, by
+  the same check.
+- **A job that uses an action runs on Docker before 29.** On the Docker
+  executor, every task with `workspace.actions` (every dagron-ci job with a
+  step that uses an action of another repository) failed as its container
+  was made: its actions were in a volume made for the task's own container,
+  read-only, which Docker refuses before 29 ("must not set ReadOnly mode
+  when using anonymous volumes"). Their volume is now made, before the
+  task's container, by a container that holds it: one made with none of the
+  fetch's variables and never started. The fetch is a container of its own
+  that mounts it, the only one with the actions' credentials, and is removed
+  before the task's container is made. The task mounts the volume by name,
+  read-only, as it does its tools: it still reads its actions and cannot
+  change them. The holder goes with its volume after the rest of the
+  attempt, however it ends, once that rest is seen gone; so does an earlier
+  attempt's, at the next dispatch or a teardown. The fleet sweep takes a
+  holder, or an init container, only once nothing else of its attempt is
+  left.
+- **A checkout's credential is in no container while its task runs.** On
+  the Docker executor, the container that fetches a workspace's checkout is
+  the only one with the repository's credential, in its settings, and it
+  was removed with no word of whether the daemon did. One the daemon did
+  not remove stayed beside the running task, where `docker inspect` read
+  the credential. It is now seen removed before the task starts, and asked
+  for again, for ten seconds at most, while a removal is under way. One
+  that is not seen removed fails the attempt, as a fetch of the task's
+  actions does; a fetch that failed still says so in git's words. That
+  container is then left, the credential still in its settings, until the
+  task's next dispatch, a stop's teardown or the fleet sweep removes it;
+  the credential itself is revoked once the attempt is over
+  (`DAGRON_CHECKOUT_TOKEN_URL`), in the background, and lives until it
+  expires where that revoke fails.
+- **A workspace no init container made is not left behind.** On the Docker
+  executor without `DAGRON_CI_EXEC_IMAGE`, the workspace made for a task is
+  a volume of the task's own container, which its checkout's and its
+  steps' containers mount by name. The task's container did not wait for
+  them: where one of them was not seen removed, the task's went anyway,
+  and its volume, still in use, was skipped by Docker and never removed
+  after. The task's container now goes after them. At the attempt's end
+  and at a stop it goes only once they are seen gone, and is otherwise
+  killed and left, volume and all: the task's next attempt removes it as
+  it starts, a stop's teardown does, and so does the fleet sweep where it
+  runs (`DAGRON_INSTALLATION`); a stop that leaves it says so. Until then
+  its settings keep the task's variables, its secrets among them, as a
+  container whose removal failed always kept its own. A task that has
+  ended is not dispatched again, and its attempt's end says what it left
+  in a warning alone: where the fleet sweep does not run, that container
+  stays until it is removed by hand, after those the warning names. Each of those takes
+  a task's container only after its checkout's and its steps', whichever
+  version left them.
+- **A stop while a task's steps are taken back leaves none of them.** On
+  the Docker executor, a task's end forgot its steps' containers as it
+  began to remove them, so a stop that landed then did not find those not
+  yet removed: it removed the init container, or the task's own, from
+  under them, and a step's container ran on, its workspace's volume left
+  for good once it went. A task's steps are now kept until each is seen
+  removed, and the stop takes them back as the task's end does. A step's
+  container being made as its task ends is waited for, ten seconds at
+  most, and removed with the rest, and none is made after; one still
+  being made after that leaves every step's container killed, for the
+  next dispatch or the fleet sweep to remove. Two attempts of one task on one engine no
+  longer share what is lent to their steps: an attempt's end took back a
+  later one's steps, and a later one's start hid an earlier one's. **A
+  volume either of these left under an earlier version stays.** It is
+  anonymous, used by no container, and carries none of dagron's labels.
+  `docker volume prune` reclaims it where Docker labelled it anonymous, as
+  Docker 28 does; `docker volume prune --all` reclaims it whatever version
+  made it, together with every other volume no container uses, named ones
+  too.
+- **A run that runs again is held to what it runs now**. Each of these holds for the rerun, the rerun of every job,
+  the retry and the clear, on SQLite and on Postgres, but where it says
+  otherwise:
+  - **Its deadlines count from then.** A run set running again after it
+    ended kept the `run_timeout_secs` deadline it was made with, so a rerun
+    of a run older than that was failed by the deadline sweep before any
+    task of it ran ("run deadline exceeded"). Its deadline and its
+    `deadline` alert are now counted again from its definition, and an
+    alert that fired may fire again.
+  - **A task put back is parked again from nothing.** What parked it last
+    time (its child run, its wake time, its dataset and cursor) and an
+    approval gate's decision were left on the row. Between the task's next
+    claim and its next park, a sweep could resolve it from its last child
+    run or its last deadline, and release what depended on it; and a gate
+    asked again showed the last decider beside its Approve button. They go
+    with the rest of its result. A decided gate's decision is kept as the
+    gate's attempt (`…/attempts`), where it was dropped.
+  - **`not_triggerer` bars whoever put the gate back.** The person who
+    reran, retried or cleared a run through dagron-api could approve the
+    gate that asked again, the only person involved. dagron-api records the
+    caller on each task it puts back (`task_runs.reset_by`, migrations
+    072/097), and refuses that person's approval (403), as it refuses the
+    run's triggerer's; `GET /api/approvals` says so.
+  - **A job run again replaces what it uploaded.** An artifact an earlier
+    attempt of the same job uploaded, before a rerun, a clear or a retry
+    queued this one, gives way to the new upload, where
+    the upload was refused (409) and the job failed. A second upload of a name in one attempt, or
+    one of another job's name, is refused as before. A build output's
+    provenance is numbered by the job's attempts for its life, as
+    `…/attempts` numbers them: a rerun's build no longer has the first's
+    `invocationId`, and a first attempt reads 1, where it read 2.
+  - **A round's first attempt leaves no old checkpoint to its retries.** A
+    task's `latest` file in its checkpoint directory is removed when the
+    first attempt of the round a rerun or a clear begins is dispatched, so a
+    retry in that round is not handed the round before's as
+    `DAGRON_RESUME_FROM`. A pointer reported through the API is kept as it
+    was, and a retry of one task goes on from its attempts as before.
+- **dagron-api's pool is at least 2 where its live-events listener shares
+  it.** Without `DATABASE_LISTEN_URL`, the listener holds one of the pool's
+  connections for as long as it listens, so `DAGRON_DB_MAX_CONNECTIONS=1`
+  left none for requests, and every request waited out its acquire timeout.
+  It is now read as 2 there, as the engine reads `DB_MAX_CONNECTIONS`; with
+  `DATABASE_LISTEN_URL` set, 1 stands.
+- **A run its parameters leave no task in ends.** A workflow whose every
+  task a `when:` of its parameters leaves out (a dagron-ci pipeline whose
+  jobs are all for another event, as `dagron-import gitlab` often writes)
+  made a run of no task, which stayed `running`: the reaper ended a run
+  once all its tasks had, and this one had none. A caller waiting on it
+  waited for ever, and `dagron-ci run` until it was stopped. The reaper,
+  SQLite's and Postgres's, now ends such a run as one that succeeded, with
+  its `run.completed` event; `dagron-ci run` says that no job ran.
+- **A job its `when:` leaves out says so on the commit.** A pipeline's job
+  that a `when:` of the event and its parameters left out (`"{{ ci_event }}
+  == tag"` on a push) had no task in the run, and so no status: a branch
+  that required its check waited for ever, and a run that left out every
+  job posted nothing at all. dagron-ci now reads the run's tasks once it is
+  made, and posts a passing status for each job left out, "skipped: its
+  when: leaves it out of this event", as it does for a GitHub workflow's job
+  its `if:` leaves out. `dagron-ci run --report` lists such a job as
+  skipped.
+- **A passing "skipped" no longer covers a run's failure for a moment.**
+  Two events of one commit can share a job's check (two pull requests with
+  the same head, say), one leaving the job out and the other running it. An
+  event saying the job skipped looked for the other's statuses, and then
+  posted: a failure the run posted in between was stood over by a pass
+  until the run, told to, posted again, seconds later or longer where its
+  reporter was behind. A run now owns a check from its first post under it,
+  and nothing is said skipped under a check a run owns; a skipped status
+  goes up under a lease on the check (dagron-ci's migration 0031,
+  `ci_contexts`), which a run waits out before its first post. The run's
+  word is the later in every order. A lease lasts three minutes, longer than
+  any post, and one not given back lapses. A row goes with the day it was
+  last written in (owned or leased) where `CI_RECORD_DAYS` is set.
+- **A log begun again is seen whole or not at all.** In
+  a store that keeps the open part in the row (an object store), an
+  attempt's log written again from its start (its first chunk, a seal) was
+  in the row before its old segments' rows went, so a reader could read the
+  old segments and then the whole new text, and a reset the row refused (the
+  attempt over) still dropped what was kept of it. A reset is now one
+  transaction with its segments' rows (`reset_task_log`), a refused one
+  changes nothing, and each writing of a log is named apart in the store
+  (`<task>/<fence>.<gen>/…`), so a reader of one never reads another's bytes
+  under the names it counted. And a log is its attempt's (`log_fence`): a
+  teardown's claim, which moves the row's version on, no longer hides the
+  attempt's log from the views. The engine learns an open part's size in
+  bytes, where it took characters. A seal that would write what was sent
+  already writes nothing, and the engine's notes stay in the log. **The
+  upgrade's migrations add `task_runs.log_gen` (and, on SQLite,
+  `log_fence`).**
+- **A remote runner's log segment is written once.** A runner sends a task's
+  live log in numbered segments, and sends one again when it does not hear
+  the answer. Where dagron-api had written it and only the answer was lost,
+  the text was appended twice; and one held up on its way past the seal
+  that ends a task with secrets (the whole log, redacted as one piece) was
+  added after it. dagron-api now keeps the last segment it wrote with the
+  task, and its fence (`task_runs.log_seq`, `log_fence`), and answers a
+  segment numbered at or below it under that fence with `204` without
+  writing it. An attempt's segment numbers now only rise, a seal's among
+  them, and a seal says so (`reset: true` in the segment): it used to be a
+  new segment 0. The runner, for its part, sends a segment again as it was:
+  before, it could carry what the task wrote since, which dagron-api,
+  reading the number as written, would now have dropped. Migration:
+  `094_task_runs_log_seq` (Postgres; runners dial dagron-api alone, so
+  SQLite has none).
+- **The images' writable directories were 0755 whatever the build meant.**
+  A `COPY --from` of a directory makes its destination 0755, so the
+  engine's `/workflows` and `/artifacts`, dagron-api's `/artifacts` and the
+  runner's state directory were their owner's alone. They are 0775 now
+  (`COPY --chmod`), group 0's: what a uid other than 65532 in group 0, as
+  OpenShift runs them, needs to seed and write there.
+- **`dagron-ci run` pulls an image a job's items fill in as each item's.**
+  A job over `with_items` whose `docker_image` names the item
+  (`node:{{ item }}-slim`, `{{ item.image }}`) had that text pulled as it
+  is written, braces and all, and the run stopped at "invalid reference
+  format" before any job started. Each item's image is pulled now. One
+  that names something else is pulled by the executor, once the run has
+  said what.
+- **What `dagron-import` writes, at the edges of what a file holds.**
+  - A control character in what the report quotes (`runs-on:
+    "self\ahosted"`) was written into its comment as it was, and
+    `dagron-ci validate` refused the file. It is a space there now.
+  - A brace of the file's just before an expression (`"{${{ matrix.os
+    }}}"`) made the template the importer wrote of it no template, and
+    nothing said so. It is parted from the expression and said, as two
+    braces together are.
+  - What is said of such braces read "the text holds `[[`" in the step a
+    job starts with, which shows every two braces as `[[`. It names them
+    in words now.
+  - An apostrophe in a comment after `;` (`echo hi;# it's`), or in a
+    here-document's body, was read as opening single quotes, and an
+    expression after it was left to do as though it stood in them.
+  - Two keys of a file that were one but for the two characters the
+    importer marks its own templates with (`build`, `"build\u0001"`): the
+    second was written over the first. Both are kept, the second as
+    `build_`.
+  - A path that is not UTF-8 stopped the program; it is said so, with the
+    usage.
+- **The pipeline reference said a tag's push reads `push`.** `CI_EVENT` is
+  `tag` for one, as `ci_event` was documented to be. The workflow
+  document's example of an expression made a variable named
+  `github.head_ref`, which is not answered here: it names
+  `github.ref_name`.
+- **An engine built without `ops` did not compile**
+  (`--no-default-features --features sqlite`). The run loop names the
+  type of a run's trigger record, for a sub-workflow's run and a dataset's,
+  and the import was the `ops` build's alone.
+- **A dispatch that named its repository with capitals was told it is not
+  connected.** `POST /ci/v1/runs` with `github.com/Acme/Widgets` answered
+  404 for a connected `acme/widgets`: a repository is kept in lower case,
+  every other door matched it so, and this lookup did not. GitHub shows a
+  name with its capitals, and that is what people copy. It is matched
+  without regard to case now, and so is the same from
+  `dagron-ci run --remote`.
+- **A job's `env:` written as a map was left out of the job without a
+  word.** A task's `env:` is dagron's own, a list of names and values; a
+  step's is a map. `dagron-ci validate` took a task's written as a map, and
+  the compiler, which adds the steps to that list, dropped it: the job ran
+  without the variables, and without a secret it named. It is refused now,
+  for a task and for `task_defaults`, and so is an entry with no name. A
+  `task_defaults` that is not a mapping went the same way, and is refused
+  as well. The schema says each of these too.
+- **The pipeline schema refused an event written with no filters.**
+  `on: { push: }` is what `dagron-ci validate` takes and what the schema's
+  own type allows, and an editor reading
+  `crates/dagron-ci/schema/pipeline.v1.json` marked it wrong: each rule
+  that a filter and its `_ignore` twin do not go together held of a bare
+  key too. The same for `pull_request:` and `merge_group:`.
+- **A Docker task's line is no longer cut in two by a line of its other
+  stream.** The daemon hands a container's stdout and stderr over as frames,
+  in the order it read them, and a frame need not end where a line does: on
+  Docker only in a line longer than 16 KiB, on Podman wherever a read of the
+  container's pipe happened to end. The Docker executor joined the frames as
+  they came. So where a part-line of stdout was followed by a line of stderr,
+  a task's log and its output held one wrong line and a second half with no
+  beginning. A job that wrote `line 27515` on a Podman host read
+  `line 275`, the lines dagron-ci's exec writes to stderr as a step ends,
+  and then `15`.
+  - Each stream's unfinished line now waits for its end, and is placed where
+    it ended. A last line with no newline is kept as it was.
+  - It waits as bytes, so a character that a frame cut in two is one
+    character, where it had been U+FFFD marks.
+  - More than 64 KiB of one line is not waited for, and is passed on as it
+    is, up to its last whole character.
+  - The Kubernetes executor reads one stream that the kubelet has already
+    joined, and the local executor reads each stream a line at a time:
+    neither changes.
+- **A NUL byte in what a task wrote no longer stops the engine.** Postgres
+  takes no NUL in a text value, and refuses the whole statement that holds
+  one. A task that wrote one, and `printf '\0'` in a job is enough, failed
+  the statement that recorded its result, and the engine exited on that
+  error with the task still running in its row. The line of its log that
+  held the byte was refused the same way. A NUL in a task's log, in its
+  output, and in the reason an attempt failed with is now kept as U+FFFD,
+  the mark a byte that is no text already has, on every executor and on both
+  databases.
+- **dagron-ci starts on no cell reached over plain http, and the chart makes
+  none up.** dagron-ci sends its token for dagron-api to each cell
+  (`CI_CELLS`) with every run it submits or follows, and the credential of
+  each caller of its run API. It took a cell at any `http://` URL, and the
+  Helm chart's `ci.enabled` made one up: `http://<release>-api:8080`, the
+  release's own dagron-api Service, which serves no TLS.
+  - **A cell is now `https://`, or `http://` to this machine** (a sidecar
+    that carries it on, a test), as `CI_GITHUB_API_URL` already was.
+    dagron-ci stops at start on any other, and names the cell.
+  - **Breaking for a dagron-ci whose `CI_CELLS` names an `http://` URL on
+    another host**, which 0.11.0 took: it no longer starts. Put TLS before
+    that dagron-api (an ingress, a mesh's sidecar on localhost, a proxy) and
+    name that.
+  - **The chart derives no cell.** With `ci.apiTokenSecret`, `ci.cells` is
+    required, and a cell that dagron-ci would refuse fails the render. Where
+    the ingress has TLS, the ingress host is one to name. The chart puts no
+    TLS before its own dagron-api.
+  - Not changed by this: the engine's token service URL
+    (`DAGRON_CHECKOUT_TOKEN_URL`), which was still taken over plain http to
+    another host, with a warning. It is refused since ("Changed", below).
+- **Logs carry colour only for a terminal.** `LOG_ANSI` was documented as
+  automatic and was on: every line of the default format carried colour codes
+  into files, pipes and container logs, and `NO_COLOR` was not read.
+  - With `LOG_ANSI` unset, lines are now coloured only when stdout is a
+    terminal and `NO_COLOR` is not set. `LOG_ANSI=1` still forces colour, and
+    `LOG_ANSI=0` none.
+  - **If you read coloured logs through `docker logs` or `kubectl logs` and
+    want them so, set `LOG_ANSI=1`.** A parser that stripped the codes has
+    nothing to strip.
+  - `dagron-mcp`, whose log is its stderr, does the same there.
+- **A task's stderr is not logged by the engine as a warning.** On Docker the
+  engine wrote one warning for every line of a task's stderr, and on the local
+  executor one for each task that wrote any, whether the task failed or not.
+  A dagron-ci job's step markers are stderr lines, so a job that succeeded
+  drew a warning for each.
+  - The lines are where they were, in the task's own log. The engine's log
+    notes them at `debug`.
+  - On Docker that line was also written unmasked. It is masked now, as the
+    local executor's was.
+- **Two settings the engine reads no longer look like typos to it.**
+  `DAGRON_ENV_SECRET_KEY`, which the chart sets on every engine that has the
+  environment secret store, and `DAGRON_DEFER_ENDPOINT` were read and were
+  not in the engine's registry: each drew "looks like a dagron knob but is
+  not one" at every start, and `dagron config` showed neither.
+  - Both are registered, the key among the values never printed. As with any
+    setting added to the registry, the fleet fingerprint of every engine
+    changes with this release.
+  - A build that reads settings of its own beside the engine can tell the
+    scan their names (the `env_names` seam).
+- **A task stopped while its container is being made leaves nothing.** On
+  Docker, a stop (a cancel, `run_timeout_secs`, a gang sibling's cancel)
+  drops the attempt where it stands and removes what it made. A stop that
+  landed while the daemon was still making a container looked for it, found
+  none, and said the work was gone; the daemon then finished making it. What
+  was left was a container made and never started, with its volume, until
+  the task's next dispatch or the orphan sweep. A run cancelled as it starts
+  is how to meet it: the window is tens of milliseconds wide.
+  - The request that makes a container now runs to its end whatever becomes
+    of the attempt, and the stop waits for it before it removes anything. So
+    what was being made is there to be removed, and a run that reads
+    cancelled has nothing of that attempt left.
+  - It ran nothing: the container was never started. It did hold the task's
+    workspace volume.
+  - Not changed: the Kubernetes executor, whose stop has the same shape and
+    may leave a pod that was being created the same way. No cluster was at
+    hand to show it or a fix for it.
+- **dagron-ci: no check waits on silence.** Two ways a commit could be left
+  with nothing said, beside the refused pull request's:
+  - **A pipeline that cannot run says so on the commit.** One that is invalid
+    as written, that was asked for by name and does not take the event, or
+    whose run dagron-api refuses, made no run and left no status: the event
+    failed, where only someone reading dagron-ci's events would see it. The
+    commit now gets one `error` status under the pipeline's own name,
+    `dagron-ci/<pipeline> (<event>)`, reading "not run:" and the reason. It
+    is posted once the event has ended for good, not at each turn of one
+    that is retried or waits. An event that runs out of attempts says it on
+    the last of them.
+  - **A status GitHub refuses for itself alone stops only its context.**
+    GitHub keeps a thousand statuses under one context on a commit, and then
+    answers 422. dagron-ci read every 422 as a refusal of the commit, and
+    posted nothing more for the run: its other jobs' statuses stopped too. A
+    422 is now the commit's only where GitHub says it has no such commit.
+    Any other stops that context for the run, the run's other statuses go
+    on, and the run's record says which context and why, in GitHub's own
+    words where it gave any.
+  - A 422 whose body cannot be read is tried again, as a 403's is.
+  - Not covered: a bound workflow that dagron-api refuses, on a repository
+    without pipelines, still leaves no status.
+- **A task's image is pulled on Docker, and a task can say when.** The Docker
+  executor made a task's container from whatever the daemon held. The Docker
+  API pulls nothing when a container is made, as `docker run` does, so a task
+  that named an image the host lacked failed with the daemon's "No such
+  image" unless someone had pulled it by hand. A machine that "worked" had
+  the image cached.
+  - The executor now fetches a task's image before its container is made:
+    pulled when the host does not hold it, as the engine's own two images
+    (`DAGRON_CI_EXEC_IMAGE`, `DAGRON_CHECKOUT_IMAGE`) always were.
+  - **`image_pull_policy`**, a new task key (and `task_defaults` key):
+    `if_not_present`, `always` or `never`. `always` pulls before every
+    attempt, and an attempt whose pull fails does not run on what the host
+    holds. `never` pulls nothing, and an attempt on a host without the image
+    fails, saying so. Any other word is refused when the workflow is parsed.
+    So is the key on a `template:` call, which hands its template nothing
+    but arguments: set it on the template's tasks, or in `task_defaults`,
+    which reaches them.
+  - A pull that fails fails the attempt, with the daemon's words and the
+    image's name, before anything is made for it.
+  - A pull is not bounded by the task's `timeout_secs`, which is for its
+    work. It is given up when the daemon says nothing of it for five minutes.
+  - On Kubernetes the policy is the pod's `imagePullPolicy`. A task that
+    states none leaves it out, as before, and the kubelet's default applies.
+  - dagron-ci's pipelines take the key on a task, as they take dagron's
+    others.
+  - Not here: pull credentials. The executor pulls with none, so a private
+    image is still one the host holds already.
+  - Not run: Kubernetes, beyond the pod that is built; and `always` against a
+    tag that has moved, which needs a registry the test controls.
+- **A cancelled task's container or pod is stopped.** A cancel changed rows:
+  the worker dropped its wait at its next lease renewal, and on Docker and
+  Kubernetes the container or pod ran on to the end of its command, with its
+  volumes. So did the work of a run past `run_timeout_secs` and of a gang
+  sibling's cancel.
+  - A worker whose claim is gone now tells the executor (`ExecContext::stop`)
+    and waits for it. The Docker executor stops the task's container with the
+    task's grace (`CI_STEP_GRACE_SECS`, `10` s), then removes it, the
+    checkout's container and the init container with their volumes. The
+    Kubernetes executor deletes the pod with that grace, deletes its env
+    Secret, and waits to see the pod gone. The Secret's delete is best
+    effort: it is tried once, and the pod owns the Secret so that it goes
+    with the pod where the delete fails. Each acts on the names that attempt
+    made, never on the task's labels, which a later attempt's workload carries
+    too.
+  - A teardown nobody saw through says so. An attempt's result reads "stopped
+    and removed" (`ClaimLost`) only once the daemon has said each container is
+    gone, or the apiserver the pod. A removal that is refused or not answered,
+    a pod still there twenty seconds past its grace, and an executor that does
+    not return in twelve minutes each read "what this attempt started may
+    still be running", with the reason (`ClaimLost::unseen`).
+  - **A rerun no longer runs beside what it replaced.** Workloads carry a
+    `dagron.dev/fence` label, the task row's version once claimed, and a
+    dispatch removes the same task's workloads with a lower one. The attempt
+    it compared before is set back to 0 by a rerun, a console retry and a
+    clear, so the container a cancelled attempt left running passed for the
+    rerun's own. A workload with no fence label is judged by its attempt, as
+    it was.
+  - **A task's next attempt starts after its earlier one is gone.** That
+    dispatch stops what a lower fence left, with the task's grace, and looks
+    again. While any of it is still there, or the daemon or the apiserver will
+    not say, it creates nothing and is handed back as back-pressure: the task
+    returns to its queue with no attempt spent and is tried again in a few
+    seconds (with `DAGRON_QUOTA_WAIT_MAX_SECS=0`, or for a gang member, the
+    attempt fails instead). It was best effort before: a dispatch started
+    beside a pod still in its grace, and beside a container whose removal had
+    timed out. Such a wait is counted and shown with the quota waiters; its
+    refusal text says "an earlier attempt of this task may still be running".
+- **A cancelled run reads cancelled once its work has stopped.** A cancel
+  wrote `cancelled` on the run and on every task of it in one statement. A
+  task a worker held went on for a lease renewal and its grace while every
+  record said it was over, the run's `run.completed` event and commit status
+  were already out, and its concurrency key was free for the next run to start
+  beside it. With `TASK_LEASE_HEARTBEAT=false` nothing ever told the work to
+  stop. The same held for a run past its `run_timeout_secs` and for a gang
+  sibling's cancel.
+  - **A cancel asks.** A task that had not started, or was waiting (an
+    approval, a sensor, a deferred job), is `cancelled` at once, as before. A
+    task a worker holds is asked to stop and stays `running`, with
+    `stop_requested_at` set, until that worker says its container, pod or
+    process is gone. Its run stays `running`, with `stopping_as` saying what
+    it will end as (`cancelled`, or `failed` for a deadline), and ends with
+    the last such task: the event, the commit status and the run sink follow
+    the work. There is no new status. A client that knows neither field sees
+    a run that is running, and then one that is cancelled.
+  - **The engine tells the work at its next sweep** (`SWEEP_INTERVAL_MS`, half
+    a second by default), not at the worker's next lease renewal, and with or
+    without a lease heartbeat. It also tells work whose claim another
+    scheduler took.
+  - **A concurrency key is held until the work is gone.** `max_active_runs`
+    counts running runs, and a run whose work is stopping is one.
+  - **Work nobody is watching is looked for again.** A task that is asked to
+    stop has a whole lease from then to answer in. A stopping task whose
+    worker died, or could not see its teardown through, is never put back to
+    run. It is claimed again for a teardown alone (`Executor::teardown`), by
+    an engine that does not still have its execution out:
+    Docker and Kubernetes stop what the task's earlier claims left and see it
+    gone, and nothing is run. A workload that cannot be seen gone keeps its
+    task reading as still stopping, and its run holding its key, until it can.
+  - **A task that was asked to stop takes no other result.** One that ends by
+    itself first is cancelled where it would have succeeded, failed, been
+    retried or handed back to its queue, and it is not parked.
+  - `POST /api/runs/{id}/cancel` answers `{cancelled, stopping}`: the tasks
+    called off, and how many of them are still to stop. A second cancel while
+    a run is stopping changes nothing. The engine's own `POST
+    /runs/{id}/cancel` answers `stopping` too. A rerun, and a retry of a task
+    being stopped, are refused until the run has ended, as for any running
+    run.
+  - The console shows a stopping run as **stopping**, and a task being
+    stopped says so in its panel.
+  - Columns `task_runs.stop_requested_at`, `workflow_runs.stopping_as` and
+    `workflow_runs.stop_requested_at` (migration 055; Postgres 073 to 075),
+    all NULL on existing rows.
+  - **Engines of two versions.** An engine from before this change does not
+    look for a stop request: a task it holds runs on as it did before, and it
+    ends no run. An engine of this version ends the run such an engine leaves
+    (a sweep), so upgrade the engines with or before dagron-api.
+  - Not run on a cluster: the Kubernetes teardown. It compiles, and is the
+    reap a dispatch already did.
+- **dagron-ci: a refused pull request says so on its commit.** A pull request
+  from a fork or a non-member runs nothing (`CI_FORK_PRS=refuse`). Nothing
+  told its author: the event was skipped, and the head commit carried no
+  status, so a pull request sat waiting on checks that were never coming.
+  - The worker that refuses it now gives the head commit one status:
+    `error`, under `dagron-ci (pull_request)`, reading "not run: pull
+    requests from forks and from non-members are refused here
+    (CI_FORK_PRS=refuse)". Never one that passes.
+  - It names no pipeline and no job: nothing of the pull request is read to
+    post it. A check that branch protection requires of such a pull request
+    still has no status of its own.
+  - GitHub's rate limit is waited out and a failed post is tried again, as
+    for any event. A post GitHub refuses (the token, the repository, the
+    commit) leaves its reason on the event instead, and the event is still
+    skipped. A repository that takes no statuses is not told, as before.
+  - **A rate limit that names no wait is waited out.** GitHub can answer a
+    secondary rate limit with a 403 that carries neither `retry-after` nor a
+    spent `x-ratelimit-remaining`. A status post read that as a refusal of
+    the token, which is not asked again: for a run, nothing more was posted.
+    The body is now read first, and one that says it is a rate limit waits a
+    minute, for a run's statuses as for a refused pull request's. A wait the
+    headers name still comes first. A 403 whose body cannot be read is tried
+    again, not taken for a refusal.
+  - Each event of a refused pull request posts it, under the one context: a
+    webhook and a sweep that see one head post it twice.
+  - **A closed pull request is skipped for being closed, whoever opened
+    it.** One from a fork or a non-member was skipped with the fork refusal's
+    reason. It gets no status.
+  - `dagron_ci_commit_statuses_total` counts these statuses beside a run's.
+- **dagron-ci: an engine that names it as its token service can run other
+  workflows.** Such an engine asks dagron-ci about every checkout. For a run
+  dagron-ci had not submitted the answer was "not one dagron-ci submitted"
+  (404), and the engine failed the task: naming dagron-ci made every checkout
+  on that engine CI's, a hand-written workflow's over a public repository
+  included.
+  - For a run that is not on its record, `POST /ci/v1/checkout-tokens` now
+    answers by whose repository the checkout names. One dagron-ci does not
+    serve: `204`, no credential, and the commit is fetched without one. One it
+    serves: refused as before, since the runs of a connected repository are
+    dagron-ci's to submit.
+  - Either is said once the run has been looked for (two seconds), as before,
+    so such a task starts two seconds later than on an engine with no token
+    service. Neither hands anything out.
+  - The repository is told by its host and `owner/name`, without regard to
+    case, a trailing `.git` or the scheme.
+- **An `Idempotency-Key` and its run are one write.** A submit under a key
+  claimed the key, created the run, and then pointed the claim at the run in a
+  statement of its own, whose failure was logged and let go. A submitter that
+  died between the last two, or whose last statement failed, left a run that
+  its key did not name. Five minutes on the claim went stale, the caller's
+  retry took the key over, and a second run was made: the one thing the key is
+  there to prevent. A submit slower than those five minutes did the same with
+  no failure at all.
+  - The claim is resolved in the transaction that creates the run
+    (`dagron_core::db::create_run_claimed`, on Postgres), for both routes
+    that take a key: `POST /api/runs` and `POST /api/workflows/{id}/run`.
+    The claim's row is locked first, so two submits of one key queue there.
+  - A submit whose claim was taken over while it was in flight now creates
+    nothing, and is answered from what holds the key: the other submit's run
+    (`200`), or `409` while that one is still in flight.
+  - A refused submit gives the key back, as before, and can no longer give
+    away a claim that a later submit holds.
+  - What a caller sees is otherwise unchanged: `201` for the first submit,
+    `200` with the same run for a repeat, `409` for another body.
+- **Rerun, retry and clear are one implementation, and keep what they
+  replace.** Each is asked for through the engine's API and through
+  dagron-api's, and dagron-api carried its own SQL for all three, "kept in
+  sync" by a comment. The copies had drifted, and all of them wiped the
+  attempt they replaced.
+  - **One implementation.** Both APIs call the engine's (`dagron_core::db`).
+    For dagron-api that changes what a rerun, a retry and a clear do: a rerun
+    resets rule-skipped tasks with the failed and cancelled ones (it left them
+    skipped, so a task skipped for an upstream failure never ran), and all
+    three clear a reset task's log, its fault verdict and its deferred job's
+    handle, which the copies did not. `rerun` in the rerun's answer counts
+    the skipped tasks too. The engine's API gains
+    `POST /runs/{id}/tasks/{task_id}/retry`, which only dagron-api had.
+  - **What is replaced is kept.** A task that ran has that attempt's status,
+    the times it was queued and ended, and the end of what it printed put in
+    `task_attempts` before its row is reset, under `reason` `rerun`, `retry`
+    or `clear`, by the policy a worker's retry is kept under
+    (`DAGRON_ATTEMPT_LOG_BYTES`, `DAGRON_ATTEMPT_LOG_KEEP`).
+    `GET …/tasks/{id}/attempts` returns them with `status` and
+    `scheduled_at`, and the console's task panel shows them.
+  - **Attempts are numbered through a task's life.** A rerun and a clear start
+    the row's `attempt` again from 0, as before, so that the task has its
+    `max_attempts` again. Kept attempts were keyed by that number, so a second
+    round's attempt 1 overwrote the first round's. The rounds before are now
+    counted beside it (`task_runs.attempt_base`), and `attempt` in the log
+    and attempts routes is the sum. The task log route adds
+    `earlier_attempts`. `attempt` on a run's task rows is unchanged.
+  - **A run that had ended asks its concurrency key before it runs again.**
+    With `max_active_runs`, a rerun, a retry or a clear that would set an
+    ended run running is refused while the key is full (`429`, nothing
+    written), as a new run of the key would be. It was admitted, so a
+    serialized workflow could run twice at once. The engine's auto-rerun
+    leaves such a run for a later sweep, and dagron-ci's rerun door
+    (`POST /ci/v1/runs/{id}/rerun`) leaves it with "waiting" and why.
+  - **A retry sets a cancelled run running again**, as it did a failed one. A
+    task retried in a cancelled run used to run while its run read cancelled.
+  - **Each writes an outbox event** in its own transaction: `run.rerun`, with
+    `{run_id, by: rerun|retry|clear, reset_tasks, task_id?}`. The engine's
+    auto-rerun keeps `run.auto_rerun` and its payload, now written with the
+    rerun or not at all.
+  - Migrations: SQLite 056, Postgres 076 (one column on `task_runs`, two on
+    `task_attempts`; none rewrites its table). Upgrade the engine with
+    dagron-api, or before it: dagron-api's routes read the new columns.
+  - Not in this change: the tail of a replaced attempt is cut in characters,
+    not bytes, so for output that is not ASCII it can be up to four times
+    `DAGRON_ATTEMPT_LOG_BYTES`.
+- **A resubmit carries the run's parameters.** `POST /api/runs/{id}/resubmit`
+  (the console's "Re-run unchanged") made its new run from the stored
+  definition and passed nothing over it. That definition holds only the
+  spec's defaults, so a run submitted with parameters was resubmitted without
+  them: one given `commit_sha` ran with it empty, and one whose parameters
+  fill in a field the spec cannot run without was refused (`400`).
+  - The new run is created with the parameters the run was created with
+    (`workflow_runs.parameters`). A run submitted without any, or made before
+    they were kept, resubmits with its spec's defaults, as before.
+  - A declared `environment:` is read again, as for any new run. What the
+    first run was given from it is not carried as if a caller had passed it:
+    a variable changed since is the new value, and one removed since is gone.
+  - Stored parameters that cannot be read refuse the resubmit (`500`): a run
+    does not go out without them.
+  - For a run dagron-ci submitted this changes what a resubmit is, not whose
+    it is. It was refused, its checkout naming no repository. It is accepted
+    now, and is a new run that dagron-ci did not submit: it has no checks, and
+    where the engine names dagron-ci as its token service its checkout is
+    given no credential. A check is run again by a rerun.
+- **dagron-ci: a run that is run again is followed again.** dagron-ci
+  followed a run to its first end and never looked again: its record's status
+  moved once. A rerun, a retry or a clear through dagron-api moved the same
+  run on, and nothing told dagron-ci. The rerun's checkout was refused its
+  credential ("the run is over", 409), so its job never started; the commit
+  kept the first attempt's statuses; and the run held no place under a build's
+  limit. A failed or cancelled check could not be run again on its commit and
+  have the commit show it.
+  - **A record re-opens when dagron-ci sees the run running** in its cell's
+    dagron-api (`GET /api/runs/{id}`, with its own token), and on nothing
+    less: not for a run that reads over, one dagron-api no longer has, or a
+    dagron-api that could not be asked, and only on a sight later than the end
+    it has on record (`ci_runs.ended_at`, migration 0011). It is `submitted`
+    again: followed, given its checkouts' credentials, and counted under a
+    build's limit.
+  - **It looks in three places.** A checkout credential asked for a run on
+    record as over: dagron-ci asks the cell before it answers, and mints for a
+    run the cell says is running, never on the request's word (a cell that
+    cannot be asked is a 503, not a refusal). Every 30 s, each cell's running
+    runs (`GET /api/runs?status=running`: all of them, so a run dagron-ci
+    could not mark as CI's is seen too), for a run whose jobs check nothing
+    out. And its own door, next.
+  - **`POST /ci/v1/runs/{id}/rerun`** reruns an event's failed and cancelled
+    runs, each from its failed jobs, for a dagron-api user who is not a
+    viewer. The cell's dagron-api is asked with the caller's own credential,
+    so who may rerun is its rule and its record names the caller, and
+    dagron-ci's record re-opens with the answer. A rerun passes a build's
+    limit like a new run. `200` lists the runs running again and the ones
+    left, each with why; `409` when there is nothing to rerun. A rerun of
+    every job (`failed=false`) is not built, and is refused.
+  - **The checks read `pending` again, then how they end,** under the names
+    they had. A job that did not succeed is posted again after each
+    re-opening, though it reads as before (`ci_runs.reopens`): it is a new
+    result. A job that had succeeded, which a rerun keeps, is left alone.
+  - **The count does not move.** A run's next end is told to a build's meter
+    again, which already had to take a repeat as a no-op.
+  - `GET /ci/v1/runs/{id}` says how dagron-ci has each engine run
+    (`engine_runs[].status`). New series:
+    `dagron_ci_runs_reopened_total{by}`, `by` one of `rerun`, `credential`,
+    `sweep`.
+  - Not covered. A run moved through dagron-api whose jobs check nothing out,
+    and that is over again inside one 30 s look, is not seen, and its checks
+    keep the earlier result. That look reads up to 10,000 running runs a
+    cell. A rerun that is over before dagron-ci's next look leaves no
+    `pending` between its two results.
+- **dagron-ci: a job that starts before its run is on record gets its
+  checkout.** dagron-api creates a run, and its engine can start the run's
+  first task, before dagron-ci has read the answer that names the run. The
+  engine then asked `POST /ci/v1/checkout-tokens` about a run dagron-ci had
+  submitted a moment before and had no record of yet. It was told at once
+  that the run was "not one dagron-ci submitted" (404), and the job failed
+  with nothing wrong with it. Seen twice in a day, at two different runs'
+  first jobs.
+  - A run that is not on record is now looked for again, for two seconds,
+    before that answer is given. A run dagron-ci never submitted is refused
+    as before, two seconds later.
+  - The looks come out of the eight seconds an answer may take, not on top of
+    them: GitHub is given what is left, so the engine is still answered inside
+    its ten. Each read of the run is held to them too: a database that has not
+    answered by then is a 503, where the read was not bounded before.
+  - What a credential is given for has not changed: a run on record that is
+    not over, its own repository and commit, and its cell.
+  - Not covered: a run whose record could not be written at all, which stays
+    refused until the event is tried again.
+- **dagron-ci: the poll sweep reads git's own server.** Asked for protocol v2,
+  `git http-backend` opens its answer to the ref advertisement with
+  `version 2`, as git's protocol document has it. github.com names the service
+  and flushes first, and dagron-ci read that form alone: against any server
+  that runs stock git, every sweep failed ("not a git smart HTTP server"), and
+  so did a dispatch that names no commit. Both forms are read now, and v0 as
+  before. A test holds the bytes git 2.54's server sent. Which form other
+  hosted forges send was not checked.
+- **dagron-ci: an annotated tag runs at the commit it names.** A tag made with
+  `git tag -a` is an object of its own, and its event carried that object's
+  id as if it were a commit's: `CI_SHA` was the tag's id while the checkout's
+  `HEAD` was the commit, and the commit statuses were posted on the tag's id.
+  - The event keeps the tag's own id, which is its key: a webhook and a poll
+    sweep that see one tag still make one run. The commit the tag names is
+    kept beside it (`ci_events.commit_sha`, migration 0010), and it is what
+    the pipelines are read at, what `ci_sha` and the checkout say, what a
+    checkout's credential is checked against, and where the statuses go.
+  - Each door says the commit from what it was shown. The poll sweep asks git
+    to peel with its ref listing (`ls-refs` with `peel`; a v0 server lists a
+    tag's commit as `refs/tags/NAME^{}`). The GitHub receiver reads a push's
+    `head_commit`. A dispatch at a tag's ref with no `sha` resolves to the
+    commit.
+  - `dagron-ci events` and `GET /ci/v1/runs/{id}` show such an event under the
+    id it came with. A lightweight tag has one id, and nothing changes for it.
+  - An event queued before this change has no commit beside its id, and runs
+    as it did.
+- **A Docker task that runs as non-root can write its workspace.** A fresh
+  volume takes its mount point from the image of the container that first
+  mounts it, so the workspace was root's, mode 0755, and only a task running
+  as root could write in it. Where the engine installs `dagron-ci-exec`, the
+  init container now makes the volume from the `dagron-ci-exec` image's own
+  `/workspace`, open to every user, and the task mounts it as it is, without
+  its image's copy over it. The image carries that directory from this
+  release; a checkout opens the workspace to every user too.
+- **An evicted Kubernetes task says why.** A pod the kubelet evicts (a
+  workspace past its `size:`, a node out of disk or memory) has no
+  containers left to read a log from, so its task failed with the kubelet's
+  "unable to retrieve container logs". It now fails with the pod's own
+  reason: `the task's pod failed (Evicted): Usage of EmptyDir volume …
+  exceeds the limit "16Mi"`.
+- **A task that fails on Docker keeps what it said.** bollard reports a
+  container's non-zero exit as an error, and the Docker executor took it for
+  one: it removed the container before reading its logs, and the task's
+  output was "Docker container wait error" and nothing else, which is what
+  `dagron-ci run` showed for a failed step. A non-zero exit is now the task's
+  result, with its logs, like any other.
+- **The fleet sweep's settings are no longer typos.** `DAGRON_INSTALLATION`,
+  `DAGRON_ORPHAN_SWEEP_SECS` and `DAGRON_ORPHAN_MIN_AGE_SECS` were read by the
+  engine and documented, and missing from its list of settings. So an engine
+  that armed the sweep warned at startup of a probable typo, and
+  `dagron config` left out the one setting that lets a sweep remove
+  containers.
+- **A cancelled or timed-out run ends fully.** Cancelling a run, through the
+  engine's API or dagron-api's, and failing it by `run_timeout_secs` used to
+  change its status and nothing else. It wrote no `run.completed` outbox
+  event, made no run-sink call, sent no webhook or Slack message and posted no
+  commit status, so a commit marked "pending" stayed pending forever. Each
+  path now writes the run's `run.completed` event (`cancelled`, or `failed`)
+  in the transaction that ends it, and stamps the run
+  (`workflow_runs.completion_pending_at`). The next tick on any engine replica
+  claims the stamp, exactly once, and does what the reaper does for a run
+  that finished: the run sink, OpenLineage, the `notify.git` status and the
+  webhooks. A cancelled run is reported as cancelled: GitLab's `canceled`
+  state, GitHub's `error` (its Statuses API has no cancelled state, and
+  `failure` would claim a verdict the run never reached), and OpenLineage
+  `ABORT` instead of `COMPLETE`. A run rerun before any tick claimed its end
+  is not reported for that end; its next end is reported instead.
+  - dagron-api's cancel now goes through the engine's own cancel
+    (`dagron_core::db::cancel_run`) instead of its own SQL. It also calls off
+    tasks waiting on an approval, which it used to skip, leaving the run
+    running. The response is unchanged: `{"cancelled": <tasks>}`.
+  - Migrations: SQLite 052–054, Postgres 067–071. The two Postgres indexes are
+    partial and built `CONCURRENTLY` in migrations of their own.
+  - Tested on both databases and through the shipped binary against a stub
+    forge: a cancelled run posts `pending`, then one `error`; a run past its
+    deadline posts `pending`, then one `failure`; each writes one
+    `run.completed` event.
 
 ## [0.10.0] - 2026-10-03
 
@@ -1306,6 +5189,27 @@ All notable changes to this project are documented here. The format is based on
   above, which gates it too, so nothing in this release leaves it open.
 
 ### Fixed
+- **The engine no longer exits when dagron-api creates one of its tables first.**
+  dagron-api's schema bootstrap creates `users`, `git_repos` and `environments` too
+  (`migrations_pg` 008, 009 and 026). Started together on a fresh database, as compose and a
+  Helm install start them, the engine's migration failed whenever dagron-api's
+  `CREATE TABLE` committed first: it hit a catalog constraint instead of taking its
+  `IF NOT EXISTS` no-op ("while executing migration 8: duplicate key value violates unique
+  constraint "pg_type_typname_nsp_index""), and the engine exited before it served. With a
+  dagron-api started right after the engine, that happened in 4 of 40 starts. `init_pool` now
+  replays its migrators past such a race:
+  - A migration that ran in a transaction rolled back whole and was not recorded, so it is
+    replayed, up to four attempts. A unique violation counts only on a `pg_*` catalog index;
+    a duplicate object or a deadlock always counts.
+  - A `-- no-transaction` migration (the concurrent index builds) is never replayed, since a
+    failure can leave it half done.
+  - sqlx returns from a failed migration without releasing its advisory lock, so the failed
+    attempt's connection is closed rather than returned to the pool. Returned, it would hold
+    the lock, and the next migrator would wait on it forever.
+
+  A live test (`TEST_DATABASE_URL`) keeps dagron-api's `CREATE TABLE users` uncommitted while
+  the engine migrates, then commits it. It fails without the fix. It also starts a second
+  migrator, which fails the test if the first left its lock held.
 - **The Databricks example in `docs/EXTERNAL_JOBS.md` missed most ways a run can fail.**
   Its `fail_when` listed three result states, and the Jobs API has some 25
   terminal codes, so a run ending in, say, `MAX_CONCURRENT_RUNS_EXCEEDED` or
@@ -1385,19 +5289,17 @@ All notable changes to this project are documented here. The format is based on
   denied` warning for each, and a path the engine resolved from its working
   directory failed the same way. The chart now runs the engine as the image's
   user, 65532, as it already ran `dagron-api`. Engines roll once on upgrade.
-- **Two knobs dagron Cloud sets on its engines were reported as typos at
-  every boot:** `DAGRON_TASK_PRIORITY_CLASS` and `DAGRON_TASK_TOLERATIONS`,
-  both read by the Kubernetes executor, were missing from the engine's
-  registry. dagron Cloud's Workspace operator sets the first on every engine
-  of a tiered workspace, and each logged a "looks like a dagron knob but is
-  not one" warning. Both are registered now, and the registry test holds
-  them, and `DAGRON_TASK_ISOLATION_FLOOR`, which the operator now sets too.
+- **Two knobs were reported as typos at every boot:**
+  `DAGRON_TASK_PRIORITY_CLASS` and `DAGRON_TASK_TOLERATIONS`, both read by
+  the Kubernetes executor, were missing from the engine's registry, so an
+  engine given either logged a "looks like a dagron knob but is not one"
+  warning. Both are registered now, and the registry test holds them, and
+  `DAGRON_TASK_ISOLATION_FLOOR`.
 - **Two more real knobs were reported as typos at every boot:**
   `DAGRON_TASK_ALLOWED_SERVICE_ACCOUNTS` and `DAGRON_TASK_SECRET_ENV`, both
   read by the Kubernetes executor and documented in `docs/CONFIG.md`, were
-  missing from the engine's registry. dagron Cloud's Workspace operator now
-  sets the first on every workspace engine with a task identity (the
-  workspace's `dagron-task`), so each would have warned. The test that pins
+  missing from the engine's registry, so an engine given either would have
+  warned. The test that pins
   the registry against the knobs other crates read now names both.
 - **A failed dead-letter redrive no longer loses the dead letter.** Both redrive routes
   deleted the row as their claim and committed that before creating the run.

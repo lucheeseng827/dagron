@@ -1,0 +1,18 @@
+shows: A workflow's defaults give a step its shell and the directory it runs in
+front: github
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on: push
+  defaults:
+    run:
+      shell: bash
+      working-directory: app
+  jobs:
+    build:
+      runs-on: ubuntu-latest
+      steps:
+        - run: npm ci
+        - run: npm test
+          working-directory: app/web
+        - run: echo done
+          shell: sh

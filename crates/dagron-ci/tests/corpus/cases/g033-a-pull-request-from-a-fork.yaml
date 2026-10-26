@@ -1,0 +1,11 @@
+shows: A workflow file run for an untrusted pull request is told its class, like a pipeline
+front: github
+event: { kind: pull_request, trust: untrusted }
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on: pull_request
+  jobs:
+    test:
+      runs-on: ubuntu-latest
+      steps:
+        - run: make test

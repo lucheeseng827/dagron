@@ -8,6 +8,9 @@
 
 pub mod hooks;
 pub use hooks::Seams;
+// What release this is, and the answer to `--version`: for the binaries built
+// on this crate, which call it before [`run`].
+pub use dagron_logging::{version_requested, VERSION};
 
 // ── ops surface (feature `ops`) — the axum management API + the leadership-gated
 // cron / GC / DB-schedule loops. They wire the library crates together rather than
@@ -40,13 +43,36 @@ mod environments;
 /// `DAGRON_SECRETS_DIR` through the executor's resolver — the tier that
 /// predates the DB store, and the ops module's own fallback. A task must not
 /// run with an empty credential in any build.
+///
+/// That store is read by `trusted` runs alone, here as in the ops module
+/// (`admit_secrets`): it belongs to no environment, so no policy speaks for
+/// it. A task's own `environment:` names a store this build does not carry,
+/// and is not read.
 #[cfg(not(feature = "ops"))]
 mod environments {
     use std::collections::BTreeMap;
 
-    use anyhow::Result;
+    use anyhow::{Context, Result};
+    use dagron_core::envpolicy;
 
     use crate::{dag, db};
+
+    pub(crate) async fn admit_secrets(
+        pool: &db::Pool,
+        run_id: &str,
+        _task_environment: Option<&str>,
+    ) -> Result<()> {
+        let trigger = db::run_trigger(pool, run_id)
+            .await
+            .context("loading what started the run, for its secrets")?;
+        let trust = envpolicy::class_of(trigger.as_ref());
+        if trust != envpolicy::TRUSTED {
+            anyhow::bail!(
+                "this run is {trust}: the engine's own store is read by trusted runs alone"
+            );
+        }
+        Ok(())
+    }
 
     pub(crate) async fn template_params(
         _pool: &db::Pool,
@@ -56,13 +82,15 @@ mod environments {
     }
 
     pub(crate) async fn resolve_secrets(
-        _pool: &db::Pool,
-        _run_id: &str,
+        pool: &db::Pool,
+        run_id: &str,
+        task_environment: Option<&str>,
         env: &mut [dag::EnvVar],
     ) -> Result<()> {
         if !env.iter().any(|e| e.value_from.is_some()) {
             return Ok(());
         }
+        admit_secrets(pool, run_id, task_environment).await?;
         let resolved = dagron_executor::secrets::resolve(env)?;
         for (var, done) in env.iter_mut().zip(resolved) {
             var.value = done.value;
@@ -78,6 +106,9 @@ mod leadership;
 // Outbound run notifications (`notify.webhook` / `notify.slack`), fired on run
 // finalization and soft-deadline breach. Best-effort, like forge feedback.
 mod notify;
+mod run_end;
+#[cfg(feature = "ops")]
+mod cdevents;
 #[cfg(feature = "ops")]
 mod schedule;
 // Timezone-aware cron fire-time helper shared by cron/schedule/backfill loops.
@@ -91,12 +122,18 @@ mod stale_ready;
 // and the Parquet compactor.
 #[cfg(feature = "archive-cloud")]
 mod objstore;
+// `dagron backup` — a database's dumps to and from a backup target.
+#[cfg(feature = "archive-cloud")]
+mod backup;
 // `dagron archive-compact` — fold archived run documents into Parquet
 // (the analytics tier of the hot/cold split).
 #[cfg(feature = "archive-parquet")]
 mod archive_compact;
 // Offline spec validation (`dagron validate`) — pure dagron-core, no ops needed.
 mod validate;
+// What remote runners said of their tasks, as results the loop
+// applies like its own workers'.
+mod runner_results;
 // Central server-settings management (LOW_LATENCY §5): the knob registry, the
 // DAGRON_CONFIG file/profile layer, typo warnings, the fleet fingerprint, and
 // `dagron config` introspection.
@@ -105,6 +142,27 @@ mod config;
 mod pressure;
 // Wall-clock confidence on disconnected units (docs/CONFIG.md).
 mod clock;
+// The operator's token service for checkout credentials.
+mod checkout_tokens;
+// Where a task's identity is asked for: https, or the operator says.
+mod oidc_request;
+// Path caches: `workspace.cache`'s signed URLs and the index's sweep.
+mod path_cache;
+// The cache service a workflow's `actions/cache` speaks, over path caches.
+#[cfg(feature = "ops")]
+mod actions_cache;
+// Quota back-pressure: what the result loop does with a task whose pod a full
+// namespace ResourceQuota refused — hand it back, or fail it at the bound.
+mod quota_wait;
+// Live-log chunks, coalesced on their way to their task's row: one append for
+// each task where there was one for each line.
+mod log_batch;
+// The log store's GC: what the store keeps of a task that no reader names.
+mod log_sweep;
+mod logs;
+// When each of the reconcile loop's sweeps runs: an interval each, and the
+// installation's one engine a window.
+mod sweeps;
 
 // Network policy for `wait.url` sensors: the opt-in `WAIT_URL_DENY_PRIVATE`
 // guard that keeps a scheduler-issued poll from reaching addresses the task
@@ -123,9 +181,19 @@ mod defer_http;
 // (A private `use` in the crate root is visible to every descendant module, so
 // `crate::db` inside api.rs/cron.rs/… keeps resolving here.)
 use dagron_core::{dag, db, metrics};
-// Used only by the ops modules (api.rs) via `crate::models`.
-#[cfg(feature = "ops")]
+// In every build: the run loop makes a run's trigger record itself (a
+// sub-workflow's, a dataset's), and the ops modules reach it as
+// `crate::models`. It was the ops build's alone, and a build without `ops`
+// did not compile.
 use dagron_core::models;
+
+/// Where a task that asks for its run's artifacts over dagron-api's API
+/// reaches it: dagron-api's `/task/v1/artifacts`, as the task's network does.
+const ENV_ARTIFACT_API_URL: &str = "DAGRON_ARTIFACT_API_URL";
+/// Whether that URL may be plain http (a closed network's).
+const ENV_ARTIFACT_API_INSECURE: &str = "DAGRON_ARTIFACT_API_INSECURE";
+
+use dagron_core::sweep::{Scope, Sweep};
 #[cfg(feature = "kubernetes")]
 use dagron_executor::kube_executor;
 use dagron_executor::{docker_executor, executor, worker};
@@ -158,6 +226,16 @@ fn new_traceparent() -> (String, String) {
     (format!("00-{trace_id}-{span_id}-01"), trace_id)
 }
 
+/// Whether a task names a trace context of its own: a `TRACEPARENT` among the
+/// variables its workflow gives it. The engine then hands it none, since the
+/// one it would add comes later in the list and would be the one the task
+/// sees: a pipeline that carries its caller's trace into a task would have it
+/// replaced by a trace nothing else is part of.
+#[cfg_attr(not(feature = "otel"), allow(dead_code))]
+fn names_its_own_trace(env: &[dag::EnvVar]) -> bool {
+    env.iter().any(|e| e.name == "TRACEPARENT")
+}
+
 /// The worker heartbeat over the datastore — renews the claim lease while a
 /// task executes, guarded by the claim triple so a reclaimed task can never be
 /// resurrected. This is what lets one task run for hours (training, stream
@@ -180,6 +258,80 @@ impl worker::LeaseKeeper for DbLeaseKeeper {
 /// Max parked `wait.url` sensors probed in a single reconcile tick. Bounds how
 /// much outbound HTTP one tick can take on; the rest roll to the next tick.
 const WAIT_URL_BATCH: i64 = 32;
+
+/// The least a `wait.url` sensor's claim lasts, in seconds: longer than its
+/// GET's timeout (10 s), so a sensor is never claimed again while a GET of
+/// it is in flight. A GET's answer moves its next poll on itself.
+const WAIT_URL_CLAIM_SECS: u64 = 11;
+
+/// How long after `due_at` (RFC 3339) a sweep acted on what fell due then, in
+/// seconds, for `scheduler_sweep_lateness_seconds`; `None` for a time that
+/// cannot be read.
+fn lateness_secs(due_at: &str, now: chrono::DateTime<chrono::Utc>) -> Option<f64> {
+    let due = chrono::DateTime::parse_from_rfc3339(due_at).ok()?;
+    let late = now - due.with_timezone(&chrono::Utc);
+    Some(late.num_milliseconds().max(0) as f64 / 1000.0)
+}
+
+/// A pass of `sweep` read a full batch: it is due again at once here, and the
+/// slot this engine took for it is handed back. This engine asks for it at
+/// its next tick, when its loop next wakes (a notification, one of its own
+/// tasks ending, or `POLL_INTERVAL_MS`), which on a quiet engine can be most
+/// of an interval away; an engine that asks before then takes it. The
+/// engines told the slot was taken in this window wait a whole interval.
+async fn full_batch(
+    pool: &db::Pool,
+    clock: &mut sweeps::SweepClock,
+    due: &sweeps::Due,
+    sweep: Sweep,
+) -> Result<()> {
+    clock.again(sweep);
+    if let Some(turn) = due.turn(sweep) {
+        db::hand_back_sweep_slot(pool, sweep.name(), turn).await?;
+    }
+    Ok(())
+}
+
+/// What a pass of the dataset-trigger sweep does with the registered
+/// workflows: the subscriptions it syncs, and the workflows whose trigger
+/// rows it clears, those whose spec declares no `on_datasets:`.
+///
+/// A spec this engine cannot read is in neither. In a rolling upgrade it may
+/// be one a newer engine wrote, with a key this one refuses, and its
+/// subscriptions are that engine's to keep: cleared by every window an older
+/// engine took, and synced again by the newer one from the latest event, they
+/// would let the events between them go by unfired.
+#[derive(Debug, Default, PartialEq)]
+struct DatasetTriggerWork {
+    /// `(workflow, uris, mode)`, each to sync.
+    sync: Vec<(String, Vec<String>, String)>,
+    /// The workflows whose trigger rows to clear.
+    clear: Vec<String>,
+    /// The workflows whose spec this engine cannot read, each with why: a
+    /// fire of one is rolled back, for an engine that can read it to make.
+    unread: std::collections::HashMap<String, String>,
+}
+
+impl DatasetTriggerWork {
+    /// The work for `workflows`, each `(name, spec)`.
+    fn of(workflows: Vec<(String, String)>) -> Self {
+        let mut work = Self::default();
+        for (name, spec) in workflows {
+            match dag::dataset_subscriptions(&spec) {
+                Ok(Some((uris, mode))) => work.sync.push((name, uris, mode)),
+                Ok(None) => work.clear.push(name),
+                Err(e) => {
+                    tracing::debug!(
+                        workflow = %name, error = %e,
+                        "dataset triggers: a spec this engine cannot read is left as it is"
+                    );
+                    work.unread.insert(name, e.to_string());
+                }
+            }
+        }
+        work
+    }
+}
 
 /// Max parked `defer:` external jobs polled in a single reconcile tick, for the
 /// same reason [`WAIT_URL_BATCH`] exists: one tick's outbound work is bounded,
@@ -338,6 +490,9 @@ fn cancel_transport(input: Option<&str>, has_poller: bool) -> Option<&'static st
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct HeaderCacheKey {
     run_id: String,
+    /// The task's own `environment:`, where it names one: two tasks of a run
+    /// that name the same secret in two environments do not share an entry.
+    environment: Option<String>,
     block: String,
 }
 
@@ -345,11 +500,25 @@ impl HeaderCacheKey {
     /// `None` for a spec that will not serialise, which means *do not cache* —
     /// never share a degenerate key with every other such spec. Resolving twice
     /// costs two queries; sharing costs a credential.
-    fn new(run_id: &str, headers: &[dag::EnvVar]) -> Option<Self> {
-        serde_json::to_string(headers)
-            .ok()
-            .map(|block| Self { run_id: run_id.to_string(), block })
+    fn new(run_id: &str, environment: Option<&str>, headers: &[dag::EnvVar]) -> Option<Self> {
+        serde_json::to_string(headers).ok().map(|block| Self {
+            run_id: run_id.to_string(),
+            environment: environment.map(str::to_string),
+            block,
+        })
     }
+}
+
+/// A task's own `environment:`, read off its stored spec.
+fn task_environment(input: Option<&str>) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Peek {
+        #[serde(default)]
+        environment: Option<String>,
+    }
+    input
+        .and_then(|j| serde_json::from_str::<Peek>(j).ok())
+        .and_then(|p| p.environment)
 }
 
 /// Poll one parked job over `defer.http` and return its verdict.
@@ -485,6 +654,7 @@ async fn poll_one(
 async fn resolve_defer_headers(
     pool: &db::Pool,
     run_id: &str,
+    environment: Option<&str>,
     spec: &dag::DeferHttpSpec,
     secrets: &mut std::collections::HashMap<HeaderCacheKey, Vec<dag::EnvVar>>,
 ) -> anyhow::Result<Vec<dag::EnvVar>> {
@@ -492,12 +662,12 @@ async fn resolve_defer_headers(
     // sweep. A spec that will not serialise is not cached at all rather than
     // sharing a degenerate key with every other such spec — resolving twice
     // costs two queries, sharing costs a credential.
-    let cache_key = HeaderCacheKey::new(run_id, &spec.headers);
+    let cache_key = HeaderCacheKey::new(run_id, environment, &spec.headers);
     if let Some(h) = cache_key.as_ref().and_then(|k| secrets.get(k)) {
         return Ok(h.clone());
     }
     let mut h = spec.headers.clone();
-    environments::resolve_secrets(pool, run_id, &mut h).await?;
+    environments::resolve_secrets(pool, run_id, environment, &mut h).await?;
     if let Some(k) = cache_key {
         secrets.insert(k, h.clone());
     }
@@ -594,6 +764,8 @@ async fn task_finished(metrics: &Metrics, seams: &Seams, success: bool) {
 async fn run_lineage_datasets(pool: &db::Pool, run_id: &str) -> dagron_lineage::RunDatasets {
     let mut inputs = match db::spec_for_run(pool, run_id).await {
         Ok(Some(spec)) => dag::dataset_subscriptions(&spec)
+            .ok()
+            .flatten()
             .map(|(uris, _)| uris)
             .unwrap_or_default(),
         Ok(None) => Vec::new(),
@@ -617,6 +789,12 @@ async fn run_lineage_datasets(pool: &db::Pool, run_id: &str) -> dagron_lineage::
     dagron_lineage::RunDatasets { inputs, outputs }
 }
 
+/// How long a task that was asked to stop, and whose work was not seen gone,
+/// is left before it is looked for again ([`db::release_stopping_task`]). A
+/// teardown takes up to twenty seconds of its own, so a workload that will
+/// not go is asked about twice a minute or so.
+const STOP_RETRY_SECS: i64 = 10;
+
 /// Feed the run-duration metrics for a run this engine just finalized.
 ///
 /// Best-effort: the run is already terminal, so a failed lookup costs one
@@ -635,20 +813,140 @@ async fn run_finished(pool: &db::Pool, metrics: &Metrics, run_id: &str, succeede
     metrics.observe_run_finished(&workflow, succeeded, elapsed.num_milliseconds() as f64 / 1000.0);
 }
 
-/// Append queued live-log chunks (#17). Fence-guarded, so a stale attempt's late
-/// chunk can't corrupt a re-run; the first chunk of an attempt resets any
-/// prior-attempt log. Best-effort: a failed append is logged, not fatal.
-async fn drain_log_chunks(
+/// What this engine holds the tasks of a run that is not trusted to
+/// (`dagron_core::confine`): a floor over the engine's own, and its limits,
+/// on a container made for one and on what the run may spend. An engine with
+/// none runs no such task.
+struct Confining {
+    floor: dagron_core::isolation::IsolationSpec,
+    limits: dagron_core::confine::Limits,
+    /// The images such a task may name, where the operator listed any.
+    images: Vec<String>,
+}
+
+/// How many tasks the run a task is of has, counted as the task is
+/// dispatched and kept for the tasks of the same run that were claimed with
+/// it.
+async fn run_size(
     pool: &db::Pool,
-    log_rx: &mut mpsc::UnboundedReceiver<dagron_executor::executor::LogChunk>,
-) {
-    while let Ok(chunk) = log_rx.try_recv() {
-        if let Err(e) =
-            db::append_task_output(pool, &chunk.task_id, chunk.fence, &chunk.chunk, chunk.first).await
-        {
-            tracing::warn!(task_id = %chunk.task_id, error = %e, "live-log append failed");
+    claimed_with: &mut std::collections::HashMap<String, i64>,
+    run_id: &str,
+) -> Result<i64> {
+    if let Some(tasks) = claimed_with.get(run_id) {
+        return Ok(*tasks);
+    }
+    let tasks = db::run_task_count(pool, run_id)
+        .await
+        .map_err(|e| e.context("counting the run's tasks, for what such a run may have"))?;
+    claimed_with.insert(run_id.to_string(), tasks);
+    Ok(tasks)
+}
+
+/// The runs whose images this engine has begun to fetch, so that each run's
+/// are fetched once; the oldest are forgotten past
+/// [`PREFETCHED_KEPT`].
+#[allow(clippy::type_complexity)]
+static PREFETCHED: std::sync::LazyLock<
+    std::sync::Mutex<(
+        std::collections::HashSet<String>,
+        std::collections::VecDeque<String>,
+    )>,
+> = std::sync::LazyLock::new(Default::default);
+const PREFETCHED_KEPT: usize = 4096;
+
+/// A run that ended is forgotten by the fetch ahead.
+fn forget_prefetched(run_id: &str) {
+    let mut seen = PREFETCHED.lock().unwrap();
+    if seen.0.remove(run_id) {
+        seen.1.retain(|r| r != run_id);
+    }
+}
+
+/// Start fetching the images of `run_id`'s tasks, and their services', in
+/// the background, once per run: the executor pulls them side by side, so
+/// that the run's first task does not wait on its own pull alone and the
+/// next ones wait on none.
+fn prefetch_run(executor: &Arc<dyn executor::Executor>, pool: &db::Pool, run_id: &str) {
+    {
+        let mut seen = PREFETCHED.lock().unwrap();
+        if !seen.0.insert(run_id.to_string()) {
+            return;
+        }
+        seen.1.push_back(run_id.to_string());
+        while seen.1.len() > PREFETCHED_KEPT {
+            if let Some(old) = seen.1.pop_front() {
+                seen.0.remove(&old);
+            }
         }
     }
+    let (executor, pool, run_id) = (Arc::clone(executor), pool.clone(), run_id.to_string());
+    tokio::spawn(async move {
+        let tasks = match db::list_tasks(&pool, &run_id).await {
+            Ok(tasks) => tasks,
+            Err(e) => {
+                tracing::debug!(%run_id, error = %e, "a run's tasks could not be read to fetch its images ahead");
+                return;
+            }
+        };
+        let mut images = Vec::new();
+        for task in tasks {
+            let Some(spec) = task
+                .input
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<dag::TaskSpec>(json).ok())
+            else {
+                continue;
+            };
+            images.push(executor::RunImage {
+                image: spec.docker_image.clone(),
+                policy: spec.image_pull_policy,
+            });
+            images.extend(spec.services.iter().map(|service| executor::RunImage {
+                image: Some(service.image.clone()),
+                policy: spec.image_pull_policy,
+            }));
+        }
+        executor.prefetch(&run_id, images).await;
+    });
+}
+
+/// The trust class of the run a task is of: its record's
+/// (`dagron_core::envpolicy::class_of`), read as the task is dispatched and
+/// kept for the tasks of the same run that were claimed with it.
+async fn run_class(
+    pool: &db::Pool,
+    claimed_with: &mut std::collections::HashMap<String, String>,
+    run_id: &str,
+) -> Result<String> {
+    if let Some(class) = claimed_with.get(run_id) {
+        return Ok(class.clone());
+    }
+    let trigger = db::run_trigger(pool, run_id)
+        .await
+        .map_err(|e| e.context("loading what started the run, for what its tasks are held to"))?;
+    let class = dagron_core::envpolicy::class_of(trigger.as_ref()).to_string();
+    claimed_with.insert(run_id.to_string(), class.clone());
+    Ok(class)
+}
+
+/// The record of the run a `type: workflow` task starts: that task's.
+///
+/// The parent run's record is read here, as its task is dispatched, and the
+/// child's says the same of where the work came from: who caused it, how far
+/// its origin is trusted, the repository and the commit
+/// ([`models::RunTrigger::child_of`]).
+///
+/// A read that fails is an error of its caller's, the loop's, as the read of
+/// the child's spec beside it is. It starts no child, since a child with no
+/// record would be one a rule on its origin could not see; and it does not
+/// fail the task, which a datastore's bad moment is no fault of.
+async fn child_trigger(pool: &db::Pool, task: &models::TaskRun) -> Result<models::RunTrigger> {
+    let parent = db::run_trigger(pool, &task.run_id).await?;
+    Ok(models::RunTrigger::child_of(
+        parent.as_ref(),
+        &task.run_id,
+        &task.name,
+    ))
 }
 
 /// Put an engine-side failure reason in the task's streamed log too, before the
@@ -738,6 +1036,168 @@ fn parse_max_inflight_runs(raw: Option<String>) -> i64 {
     raw.and_then(|v| v.trim().parse::<i64>().ok())
         .unwrap_or(64)
         .max(0)
+}
+
+/// How often the engine looks again for the datastore's INVALID indexes: one
+/// rebuilt by hand leaves `scheduler_db_invalid_indexes`, and the alert on
+/// it, at the next look, with no restart.
+const INVALID_INDEX_CHECK: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// What the engine says of the datastore's INVALID indexes `found`: a line
+/// for each it had not reported before (`known`), with the statement that
+/// rebuilds it; and their count, on `scheduler_db_invalid_indexes`. `known`
+/// becomes what was found, so that one rebuilt and then left invalid again
+/// is said again.
+///
+/// A `CREATE INDEX CONCURRENTLY` cut short leaves one. Postgres never reads
+/// it, so the sweep it was made for reads every row it would have spared,
+/// and nothing rebuilds it: when its migration runs again, `IF NOT EXISTS`
+/// takes it for built. The copies a `REINDEX INDEX CONCURRENTLY` makes while
+/// it runs are left out ([`is_rebuild_copy`]).
+fn report_invalid_indexes(
+    found: &[String],
+    known: &mut std::collections::BTreeSet<String>,
+    metrics: &Metrics,
+) -> Vec<String> {
+    let invalid: std::collections::BTreeSet<String> = found
+        .iter()
+        .filter(|index| !is_rebuild_copy(index))
+        .cloned()
+        .collect();
+    metrics.set_db_invalid_indexes(invalid.len());
+    let mut said = std::collections::BTreeSet::new();
+    let lines = found
+        .iter()
+        .filter(|index| invalid.contains(*index) && !known.contains(*index) && said.insert(*index))
+        .map(|index| {
+            format!(
+                "the datastore's index {index} is INVALID: a build of it was cut short, and \
+                 nothing reads it; rebuild it with `REINDEX INDEX CONCURRENTLY {index}`"
+            )
+        })
+        .collect();
+    *known = invalid;
+    lines
+}
+
+/// A copy of an index that `REINDEX INDEX CONCURRENTLY` makes while it runs:
+/// `<name>_ccnew`, the index it is building, and `<name>_ccold`, the one it is
+/// about to drop, each with a number after it where there are more. Both are
+/// INVALID for a while by design, and neither is an index a build left so.
+fn is_rebuild_copy(index: &str) -> bool {
+    let stem = index.trim_end_matches(|c: char| c.is_ascii_digit());
+    stem.ends_with("_ccnew") || stem.ends_with("_ccold")
+}
+
+/// Look for the datastore's INVALID indexes, and log and count them
+/// ([`report_invalid_indexes`]). A failed look changes nothing.
+async fn check_invalid_indexes(
+    pool: &db::Pool,
+    metrics: &Metrics,
+    known: &mut std::collections::BTreeSet<String>,
+) {
+    match db::invalid_indexes(pool).await {
+        Ok(found) => {
+            for line in report_invalid_indexes(&found, known, metrics) {
+                tracing::error!("{line}");
+            }
+        }
+        Err(e) => warn!(error = %e, "could not look for the datastore's invalid indexes"),
+    }
+}
+
+/// The limits each database's warnings were last said for, by the prefix
+/// of its scopes: limits unchanged since are not said again at every look.
+type SaidLimits = std::collections::BTreeMap<&'static str, (Option<i64>, Option<i64>, i64)>;
+
+/// What the engine says of the `limits` over its sessions on one database
+/// (its datastore's, `prefix` `""`; the control database a build that adds
+/// control-database checks hands it, `control_`),
+/// where it may hold `holds` at once: they are gauged
+/// (`scheduler_db_connection_limit`, `scheduler_db_connection_sessions`), and
+/// a line for each that `holds` is past, or past half of
+/// (`dagron_core::connections::warnings`), the first time those limits are
+/// read, and again whenever they change.
+fn report_connection_limits(
+    prefix: &'static str,
+    limits: &dagron_core::connections::Limits,
+    holds: u32,
+    what: &str,
+    metrics: &Metrics,
+    said: &mut SaidLimits,
+) -> Vec<String> {
+    metrics.set_db_connections(prefix, limits);
+    let key = (limits.database, limits.login, limits.server);
+    if said.insert(prefix, key) == Some(key) {
+        return Vec::new();
+    }
+    dagron_core::connections::warnings(limits, holds, what)
+}
+
+/// How long one read of a database's connection limits may take before it is
+/// given up on: the read carries no timeout of its own.
+const CONNECTION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// One look at the limits over the engine's sessions: its datastore's, on
+/// Postgres, where it may hold `own`'s count, and each of `checks`'
+/// ([`report_connection_limits`]). Said, never a stop: the limits are an
+/// operator's, and a failed read changes nothing. Each read is given up after
+/// [`CONNECTION_READ_TIMEOUT`], so that one that hangs neither holds the
+/// engine's start nor stops the looks after it.
+async fn check_connection_limits(
+    own: Option<(&db::Pool, u32)>,
+    checks: &[Arc<dyn hooks::ConnectionCheck>],
+    metrics: &Metrics,
+    said: &mut SaidLimits,
+) {
+    #[cfg(feature = "postgres")]
+    if let Some((pool, holds)) = own {
+        let read = tokio::time::timeout(
+            CONNECTION_READ_TIMEOUT,
+            dagron_core::connections::read(pool),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("no answer within {}s", CONNECTION_READ_TIMEOUT.as_secs()))
+        .and_then(|read| read.map_err(anyhow::Error::from));
+        match read {
+            Ok(limits) => {
+                let what = format!(
+                    "the engine (its pool of {}, DB_MAX_CONNECTIONS, and a LISTEN session)",
+                    holds.saturating_sub(1)
+                );
+                for line in report_connection_limits("", &limits, holds, &what, metrics, said) {
+                    warn!("{line}");
+                }
+            }
+            Err(e) => warn!(error = %e, "could not read the datastore's connection limits"),
+        }
+    }
+    #[cfg(not(feature = "postgres"))]
+    let _ = own;
+    for check in checks {
+        let (holds, what) = check.holds();
+        let read = tokio::time::timeout(CONNECTION_READ_TIMEOUT, check.read())
+            .await
+            .unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(
+                    "no answer within {}s",
+                    CONNECTION_READ_TIMEOUT.as_secs()
+                ))
+            });
+        match read {
+            Ok(limits) => {
+                for line in
+                    report_connection_limits(check.prefix(), &limits, holds, &what, metrics, said)
+                {
+                    warn!("{line}");
+                }
+            }
+            Err(e) => warn!(
+                error = %format!("{e:#}"), scope = check.prefix(),
+                "could not read a database's connection limits"
+            ),
+        }
+    }
 }
 
 /// Does the engine start with no initial run, rather than a file source that
@@ -835,32 +1295,77 @@ fn run_images(spec: &dag::DagSpec) -> String {
     seen.join(", ")
 }
 
-/// Post a terminal commit status for a finalized run, if its spec declares a
-/// `notify.git` target. Best-effort: any failure (spec missing, no notify block,
-/// forge error) is logged and swallowed so run execution is never affected.
-/// [`git_target`] does the resolution — templates against the spec's
-/// `parameters` (e.g. `sha: "{{ commit_sha }}"` from the CI caller), plus the
-/// `run.*` names only the engine can fill in.
+/// Runs claimed per tick by Step 5b. A mass cancel is worked off over a few
+/// ticks rather than holding one tick for all of it: each run's end may post
+/// to a forge, and each post can take its full timeout.
+const END_OF_RUN_CLAIM_LIMIT: i64 = 64;
+
+/// Running runs one slice of the slow sweep for ended runs looks at. A slice
+/// is one bounded query each REAP_INTERVAL_MS, and the slices cover every
+/// running run in turn: with more runs than this, a run that no notification
+/// named waits that many intervals at most.
+const REAP_SLICE: i64 = 500;
+
+/// Runs whose start Step 5c announces per tick. The posts are spawned, so this
+/// bounds how many go out at once, not how long the tick takes.
+const START_CLAIM_LIMIT: i64 = 64;
+
+/// Post the `pending` commit status for a run that has just started, then look
+/// again: if the run ended while the post was in flight, post its terminal
+/// status once more. The end's own post may have landed first, and on a forge
+/// the last status for a context is the one that shows, so without this a fast
+/// run could finish on `pending`. The terminal status is read after `pending`
+/// lands, and an end that commits later posts after that, so the check always
+/// finishes on the run's end. The cost is an occasional duplicate terminal post.
+async fn announce_start(pool: db::Pool, forge: Arc<dagron_forge::ForgeClient>, run_id: String) {
+    post_forge_status(&forge, &pool, &run_id, "running").await;
+    match db::run_status(&pool, &run_id).await {
+        Ok(Some(status)) if status.is_terminal() => {
+            post_forge_status(&forge, &pool, &run_id, &status.to_string()).await;
+        }
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, %run_id, "could not re-read the run after posting pending"),
+    }
+}
+
+/// Post the commit status for `run_id` in `status`, if its spec declares a
+/// `notify.git` target: `pending` while the run goes (`running`). Best-effort:
+/// any failure is logged and swallowed so run execution is never affected.
+/// A run's end is posted by its `engine.forge` part instead ([`run_end`]),
+/// which tries again.
 async fn post_forge_status(
     forge: &dagron_forge::ForgeClient,
     pool: &db::Pool,
     run_id: &str,
     status: &str,
 ) {
-    let Some(yaml) = db::spec_for_run(pool, run_id).await.ok().flatten() else {
-        return;
-    };
-    let spec: dag::DagSpec = match serde_yaml::from_str(&yaml) {
-        Ok(s) => s,
-        Err(_) => return, // a spec this build can't parse; nothing to notify
-    };
-    let Some(target) = git_target(&spec, run_id, status) else {
-        return;
-    };
-    let state = dagron_forge::CommitState::from_run_status(status);
-    if let Err(e) = forge.post_status(&target, state).await {
+    if let Err(e) = forge_status(forge, pool, run_id, status).await {
         tracing::warn!(error = %e, %run_id, "forge commit status post failed");
     }
+}
+
+/// [`post_forge_status`], saying what failed. `Ok` where nothing is to be
+/// posted: a run that is gone, a spec this build can't parse, one with no
+/// `notify.git` block. [`git_target`] does the resolution — templates
+/// against the run's parameters (e.g. `sha: "{{ commit_sha }}"` from the CI
+/// caller), plus the `run.*` names only the engine can fill in.
+async fn forge_status(
+    forge: &dagron_forge::ForgeClient,
+    pool: &db::Pool,
+    run_id: &str,
+    status: &str,
+) -> Result<(), String> {
+    let Some(spec) = notify::run_spec(pool, run_id).await else {
+        return Ok(());
+    };
+    let Some(target) = git_target(&spec, run_id, status) else {
+        return Ok(());
+    };
+    let state = dagron_forge::CommitState::from_run_status(status);
+    forge
+        .post_status(&target, state)
+        .await
+        .map_err(|e| format!("forge commit status post failed: {e:#}"))
 }
 
 /// Resolve a spec's `notify.git` block into the target to post to. `None` when
@@ -872,7 +1377,8 @@ async fn post_forge_status(
 fn git_target(spec: &dag::DagSpec, run_id: &str, status: &str) -> Option<dagron_forge::GitTarget> {
     let git = spec.notify.as_ref()?.git.as_ref()?;
 
-    // Resolve templated fields against the workflow parameters, plus four
+    // Resolve templated fields against the run's parameters (`spec` carries
+    // them, folded over its defaults by `notify::run_spec`), plus four
     // `run.*` names the author cannot supply because only the engine knows
     // them. The dot keeps them out of the way of ordinary parameter names; a
     // parameter perversely named `run.status` loses to the engine's value,
@@ -912,6 +1418,25 @@ pub async fn run(seams: Seams) -> Result<()> {
     // and any other knob, so it must be applied before anything (including
     // logging) reads the environment. Env always wins over file over profile.
     let cfg_layer = config::apply_file_layer()?;
+
+    // `dagron backup put|list|get|prune …` — move a database's dumps
+    // to and from a backup target. Before logging starts: what it prints is
+    // what a script reads (`get` prints the path it fetched to), and a log
+    // line goes to stdout too. It needs no datastore, only the target's
+    // credentials, which the config file layer above may have set.
+    if std::env::args().nth(1).as_deref() == Some("backup") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        #[cfg(feature = "archive-cloud")]
+        return backup::run_cli(&args).await;
+        #[cfg(not(feature = "archive-cloud"))]
+        {
+            let _ = args;
+            anyhow::bail!(
+                "`dagron backup` needs a build with an object store (archive-s3, archive-gcs \
+                 or archive-azure); the published images have all three"
+            );
+        }
+    }
 
     // Tunable, structured logging for the workflow controller (and the worker
     // pool it spawns). Verbosity/format are env-driven — see the shared
@@ -968,7 +1493,7 @@ pub async fn run(seams: Seams) -> Result<()> {
         // the table on stdout stays parseable): the operator asking "what am
         // I running with" is exactly who needs to hear "…and this var you set
         // does nothing".
-        config::warn_unknown_vars();
+        config::warn_unknown_vars(&seams.env_names);
         let result = config::run_cli(&args[2..]);
         dagron_logging::shutdown();
         return result;
@@ -982,9 +1507,11 @@ pub async fn run(seams: Seams) -> Result<()> {
         fingerprint = %config::fingerprint(),
         config_file = cfg_layer.path.as_deref().unwrap_or("—"),
         profile = cfg_layer.profile.as_deref().unwrap_or("—"),
+        // What this binary can do at all, beside what it was told to do.
+        features = %config::built_with().join(","),
         "configuration resolved"
     );
-    config::warn_unknown_vars();
+    config::warn_unknown_vars(&seams.env_names);
 
     // GitOps init: seed /workflows from the image's bundled examples if empty.
     // (Was docker-entrypoint.sh; in-binary now so the image needs no shell.)
@@ -1087,7 +1614,34 @@ pub async fn run(seams: Seams) -> Result<()> {
     // Trust envelope (family 3): which envelope fields this scheduler's executor
     // can actually deliver. The same `executor_kind` the dispatch path uses, so
     // what is validated is always what will run.
-    let executor_isolation = Some(executor_kind);
+    // And what the operator has said of what is under it: whether a pod's
+    // network can be taken away is the cluster's CNI's to decide, so that one
+    // field is deliverable on Kubernetes only on their word. Read here, for
+    // the floor below; the executor checks what can be checked of it.
+    #[cfg(feature = "kubernetes")]
+    let network_policy = kube_executor::parse_network_policy(
+        &std::env::var(kube_executor::ENV_NETWORK_POLICY).unwrap_or_default(),
+    )
+    .map_err(|e| anyhow::anyhow!("invalid {}: {e}", kube_executor::ENV_NETWORK_POLICY))?;
+    #[cfg(not(feature = "kubernetes"))]
+    let network_policy = false;
+    // And which allowlists they have made: a task may name one of these and
+    // no other. The executor reads each one as it starts: a NetworkPolicy on
+    // Kubernetes, an internal network on Docker.
+    let allowlists = dagron_core::isolation::parse_allowlists(
+        &std::env::var(dagron_core::isolation::ENV_NETWORK_ALLOWLISTS).unwrap_or_default(),
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "invalid {}: {e}",
+            dagron_core::isolation::ENV_NETWORK_ALLOWLISTS
+        )
+    })?;
+    let executor_isolation = Some(dagron_core::isolation::Enforcer {
+        kind: executor_kind,
+        network_policy,
+        allowlists,
+    });
     // The floor is the privileges no task dispatched by this scheduler may go
     // below, however its workflow was written. Parsed at startup so a malformed
     // floor is a boot failure — a floor discovered to be invalid at dispatch is
@@ -1100,7 +1654,7 @@ pub async fn run(seams: Seams) -> Result<()> {
             // it must be found here rather than one task at a time: every task
             // inherits the floor, so the alternative is an engine that boots
             // cleanly and then fails literally everything it is given.
-            if let Some(kind) = executor_isolation {
+            if let Some(kind) = &executor_isolation {
                 floor.require_enforceable_by(kind).map_err(|e| {
                     anyhow::anyhow!("DAGRON_TASK_ISOLATION_FLOOR is not enforceable here: {e}")
                 })?;
@@ -1110,6 +1664,115 @@ pub async fn run(seams: Seams) -> Result<()> {
         }
         _ => None,
     };
+
+    // What this engine holds a run that is not trusted to, and whether it
+    // runs any (`dagron_core::confine`): a pull request from a fork, as a CI
+    // service records it. Given no floor for such runs, it runs none: a task
+    // of one is failed where it would have been dispatched. Given one, it is
+    // applied over the engine's own to those tasks alone, and the engine
+    // starts only where its executor can hold such a task at all. Found
+    // here for the floor's own reason, and not one task at a time.
+    let confining = match std::env::var(dagron_core::confine::ENV_FLOOR) {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let name = dagron_core::confine::ENV_FLOOR;
+            let mut floor = dagron_core::isolation::IsolationSpec::parse_floor(&raw)
+                .map_err(|e| anyhow::anyhow!("invalid {name}: {e}"))?;
+            // Whatever else it says: such a task is given no token of this
+            // installation's.
+            floor.service_account_token = Some(false);
+            let names_a_network = !std::env::var(docker_executor::ENV_NETWORK)
+                .unwrap_or_default()
+                .trim()
+                .is_empty();
+            dagron_core::confine::engine_refusal(executor_kind, &floor, names_a_network).map_err(
+                |why| {
+                    anyhow::anyhow!(
+                        "{name} is set, and this engine cannot run work that is not trusted: {why}"
+                    )
+                },
+            )?;
+            // Enforceable with the engine's own floor under it: such a task
+            // is raised to both.
+            let both = match &isolation_floor {
+                Some(own) => own.apply_floor(&floor).0,
+                None => floor.clone(),
+            };
+            if let Some(kind) = &executor_isolation {
+                both.require_enforceable_by(kind)
+                    .map_err(|e| anyhow::anyhow!("{name} is not enforceable here: {e}"))?;
+            }
+            let limits = dagron_core::confine::Limits::parse(
+                &std::env::var(dagron_core::confine::ENV_LIMITS).unwrap_or_default(),
+            )
+            .map_err(|e| anyhow::anyhow!("invalid {}: {e}", dagron_core::confine::ENV_LIMITS))?;
+            let images = dagron_core::confine::parse_images(
+                &std::env::var(dagron_core::confine::ENV_IMAGES).unwrap_or_default(),
+            )
+            .map_err(|e| anyhow::anyhow!("invalid {}: {e}", dagron_core::confine::ENV_IMAGES))?;
+            info!(
+                floor = %both.canonical().replace('\n', " "),
+                ?limits,
+                images = if images.is_empty() { "any".to_string() } else { images.join(",") },
+                "work that is not trusted is run here, under this floor"
+            );
+            Some(Confining {
+                floor,
+                limits,
+                images,
+            })
+        }
+        _ => None,
+    };
+
+    // A Docker daemon beside a task that asks for one
+    // (`dagron_core::docker_daemon`): offered by the operator alone, since it
+    // runs privileged, and only where the executor can run it. Found here
+    // for the floor's reason.
+    let docker_daemon = {
+        use dagron_core::docker_daemon::{offered, refusal, ENV, ENV_IMAGE};
+        let image = offered(
+            std::env::var(ENV).ok().as_deref(),
+            std::env::var(ENV_IMAGE).ok().as_deref(),
+        )?;
+        if let Some(image) = &image {
+            if let Some(why) = refusal(executor_kind, Some(image)) {
+                anyhow::bail!("{ENV} is set, and this engine cannot run a daemon: {why}");
+            }
+            if confining.is_some() {
+                anyhow::bail!(dagron_core::docker_daemon::refusal_with_untrusted());
+            }
+            info!(%image, "a task that asks for a Docker daemon is given one");
+        }
+        image
+    };
+    // A task that asks to be privileged (`dagron_core::privileged`): allowed
+    // by the operator alone, and only on a dedicated pool of trusted work.
+    // Found here for the floor's reason; what only the cluster can say is
+    // asked where the executor is made.
+    let privileged_allowed = {
+        use dagron_core::privileged::{allowed, engine_refusal, ENV};
+        let allow = allowed(std::env::var(ENV).ok().as_deref()).map_err(|e| anyhow::anyhow!(e))?;
+        if allow {
+            if let Some(why) = engine_refusal(
+                executor_kind,
+                &runner_classes,
+                confining.is_some(),
+                isolation_floor.as_ref(),
+            ) {
+                anyhow::bail!("{ENV}=allow, and this engine is no dedicated pool for it: {why}");
+            }
+            info!(classes = %runner_classes.join(","), "a task that asks to be privileged is run privileged");
+        }
+        allow
+    };
+    // And the runtime it is run on, unprivileged, where the operator names
+    // one: asked of the Docker daemon where the executor is made.
+    let docker_daemon_runtime = dagron_core::docker_daemon::runtime(
+        std::env::var(dagron_core::docker_daemon::ENV_RUNTIME)
+            .ok()
+            .as_deref(),
+        docker_daemon.is_some(),
+    )?;
 
     // Task-pod tolerations: which tainted nodes task pods may land on. Checked
     // at startup for the floor's reason. A malformed value found at dispatch
@@ -1125,38 +1788,24 @@ pub async fn run(seams: Seams) -> Result<()> {
         tolerations
     };
 
+    // The group a task pod's claim workspace is given: checked at startup for
+    // the same reason. `none` is what OpenShift's restricted SCCs want.
+    #[cfg(feature = "kubernetes")]
+    {
+        let raw = std::env::var(kube_executor::ENV_TASK_FS_GROUP).unwrap_or_default();
+        kube_executor::FsGroup::parse(&raw)?;
+        let raw = std::env::var(kube_executor::ENV_TASK_SERVICE_ACCOUNT_POD_LABELS).unwrap_or_default();
+        kube_executor::parse_pod_labels(&raw)?;
+    }
+
     // Named concurrency pools (#21): POOLS=etl:4,db:2 caps how many tasks in each
     // pool may run at once. A task's `pool:` draws a slot; when a pool is full its
     // tasks wait in `ready` until one frees (no run is dropped). Unset/empty = no
     // pools, and the claim path is unchanged. Names are validated like the spec
     // side; a non-positive or unparseable slot count is a startup error, not a
     // silently-ignored limit.
-    let pool_caps: std::collections::BTreeMap<String, i64> = {
-        let raw = std::env::var("POOLS").unwrap_or_default();
-        let mut m = std::collections::BTreeMap::new();
-        for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            let (name, slots) = entry.split_once(':').ok_or_else(|| {
-                anyhow::anyhow!("invalid POOLS entry '{entry}': expected name:slots")
-            })?;
-            let name = name.trim();
-            dag::validate_pool(name).map_err(|e| anyhow::anyhow!("invalid POOLS entry: {e}"))?;
-            let slots: i64 = slots
-                .trim()
-                .parse()
-                .map_err(|_| anyhow::anyhow!("invalid POOLS slots for '{name}': '{slots}'"))?;
-            if slots < 1 {
-                anyhow::bail!("POOLS slots for '{name}' must be >= 1, got {slots}");
-            }
-            // Every other malformed POOLS input is a hard startup error; a
-            // silently-overwritten duplicate would be the odd one out.
-            if let Some(prev) = m.insert(name.to_string(), slots) {
-                anyhow::bail!(
-                    "duplicate POOLS entry for '{name}' (slots {prev} then {slots}) — declare each pool once"
-                );
-            }
-        }
-        m
-    };
+    let pool_caps: std::collections::BTreeMap<String, i64> =
+        dag::parse_pools(&std::env::var("POOLS").unwrap_or_default())?;
 
     // Gang co-scheduling (enterprise scheduler + RUNNER_GANGS=1): claim gangs
     // all-or-nothing before filling leftover capacity with ordinary tasks, and
@@ -1185,6 +1834,14 @@ pub async fn run(seams: Seams) -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    // How long GET /metrics may serve the datastore gauges from a cache
+    // (SCALE_ROADMAP 0.3): what has not finished for METRICS_CACHE_SECS, the
+    // history for METRICS_HISTORY_CACHE_SECS. Whole seconds; 0
+    // reads that tier on every scrape. One cache, for the API and the OTLP
+    // export alike (`api::served`). Only the management API serves /metrics,
+    // so a build without `ops` has no use for it.
+    #[cfg(feature = "ops")]
+    let gauges = api::gauge_cache_from_env();
     // How many times a transient create_run failure is retried (nacked) before a
     // submission is dead-lettered. Parse failures dead-letter immediately.
     let dead_letter_max_attempts: i64 = std::env::var("DEAD_LETTER_MAX_ATTEMPTS")
@@ -1202,11 +1859,100 @@ pub async fn run(seams: Seams) -> Result<()> {
         dagron_executor::install_crypto_provider();
     }
 
+    // Process metrics (counters + latency histograms); the management API renders
+    // these alongside the datastore gauges (cached for METRICS_CACHE_SECS) at GET /metrics. Created before the
+    // executor, which counts its image pulls into it, and the worker pool, so
+    // workers can record per-task durations into it.
+    let metrics = Arc::new(Metrics::new());
+
     let executor: Arc<dyn executor::Executor> = match executor_kind {
         dagron_core::isolation::ExecutorKind::Docker => {
             let image = std::env::var("DOCKER_IMAGE").unwrap_or_else(|_| "alpine:latest".to_string());
-            info!(%image, "using DockerExecutor");
-            Arc::new(docker_executor::DockerExecutor::connect(image).await?)
+            // Mounts and a working directory for every task container, checked
+            // here, before the first task: every task gets them, so a bad one
+            // found at dispatch would fail every task.
+            let mounts = docker_executor::parse_mounts(
+                &std::env::var(docker_executor::ENV_MOUNTS).unwrap_or_default(),
+            )
+            .map_err(|e| anyhow::anyhow!("invalid {}: {e}", docker_executor::ENV_MOUNTS))?;
+            let workdir = docker_executor::parse_workdir(
+                &std::env::var(docker_executor::ENV_WORKDIR).unwrap_or_default(),
+            )
+            .map_err(|e| anyhow::anyhow!("invalid {}: {e}", docker_executor::ENV_WORKDIR))?;
+            // The image that installs dagron-ci-exec into workspace tasks:
+            // pulled now if the daemon lacks it, so one that cannot be had
+            // stops the engine here rather than failing those tasks later.
+            let ci_exec_image = dagron_executor::workspace::parse_image(
+                &std::env::var(dagron_executor::workspace::ENV_CI_EXEC_IMAGE).unwrap_or_default(),
+            )
+            .map_err(|e| anyhow::anyhow!("invalid {}: {e}", dagron_executor::workspace::ENV_CI_EXEC_IMAGE))?;
+            // And the one a workspace's checkout is fetched with, likewise.
+            let checkout_image = dagron_executor::workspace::parse_image(
+                &std::env::var(dagron_executor::checkout::ENV_CHECKOUT_IMAGE).unwrap_or_default(),
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid {}: {e}",
+                    dagron_executor::checkout::ENV_CHECKOUT_IMAGE
+                )
+            })?;
+            // The log driver each container is made with, where the operator
+            // names one: the daemon's own otherwise, as it always was.
+            let log_driver = docker_executor::parse_log_driver(
+                &std::env::var(docker_executor::ENV_LOG_DRIVER).unwrap_or_default(),
+            )
+            .map_err(|e| anyhow::anyhow!("invalid {}: {e}", docker_executor::ENV_LOG_DRIVER))?;
+            // The network each container is made on, where the operator names
+            // one: the daemon's default otherwise, as it always was.
+            let network = docker_executor::parse_network(
+                &std::env::var(docker_executor::ENV_NETWORK).unwrap_or_default(),
+            )
+            .map_err(|e| anyhow::anyhow!("invalid {}: {e}", docker_executor::ENV_NETWORK))?;
+            // Whether a trusted run's step may have its image built from a
+            // Dockerfile on the daemon: none, unless the operator says so.
+            let build_actions = docker_executor::parse_build_actions(
+                &std::env::var(docker_executor::ENV_BUILD_ACTIONS).unwrap_or_default(),
+            )
+            .map_err(|e| anyhow::anyhow!("invalid {}: {e}", docker_executor::ENV_BUILD_ACTIONS))?;
+            info!(
+                %image,
+                mounts = mounts.len(),
+                workdir = workdir.as_deref().unwrap_or("—"),
+                network = network.as_deref().unwrap_or("the daemon's default"),
+                docker_daemon_runtime = docker_daemon_runtime.as_deref().unwrap_or("—"),
+                ci_exec_image = ci_exec_image.as_deref().unwrap_or("—"),
+                checkout_image = checkout_image.as_deref().unwrap_or("—"),
+                build_actions,
+                "using DockerExecutor"
+            );
+            // Where images are pulled from, and with what.
+            let registries = dagron_executor::images::Registries::from_env()?;
+            Arc::new(
+                docker_executor::DockerExecutor::connect(image)
+                    .await?
+                    .with_registries(registries)
+                    .with_metrics(Arc::clone(&metrics))
+                    .with_privileged(privileged_allowed)
+                    .with_log_driver(log_driver)
+                    .await?
+                    .with_network(network)
+                    .await?
+                    .with_network_allowlists(
+                        executor_isolation
+                            .as_ref()
+                            .map(|e| e.allowlists.clone())
+                            .unwrap_or_default(),
+                    )
+                    .await?
+                    .with_daemon_runtime(docker_daemon_runtime.clone())
+                    .await?
+                    .with_task_mounts(mounts, workdir)
+                    .with_build_actions(build_actions)
+                    .with_ci_exec_image(ci_exec_image)
+                    .await?
+                    .with_checkout_image(checkout_image)
+                    .await?,
+            )
         }
         dagron_core::isolation::ExecutorKind::Kubernetes => {
             // Cluster-gated: only compiled with `--features kubernetes`. Without
@@ -1219,7 +1965,12 @@ pub async fn run(seams: Seams) -> Result<()> {
                 let namespace =
                     std::env::var("K8S_NAMESPACE").unwrap_or_else(|_| "default".to_string());
                 info!(%image, %namespace, "using KubeExecutor");
-                Arc::new(kube_executor::KubeExecutor::connect(image, namespace).await?)
+                Arc::new(
+                    kube_executor::KubeExecutor::connect(image, namespace)
+                        .await?
+                        .with_privileged(privileged_allowed)
+                        .await?,
+                )
             }
             #[cfg(not(feature = "kubernetes"))]
             {
@@ -1229,17 +1980,62 @@ pub async fn run(seams: Seams) -> Result<()> {
             }
         }
         dagron_core::isolation::ExecutorKind::Local => {
-            info!("using LocalExecutor");
-            Arc::new(LocalExecutor)
+            let workdir = dagron_executor::workspace::parse_local_workdir(
+                &std::env::var(dagron_executor::workspace::ENV_LOCAL_WORKDIR).unwrap_or_default(),
+            )
+            .map_err(|e| anyhow::anyhow!("invalid {}: {e}", dagron_executor::workspace::ENV_LOCAL_WORKDIR))?;
+            info!(workdir = %workdir.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| "—".into()), "using LocalExecutor");
+            Arc::new(LocalExecutor { workdir })
         }
     };
 
-    // Process metrics (counters + latency histograms); the management API renders
-    // these alongside live datastore gauges at GET /metrics. Created before the
-    // worker pool so workers can record per-task durations into it.
-    let metrics = Arc::new(Metrics::new());
 
     let pool = db::init_pool(&db_target).await?;
+    // The datastore's INVALID indexes: looked for now, so that the first
+    // scrape has them, and again every few minutes, so that one rebuilt by
+    // hand leaves the gauge without a restart.
+    {
+        let mut known = std::collections::BTreeSet::new();
+        check_invalid_indexes(&pool, &metrics, &mut known).await;
+        let (pool, metrics) = (pool.clone(), Arc::clone(&metrics));
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(INVALID_INDEX_CHECK).await;
+                check_invalid_indexes(&pool, &metrics, &mut known).await;
+            }
+        });
+    }
+    // The limits over the engine's sessions: on Postgres, its
+    // database's, its login's and the server's, against its pool and its
+    // LISTEN session, and a build's own databases beside (`Seams::
+    // connection_checks`). Read now, so that the first scrape has them, and
+    // every few minutes after; gauged, and said where the engine may hold
+    // more than one admits, or more than half. Never a stop.
+    {
+        let own = cfg!(feature = "postgres").then(|| pool.options().get_max_connections() + 1);
+        let checks = seams.connection_checks.clone();
+        let mut said = SaidLimits::new();
+        check_connection_limits(
+            own.map(|holds| (&pool, holds)),
+            &checks,
+            &metrics,
+            &mut said,
+        )
+        .await;
+        let (pool, metrics) = (pool.clone(), Arc::clone(&metrics));
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(dagron_core::connections::CHECK_EVERY).await;
+                check_connection_limits(
+                    own.map(|holds| (&pool, holds)),
+                    &checks,
+                    &metrics,
+                    &mut said,
+                )
+                .await;
+            }
+        });
+    }
 
     // Clock discipline: assess the wall clock against the datastore NOW —
     // awaited, so the first run this process creates already carries a
@@ -1301,12 +2097,20 @@ pub async fn run(seams: Seams) -> Result<()> {
     // the reconcile loop, and it must be the SAME one — a second connection
     // would be a second client to keep healthy for no gain.
     let sweeper = Arc::clone(&executor);
-    let workers = WorkerPool::with_lease_keeper(
+    // The operator's token service, which mints each attempt's checkout
+    // credential; read now, so a half-set or unreadable one stops the engine
+    // rather than failing every checkout.
+    let checkout_tokens = checkout_tokens::HttpTokens::from_env()?;
+    if let Some(tokens) = &checkout_tokens {
+        info!(url = %tokens.url(), "checkout credentials from the token service");
+    }
+    let workers = WorkerPool::with_checkout_tokens(
         worker_count,
-        executor,
+        Arc::clone(&executor),
         Arc::clone(&metrics),
         lease_keeper,
         heartbeat_every,
+        checkout_tokens.map(|t| Arc::new(t) as Arc<dyn dagron_executor::checkout::CheckoutTokens>),
     )
     .await?;
     info!(size = workers.size(), "worker pool ready");
@@ -1356,18 +2160,29 @@ pub async fn run(seams: Seams) -> Result<()> {
             info!(path = %p.display(), "admission gate armed — new runs are refused while this file exists");
         }
 
+        // The API's state and the OTLP export's, made with one gauge cache
+        // between them.
+        let served = api::served(
+            pool.clone(),
+            Arc::clone(&metrics),
+            max_inflight_runs,
+            max_inflight_tasks,
+            admission_gate.clone(),
+            gauges,
+        );
+        let api_state = served.api;
+
+        // OTLP metrics: what `/metrics` serves, pushed, whether or not
+        // the API is served.
+        #[cfg(feature = "otel")]
+        api::spawn_otlp_metrics(served.export);
+
         let mut api_on = false;
         if let Ok(addr_raw) = std::env::var("API_ADDR") {
             match addr_raw.parse::<std::net::SocketAddr>() {
                 Ok(addr) => {
                     api_on = true;
-                    let state = api::ApiState {
-                        pool: pool.clone(),
-                        metrics: Arc::clone(&metrics),
-                        max_inflight_runs,
-                        max_inflight_tasks,
-                        admission: admission_gate.clone(),
-                    };
+                    let state = api_state.clone();
                     tokio::spawn(async move {
                         if let Err(e) = api::serve(addr, state).await {
                             tracing::error!(error = %e, "management API stopped");
@@ -1474,7 +2289,8 @@ pub async fn run(seams: Seams) -> Result<()> {
 
     // Reconcile-loop waker. On Postgres this is a LISTEN/NOTIFY listener that
     // wakes the loop the instant any worker changes task readiness; on SQLite it
-    // degrades to the fixed-interval timer.
+    // is the fixed-interval timer, and reads the runs the file's triggers
+    // wrote to `run_wakes` (migrations/079).
     let mut waker = db::Waker::connect(&pool).await?;
 
     // Build the configured ingestion source and start the ractor ingest actor.
@@ -1529,10 +2345,34 @@ pub async fn run(seams: Seams) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<worker::TaskResult>();
 
     // Live-log stream (#17): workers push incremental output chunks here as tasks
-    // run; the loop drains them each tick and appends to the task's stored output
-    // for tailing. Separate from the result channel so partial output is visible
-    // before the task's terminal result arrives.
+    // run; the loop takes them each tick and appends them to the task's stored
+    // log for tailing, a task's chunks together (`log_batch`). Separate from the
+    // result channel so partial output is visible before the task's terminal
+    // result arrives.
     let (log_tx, mut log_rx) = mpsc::unbounded_channel::<dagron_executor::executor::LogChunk>();
+    // Where task logs are kept once out of the task rows: a
+    // file:// directory, or an object store's URL; unset, in the rows.
+    let kept_logs = dagron_artifact::log_segments::from_env()?;
+    if let Some((store, segment_bytes)) = &kept_logs {
+        info!(store = ?store, segment_bytes, "task logs are kept in segments in the log store");
+    }
+    logs::keep_in(kept_logs.as_ref().map(|(store, _)| store.clone()));
+    // Its GC, woken by a log begun again over a
+    // writing the store kept, which the batch no longer removes itself.
+    let sweep_wake = Arc::new(tokio::sync::Notify::new());
+    log_sweep::start(
+        &pool,
+        kept_logs.as_ref().map(|(store, _)| store.clone()),
+        Arc::clone(&metrics),
+        Arc::clone(&sweep_wake),
+    )?;
+    let mut logs = log_batch::LogBatch::new(kept_logs.map(|(store, segment_bytes)| {
+        log_batch::Kept::new(store, segment_bytes).waking(Arc::clone(&sweep_wake))
+    }));
+    // Read here, so that a cap that is no number is said as the engine starts
+    // and not at its first task; and an end of a log past it that is no
+    // number, or more than the cap.
+    let _ = dagron_executor::executor::log_tail_bytes(dagron_executor::executor::log_task_cap());
 
     // Tick pacing (docs/LOW_LATENCY.md A-2/A-4). `POLL_INTERVAL_MS` bounds how
     // long the loop may sleep with work outstanding: on Postgres the timer is a
@@ -1551,16 +2391,26 @@ pub async fn run(seams: Seams) -> Result<()> {
     // NOTIFY-woken tick pays only the hot path (advance → claim → dispatch →
     // drain → reap). Defaults to the poll interval — at stock settings that is
     // today's behaviour exactly; profiles that shrink `POLL_INTERVAL_MS` set
-    // this back to ~500 ms so faster ticks don't multiply sweep load.
+    // this back to ~500 ms so faster ticks don't multiply sweep load. It is
+    // each sweep's interval unless `SWEEP_INTERVALS` names it.
     let sweep_interval_ms: u64 = std::env::var("SWEEP_INTERVAL_MS")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(poll_interval_ms)
         .max(10);
-    let sweep_interval = std::time::Duration::from_millis(sweep_interval_ms);
+    // Ended runs are looked for among the runs a notification named, and the
+    // rest of what is running is covered a slice at a time, this often: the
+    // net under a notification nobody took. 0 is the loop as it was: every
+    // tick looks at every running run.
+    let reap_interval_ms: u64 = std::env::var("REAP_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(5_000);
+    let reap_interval = std::time::Duration::from_millis(reap_interval_ms);
     info!(
         poll_interval_ms,
         sweep_interval_ms,
+        reap_interval_ms,
         lease_secs = db::lease_secs(),
         heartbeat_secs = heartbeat_every.as_secs(),
         "tick pacing configured"
@@ -1605,14 +2455,57 @@ pub async fn run(seams: Seams) -> Result<()> {
         ),
     }
 
-    // None → the first tick always sweeps (recovery must not wait a window).
-    let mut last_sweep: Option<std::time::Instant> = None;
-    // Likewise, and it matters more here: a scheduler that has just restarted
-    // after a crash is exactly when leftovers exist.
-    let mut last_orphan_sweep: Option<std::time::Instant> = None;
+    // How long a task may wait on a full namespace quota before it fails
+    // (`DAGRON_QUOTA_WAIT_MAX_SECS`). Said at boot either way: with it off, a
+    // refusal is a failed attempt, and "why did this fail instead of wait" is
+    // otherwise answered only by reading the environment.
+    let quota_wait_max_secs = quota_wait::max_wait_from_env();
+    if quota_wait_max_secs > 0 {
+        info!(
+            max_wait_secs = quota_wait_max_secs,
+            "quota back-pressure on — a task whose pod a full namespace ResourceQuota refuses \
+             returns to the queue without consuming an attempt, and fails once it has waited \
+             this long"
+        );
+    } else {
+        info!(
+            "quota back-pressure OFF (DAGRON_QUOTA_WAIT_MAX_SECS=0) — a pod refused by a full \
+             namespace ResourceQuota is a failed attempt"
+        );
+    }
+
+    // When each sweep runs: its interval, and whether the
+    // installation's are taken one engine a window. Every sweep is due on the
+    // first tick: recovery must not wait a window, a scheduler that has just
+    // restarted after a crash is exactly when leftovers exist, and tasks that
+    // were waiting on quota before a restart still are. A sweep whose part is
+    // off here is never due, and no slot is asked for it.
+    let mut sweep_clock =
+        sweeps::SweepClock::from_env(sweep_interval_ms, orphan_sweep_interval, reap_interval)?;
+    if installation.is_none() {
+        sweep_clock.switch_off(Sweep::Orphans);
+    }
+    if quota_wait_max_secs == 0 {
+        sweep_clock.switch_off(Sweep::QuotaSummary);
+    }
+    if !gangs_on {
+        sweep_clock.switch_off(Sweep::Gangs);
+    }
+    // The slow sweep for ended runs: the run its last slice ended at, where
+    // there is no slot to keep it (None: the next slice begins again).
+    let mut reap_after: Option<String> = None;
 
     // Simple counter: how many tasks are currently in-flight inside the worker pool.
     let mut in_flight: usize = 0;
+
+    // The executions this engine has out, by task: each claim's fence, and the
+    // signal that stops its work. A cancel is a row another process may have
+    // written, so nothing tells this engine of it. It asks the datastore about
+    // these at every sweep ([`db::tasks_to_stop`]) and signals the ones whose
+    // work should stop: within a sweep of the cancel, and with or without a
+    // lease heartbeat. A teardown is not kept here: it has nothing to stop.
+    let mut held: std::collections::HashMap<String, (i64, executor::Stop)> =
+        std::collections::HashMap::new();
 
     // Results the completion wake (A-1) pulled out of the channel while the
     // loop was between ticks; drained ahead of the channel in step 4 so
@@ -1628,11 +2521,23 @@ pub async fn run(seams: Seams) -> Result<()> {
 
     // Optional forge feedback (GitHub/GitLab commit statuses). Active when a
     // GITHUB_TOKEN / GITLAB_TOKEN is set; a run whose spec carries a `notify.git`
-    // block posts its terminal status on finalization. Best-effort, like lineage.
-    let forge = dagron_forge::ForgeClient::from_env();
+    // block posts `pending` when it starts and its terminal status when it
+    // ends. Best-effort, like lineage. Shared, because a start is announced
+    // from a spawned task (Step 5c).
+    let forge = dagron_forge::ForgeClient::from_env().map(Arc::new);
     if forge.is_some() {
         info!("forge feedback enabled (notify.git commit statuses)");
     }
+
+    // The end-of-run work: each part a worker of its own, draining its
+    // own sink of the outbox, so that none of it is done in this loop. The
+    // parts are registered before any run can end here, so that every end
+    // written from now on is owed to each; `run_ended` is how Step 5 says a
+    // run has ended, for its end to be done at once.
+    let end_parts = run_end::parts(Arc::clone(&seams.run_sink), lineage, forge.clone());
+    run_end::register(&pool, &end_parts).await?;
+    let run_ended = Arc::new(tokio::sync::Notify::new());
+    run_end::spawn(pool.clone(), end_parts.clone(), Arc::clone(&run_ended));
 
     // Optional artifact store for passing files between tasks. When
     // DAGRON_ARTIFACT_DIR is set, each dispatched task gets a per-run shared dir
@@ -1710,16 +2615,15 @@ pub async fn run(seams: Seams) -> Result<()> {
     // registered workflows with `on_datasets:` fire when their subscribed
     // datasets record new updates. On by default; DATASET_TRIGGERS=0 opts a
     // scheduler out of sweeping (sensors and `produces:` recording stay on —
-    // they are run-local, not trigger machinery). The sweep itself is throttled
-    // below; `dataset_trigger_sweep` is its last-run instant.
+    // they are run-local, not trigger machinery). The sweep itself runs at its
+    // own interval (`dataset_triggers`, 5 s), and an engine opted out does not
+    // ask for its slot.
     let dataset_triggers_on = std::env::var("DATASET_TRIGGERS")
         .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
         .unwrap_or(true);
-    let mut dataset_trigger_sweep: Option<std::time::Instant> = None;
-    // Workflows this scheduler has synced subscription rows for, so a spec that
-    // later drops `on_datasets:` is cleared once instead of every sweep.
-    let mut subscribed_workflows: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    if !dataset_triggers_on {
+        sweep_clock.switch_off(Sweep::DatasetTriggers);
+    }
     // One warning per unowned `defer.kind`, not one per tick: a build holding a
     // job it cannot resolve is worth saying, and saying it twice a second is how
     // an operator learns to filter it out.
@@ -1741,12 +2645,184 @@ pub async fn run(seams: Seams) -> Result<()> {
         info!(%url, "cloud artifact location enabled (DAGRON_ARTIFACTS_URL / DAGRON_CHECKPOINT_URL injected per task)");
     }
 
+    // Path caches: the store `workspace.cache`
+    // keeps entries in. A task with caches is given signed URLs for them as
+    // it is dispatched (`DAGRON_CACHE`); the sweep makes ready what tasks
+    // saved and evicts. Unset: every task starts cold.
+    let path_caches = path_cache::PathCaches::from_env().await?;
+    if let Some(caches) = &path_caches {
+        let s = caches.settings();
+        info!(
+            quota_bytes = s.quota_bytes,
+            max_entry_bytes = s.max_entry_bytes,
+            unused_days = s.unused_days,
+            "path caches enabled (DAGRON_CACHE_URL)"
+        );
+        Arc::clone(caches).spawn_sweeper(pool.clone());
+    }
+    let mut warned_no_cache_store = false;
+
+    // The cache service: what a workflow's
+    // `actions/cache` saves to and restores from, over the path caches'
+    // index and store. Off unless it is given a place to listen and the URL
+    // jobs reach it at; on, it needs the path caches' store.
+    #[cfg(feature = "ops")]
+    let actions_cache = match actions_cache::settings(
+        std::env::var(actions_cache::ENV_LISTEN).ok().as_deref(),
+        std::env::var(actions_cache::ENV_URL).ok().as_deref(),
+        std::env::var(actions_cache::ENV_INSECURE).ok().as_deref(),
+    )? {
+        None => {
+            // A key for provenance with nothing to sign: said, not refused.
+            if dagron_crypto::provenance::signer_from_env().is_ok_and(|s| s.is_some()) {
+                warn!(
+                    "a provenance key is set ({} or {}) and the artifact service is off ({} \
+                     unset): no artifact is signed",
+                    dagron_crypto::provenance::ENV_KEY,
+                    dagron_crypto::provenance::ENV_SIGN_CMD,
+                    actions_cache::ENV_LISTEN
+                );
+            }
+            None
+        }
+        Some((addr, url)) => {
+            let Some(caches) = &path_caches else {
+                anyhow::bail!(
+                    "{} is set and DAGRON_CACHE_URL is not: the cache service keeps its entries in \
+                     the path caches' store",
+                    actions_cache::ENV_LISTEN
+                );
+            };
+            let dir = std::env::var(actions_cache::ENV_DIR)
+                .ok()
+                .map(|d| d.trim().to_string())
+                .filter(|d| !d.is_empty())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::temp_dir().join("dagron-actions-cache"));
+            if url.starts_with("http://") {
+                warn!(
+                    %url,
+                    "the actions cache service over plain http (DAGRON_ACTIONS_CACHE_INSECURE=allow): \
+                     a job's cache credential crosses the network in the clear"
+                );
+            }
+            // The artifact service rides the same listener: how long it
+            // keeps a run's artifacts, and how large one may be.
+            let artifacts = actions_cache::artifact_settings(
+                std::env::var(actions_cache::ENV_ARTIFACT_RETENTION_DAYS)
+                    .ok()
+                    .as_deref(),
+                std::env::var(actions_cache::ENV_ARTIFACT_MAX_BYTES)
+                    .ok()
+                    .as_deref(),
+            )?;
+            // Each artifact's provenance signed, where the operator
+            // gives a key: one that cannot be read stops the engine here.
+            let provenance = actions_cache::Provenance::from_env()?;
+            if let Some(p) = &provenance {
+                info!(
+                    public_key = %p.public_key_pem().replace('\n', " "),
+                    "workflow artifacts are signed with their provenance: verify with this key"
+                );
+            }
+            // And a job's steps in images of their own, on this engine's
+            // executor, held to the images a run that is not trusted may
+            // name.
+            let images = confining
+                .as_ref()
+                .map(|held| held.images.clone())
+                .unwrap_or_default();
+            let svc = Arc::new(
+                actions_cache::ActionsCache::new(
+                    Arc::clone(caches),
+                    pool.clone(),
+                    url,
+                    dir,
+                    artifacts,
+                )?
+                .with_steps(Arc::clone(&executor), images)
+                .with_provenance(provenance),
+            );
+            Arc::clone(&svc).serve(addr).await?;
+            Some(svc)
+        }
+    };
+
+    // Task identity: where a task that asks for one
+    // (`identity: { oidc: … }`) asks dagron-api's issuer for tokens. Unset:
+    // such a task is refused, and says why. Over https, unless the operator
+    // allows plain http: one that does not stops the engine here.
+    let oidc_request_url = oidc_request::from_settings(
+        std::env::var(oidc_request::ENV_URL).ok().as_deref(),
+        std::env::var(oidc_request::ENV_INSECURE).ok().as_deref(),
+    )?;
+    if let Some(url) = &oidc_request_url {
+        if url.starts_with("http://") {
+            warn!(
+                %url,
+                "task identity over plain http (DAGRON_OIDC_REQUEST_INSECURE=allow): a task's \
+                 request credential crosses the network in the clear"
+            );
+        } else {
+            info!(%url, "task identity enabled (DAGRON_OIDC_REQUEST_URL)");
+        }
+    }
+
+    // A task's artifacts over dagron-api's API: where a
+    // task that asks for it (`artifact_api: true`) reaches dagron-api's
+    // `/task/v1/artifacts`. Unset: such a task is refused, and says why.
+    // Over https, as the request URL above.
+    let artifact_api_url = oidc_request::task_url(
+        ENV_ARTIFACT_API_URL,
+        ENV_ARTIFACT_API_INSECURE,
+        "its run's artifacts are read and written",
+        std::env::var(ENV_ARTIFACT_API_URL).ok().as_deref(),
+        std::env::var(ENV_ARTIFACT_API_INSECURE).ok().as_deref(),
+    )?
+    .map(|url| url.trim_end_matches('/').to_string());
+    if let Some(url) = &artifact_api_url {
+        if url.starts_with("http://") {
+            warn!(
+                %url,
+                "the artifact API over plain http (DAGRON_ARTIFACT_API_INSECURE=allow): a task's \
+                 credential crosses the network in the clear"
+            );
+        } else {
+            info!(%url, "the artifact API given to tasks that ask for it (DAGRON_ARTIFACT_API_URL)");
+        }
+    }
+
+    // Each sweep's cadence, a line each, and its interval on /metrics: where
+    // engines of one installation are set apart, the engine that takes a
+    // sweep's slot sets its cadence for the window. One switched off here
+    // shows no interval, so that the alert on a sweep that has stopped
+    // leaves it out.
+    for s in Sweep::ALL {
+        metrics.set_sweep_interval(s, sweep_clock.shown_every(s));
+        info!(
+            sweep = s.name(),
+            scope = s.scope().as_str(),
+            interval_ms = sweep_clock.every(s).as_millis() as u64,
+            source = sweep_clock.source(s),
+            // SQLite is one engine, and has no slots to share.
+            shared = cfg!(feature = "postgres")
+                && sweep_clock.share()
+                && s.scope() == Scope::Installation,
+            off = sweep_clock.is_off(s),
+            "sweep cadence"
+        );
+    }
+
     info!("reconcile loop running (multi-run, queue-driven daemon)");
 
-    // Oversized-gang alarm state (gangs_on only): slow-cadence check + a
-    // warned set so each impossible gang logs exactly once per process.
-    let mut oversized_gang_check: Option<std::time::Instant> = None;
+    // Oversized-gang alarm state (gangs_on only): the check runs at its own
+    // interval (`gangs`), and a warned set has each impossible gang logged
+    // exactly once per process.
     let mut warned_oversized_gangs: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    // The workflows whose dataset fire this engine has handed back, its spec
+    // being one it cannot read: warned of once each a process.
+    let mut warned_unread_specs: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
     // Constrained-host claim gate (`DAGRON_PRESSURE_FILE`): polled once per
@@ -1775,12 +2851,23 @@ pub async fn run(seams: Seams) -> Result<()> {
         // Crash recovery, run deadlines, SLA alerts, approval expiry, and the
         // sub-workflow / wait-sensor / dataset reconciliations are time-based,
         // idempotent sweeps — none of them needed to run at the moment a
-        // dependency finished. They run at `SWEEP_INTERVAL_MS` cadence so a
-        // completion- or NOTIFY-woken tick goes straight to advance → claim.
-        let run_sweeps =
-            last_sweep.is_none_or(|t: std::time::Instant| t.elapsed() >= sweep_interval);
-        if run_sweeps {
-            last_sweep = Some(std::time::Instant::now());
+        // dependency finished. Each runs at its own interval (`SWEEP_INTERVALS`
+        // over `SWEEP_INTERVAL_MS`) so a completion- or NOTIFY-woken tick goes
+        // straight to advance → claim. The installation's are run by one engine
+        // a window: the tick asks for the slots of those due, in one statement,
+        // and runs those it took and its own; the rest wait a whole interval,
+        // timed from when the claim came back.
+        let sweeps_due = {
+            let (pool, worker_id) = (&pool, &worker_id);
+            sweep_clock
+                .take(
+                    std::time::Instant::now(),
+                    |wanted| async move { db::claim_sweep_slots(pool, worker_id, &wanted).await },
+                    |s| metrics.sweep_elsewhere(s),
+                )
+                .await?
+        };
+        if sweeps_due.any() {
             // ── Step 0: leftover workloads from schedulers that died ────────────
             //
             // The per-dispatch reap cannot see these. It runs when a task is
@@ -1796,10 +2883,9 @@ pub async fn run(seams: Seams) -> Result<()> {
             // yet". `min_age` covers the clock skew and the replication lag
             // that ordering alone does not.
             if let Some(inst) = installation.as_deref() {
-                if last_orphan_sweep
-                    .is_none_or(|t: std::time::Instant| t.elapsed() >= orphan_sweep_interval)
-                {
-                    last_orphan_sweep = Some(std::time::Instant::now());
+                if sweeps_due.runs(Sweep::Orphans) {
+                    let pass = std::time::Instant::now();
+                    let mut reaped = 0;
                     let scope = dagron_executor::executor::OrphanScope {
                         installation: inst,
                         min_age: orphan_min_age,
@@ -1829,8 +2915,8 @@ pub async fn run(seams: Seams) -> Result<()> {
                             // worse than none: a task whose chunk never ran
                             // looks dead, and the whole sweep acts on absence.
                             // So one failed chunk abandons the deletes
-                            // entirely, and `last_orphan_sweep` is already
-                            // stamped, so the next attempt waits the normal
+                            // entirely, and the sweep is already stamped as
+                            // run, so the next attempt waits the normal
                             // cadence rather than hot-looping.
                             let mut live = std::collections::HashSet::new();
                             let mut liveness_complete = true;
@@ -1860,6 +2946,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                                 match sweeper.delete_workload(w).await {
                                     Ok(()) => {
                                         metrics.inc_orphan_workloads_reaped();
+                                        reaped += 1;
                                         warn!(
                                             handle = %w.handle,
                                             task_id = %w.task_id,
@@ -1886,53 +2973,170 @@ pub async fn run(seams: Seams) -> Result<()> {
                         // stop scheduling.
                         Err(e) => warn!(error = %e, "fleet sweep could not list workloads — skipping this pass"),
                     }
+                    metrics.sweep_ran(Sweep::Orphans, pass.elapsed(), reaped);
                 }
             }
 
             // ── Step 1: crash recovery ──────────────────────────────────────────
-            let recovered = db::recover_expired_leases(&pool).await?;
-            if recovered > 0 {
-                info!(recovered, "reclaimed expired leases");
+            if sweeps_due.runs(Sweep::Leases) {
+                let pass = std::time::Instant::now();
+                let recovered = db::recover_expired_leases(&pool).await?;
+                if recovered > 0 {
+                    info!(recovered, "reclaimed expired leases");
+                }
+                metrics.sweep_ran(Sweep::Leases, pass.elapsed(), recovered as usize);
+            }
+            // The tasks of remote runners' sessions whose lease has lapsed: a
+            // session's tasks keep no lease of their own.
+            if sweeps_due.runs(Sweep::Sessions) {
+                let pass = std::time::Instant::now();
+                let recovered = db::recover_expired_sessions(&pool).await?;
+                if recovered > 0 {
+                    info!(recovered, "took back the tasks of expired runner sessions");
+                }
+                metrics.sweep_ran(Sweep::Sessions, pass.elapsed(), recovered as usize);
+            }
+
+            // ── Step 1 (stops): the work whose task was asked to stop ───────────
+            // A run cancelled or past its deadline, a gang sibling that failed,
+            // a claim another scheduler took: each is a change to a row, and
+            // the work goes on until its executor is told. Its worker's next
+            // lease renewal used to be what told it, a third of LEASE_SECS
+            // later, and nothing did with the heartbeat off.
+            if sweeps_due.runs(Sweep::Stops) && !held.is_empty() {
+                let pass = std::time::Instant::now();
+                let asked: Vec<(String, i64)> =
+                    held.iter().map(|(id, (fence, _))| (id.clone(), *fence)).collect();
+                let to_stop = db::tasks_to_stop(&pool, &worker_id, &asked).await?;
+                for task_id in &to_stop {
+                    if let Some((fence, stop)) = held.get(task_id) {
+                        if !stop.is_requested() {
+                            info!(
+                                %task_id, fence,
+                                "the task was asked to stop, or its claim is gone: stopping its work"
+                            );
+                            stop.request();
+                        }
+                    }
+                }
+                metrics.sweep_ran(Sweep::Stops, pass.elapsed(), to_stop.len());
+            }
+            // Nothing held here, so nothing to ask of: the window ran all the
+            // same, and an idle engine's sweep is not one that has stopped.
+            if sweeps_due.runs(Sweep::Stops) && held.is_empty() {
+                metrics.sweep_ran(Sweep::Stops, std::time::Duration::ZERO, 0);
+            }
+
+            // ── Step 1a: quota-wait summary ─────────────────────────────────────
+            // A task waiting on a namespace quota logs its own refusals ever
+            // more rarely, so this is the line that says, once a minute, that
+            // the wait is still going on and how old it is. Silent when nothing
+            // waits, and never fails the tick. Off where quota waits are off.
+            if sweeps_due.runs(Sweep::QuotaSummary) {
+                let pass = std::time::Instant::now();
+                quota_wait::log_summary(&pool).await;
+                metrics.sweep_ran(Sweep::QuotaSummary, pass.elapsed(), 0);
             }
 
             // ── Step 1b: run-level deadlines ────────────────────────────────────
             // Fail any run past its `run_timeout_secs` budget and cancel its
             // remaining tasks. Idempotent, so every scheduler may sweep; an executor
             // finishing after the sweep is rejected by the fence guard.
-            for run_id in db::cancel_overdue_runs(&pool).await? {
-                tracing::warn!(%run_id, "run deadline exceeded (run_timeout_secs) — run failed, tasks cancelled");
-                metrics.inc_runs_deadline_exceeded();
-                #[cfg(feature = "ops")]
-                run_finished(&pool, &metrics, &run_id, false).await;
+            if sweeps_due.runs(Sweep::Deadlines) {
+                let pass = std::time::Instant::now();
+                let overdue = db::cancel_overdue_runs(&pool).await?;
+                let now = chrono::Utc::now();
+                for (run_id, deadline_at) in &overdue {
+                    if let Some(late) = lateness_secs(deadline_at, now) {
+                        metrics.observe_sweep_lateness(Sweep::Deadlines, late);
+                    }
+                    tracing::warn!(%run_id, "run deadline exceeded (run_timeout_secs) — run failing; its tasks are cancelled, or asked to stop");
+                    metrics.inc_runs_deadline_exceeded();
+                    #[cfg(feature = "ops")]
+                    run_finished(&pool, &metrics, run_id, false).await;
+                }
+                metrics.sweep_ran(Sweep::Deadlines, pass.elapsed(), overdue.len());
+            }
+
+            // ── Step 1b (ends): runs left with nothing stopping ─────────────────
+            // A run that was asked to stop ends in the statement that settles
+            // its last task. An engine from before the stop request settles
+            // nothing: it finishes the task as it always did. This ends what
+            // such an engine leaves, while both versions share a datastore.
+            if sweeps_due.runs(Sweep::StoppedRuns) {
+                let pass = std::time::Instant::now();
+                let ended = db::end_stopped_runs(&pool).await?;
+                if ended > 0 {
+                    warn!(
+                        ended,
+                        "ended runs that were asked to stop and left with nothing stopping \
+                         (an engine from before the stop request finished their tasks)"
+                    );
+                }
+                metrics.sweep_ran(Sweep::StoppedRuns, pass.elapsed(), ended as usize);
+            }
+
+            // ── Step 1b (admits): runs that wait for their workflow's cap ───────
+            // A run made while its workflow's `max_active_runs` was full
+            // (`when_full: queue`, or `supersede`) has its tasks held, and is
+            // let in here once a run before it has ended: oldest first, as
+            // many as the cap has room for. Every scheduler may sweep: a key
+            // is taken under its admission lock, and a run is let in once.
+            if sweeps_due.runs(Sweep::Admissions) {
+                let pass = std::time::Instant::now();
+                let admitted = db::admit_waiting_runs(&pool).await?;
+                for run_id in &admitted {
+                    info!(%run_id, "a run that waited for its workflow's max_active_runs is let in");
+                    metrics.inc_runs_admitted();
+                }
+                metrics.sweep_ran(Sweep::Admissions, pass.elapsed(), admitted.len());
             }
 
             // ── Step 1c: soft SLA deadline alerts ───────────────────────────────
             // Emit a `run.deadline_exceeded` outbox event (once) for a run past its
             // `deadline` — the run keeps running. Fire-once + winner-take-all in SQL.
-            for run_id in db::fire_deadline_alerts(&pool).await? {
-                tracing::warn!(%run_id, "run exceeded its soft deadline — SLA alert emitted");
-                metrics.inc_deadline_alerts();
-                // Push the SLA breach to any notify.webhook / notify.slack targets
-                // (fire-once is guaranteed by fire_deadline_alerts above). Spawned
-                // so a slow target can't stall the reconcile tick.
-                {
-                    let pool = pool.clone();
-                    tokio::spawn(async move {
-                        notify::notify_run_event(&pool, &run_id, "deadline_exceeded").await;
-                    });
+            if sweeps_due.runs(Sweep::Alerts) {
+                let pass = std::time::Instant::now();
+                let fired = db::fire_deadline_alerts(&pool).await?;
+                let (rows, now) = (fired.len(), chrono::Utc::now());
+                for (run_id, alert_deadline_at) in fired {
+                    if let Some(late) = lateness_secs(&alert_deadline_at, now) {
+                        metrics.observe_sweep_lateness(Sweep::Alerts, late);
+                    }
+                    tracing::warn!(%run_id, "run exceeded its soft deadline — SLA alert emitted");
+                    metrics.inc_deadline_alerts();
+                    // Push the SLA breach to any notify.webhook / notify.slack targets
+                    // (fire-once is guaranteed by fire_deadline_alerts above). Spawned
+                    // so a slow target can't stall the reconcile tick.
+                    {
+                        let pool = pool.clone();
+                        tokio::spawn(async move {
+                            notify::notify_run_event(&pool, &run_id, "deadline_exceeded").await;
+                        });
+                    }
                 }
+                metrics.sweep_ran(Sweep::Alerts, pass.elapsed(), rows);
             }
 
             // ── Step 1d: expire human approval gates (#19) ──────────────────────
             // Auto-resolve any `awaiting_approval` task past its `approval_timeout_secs`
             // per its `approval_on_timeout` default. Idempotent (guarded resolve), so
             // every scheduler may sweep.
-            for (task_id, approved) in db::resolve_expired_approvals(&pool).await? {
-                tracing::info!(%task_id, approved, "approval gate timed out — auto-resolved");
-                // Both arms are terminal: `resolve_approval` writes `succeeded`
-                // on approve and `failed` on reject. An approved gate is not
-                // handed on to a worker, so this is its only completion.
-                task_finished(&metrics, &seams, approved).await;
+            if sweeps_due.runs(Sweep::Approvals) {
+                let pass = std::time::Instant::now();
+                let expired = db::resolve_expired_approvals(&pool).await?;
+                let (rows, now) = (expired.len(), chrono::Utc::now());
+                for (task_id, approved, deadline) in expired {
+                    if let Some(late) = lateness_secs(&deadline, now) {
+                        metrics.observe_sweep_lateness(Sweep::Approvals, late);
+                    }
+                    tracing::info!(%task_id, approved, "approval gate timed out — auto-resolved");
+                    // Both arms are terminal: `resolve_approval` writes `succeeded`
+                    // on approve and `failed` on reject. An approved gate is not
+                    // handed on to a worker, so this is its only completion.
+                    task_finished(&metrics, &seams, approved).await;
+                }
+                metrics.sweep_ran(Sweep::Approvals, pass.elapsed(), rows);
             }
 
             // Resolve any `type: workflow` trigger whose child run has finished (#23):
@@ -1941,12 +3145,22 @@ pub async fn run(seams: Seams) -> Result<()> {
             // Also where a `repeat:` on a trigger is evaluated: an iteration that
             // continues re-arms the task and is *not* reported here, so a quiet tick
             // during a long conversation is the loop working, not the loop stalled.
-            for (task_id, succeeded) in db::reconcile_subworkflows(&pool).await? {
-                tracing::info!(%task_id, succeeded, "sub-workflow finished — resolved trigger task");
-                // A `repeat:` iteration that re-arms is not in this vec (the
-                // sweep `continue`s past it), so a conversation is metered once
-                // when it ends, not once per turn.
-                task_finished(&metrics, &seams, succeeded).await;
+            // A batch at a time: a full one is taken again on the next tick.
+            if sweeps_due.runs(Sweep::Subworkflows) {
+                let pass = std::time::Instant::now();
+                let resolved = db::reconcile_subworkflows(&pool).await?;
+                let rows = resolved.done.len();
+                for (task_id, succeeded) in resolved.done {
+                    tracing::info!(%task_id, succeeded, "sub-workflow finished — resolved trigger task");
+                    // A `repeat:` iteration that re-arms is not in this vec (the
+                    // sweep `continue`s past it), so a conversation is metered once
+                    // when it ends, not once per turn.
+                    task_finished(&metrics, &seams, succeeded).await;
+                }
+                if resolved.full {
+                    full_batch(&pool, &mut sweep_clock, &sweeps_due, Sweep::Subworkflows).await?;
+                }
+                metrics.sweep_ran(Sweep::Subworkflows, pass.elapsed(), rows);
             }
 
             // Resolve any parked runtime fan-out (`with_output_of:`): read the
@@ -1960,27 +3174,55 @@ pub async fn run(seams: Seams) -> Result<()> {
             // appearing after admission decided how many there would be, which
             // is why it is logged at info with its count and why the sweep
             // re-checks the run's task ceiling before inserting.
-            for (task_id, outcome) in db::reconcile_fanouts(&pool).await? {
-                match outcome {
-                    dagron_core::models::FanoutOutcome::Expanded { instances } => {
-                        tracing::info!(%task_id, instances, "runtime fan-out expanded");
-                    }
-                    dagron_core::models::FanoutOutcome::Joined { succeeded, instances } => {
-                        tracing::info!(%task_id, succeeded, instances, "runtime fan-out joined");
-                        task_finished(&metrics, &seams, succeeded).await;
-                    }
-                    dagron_core::models::FanoutOutcome::Failed { reason } => {
-                        tracing::warn!(%task_id, %reason, "runtime fan-out could not be resolved");
-                        task_finished(&metrics, &seams, false).await;
+            //
+            // A barrier whose instances of its generation still run is not
+            // read at all: it has nothing to do until they have ended.
+            if sweeps_due.runs(Sweep::Fanouts) {
+                let pass = std::time::Instant::now();
+                let resolved = db::reconcile_fanouts(&pool).await?;
+                let rows = resolved.done.len();
+                for (task_id, outcome) in resolved.done {
+                    match outcome {
+                        dagron_core::models::FanoutOutcome::Expanded { instances } => {
+                            tracing::info!(%task_id, instances, "runtime fan-out expanded");
+                        }
+                        dagron_core::models::FanoutOutcome::Joined {
+                            succeeded,
+                            instances,
+                        } => {
+                            tracing::info!(%task_id, succeeded, instances, "runtime fan-out joined");
+                            task_finished(&metrics, &seams, succeeded).await;
+                        }
+                        dagron_core::models::FanoutOutcome::Failed { reason } => {
+                            tracing::warn!(%task_id, %reason, "runtime fan-out could not be resolved");
+                            task_finished(&metrics, &seams, false).await;
+                        }
                     }
                 }
+                if resolved.full {
+                    full_batch(&pool, &mut sweep_clock, &sweeps_due, Sweep::Fanouts).await?;
+                }
+                metrics.sweep_ran(Sweep::Fanouts, pass.elapsed(), rows);
             }
 
             // Resolve any deferred `type: wait` sensor whose deadline has passed (#27):
-            // the task succeeds and its dependents advance. Idempotent, HA-safe.
-            for task_id in db::reconcile_waits(&pool).await? {
-                tracing::info!(%task_id, "wait sensor elapsed — resolved");
-                task_finished(&metrics, &seams, true).await;
+            // the task succeeds and its dependents advance. Idempotent, HA-safe. The
+            // longest due first, a batch at a time.
+            if sweeps_due.runs(Sweep::Waits) {
+                let pass = std::time::Instant::now();
+                let resolved = db::reconcile_waits(&pool).await?;
+                let (rows, now) = (resolved.done.len(), chrono::Utc::now());
+                for (task_id, wake_at) in resolved.done {
+                    if let Some(late) = lateness_secs(&wake_at, now) {
+                        metrics.observe_sweep_lateness(Sweep::Waits, late);
+                    }
+                    tracing::info!(%task_id, "wait sensor elapsed — resolved");
+                    task_finished(&metrics, &seams, true).await;
+                }
+                if resolved.full {
+                    full_batch(&pool, &mut sweep_clock, &sweeps_due, Sweep::Waits).await?;
+                }
+                metrics.sweep_ran(Sweep::Waits, pass.elapsed(), rows);
             }
 
             // Poll any parked `wait.url` HTTP sensor (#27 follow-on) that is due: a 2xx
@@ -1994,10 +3236,28 @@ pub async fn run(seams: Seams) -> Result<()> {
             // them. `WAIT_URL_BATCH` additionally caps the batch in SQL, so the work
             // one tick can take on is bounded from both ends; anything not polled
             // this tick is simply picked up by the next.
-            let due = db::due_url_waits(&pool, WAIT_URL_BATCH).await?;
+            //
+            // Claimed, as the external polls below are: every engine
+            // sweeps, and a sensor that was only read was polled by each of them,
+            // which a vendor's endpoint sees as that many times the rate. The
+            // claim outlasts the GET's timeout, and is the crash bound too.
+            let url_waits = sweeps_due.runs(Sweep::UrlWaits);
+            let url_pass = std::time::Instant::now();
+            let due = if url_waits {
+                let claim_secs = wait_poll_secs.max(WAIT_URL_CLAIM_SECS);
+                db::claim_due_url_waits(&pool, WAIT_URL_BATCH, claim_secs).await?
+            } else {
+                Vec::new()
+            };
+            let (url_rows, now) = (due.len(), chrono::Utc::now());
+            for (_, _, due_at) in &due {
+                if let Some(late) = lateness_secs(due_at, now) {
+                    metrics.observe_sweep_lateness(Sweep::UrlWaits, late);
+                }
+            }
             if !due.is_empty() {
                 let mut probes = tokio::task::JoinSet::new();
-                for (task_id, url) in due {
+                for (task_id, url, _) in due {
                     let client = wait_http.clone(); // Client is an Arc handle — cheap
                     let deny_private = wait_url_deny_private;
                     probes.spawn(async move {
@@ -2040,6 +3300,9 @@ pub async fn run(seams: Seams) -> Result<()> {
                     }
                 }
             }
+            if url_waits {
+                metrics.sweep_ran(Sweep::UrlWaits, url_pass.elapsed(), url_rows);
+            }
 
             // Poll any parked `defer:` external job that is due. This is the
             // sweep that makes the park worth having: the row is the whole
@@ -2061,9 +3324,15 @@ pub async fn run(seams: Seams) -> Result<()> {
             // would have all of them call the vendor for the same job. The claim
             // advances next_poll_at, which doubles as the crash bound — a
             // scheduler that dies mid-request leaves the row due again then.
-            let due_external =
+            let external_polls = sweeps_due.runs(Sweep::ExternalPolls);
+            let external_pass = std::time::Instant::now();
+            let due_external = if external_polls {
                 db::claim_due_external_polls(&pool, EXTERNAL_POLL_BATCH, external_poll_secs)
-                    .await?;
+                    .await?
+            } else {
+                Vec::new()
+            };
+            let external_rows = due_external.len();
             if !due_external.is_empty() {
                 // Secrets resolved for defer.http headers, cached for THIS sweep
                 // only. Resolution is two DB queries plus an AES-GCM decrypt, and
@@ -2138,7 +3407,8 @@ pub async fn run(seams: Seams) -> Result<()> {
                         .and_then(|d| d.http);
                     let plan = match http {
                         Some(spec) => {
-                            match resolve_defer_headers(&pool, &park.run_id, &spec, &mut secrets).await {
+                            let environment = task_environment(park.input.as_deref());
+                            match resolve_defer_headers(&pool, &park.run_id, environment.as_deref(), &spec, &mut secrets).await {
                                 Ok(headers) => {
                                     PollPlan { spec: Some((spec, headers)), http_unresolved: false }
                                 }
@@ -2287,6 +3557,9 @@ pub async fn run(seams: Seams) -> Result<()> {
                     }
                 }
             }
+            if external_polls {
+                metrics.sweep_ran(Sweep::ExternalPolls, external_pass.elapsed(), external_rows);
+            }
 
             // Tear down the remote jobs that terminated tasks left running.
             //
@@ -2298,12 +3571,19 @@ pub async fn run(seams: Seams) -> Result<()> {
             // design holds no Seams, so a teardown the cancel *performed* would
             // be one the SDK and MCP server never triggered. A cancel that
             // merely leaves evidence is one every caller performs for free.
-            let owing = db::claim_due_external_cancels(
-                &pool,
-                EXTERNAL_CANCEL_BATCH,
-                external_poll_secs.max(30),
-            )
-            .await?;
+            let external_cancels = sweeps_due.runs(Sweep::ExternalCancels);
+            let cancels_pass = std::time::Instant::now();
+            let owing = if external_cancels {
+                db::claim_due_external_cancels(
+                    &pool,
+                    EXTERNAL_CANCEL_BATCH,
+                    external_poll_secs.max(30),
+                )
+                .await?
+            } else {
+                Vec::new()
+            };
+            let cancel_rows = owing.len();
             if !owing.is_empty() {
                 let now = chrono::Utc::now();
                 // Header secrets resolved here, serially, for the same reason the
@@ -2338,9 +3618,15 @@ pub async fn run(seams: Seams) -> Result<()> {
                     // sweeping forever on a credential that will not resolve.
                     let http_cancel = match http_with_cancel(row.input.as_deref()) {
                         Some(spec) => Some(
-                            resolve_defer_headers(&pool, &row.run_id, &spec, &mut cancel_secrets)
-                                .await
-                                .map(|headers| (spec, headers)),
+                            resolve_defer_headers(
+                                &pool,
+                                &row.run_id,
+                                task_environment(row.input.as_deref()).as_deref(),
+                                &spec,
+                                &mut cancel_secrets,
+                            )
+                            .await
+                            .map(|headers| (spec, headers)),
                         ),
                         None => None,
                     };
@@ -2427,64 +3713,70 @@ pub async fn run(seams: Seams) -> Result<()> {
                 }
                 while jobs.join_next().await.is_some() {}
             }
+            if external_cancels {
+                metrics.sweep_ran(Sweep::ExternalCancels, cancels_pass.elapsed(), cancel_rows);
+            }
 
 
             // Resolve any parked `wait.dataset` sensor whose dataset recorded an
             // update after the park: the task succeeds and its dependents advance.
-            // Idempotent, HA-safe (guarded UPDATE).
-            for (task_id, uri) in db::reconcile_dataset_waits(&pool).await? {
-                tracing::info!(%task_id, dataset = %uri, "dataset sensor saw a new update — resolved");
-                task_finished(&metrics, &seams, true).await;
+            // Idempotent, HA-safe (guarded UPDATE). A batch at a time.
+            if sweeps_due.runs(Sweep::DatasetWaits) {
+                let pass = std::time::Instant::now();
+                let resolved = db::reconcile_dataset_waits(&pool).await?;
+                let rows = resolved.done.len();
+                for (task_id, uri) in resolved.done {
+                    tracing::info!(%task_id, dataset = %uri, "dataset sensor saw a new update — resolved");
+                    task_finished(&metrics, &seams, true).await;
+                }
+                if resolved.full {
+                    full_batch(&pool, &mut sweep_clock, &sweeps_due, Sweep::DatasetWaits).await?;
+                }
+                metrics.sweep_ran(Sweep::DatasetWaits, pass.elapsed(), rows);
             }
 
             // Dataset-triggered scheduling: sync `on_datasets:` subscriptions from
             // the workflow registry, then claim-and-fire triggers whose datasets
             // recorded new updates. HA-safe with no leadership — claiming is a CAS
             // cursor advance, so exactly one scheduler creates each run; every
-            // scheduler may sweep. Throttled: registry parsing every tick would be
-            // wasted work at a 500 ms cadence.
-            if dataset_triggers_on
-                && dataset_trigger_sweep
-                    .is_none_or(|t: std::time::Instant| t.elapsed().as_secs() >= 5)
-            {
-                dataset_trigger_sweep = Some(std::time::Instant::now());
+            // scheduler may sweep. At its own interval (5 s): registry parsing
+            // every tick would be wasted work at a 500 ms cadence. Off on an
+            // engine with DATASET_TRIGGERS=0.
+            if sweeps_due.runs(Sweep::DatasetTriggers) {
+                let pass = std::time::Instant::now();
+                let mut fired = 0;
 
-                // 1. Sync subscriptions for workflows that declare any. A spec with
-                //    no `on_datasets:` is skipped entirely rather than issuing a
-                //    per-workflow DELETE every sweep — with a few hundred registered
-                //    workflows that would be a few hundred pointless writes a minute,
-                //    forever. `subscribed` remembers who we synced, so a workflow that
-                //    *drops* its `on_datasets:` still gets its rows cleared exactly
-                //    once (and the orphan prune below is the backstop for the rest).
-                //    Every subscription syncs, whatever its arity or mode:
+                // 1. Sync subscriptions for workflows that declare any. Every
+                //    subscription syncs, whatever its arity or mode:
                 //    multi-dataset and all-of composition are open, and
                 //    `claim_due_dataset_triggers` has handled `mode="all"` on
-                //    both backends all along.
+                //    both backends all along. The rows of every workflow whose
+                //    spec declares none are cleared in one statement by the
+                //    table's key, so a workflow that *drops* its `on_datasets:`
+                //    is cleared by any engine, whenever it dropped it; one that
+                //    never declared any has no rows to clear. A spec this engine
+                //    cannot read is neither synced nor cleared (see
+                //    `DatasetTriggerWork`). The orphan prune below is the
+                //    backstop for deregistered workflows.
+                let mut unread = std::collections::HashMap::new();
+                // With no listing, which specs this engine cannot read is not
+                // known: no fire is claimed this pass, or one of them would be
+                // consumed here and skipped.
+                let mut listed = false;
                 match db::list_registered_workflows(&pool).await {
                     Ok(wfs) => {
-                        let mut still_subscribed: std::collections::HashSet<String> =
-                            std::collections::HashSet::new();
-                        for (name, spec) in wfs {
-                            match dag::dataset_subscriptions(&spec) {
-                                Some((uris, mode)) => {
-                                    still_subscribed.insert(name.clone());
-                                    if let Err(e) =
-                                        db::sync_dataset_triggers(&pool, &name, &uris, &mode).await
-                                    {
-                                        tracing::warn!(workflow = %name, error = %e, "dataset trigger sync failed");
-                                        still_subscribed.remove(&name);
-                                    }
-                                }
-                                None => {
-                                    // Only clear when this scheduler previously synced
-                                    // rows for it — otherwise this is a no-op workflow.
-                                    if subscribed_workflows.contains(&name) {
-                                        let _ = db::sync_dataset_triggers(&pool, &name, &[], "any").await;
-                                    }
-                                }
+                        listed = true;
+                        let work = DatasetTriggerWork::of(wfs);
+                        unread.clone_from(&work.unread);
+                        for (name, uris, mode) in &work.sync {
+                            if let Err(e) = db::sync_dataset_triggers(&pool, name, uris, mode).await
+                            {
+                                tracing::warn!(workflow = %name, error = %e, "dataset trigger sync failed");
                             }
                         }
-                        subscribed_workflows = still_subscribed;
+                        if let Err(e) = db::clear_dataset_triggers(&pool, &work.clear).await {
+                            tracing::warn!(error = %e, "dataset trigger clear failed");
+                        }
                     }
                     Err(e) => tracing::warn!(error = %e, "dataset trigger sweep: workflow listing failed"),
                 }
@@ -2495,10 +3787,37 @@ pub async fn run(seams: Seams) -> Result<()> {
                 // 2. Claim + fire. The triggering dataset is injected as the
                 //    `{{ trigger_dataset }}` parameter so the fired run can reference
                 //    what woke it. A fire refused at the workflow's max_active_runs
-                //    cap rolls its cursors back and retries on a later sweep; a spec
-                //    that no longer parses keeps its advanced cursor (skipping the
-                //    fire) so a broken spec can't warn-loop forever.
-                for fire in db::claim_due_dataset_triggers(&pool).await? {
+                //    cap rolls its cursors back and retries on a later sweep. A
+                //    spec this engine cannot read at all rolls them back too, for
+                //    an engine that can; where none can (a spec that is broken,
+                //    not newer), that is every pass until it is fixed, warned of
+                //    once a process. A spec that reads but whose run cannot be
+                //    made from it keeps its advanced cursor (skipping the fire),
+                //    so it can't warn-loop forever.
+                let fires = if listed {
+                    db::claim_due_dataset_triggers(&pool).await?
+                } else {
+                    Vec::new()
+                };
+                for fire in fires {
+                    // A spec this engine cannot read (a newer engine's, in a
+                    // rolling upgrade): its cursors go back, and the fire is
+                    // an engine's that can read it, not skipped here.
+                    if let Some(why) = unread.get(&fire.workflow_name) {
+                        db::unclaim_dataset_trigger(&pool, &fire.workflow_name, &fire.advanced)
+                            .await?;
+                        if warned_unread_specs.insert(fire.workflow_name.clone()) {
+                            tracing::warn!(
+                                workflow = %fire.workflow_name, error = %why,
+                                "a dataset fire of a workflow whose spec this engine cannot read \
+                                 is left for an engine that reads it; if none does, it is handed \
+                                 back on every pass until the spec is fixed"
+                            );
+                        } else {
+                            tracing::debug!(workflow = %fire.workflow_name, "dataset fire left for an engine that reads its spec");
+                        }
+                        continue;
+                    }
                     let Some(spec_yaml) =
                         db::workflow_spec_by_name(&pool, &fire.workflow_name).await?
                     else {
@@ -2513,11 +3832,17 @@ pub async fn run(seams: Seams) -> Result<()> {
                         }
                         Err(e) => Err(e),
                     };
+                    // The dataset whose update this is.
+                    let trigger = models::RunTrigger::engine(
+                        models::trigger_kind::DATASET,
+                        format!("dataset:{}", fire.trigger_uri),
+                    );
                     match parsed {
-                        Ok(child_dag) => match db::create_run(&pool, &child_dag, &spec_yaml).await {
+                        Ok(child_dag) => match db::create_run_triggered(&pool, &child_dag, &spec_yaml, &trigger).await {
                             Ok(run_id) => {
                                 metrics.inc_runs_created();
                                 metrics.inc_dataset_fires();
+                                fired += 1;
                                 if let Err(e) =
                                     db::stamp_dataset_trigger_fired(&pool, &fire.workflow_name, &run_id)
                                         .await
@@ -2550,6 +3875,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                         }
                     }
                 }
+                metrics.sweep_ran(Sweep::DatasetTriggers, pass.elapsed(), fired);
             }
         }
 
@@ -2561,14 +3887,13 @@ pub async fn run(seams: Seams) -> Result<()> {
         // can never be claimed HERE and would sit ready silently if no larger
         // peer exists. Warn loudly, once per gang, on a slow cadence (a peer
         // with a bigger pool may still claim it, so this warns rather than
-        // fails — but it must never be silent).
-        if gangs_on
-            && oversized_gang_check
-                .map_or(true, |t: std::time::Instant| t.elapsed().as_secs() >= 60)
-        {
-            oversized_gang_check = Some(std::time::Instant::now());
+        // fails — but it must never be silent). Off where gangs are.
+        if sweeps_due.runs(Sweep::Gangs) {
+            let pass = std::time::Instant::now();
+            let mut oversized = 0;
             match db::oversized_ready_gangs(&pool, workers.size() as i64).await {
                 Ok(gangs) => {
+                    oversized = gangs.len();
                     for (gang_id, size) in gangs {
                         if warned_oversized_gangs.insert(gang_id.clone()) {
                             tracing::warn!(
@@ -2582,6 +3907,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                 }
                 Err(e) => tracing::warn!(error = %e, "oversized-gang check failed"),
             }
+            metrics.sweep_ran(Sweep::Gangs, pass.elapsed(), oversized);
         }
 
         // Pressure file present ⇒ capacity 0: nothing new is claimed, runs
@@ -2591,7 +3917,77 @@ pub async fn run(seams: Seams) -> Result<()> {
         // file is removed — which is the point of a maintenance hold.
         let claims_paused = pressure_gate.poll();
         metrics.set_claims_paused(claims_paused);
-        let capacity = if claims_paused { 0 } else { workers.size().saturating_sub(in_flight) };
+        let mut capacity = if claims_paused { 0 } else { workers.size().saturating_sub(in_flight) };
+
+        // ── Step 3 (teardowns): stopping tasks nobody is watching ───────────
+        // A task that was asked to stop, and whose lease has lapsed: the
+        // worker that held it died, or could not see its teardown through.
+        // It is claimed anew, so that everything it left is an earlier
+        // claim's, and dispatched for a teardown alone. Its result settles
+        // it (step 4), or it is looked for again. Ahead of new work: a run
+        // waits on these to end, and a concurrency key on that.
+        //
+        // Not a task this engine still has an execution out for: its worker is
+        // watching the work, whether or not it renews a lease, and will say.
+        // No room for one (a pressure file, or every worker busy): the window
+        // ran all the same, and took nothing.
+        if sweeps_due.runs(Sweep::Teardowns) && capacity == 0 {
+            metrics.sweep_ran(Sweep::Teardowns, std::time::Duration::ZERO, 0);
+        }
+        if sweeps_due.runs(Sweep::Teardowns) && capacity > 0 {
+            let pass = std::time::Instant::now();
+            let mine: Vec<String> = held.keys().cloned().collect();
+            let teardowns =
+                db::claim_teardowns(&pool, &worker_id, capacity as i64, &runner_classes, &mine)
+                    .await?;
+            let rows = teardowns.len();
+            for task in teardowns {
+                let fence = task.version.saturating_add(1);
+                let mut ctx = ExecContext::new(Vec::new(), None, None);
+                // The grace its steps were promised is in the task's own env.
+                ctx.env = task
+                    .input
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<dag::TaskSpec>(json).ok())
+                    .map(|spec| {
+                        spec.env
+                            .into_iter()
+                            .filter(|e| e.name == executor::ENV_STEP_GRACE)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                ctx.identity = Some(executor::TaskIdentity {
+                    task_id: task.id.clone(),
+                    run_id: task.run_id.clone(),
+                    attempt: task.attempt,
+                    fence,
+                    installation: installation.clone(),
+                });
+                info!(
+                    task = %task.name, task_id = %task.id, fence,
+                    "a stopping task has nobody watching its work: looking for what it left"
+                );
+                workers.dispatch(DispatchPayload {
+                    task_id: task.id.clone(),
+                    worker_id: worker_id.clone(),
+                    ctx,
+                    spec: None,
+                    attempt: task.attempt,
+                    max_attempts: 1,
+                    retry_delay_secs: 0,
+                    retry_max_delay_secs: None,
+                    retry_on_timeout: false,
+                    fence,
+                    teardown: true,
+                    result_tx: tx.clone(),
+                    log_tx: None,
+                })?;
+                in_flight += 1;
+                capacity = capacity.saturating_sub(1);
+            }
+            metrics.sweep_ran(Sweep::Teardowns, pass.elapsed(), rows);
+        }
+
         if capacity > 0 {
             // Both claim paths take the same `pool_caps` (#21) and order by
             // priority (#25), so gang co-scheduling never bypasses either.
@@ -2634,10 +4030,104 @@ pub async fn run(seams: Seams) -> Result<()> {
             if !claimed.is_empty() {
                 metrics.observe_claim_batch(claimed.len());
             }
+            // The class of each run that has a task among these, read once,
+            // and the size of each that is not trusted.
+            let mut run_classes = std::collections::HashMap::new();
+            let mut run_sizes = std::collections::HashMap::new();
             for task in claimed {
+                // What the run this task is of is held to: its class is its
+                // record's, written with the run.
+                let class = run_class(&pool, &mut run_classes, &task.run_id).await?;
+                // The first of a run's tasks this engine dispatches starts
+                // the fetch of all the run's images; a run that
+                // is not trusted is not fetched for with the engine's
+                // credentials.
+                if executor.prefetches() && !dagron_core::confine::confined(&class) {
+                    prefetch_run(&executor, &pool, &task.run_id);
+                }
                 let (mut ctx, max_attempts, retry_delay_secs, retry_max_delay_secs, retry_on_timeout, cache, sub_workflow, wait, gang_member, produces, carried_spec) = match &task.input {
                     Some(json) => match serde_json::from_str::<dag::TaskSpec>(json) {
-                        Ok(spec) => {
+                        Ok(mut spec) => {
+                            // A task of a run that is not trusted is confined
+                            // (`dagron_core::confine`). An engine with no floor
+                            // for such runs runs none of their tasks. One that
+                            // has refuses what such a run may not use, as the
+                            // run's making did, and takes from the task what
+                            // it is not given. Asked here of the task as it is
+                            // stored, so that it holds however the run, or
+                            // this task's row, came to be.
+                            let what_is_refused = dagron_core::confine::task_refusal(&spec, &class);
+                            let confinement = if dagron_core::confine::confined(&class) {
+                                let refused = match &confining {
+                                    None => Some(dagron_core::confine::not_run_here(&class)),
+                                    Some(held) => match what_is_refused {
+                                        Some((what, why)) => Some(
+                                            dagron_core::confine::ConfinedRefused {
+                                                class: class.clone(),
+                                                what,
+                                                why,
+                                            }
+                                            .to_string(),
+                                        ),
+                                        // An image that is none of those the
+                                        // operator listed for such runs, the
+                                        // task's or a service's of it. More
+                                        // services than such a task may have.
+                                        // And a run with more tasks than such
+                                        // a run may have has none of them run.
+                                        // Such a run does not grow after it is
+                                        // made (what would grow it is refused
+                                        // above), so each of its tasks is
+                                        // asked the same number.
+                                        None => match dagron_core::confine::image_refusal(
+                                            &class,
+                                            &held.images,
+                                            &spec,
+                                        )
+                                        .or_else(|| held.limits.too_many_services(&class, &spec))
+                                        {
+                                            Some(why) => Some(why),
+                                            None => {
+                                                let tasks =
+                                                    run_size(&pool, &mut run_sizes, &task.run_id)
+                                                        .await?;
+                                                held.limits.too_many(&class, tasks)
+                                            }
+                                        },
+                                    },
+                                };
+                                if let Some(reason) = refused {
+                                    tracing::error!(
+                                        task = %task.name, task_id = %task.id, %class, %reason,
+                                        "a task of a run that is not trusted is refused — marking task failed"
+                                    );
+                                    if db::mark_task_failed(
+                                        &pool,
+                                        &task.id,
+                                        &worker_id,
+                                        task.version.saturating_add(1),
+                                        Some(reason),
+                                    )
+                                    .await?
+                                    {
+                                        task_finished(&metrics, &seams, false).await;
+                                    }
+                                    continue;
+                                }
+                                dagron_core::confine::withhold(&mut spec);
+                                confining.as_ref().map(|held| {
+                                    // Its timeout and its attempts are the
+                                    // lesser of its own and the operator's.
+                                    held.limits.spend(&mut spec);
+                                    executor::Confinement {
+                                        memory_bytes: held.limits.memory_bytes,
+                                        pids: held.limits.pids,
+                                        nano_cpus: held.limits.nano_cpus,
+                                    }
+                                })
+                            } else {
+                                None
+                            };
                             // Carried through dispatch and echoed back in the
                             // TaskResult (B-4), so the result path never
                             // re-reads and re-parses this row's input JSON.
@@ -2670,6 +4160,29 @@ pub async fn run(seams: Seams) -> Result<()> {
                             // keep the non-enterprise build free of an unused
                             // `mut` no longer buys anything.
                             let mut env = spec.env;
+                            // The task's Docker daemon is a service of it,
+                            // named as the variable says, unless the task
+                            // set the variable itself. Refused below where
+                            // this engine starts none. Its first: the
+                            // network the task and its other services share
+                            // is the first service's, and a daemon on a
+                            // runtime of its own (Sysbox) can make its
+                            // network's devices only in a network it owns.
+                            let mut services = spec.services;
+                            if spec.docker_daemon {
+                                use dagron_core::docker_daemon::{
+                                    service, DEFAULT_IMAGE, ENV_HOST, HOST,
+                                };
+                                let image = docker_daemon.as_deref().unwrap_or(DEFAULT_IMAGE);
+                                services.insert(0, service(image));
+                                if !env.iter().any(|e| e.name == ENV_HOST) {
+                                    env.push(dagron_core::dag::EnvVar {
+                                        name: ENV_HOST.to_string(),
+                                        value: HOST.to_string(),
+                                        value_from: None,
+                                    });
+                                }
+                            }
                             // Behind the `enterprise` feature: merge top-level string keys
                             // from `input` as env vars so parameterized reruns
                             // (params deep-merge) visibly change
@@ -2734,13 +4247,26 @@ pub async fn run(seams: Seams) -> Result<()> {
                             // which executor will run it — and because a task
                             // that runs believing it is sandboxed when it is
                             // not is the one outcome this must never produce.
-                            let isolation = match (&spec.isolation, &isolation_floor) {
-                                (None, None) => None,
-                                (declared, floor) => {
+                            //
+                            // A task of a run that is not trusted is raised to
+                            // the floor for such runs as well, over the first.
+                            let class_floor =
+                                confinement.and(confining.as_ref()).map(|held| &held.floor);
+                            let isolation = match (&spec.isolation, &isolation_floor, class_floor) {
+                                (None, None, None) => None,
+                                (declared, floor, class_floor) => {
                                     let declared = declared.clone().unwrap_or_default();
-                                    let (effective, tightened) = match floor {
+                                    let (effective, mut tightened) = match floor {
                                         Some(f) => declared.apply_floor(f),
                                         None => (declared, Vec::new()),
+                                    };
+                                    let effective = match class_floor {
+                                        Some(f) => {
+                                            let (effective, more) = effective.apply_floor(f);
+                                            tightened.extend(more);
+                                            effective
+                                        }
+                                        None => effective,
                                     };
                                     let overridden: Vec<String> = tightened
                                         .iter()
@@ -2765,14 +4291,30 @@ pub async fn run(seams: Seams) -> Result<()> {
                                     command: spec.command,
                                     timeout_secs: spec.timeout_secs,
                                     docker_image: spec.docker_image,
+                                    image_pull_policy: spec.image_pull_policy,
                                     env,
                                     resources: spec.resources,
                                     service_account: spec.service_account,
                                     isolation,
+                                    workspace: spec.workspace,
+                                    services,
+                                    privileged: spec.privileged,
                                     // Wired per-attempt by the worker from `log_tx`.
                                     log_sink: None,
                                     // Stamped below, once, for every arm.
                                     identity: None,
+                                    // Minted per attempt by the worker, from
+                                    // DAGRON_CHECKOUT_TOKEN_URL.
+                                    checkout_credential: None,
+                                    checkout_patch: None,
+                                    action_credentials: Vec::new(),
+                                    // Likewise, and given to the task.
+                                    forge_token: spec.forge_token,
+                                    // What a backend withholds from a task of
+                                    // a run that is not trusted, and holds it
+                                    // to.
+                                    confinement,
+                                    stop: dagron_executor::executor::Stop::default(),
                                 },
                                 spec.max_attempts,
                                 spec.retry_delay_secs,
@@ -2825,13 +4367,18 @@ pub async fn run(seams: Seams) -> Result<()> {
                 // held only on the creating task's stack — so a lease expiry
                 // started a SECOND one while the first still ran, and a
                 // scheduler crash orphaned the first beyond any possibility of
-                // cleanup. `attempt` is the discriminator because it increments
-                // on every claim, recovery included: a workload carrying a
-                // different attempt for this task id is a predecessor.
+                // cleanup. The fence is the discriminator: this claim's
+                // version, which every claim raises and nothing sets back, a
+                // rerun and a clear included. A workload carrying a lower one
+                // for this task id is a predecessor. The attempt is carried
+                // too, for a reader and for workloads made before the fence
+                // was: a rerun resets it, so it cannot order claims alone.
                 ctx.identity = Some(dagron_executor::executor::TaskIdentity {
                     task_id: task.id.clone(),
                     run_id: task.run_id.clone(),
                     attempt: task.attempt,
+                    // As the dispatch below has it: the version the claim made.
+                    fence: task.version.saturating_add(1),
                     // Stamped even when the sweep is off, so arming it later
                     // finds the workloads already running rather than only
                     // those dispatched after the restart.
@@ -2845,7 +4392,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                 // tenant halt a scheduler running everyone else's work by
                 // submitting one workflow that asks for gVisor on a plain
                 // Docker runner.
-                if let (Some(iso), Some(kind)) = (&ctx.isolation, executor_isolation) {
+                if let (Some(iso), Some(kind)) = (&ctx.isolation, &executor_isolation) {
                     if let Err(e) = iso.require_enforceable_by(kind) {
                         tracing::error!(
                             task = %task.name, task_id = %task.id, error = %e,
@@ -2857,6 +4404,86 @@ pub async fn run(seams: Seams) -> Result<()> {
                             &worker_id,
                             task.version.saturating_add(1),
                             Some(e.to_string()),
+                        )
+                        .await?
+                        {
+                            task_finished(&metrics, &seams, false).await;
+                        }
+                        continue;
+                    }
+                }
+
+                // Refuse a task that asks for a Docker daemon where none is
+                // run: an engine whose operator offers none, or whose
+                // executor cannot run one. As a failure of this task alone,
+                // for the reason below.
+                if ctx.services.iter().any(|s| s.daemon) {
+                    if let Some(why) =
+                        dagron_core::docker_daemon::refusal(executor_kind, docker_daemon.as_deref())
+                    {
+                        tracing::error!(
+                            task = %task.name, task_id = %task.id, error = %why,
+                            "a task that asks for a Docker daemon cannot be run here — marking task failed"
+                        );
+                        if db::mark_task_failed(
+                            &pool,
+                            &task.id,
+                            &worker_id,
+                            task.version.saturating_add(1),
+                            Some(why),
+                        )
+                        .await?
+                        {
+                            task_finished(&metrics, &seams, false).await;
+                        }
+                        continue;
+                    }
+                }
+
+                // Refuse a task that asks to be privileged where it is not
+                // run: an engine whose operator does not allow one, or one it
+                // would be held to what contradicts it. As a failure of this
+                // task alone, for the reason below.
+                if ctx.privileged {
+                    if let Some(why) = dagron_core::privileged::task_refusal(
+                        privileged_allowed,
+                        ctx.isolation.as_ref(),
+                    ) {
+                        tracing::error!(
+                            task = %task.name, task_id = %task.id, error = %why,
+                            "a task that asks to be privileged cannot be run here — marking task failed"
+                        );
+                        if db::mark_task_failed(
+                            &pool,
+                            &task.id,
+                            &worker_id,
+                            task.version.saturating_add(1),
+                            Some(why),
+                        )
+                        .await?
+                        {
+                            task_finished(&metrics, &seams, false).await;
+                        }
+                        continue;
+                    }
+                }
+
+                // Refuse a task with services where there is nothing to run one
+                // in: an engine whose tasks are its own processes. Here, as a
+                // failure of this task alone, and not as an attempt of it, which
+                // would fail the same each time it was tried.
+                if executor_kind == dagron_core::isolation::ExecutorKind::Local {
+                    if let Some(why) = dagron_core::service::not_run_locally(&ctx.services) {
+                        tracing::error!(
+                            task = %task.name, task_id = %task.id, error = %why,
+                            "a task with services cannot be run here — marking task failed"
+                        );
+                        if db::mark_task_failed(
+                            &pool,
+                            &task.id,
+                            &worker_id,
+                            task.version.saturating_add(1),
+                            Some(why),
                         )
                         .await?
                         {
@@ -2966,6 +4593,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                         }
                         continue;
                     }
+                    let child_trigger = child_trigger(&pool, &task).await?;
                     match db::workflow_spec_by_name(&pool, child_name).await? {
                         None => {
                             tracing::error!(task = %task.name, workflow = %child_name, "type: workflow names an unknown workflow — failing task");
@@ -2989,7 +4617,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                                     task_finished(&metrics, &seams, false).await;
                                 }
                             }
-                            Ok(child_dag) => match db::create_run(&pool, &child_dag, &child_yaml).await {
+                            Ok(child_dag) => match db::create_run_triggered(&pool, &child_dag, &child_yaml, &child_trigger).await {
                                 Ok(child_run) => {
                                     db::park_subworkflow(&pool, &task.id, fence, &child_run).await?;
                                     info!(task = %task.name, task_id = %task.id, workflow = %child_name, %child_run, "sub-workflow triggered — parking until it finishes");
@@ -3013,6 +4641,49 @@ pub async fn run(seams: Seams) -> Result<()> {
                         },
                     }
                     continue;
+                }
+
+                // Which stores a task may read its secrets from is asked of
+                // the run's own record: its environment's policy, and for the
+                // engine's own store, its trust class. A task may name an
+                // environment of its own for its secrets.
+                //
+                // Asked here, before a cached output could stand in for the
+                // task: what an earlier run printed with a secret is not
+                // handed to a run that may not read that secret. And asked
+                // of a task whose only secrets are a deferred job's headers,
+                // which the sweep that polls it resolves, where a refusal
+                // could only be tried again.
+                let task_environment: Option<String> =
+                    carried_spec.as_deref().and_then(|s| s.environment.clone());
+                let names_a_secret = ctx.env.iter().any(|e| e.value_from.is_some())
+                    || carried_spec
+                        .as_deref()
+                        .and_then(|s| s.defer.as_ref())
+                        .and_then(|d| d.http.as_ref())
+                        .is_some_and(|h| h.headers.iter().any(|e| e.value_from.is_some()));
+                if names_a_secret {
+                    if let Err(e) = environments::admit_secrets(
+                        &pool,
+                        &task.run_id,
+                        task_environment.as_deref(),
+                    )
+                    .await
+                    {
+                        tracing::error!(task = %task.name, task_id = %task.id, error = %e, "the task may not have its secrets — marking task failed");
+                        if db::mark_task_failed(
+                            &pool,
+                            &task.id,
+                            &worker_id,
+                            task.version.saturating_add(1),
+                            Some(format!("secret resolution failed: {e}")),
+                        )
+                        .await?
+                        {
+                            task_finished(&metrics, &seams, false).await;
+                        }
+                        continue;
+                    }
                 }
 
                 // Memoization (#22): a cache hit resolves the task from a prior
@@ -3160,57 +4831,270 @@ pub async fn run(seams: Seams) -> Result<()> {
                     }
                 }
 
-                // Checkpoint-aware resume: a retry attempt is handed the last
-                // committed checkpoint instead of restarting from zero. The
-                // pointer comes from the datastore (reported via
-                // POST …/tasks/{id}/checkpoint), falling back to the
-                // `<checkpoint_dir>/latest` file convention for setups that run
-                // without the management API. dagron owns pointer durability;
-                // what is inside the checkpoint belongs to the task.
-                if task.attempt > 0 {
-                    let mut resume: Option<(String, Option<String>)> = None;
-                    match db::task_checkpoint(&pool, &task.id).await {
-                        Ok(found @ Some(_)) => resume = found,
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!(error = %e, task = %task.name, "checkpoint lookup failed — dispatching without resume pointer")
-                        }
-                    }
-                    if resume.is_none() {
-                        if let Some(ck) = &checkpoint_dir {
-                            if let Ok(uri) = tokio::fs::read_to_string(ck.join("latest")).await {
-                                let uri = uri.trim().to_string();
-                                if !uri.is_empty() {
-                                    resume = Some((uri, None));
-                                }
+                // Path caches: what this task's `workspace.cache` reads
+                // and, for a trusted run, writes, as signed URLs. Whatever
+                // goes wrong here, the task runs, cold.
+                if let Some(ws) = ctx.workspace.as_ref().filter(|ws| !ws.cache.is_empty()) {
+                    match &path_caches {
+                        None => {
+                            if !warned_no_cache_store {
+                                warned_no_cache_store = true;
+                                tracing::warn!(
+                                    task = %task.name,
+                                    "a task has workspace.cache and this engine has no cache store (DAGRON_CACHE_URL): its tasks start cold"
+                                );
                             }
                         }
-                    }
-                    if let Some((uri, marker)) = resume {
-                        info!(task = %task.name, attempt = task.attempt + 1, resume_from = %uri, "dispatching with checkpoint resume");
-                        ctx.env.push(dag::EnvVar {
-                            name: "DAGRON_RESUME_FROM".to_string(),
-                            value: uri,
-                            value_from: None,
-                        });
-                        if let Some(marker) = marker {
-                            ctx.env.push(dag::EnvVar {
-                                name: "DAGRON_RESUME_MARKER".to_string(),
-                                value: marker,
-                                value_from: None,
-                            });
+                        Some(caches) => {
+                            let given = match db::run_trigger(&pool, &task.run_id).await {
+                                Ok(trigger) => {
+                                    caches
+                                        .offer(
+                                            &pool,
+                                            path_cache::Asked {
+                                                task_id: &task.id,
+                                                trigger: trigger.as_ref(),
+                                                trusted: !dagron_core::confine::confined(&class),
+                                                caches: &ws.cache,
+                                                timeout_secs: ctx.timeout_secs,
+                                            },
+                                        )
+                                        .await
+                                }
+                                Err(e) => Err(e),
+                            };
+                            match given {
+                                Ok(Some(value)) => ctx.env.push(dag::EnvVar {
+                                    name: path_cache::ENV.to_string(),
+                                    value,
+                                    value_from: None,
+                                }),
+                                Ok(None) => {}
+                                Err(e) => tracing::warn!(
+                                    task = %task.name, task_id = %task.id, error = %format!("{e:#}"),
+                                    "the task's caches were not offered: it starts cold"
+                                ),
+                            }
                         }
                     }
                 }
 
+                // The cache service: a task with a workspace, of a run
+                // with a repository, is told where it is and given a
+                // credential of its own for it.
+                #[cfg(feature = "ops")]
+                if let Some(svc) = actions_cache.as_ref().filter(|_| ctx.workspace.is_some()) {
+                    match db::run_trigger(&pool, &task.run_id).await {
+                        Ok(trigger) => {
+                            let base = ctx
+                                .env
+                                .iter()
+                                // dagron-ci writes it after the task's own
+                                // variables, and refuses one of a workflow's.
+                                .rev()
+                                .find(|v| {
+                                    v.name == actions_cache::RESTORE_FROM && v.value_from.is_none()
+                                })
+                                .map(|v| v.value.clone());
+                            let given = svc.offer(
+                                &task.id,
+                                &task.run_id,
+                                trigger.as_ref(),
+                                base.as_deref(),
+                                !dagron_core::confine::confined(&class),
+                                ctx.timeout_secs,
+                            );
+                            for (name, value) in given.into_iter().flatten() {
+                                ctx.env.retain(|v| v.name != name);
+                                ctx.env.push(dag::EnvVar {
+                                    name: name.to_string(),
+                                    value,
+                                    value_from: None,
+                                });
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            task = %task.name, task_id = %task.id, error = %format!("{e:#}"),
+                            "the task was not given the cache service: its actions/cache misses"
+                        ),
+                    }
+                }
+
+                // An identity: a request credential for this attempt,
+                // with which the task asks dagron-api's issuer for tokens
+                // while it runs. A task of a run that is not trusted gets
+                // here only as an agent's (it was refused above otherwise),
+                // and holds one only where its environment's policy says so.
+                // A token names the task's environment, so a run that may not
+                // use that environment is refused one, as it would be the
+                // environment's secrets.
+                if let Some(identity) = carried_spec.as_deref().and_then(|s| s.identity.as_ref()) {
+                    let environment = carried_spec.as_deref().and_then(|s| s.environment.clone());
+                    let given = match &oidc_request_url {
+                        None => Err(
+                            "this engine gives no task an identity: DAGRON_OIDC_REQUEST_URL is unset".to_string(),
+                        ),
+                        Some(url) => {
+                            match environments::admit_secrets(&pool, &task.run_id, environment.as_deref()).await {
+                                Err(e) => Err(format!("its environment is not this run's to use: {e}")),
+                                Ok(_) => match dagron_core::secrets::admit_identity(&pool, environment.as_deref(), &class).await {
+                                    Err(e) => Err(format!("{e:#}")),
+                                    Ok(()) => dagron_core::oidc::request_credential(&pool, &task, identity, environment, ctx.timeout_secs)
+                                        .await
+                                        .map(|token| (url.clone(), token, identity.first_audience().to_string()))
+                                        .map_err(|e| format!("its request credential was not written: {e:#}")),
+                                },
+                            }
+                        }
+                    };
+                    match given {
+                        Ok((url, token, audience)) => {
+                            for (name, value) in [
+                                ("DAGRON_OIDC_REQUEST_URL", url),
+                                ("DAGRON_OIDC_REQUEST_TOKEN", token),
+                                ("DAGRON_OIDC_AUDIENCE", audience),
+                            ] {
+                                ctx.env.push(dag::EnvVar {
+                                    name: name.to_string(),
+                                    value,
+                                    value_from: None,
+                                });
+                            }
+                        }
+                        Err(why) => {
+                            tracing::error!(task = %task.name, task_id = %task.id, reason = %why, "the task asks for an identity it may not have — marking task failed");
+                            if db::mark_task_failed(
+                                &pool,
+                                &task.id,
+                                &worker_id,
+                                task.version.saturating_add(1),
+                                Some(format!("identity: {why}")),
+                            )
+                            .await?
+                            {
+                                task_finished(&metrics, &seams, false).await;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                // Its run's artifacts over dagron-api's API: a
+                // credential of this attempt's own, and where to send it.
+                if carried_spec.as_deref().is_some_and(|s| s.artifact_api) {
+                    let given = match &artifact_api_url {
+                        None => Err(
+                            "this engine gives no task the artifact API: DAGRON_ARTIFACT_API_URL is unset"
+                                .to_string(),
+                        ),
+                        Some(url) => dagron_core::artifact_api::credential(&pool, &task, ctx.timeout_secs)
+                            .await
+                            .map(|token| (url.clone(), token))
+                            .map_err(|e| format!("its credential was not written: {e:#}")),
+                    };
+                    match given {
+                        Ok((url, token)) => {
+                            for (name, value) in [
+                                (dagron_core::artifact_api::ENV_API, url),
+                                (dagron_core::artifact_api::ENV_TOKEN, token),
+                            ] {
+                                ctx.env.retain(|v| v.name != name);
+                                ctx.env.push(dag::EnvVar {
+                                    name: name.to_string(),
+                                    value,
+                                    value_from: None,
+                                });
+                            }
+                        }
+                        Err(why) => {
+                            tracing::error!(task = %task.name, task_id = %task.id, reason = %why, "the task asks for the artifact API, which it is not given — marking task failed");
+                            if db::mark_task_failed(
+                                &pool,
+                                &task.id,
+                                &worker_id,
+                                task.version.saturating_add(1),
+                                Some(format!("artifact_api: {why}")),
+                            )
+                            .await?
+                            {
+                                task_finished(&metrics, &seams, false).await;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                // Checkpoint-aware resume: a retry attempt is handed the last
+                // committed checkpoint instead of restarting from zero
+                // (`resume_from`).
+                let resume = resume_from(
+                    &pool,
+                    &task.id,
+                    &task.name,
+                    task.attempt,
+                    checkpoint_dir.as_deref(),
+                )
+                .await;
+                if let Some((uri, marker)) = resume {
+                    info!(task = %task.name, attempt = task.attempt + 1, resume_from = %uri, "dispatching with checkpoint resume");
+                    ctx.env.push(dag::EnvVar {
+                        name: "DAGRON_RESUME_FROM".to_string(),
+                        value: uri,
+                        value_from: None,
+                    });
+                    if let Some(marker) = marker {
+                        ctx.env.push(dag::EnvVar {
+                            name: "DAGRON_RESUME_MARKER".to_string(),
+                            value: marker,
+                            value_from: None,
+                        });
+                    }
+                }
+
+
+                // The variables the task is given from earlier tasks of its
+                // run (`env_from`), read now: a task that is run again reads
+                // what the earlier one came to this time. Each is a whole
+                // value, given before the secrets are resolved: nothing here
+                // is filled into a text, the task's or a secret's.
+                let env_from = carried_spec
+                    .as_deref()
+                    .map(|spec| spec.env_from.clone())
+                    .unwrap_or_default();
+                if !env_from.is_empty() {
+                    match db::given_from_tasks(&pool, &task.run_id, &env_from).await? {
+                        Ok(given) => ctx.env.extend(given),
+                        Err(why) => {
+                            tracing::error!(task = %task.name, task_id = %task.id, reason = %why, "a variable from an earlier task could not be given — marking task failed");
+                            if db::mark_task_failed(
+                                &pool,
+                                &task.id,
+                                &worker_id,
+                                task.version.saturating_add(1),
+                                Some(format!("env_from: {why}")),
+                            )
+                            .await?
+                            {
+                                task_finished(&metrics, &seams, false).await;
+                            }
+                            continue;
+                        }
+                    }
+                }
 
                 // Resolve `value_from` secret refs into concrete env values just
                 // before dispatch (#9): the run's environment secret store
                 // first (DB, decrypted), then process env / secrets dir. A
                 // missing secret fails the task rather than running it with an
-                // empty credential.
-                if let Err(e) =
-                    environments::resolve_secrets(&pool, &task.run_id, &mut ctx.env).await
+                // empty credential. Which stores are read was asked above, and
+                // is asked again by the resolver itself, as it reads them.
+                if let Err(e) = environments::resolve_secrets(
+                    &pool,
+                    &task.run_id,
+                    task_environment.as_deref(),
+                    &mut ctx.env,
+                )
+                .await
                 {
                     tracing::error!(task = %task.name, task_id = %task.id, error = %e, "secret resolution failed — marking task failed");
                     if db::mark_task_failed(
@@ -3225,6 +5109,46 @@ pub async fn run(seams: Seams) -> Result<()> {
                         task_finished(&metrics, &seams, false).await;
                     }
                     continue;
+                }
+
+                // Its reservation of the token budgets over it,
+                // the last thing asked, so that a task refused anything else
+                // reserves nothing. One a budget cannot fit waits while the
+                // reservations out may give room back, and fails, saying so,
+                // once what was spent leaves it none.
+                #[cfg(feature = "enterprise")]
+                if let Some(tokens) = carried_spec.as_deref().and_then(|s| s.tokens) {
+                    let fence = task.version.saturating_add(1);
+                    match dagron_core::tokens::reserve(&pool, &task.id, &task.run_id, fence, tokens)
+                        .await?
+                    {
+                        Ok(()) => {}
+                        Err(no) if no.for_good() => {
+                            let reason = no.reason();
+                            tracing::warn!(task = %task.name, task_id = %task.id, %reason, "no token budget left — marking task failed");
+                            if db::mark_task_failed(
+                                &pool,
+                                &task.id,
+                                &worker_id,
+                                fence,
+                                Some(reason),
+                            )
+                            .await?
+                            {
+                                task_finished(&metrics, &seams, false).await;
+                            }
+                            continue;
+                        }
+                        Err(no) => {
+                            info!(
+                                task = %task.name, task_id = %task.id, budget_run = %no.run_id,
+                                budget = no.budget, spent = no.spent, reserved = no.reserved, asked = no.asked,
+                                "a token budget has no room while reservations are out — waiting"
+                            );
+                            dagron_core::tokens::wait_for_room(&pool, &task.id, fence).await?;
+                            continue;
+                        }
+                    }
                 }
 
                 // Became-claimable → dispatched (A-5). `scheduled_at` is the
@@ -3269,9 +5193,10 @@ pub async fn run(seams: Seams) -> Result<()> {
                     // propagator injects nothing, so fall back to a freshly
                     // generated context — that build still gets a valid, unique
                     // traceparent, exactly as before. Off entirely without
-                    // `--features otel`.
+                    // `--features otel`, and for a task whose workflow names a
+                    // `TRACEPARENT` of its own, which it keeps.
                     #[cfg(feature = "otel")]
-                    {
+                    if !names_its_own_trace(&ctx.env) {
                         use tracing_opentelemetry::OpenTelemetrySpanExt;
                         let mut carrier = std::collections::HashMap::<String, String>::new();
                         let cx = tracing::Span::current().context();
@@ -3306,6 +5231,8 @@ pub async fn run(seams: Seams) -> Result<()> {
                         "dispatching"
                     );
 
+                    // Kept, so that this engine can stop the work (step 1).
+                    let stop = ctx.stop.clone();
                     workers.dispatch(DispatchPayload {
                         task_id: task.id.clone(),
                         worker_id: worker_id.clone(),
@@ -3320,9 +5247,11 @@ pub async fn run(seams: Seams) -> Result<()> {
                         // version from task.version to task.version + 1). saturating_add
                         // guards the theoretical i64 overflow without a debug panic.
                         fence: task.version.saturating_add(1),
+                        teardown: false,
                         result_tx: tx.clone(),
                         log_tx: Some(log_tx.clone()),
                     })?;
+                    held.insert(task.id.clone(), (task.version.saturating_add(1), stop));
                     metrics.inc_dispatched();
                     in_flight += 1;
                     Ok(())
@@ -3332,29 +5261,137 @@ pub async fn run(seams: Seams) -> Result<()> {
 
         // ── Step 3b: drain live-log chunks (#17) ────────────────────────────
         // Append incremental output from still-running tasks so the API/UI can
-        // tail it before the task exits. Fence-guarded, so a stale attempt's late
-        // chunk can't corrupt a re-run; the first chunk of an attempt resets any
-        // prior-attempt output. Best-effort: a failed append is logged, not fatal.
-        drain_log_chunks(&pool, &mut log_rx).await;
+        // tail it before the task exits. Taken from the executors every tick,
+        // and written as one append for each task whose chunks have waited
+        // their second (`log_batch`): an append for each line is what a chatty
+        // task cost this loop and its database. Fence-guarded, so a stale
+        // attempt's late chunk can't corrupt a re-run; the first chunk of an
+        // attempt resets any prior-attempt output. Best-effort: a failed append
+        // is logged, not fatal.
+        logs.take(&mut log_rx);
+        logs.write_due(&pool).await;
 
         // ── Step 4: collect finished tasks ──────────────────────────────────
         let mut results = std::mem::take(&mut pending_results);
         while let Ok(result) = rx.try_recv() {
             results.push(result);
         }
+        // Those of this engine's own workers come first, and each frees one
+        // of its slots. Then what remote runners said of their tasks,
+        // which held none of them: dagron-api keeps each word, and this
+        // engine applies it as its own, and drops it once applied.
+        let local_results = results.len();
+        let mut runner_words: Vec<(String, i64)> = Vec::new();
+        for word in db::take_runner_results(&pool, &worker_id, runner_results::PER_TICK).await? {
+            runner_words.push((word.task_id.clone(), word.fence));
+            if let Some(result) = runner_results::as_task_result(word) {
+                results.push(result);
+            }
+        }
         // An executor sends its last chunks (and the sealed, whole-redacted
         // log) before its result, so anything for these results is queued by
-        // now. Drain it while the tasks are still `running`: once terminal, the
-        // status guard refuses the append.
+        // now. Write it while the tasks are still `running`, however short a
+        // time it has waited: once terminal, the status guard refuses the
+        // append.
         if !results.is_empty() {
-            drain_log_chunks(&pool, &mut log_rx).await;
+            logs.take(&mut log_rx);
+            logs.write_for(&pool, results.iter().map(|r| r.task_id.as_str()))
+                .await;
         }
-        for mut result in results {
+        for (nth, mut result) in results.into_iter().enumerate() {
             // Executor finished → drained here (A-5). Before the completion
             // wake this sat at "remainder of the poll interval" for every
             // locally-run task; it should now track tick cost alone.
             metrics.observe_result_wait(result.finished.elapsed().as_secs_f64());
-            in_flight = in_flight.saturating_sub(1);
+            if nth < local_results {
+                in_flight = in_flight.saturating_sub(1);
+            }
+            // Its work is over, whatever follows. By the fence: a teardown of
+            // this task carries a later one, and is not what was kept.
+            if held.get(&result.task_id).is_some_and(|(fence, _)| *fence == result.fence) {
+                held.remove(&result.task_id);
+            }
+
+            // What it said it spent of a model's tokens: a line of its output,
+            // taken out of it in every build, and kept, with its
+            // reservation given back, where the build keeps the meter. A
+            // failure to keep it is not the task's: a reservation not given
+            // back is taken as spent by the next one against its run. One the
+            // executor had no room to start spent nothing, and is given back
+            // whole before it goes back to the queue to reserve again.
+            let reported = if result.teardown {
+                None
+            } else if result.backpressure && !result.success {
+                Some(0)
+            } else {
+                result
+                    .output
+                    .as_mut()
+                    .and_then(dagron_core::tokens::take_report)
+            };
+            #[cfg(feature = "enterprise")]
+            {
+                let reserves = result.spec.as_deref().is_some_and(|s| s.tokens.is_some());
+                if !result.teardown && (reserves || reported.is_some()) {
+                    if let Err(e) = dagron_core::tokens::settle(
+                        &pool,
+                        &result.task_id,
+                        result.fence,
+                        reserves,
+                        reported,
+                    )
+                    .await
+                    {
+                        warn!(task_id = %result.task_id, error = %e, "keeping what a task spent of its tokens failed");
+                    }
+                }
+            }
+            #[cfg(not(feature = "enterprise"))]
+            let _ = reported;
+
+            // Work that stopped because it was told to: a task asked to stop,
+            // a claim that was lost, or a teardown alone. It is no result of
+            // the task's, so none of what follows applies to it. A task that
+            // was asked to stop is cancelled once its work was seen gone, and
+            // its run ends with the last such task. One whose work nobody saw
+            // go is left as it is, and looked for again when its lease, cut
+            // short here, has lapsed. A claim lost any other way has a row
+            // that is another's now: nothing is written.
+            match result.stopped {
+                worker::Stopped::No => {}
+                worker::Stopped::Gone => {
+                    if db::settle_stopped_task(&pool, &result.task_id, &result.worker_id, result.fence)
+                        .await?
+                    {
+                        info!(
+                            task_id = %result.task_id, teardown = result.teardown,
+                            "the task was asked to stop and its work is gone: cancelled"
+                        );
+                        newly_terminal = true;
+                    }
+                    continue;
+                }
+                worker::Stopped::Unseen => {
+                    if db::release_stopping_task(
+                        &pool,
+                        &result.task_id,
+                        &result.worker_id,
+                        result.fence,
+                        STOP_RETRY_SECS,
+                    )
+                    .await?
+                    {
+                        warn!(
+                            task_id = %result.task_id, teardown = result.teardown,
+                            retry_in_secs = STOP_RETRY_SECS,
+                            reason = result.output.as_deref().unwrap_or(""),
+                            "the task was asked to stop and its work was not seen gone: \
+                             it reads as still stopping, and will be looked for again"
+                        );
+                    }
+                    continue;
+                }
+            }
 
             if result.success {
                 // Loop operator (`repeat:`): a successful iteration only counts
@@ -3482,6 +5519,19 @@ pub async fn run(seams: Seams) -> Result<()> {
                                     "submit finished on a reclaimed lease — remote job is \
                                      orphaned and will not be polled by this row"
                                 );
+                                // Or the task was asked to stop while its
+                                // submit ran: a park is refused then too, and
+                                // the claim is still this engine's to settle.
+                                if db::settle_stopped_task(
+                                    &pool,
+                                    &result.task_id,
+                                    &result.worker_id,
+                                    result.fence,
+                                )
+                                .await?
+                                {
+                                    newly_terminal = true;
+                                }
                             }
                             continue;
                         }
@@ -3573,6 +5623,39 @@ pub async fn run(seams: Seams) -> Result<()> {
                     }
                 }
             } else {
+                // ── Back-pressure ────────────────────────────────────────────
+                // The executor refused to start this for lack of capacity — a
+                // pod a full namespace quota would not admit. Nothing ran, so
+                // it is settled before anything below can treat it as a failed
+                // attempt: there is no attempt to number, no failure text to
+                // classify and no retry budget to spend. The task goes back to
+                // the queue with its attempt given back, or, once it has waited
+                // out `DAGRON_QUOTA_WAIT_MAX_SECS`, fails for good.
+                if result.backpressure {
+                    match quota_wait::settle(
+                        &pool,
+                        &metrics,
+                        &seams,
+                        quota_wait_max_secs,
+                        gangs_on,
+                        &result,
+                    )
+                    .await?
+                    {
+                        // Like a scheduled retry, a requeue unblocks nothing
+                        // now, and a stale fence changed nothing at all.
+                        quota_wait::Settled::Requeued | quota_wait::Settled::Stale => continue,
+                        quota_wait::Settled::Expired => {
+                            newly_terminal = true;
+                            continue;
+                        }
+                        // A task that does not wait (the bound is 0, or it is a
+                        // gang member and gangs are claimed as a unit) fails
+                        // the ordinary way, below.
+                        quota_wait::Settled::NotApplicable => {}
+                    }
+                }
+
                 // attempt + 1 = the attempt number that just ran (claim_ready increments
                 // the counter in the DB, but the snapshot we received is pre-claim).
                 let actual_attempt = result.attempt + 1;
@@ -3592,10 +5675,16 @@ pub async fn run(seams: Seams) -> Result<()> {
                     .as_deref()
                     .and_then(dagron_core::fault::classify_text);
                 let fault_class = classification.as_ref().map(|c| c.class);
+                // The class is read off what the task printed, and it can buy
+                // attempts: its default budget stands in for the task's own
+                // `max_attempts`. A task of a run that is not trusted prints
+                // what its author likes, so its class is recorded, and
+                // decides nothing.
+                let deciding_class = if result.confined { None } else { fault_class };
                 // The author's per-class budget, if they wrote one for *this*
                 // class. Read off the spec that already rode the dispatch
                 // payload (B-4) — no re-parse of the row's input JSON.
-                let budget_override = fault_class.and_then(|c| {
+                let budget_override = deciding_class.and_then(|c| {
                     result
                         .spec
                         .as_ref()
@@ -3629,7 +5718,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                 // nan-loss" is an answer; "not retrying" is not.
                 let budget = dagron_core::models::effective_budget(
                     result.max_attempts,
-                    fault_class,
+                    deciding_class,
                     budget_override,
                 );
 
@@ -3641,7 +5730,7 @@ pub async fn run(seams: Seams) -> Result<()> {
                     result.max_attempts,
                     result.timed_out,
                     result.retry_on_timeout,
-                    fault_class,
+                    deciding_class,
                     budget_override,
                 ) {
                     // Exponential backoff: base * 2^(attempt-1), capped at 2^10 doublings
@@ -3725,48 +5814,129 @@ pub async fn run(seams: Seams) -> Result<()> {
                 }
             }
         }
+        // Applied, each one, or nothing to apply it to: dropped by its fence.
+        // An engine that dies before this leaves them to be taken again once
+        // a minute has gone by, and applying one twice changes nothing.
+        db::drop_runner_results(&pool, &runner_words).await?;
 
         // ── Step 5: finalize any runs whose tasks are all terminal ──────────
-        for (run_id, status) in db::reap_completed_runs(&pool).await? {
-            info!(%run_id, %status, "run complete");
-            #[cfg(feature = "ops")]
-            run_finished(&pool, &metrics, &run_id, status == models::RunStatus::Succeeded).await;
-            // Extension seam: no-op by default; an alternate build may emit the run event.
-            seams.run_sink.on_run_completed(&run_id, &status.to_string()).await;
-            // OpenLineage: emit the terminal RunEvent (best-effort — a lineage
-            // backend being down never affects run execution).
-            if let Some(ol) = &lineage {
-                let job = db::workflow_name_for_run(&pool, &run_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| run_id.clone());
-                let failed = status.to_string() == "failed";
-                let datasets = run_lineage_datasets(&pool, &run_id).await;
-                if let Err(e) = ol
-                    .emit_run_completed(&run_id, &job, failed, &datasets)
-                    .await
-                {
-                    tracing::warn!(error = %e, %run_id, "OpenLineage emit failed");
+        // Among the runs this loop was told of since it last looked: a
+        // notification names the run a task changed state in, so a run can
+        // have ended only if it was named. That is a question of those runs
+        // by their keys, where it was a join of every running run to all its
+        // tasks, on every tick of every replica. Asked for here and not where
+        // the tick began, so that what this tick's own marks sent is in it.
+        let woken = match waker.take_woken().await {
+            _ if reap_interval.is_zero() => db::Woken::All,
+            woken => woken,
+        };
+        let mut ended = db::reap_woken(&pool, &woken).await?;
+        // The net under a notification nobody took: every running run is
+        // looked at in turn, a slice a pass. A tick that looked at them all
+        // has no need of it. One engine a window takes the slice, from
+        // where the engine before it left off: the slot keeps
+        // the cursor, so the running runs are walked once an installation,
+        // not once an engine. With no slot to keep it (SQLite, or
+        // `SWEEP_SHARE=off`), this engine keeps its own.
+        let reap_now = std::time::Instant::now();
+        if woken == db::Woken::All {
+            // The full reap looked at every run: a window of the slice's, run
+            // here (at a start, after a take that failed, or every tick with
+            // `REAP_INTERVAL_MS=0`).
+            // Stamped as the pass is counted, a window at a time, not each
+            // tick, or no window would ever come due to count.
+            if sweep_clock.due(Sweep::Reap, reap_now) {
+                metrics.sweep_ran(Sweep::Reap, std::time::Duration::ZERO, 0);
+                sweep_clock.ran(Sweep::Reap, reap_now);
+            }
+        } else if sweep_clock.due(Sweep::Reap, reap_now) {
+            let slot = if sweep_clock.share() {
+                let wanted = [(Sweep::Reap.name(), sweep_clock.slot_secs(Sweep::Reap))];
+                db::claim_sweep_slots(&pool, &worker_id, &wanted)
+                    .await?
+                    .pop()
+            } else {
+                Some(db::SweepSlot {
+                    name: Sweep::Reap.name().to_string(),
+                    turn: 0,
+                    cursor: None,
+                })
+            };
+            // Timed from when the claim came back, as the tick's sweeps are
+            // (`SweepClock::take`).
+            sweep_clock.ran(Sweep::Reap, std::time::Instant::now());
+            match slot {
+                None => metrics.sweep_elsewhere(Sweep::Reap),
+                Some(slot) => {
+                    let pass = std::time::Instant::now();
+                    let after = if slot.turn > 0 {
+                        slot.cursor
+                    } else {
+                        reap_after.take()
+                    };
+                    let (swept, next) = db::reap_slice(&pool, after.as_deref(), REAP_SLICE).await?;
+                    if slot.turn > 0 {
+                        // At the turn it was taken at: an engine that stalled
+                        // since writes nothing over the walk of the one after.
+                        db::set_sweep_cursor(&pool, Sweep::Reap.name(), slot.turn, next.as_deref())
+                            .await?;
+                    }
+                    reap_after = next;
+                    metrics.sweep_ran(Sweep::Reap, pass.elapsed(), swept.len());
+                    if !swept.is_empty() {
+                        // Most often a change that notified nobody. Now and then
+                        // a run whose own notification was still on its way.
+                        tracing::debug!(
+                            runs = swept.len(),
+                            "the sweep ended runs before any notification that named them was taken"
+                        );
+                        metrics.add_reaped_by_sweep(swept.len());
+                        ended.extend(swept);
+                    }
                 }
             }
-            // Forge feedback: if the run's spec has a `notify.git` block, post the
-            // terminal commit status (best-effort — a forge being down never
-            // affects run execution).
-            if let Some(forge) = &forge {
-                post_forge_status(forge, &pool, &run_id, &status.to_string()).await;
-            }
-            // Operator notifications: push the terminal status to any
-            // notify.webhook / notify.slack targets in the run's spec. Spawned
-            // so up to four sequential HTTP posts (each with a 10s timeout)
-            // can't stall task dispatch for every other run in this tick.
-            {
-                let pool = pool.clone();
-                let run_id = run_id.clone();
-                let status = status.to_string();
-                tokio::spawn(async move {
-                    notify::notify_run_event(&pool, &run_id, &status).await;
-                });
+        }
+        // Each end's work is its `run.completed` event's, done by the
+        // end-of-run workers ([`run_end`]); they are told there is some.
+        if !ended.is_empty() {
+            run_ended.notify_waiters();
+        }
+        for (run_id, status) in ended {
+            info!(%run_id, %status, "run complete");
+            // What the executor and the fetch ahead kept for the run alone.
+            executor.forget_run(&run_id);
+            forget_prefetched(&run_id);
+            #[cfg(feature = "ops")]
+            run_finished(
+                &pool,
+                &metrics,
+                &run_id,
+                status == models::RunStatus::Succeeded,
+            )
+            .await;
+        }
+
+        // ── Step 5b: runs a release before the outbox ended outside the reaper
+        // A cancel and the run_timeout_secs sweep used to leave the rest of a
+        // run's end to here (`completion_pending_at`); now its event is owed
+        // to the end-of-run workers like any other's. A run stamped so before
+        // this release came up, whose event was written before its parts were
+        // registered, still has its end done, once: here, by the parts, each
+        // spawned, so that the loop waits on none of them.
+        for (run_id, status) in db::claim_pending_completions(&pool, END_OF_RUN_CLAIM_LIMIT).await?
+        {
+            info!(%run_id, %status, "a run ended before this release: its end is done");
+            run_end::spawn_once(&pool, &end_parts, &run_id, &status.to_string());
+        }
+
+        // ── Step 5c: announce runs that started ─────────────────────────────
+        // A run created with a `notify.git` block owes its commit a `pending`
+        // status, whichever process created it (most runs come through
+        // dagron-api, which holds no forge token). Only an engine that can post
+        // claims; each post is spawned so a slow forge never holds the tick.
+        if let Some(forge) = &forge {
+            for run_id in db::claim_pending_starts(&pool, START_CLAIM_LIMIT).await? {
+                tokio::spawn(announce_start(pool.clone(), forge.clone(), run_id));
             }
         }
 
@@ -3807,9 +5977,13 @@ pub async fn run(seams: Seams) -> Result<()> {
         //    timer alone. The timer also paces time-based retries and parked
         //    sensors, and covers the (rare) notification a cancelled listener
         //    poll could drop — the timer has always been that safety net.
+        //    The waker takes every notification that is waiting, so a burst
+        //    of them is one tick, and the loop does not go on ticking through
+        //    a backlog after the work that sent it is over.
         // Live-log chunks are deliberately NOT a wake source: tailing has no
         // latency SLO, and waking per chunk would let one chatty task spin the
-        // loop at its output rate. Chunks keep draining at tick cadence.
+        // loop at its output rate. Chunks are taken at tick cadence, and
+        // written when they have waited (`log_batch`).
         // Both futures are cancel-safe to drop mid-wait: an mpsc message stays
         // queued until actually received.
         tokio::select! {
@@ -3820,7 +5994,11 @@ pub async fn run(seams: Seams) -> Result<()> {
                 // but a closed channel must degrade to timer pacing, not spin.
                 None => tokio::time::sleep(poll_interval).await,
             },
-            _ = waker.wait(poll_interval) => {}
+            taken = waker.wait(poll_interval) => {
+                if let Ok(taken) = taken {
+                    metrics.add_notifications(taken);
+                }
+            }
         }
     }
 
@@ -3831,18 +6009,196 @@ pub async fn run(seams: Seams) -> Result<()> {
     Ok(())
 }
 
+/// What a task's attempt is handed to resume from (`DAGRON_RESUME_FROM`, and
+/// its marker): the last checkpoint committed, for a retry. The pointer comes
+/// from the datastore (reported via POST …/tasks/{id}/checkpoint), falling
+/// back to the `<checkpoint_dir>/latest` file convention for setups that run
+/// without the management API. dagron owns pointer durability; what is
+/// inside the checkpoint belongs to the task.
+///
+/// A round's first attempt (`attempt` 0) resumes nothing, and starts the file
+/// convention over: a `latest` an earlier round left in the directory, which
+/// is the run's and the task's whatever the round, is removed, so that no
+/// retry of this round is handed it. A rerun of every job and a clear drop
+/// the datastore's pointer with the rest of a task's result, and the file
+/// went on pointing at the run before.
+async fn resume_from(
+    pool: &db::Pool,
+    task_id: &str,
+    task_name: &str,
+    attempt: i64,
+    checkpoint_dir: Option<&std::path::Path>,
+) -> Option<(String, Option<String>)> {
+    if attempt == 0 {
+        if let Some(ck) = checkpoint_dir {
+            match tokio::fs::remove_file(ck.join("latest")).await {
+                Ok(()) => {
+                    info!(task = %task_name, "a round's first attempt: the checkpoint an earlier round left is not resumed from")
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, task = %task_name, "the checkpoint an earlier round left could not be removed: a retry may resume from it")
+                }
+            }
+        }
+        return None;
+    }
+    match db::task_checkpoint(pool, task_id).await {
+        Ok(found @ Some(_)) => return found,
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, task = %task_name, "checkpoint lookup failed — dispatching without resume pointer")
+        }
+    }
+    let uri = tokio::fs::read_to_string(checkpoint_dir?.join("latest"))
+        .await
+        .ok()?;
+    let uri = uri.trim().to_string();
+    (!uri.is_empty()).then_some((uri, None))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        dag, git_target, new_traceparent, parse_max_inflight_runs, run_images,
-        starts_without_a_run, HeaderCacheKey,
+        dag, full_batch, git_target, new_traceparent, parse_max_inflight_runs,
+        report_invalid_indexes, run_images, starts_without_a_run, DatasetTriggerWork,
+        HeaderCacheKey,
     };
+
+    /// A forge that answers every request `201` and records each body's
+    /// `state`, in arrival order. Enough HTTP/1.1 for one JSON POST per
+    /// connection.
+    #[cfg(feature = "ops")]
+    async fn stub_forge() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let states = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = states.clone();
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // Read until the body is in: it ends with the JSON's `}`.
+                while !buf.ends_with(b"}") {
+                    match conn.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf);
+                if let Some(at) = text.find("\"state\":\"") {
+                    let state = text[at + 9..].split('"').next().unwrap_or("").to_string();
+                    seen.lock().unwrap().push(state);
+                }
+                let _ = conn
+                    .write_all(
+                        b"HTTP/1.1 201 Created\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                    )
+                    .await;
+            }
+        });
+        (base, states)
+    }
+
+    /// A round's first attempt resumes nothing, and leaves nothing of an
+    /// earlier round's to its retries: the `latest` an earlier round wrote in
+    /// the task's checkpoint directory is removed when it is dispatched. A
+    /// retry resumes from the datastore's pointer, or from a `latest` its own
+    /// round wrote.
+    #[tokio::test]
+    async fn a_round_s_first_attempt_leaves_no_earlier_checkpoint_to_its_retries() {
+        let path =
+            std::env::temp_dir().join(format!("module54_resume_{}.db", uuid::Uuid::new_v4()));
+        let pool = crate::db::init_pool(path.to_str().unwrap()).await.unwrap();
+        let yaml = "name: train\ntasks:\n- name: fit\n  command: [\"true\"]\n";
+        let run = crate::db::create_run(&pool, &dag::DagGraph::from_yaml(yaml).unwrap(), yaml)
+            .await
+            .unwrap();
+        let task: String = sqlx::query_scalar("SELECT id FROM task_runs WHERE run_id = ?")
+            .bind(&run)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let latest = dir.path().join("latest");
+        let resume =
+            |attempt: i64| super::resume_from(&pool, &task, "fit", attempt, Some(dir.path()));
+        let file = |uri: &str| Some((uri.to_string(), None));
+
+        std::fs::write(&latest, "file:///round-1/epoch-7\n").unwrap();
+        assert_eq!(
+            resume(1).await,
+            file("file:///round-1/epoch-7"),
+            "a retry of round 1"
+        );
+        // Round 2, a rerun of every job: its first attempt starts from nothing.
+        assert_eq!(resume(0).await, None);
+        assert!(!latest.exists(), "round 1's checkpoint is gone");
+        assert_eq!(resume(1).await, None, "and round 2's retry starts over too");
+        std::fs::write(&latest, "file:///round-2/epoch-1").unwrap();
+        assert_eq!(resume(1).await, file("file:///round-2/epoch-1"));
+        // The datastore's pointer goes before the file.
+        sqlx::query("UPDATE task_runs SET checkpoint_uri = 's3://ck/9', checkpoint_marker = 'epoch=9' WHERE id = ?")
+            .bind(&task)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            resume(1).await,
+            Some(("s3://ck/9".to_string(), Some("epoch=9".to_string())))
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A start announced after the run already ended still leaves the check
+    /// on the end. On a forge the last status for a context is the one that
+    /// shows, so a `pending` landing after the terminal post would leave a
+    /// finished run "in progress". `announce_start` re-reads the run after
+    /// posting and posts the end again.
+    #[tokio::test]
+    #[cfg(feature = "ops")]
+    async fn a_start_announced_after_the_end_still_finishes_on_the_end() {
+        let path =
+            std::env::temp_dir().join(format!("module54_announce_{}.db", uuid::Uuid::new_v4()));
+        let pool = crate::db::init_pool(path.to_str().unwrap()).await.unwrap();
+        let yaml = "name: ci\n\
+                    parameters: { commit_sha: 4b4708e725f29891d22b4c96af9f0a403ff51c7c }\n\
+                    notify:\n  git: { provider: github, repo: acme/etl, sha: \"{{ commit_sha }}\" }\n\
+                    tasks:\n- name: a\n  command: [\"true\"]\n";
+        let dag = dag::DagGraph::from_yaml(yaml).unwrap();
+        let (base, states) = stub_forge().await;
+        let forge = std::sync::Arc::new(dagron_forge::ForgeClient::github("token", base));
+
+        // Still running when the post lands: `pending`, and nothing more.
+        let running = crate::db::create_run(&pool, &dag, yaml).await.unwrap();
+        super::announce_start(pool.clone(), forge.clone(), running).await;
+        assert_eq!(*states.lock().unwrap(), ["pending"]);
+
+        // Ended before the re-read: the end is posted again, after `pending`.
+        states.lock().unwrap().clear();
+        let ended = crate::db::create_run(&pool, &dag, yaml).await.unwrap();
+        assert!(crate::db::cancel_run(&pool, &ended)
+            .await
+            .unwrap()
+            .is_some());
+        super::announce_start(pool.clone(), forge, ended).await;
+        assert_eq!(*states.lock().unwrap(), ["pending", "error"]);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
 
     fn header(name: &str, secret: &str) -> dag::EnvVar {
         dag::EnvVar {
             name: name.to_string(),
             value: String::new(),
-            value_from: Some(dag::SecretRef { secret: secret.to_string() }),
+            value_from: Some(dag::SecretRef {
+                secret: secret.to_string(),
+                optional: false,
+            }),
         }
     }
 
@@ -3856,8 +6212,8 @@ mod tests {
         let a = [header("Authorization", "VENDOR_A_TOKEN")];
         let b = [header("X-Api-Key", "VENDOR_B_KEY")];
         assert_ne!(
-            HeaderCacheKey::new("run-1", &a),
-            HeaderCacheKey::new("run-1", &b),
+            HeaderCacheKey::new("run-1", None, &a),
+            HeaderCacheKey::new("run-1", None, &b),
             "same run, different credentials — these must not collide"
         );
     }
@@ -3868,7 +6224,37 @@ mod tests {
     fn an_identical_header_block_still_shares_one_resolution() {
         let a = [header("Authorization", "VENDOR_A_TOKEN")];
         let same = [header("Authorization", "VENDOR_A_TOKEN")];
-        assert_eq!(HeaderCacheKey::new("run-1", &a), HeaderCacheKey::new("run-1", &same));
+        assert_eq!(
+            HeaderCacheKey::new("run-1", None, &a),
+            HeaderCacheKey::new("run-1", None, &same)
+        );
+    }
+
+    /// A task may name an environment of its own, so the same block in one
+    /// run can be two secrets: one from the run's environment and one from
+    /// the task's. Sharing an entry would hand one task the other's.
+    #[test]
+    fn the_same_block_from_two_environments_is_two_entries() {
+        let a = [header("Authorization", "VENDOR_A_TOKEN")];
+        assert_ne!(
+            HeaderCacheKey::new("run-1", None, &a),
+            HeaderCacheKey::new("run-1", Some("prod"), &a)
+        );
+        assert_ne!(
+            HeaderCacheKey::new("run-1", Some("staging"), &a),
+            HeaderCacheKey::new("run-1", Some("prod"), &a)
+        );
+        assert_eq!(
+            HeaderCacheKey::new("run-1", Some("prod"), &a),
+            HeaderCacheKey::new("run-1", Some("prod"), &a)
+        );
+        assert_eq!(
+            super::task_environment(Some(r#"{"name":"a","environment":"prod"}"#)).as_deref(),
+            Some("prod")
+        );
+        assert_eq!(super::task_environment(Some(r#"{"name":"a"}"#)), None);
+        assert_eq!(super::task_environment(Some("not json")), None);
+        assert_eq!(super::task_environment(None), None);
     }
 
     /// The run half is load-bearing too: `environment:` is per-run, so the same
@@ -3876,14 +6262,18 @@ mod tests {
     #[test]
     fn the_same_block_in_two_runs_is_two_entries() {
         let a = [header("Authorization", "VENDOR_A_TOKEN")];
-        assert_ne!(HeaderCacheKey::new("run-1", &a), HeaderCacheKey::new("run-2", &a));
+        assert_ne!(
+            HeaderCacheKey::new("run-1", None, &a),
+            HeaderCacheKey::new("run-2", None, &a)
+        );
     }
 
     /// A header order swap is a different block. Over-keying costs one extra
     /// resolution; under-keying costs a credential, so the key errs that way.
     #[test]
     fn the_key_is_built_from_the_unresolved_spec() {
-        let k = HeaderCacheKey::new("run-1", &[header("Authorization", "TOK")]).expect("serialises");
+        let k = HeaderCacheKey::new("run-1", None, &[header("Authorization", "TOK")])
+            .expect("serialises");
         assert!(k.block.contains("TOK"), "the SECRET NAME is in the key, not its value: {}", k.block);
         assert!(!k.block.contains("value_from\":null"));
     }
@@ -3999,6 +6389,53 @@ mod tests {
                  — all inside task_finished. A terminal transition that bumps it directly \
                  desynchronises the counters from the Meter quota seam; call task_finished instead.",
                 totals[i]
+            );
+        }
+    }
+
+    /// A back-pressure result is settled before the failure branch can treat it
+    /// as a failed attempt.
+    ///
+    /// The settle function is tested by calling it and the worker's flag by a
+    /// fake backend, but nothing in-process can drive `run()` with an executor
+    /// that refuses to start a task: it builds its own from `EXECUTOR`. So the
+    /// call site is pinned by shape, like the funnel above: one gate, one call,
+    /// in the result loop after the success test and above every step that
+    /// numbers, classifies, counts or budgets an attempt. The needles are
+    /// assembled with `concat!` so this test's own source cannot satisfy them.
+    #[test]
+    fn a_backpressure_result_is_settled_before_the_failure_branch_sees_it() {
+        let src = include_str!("lib.rs");
+        let once = |needle: &str| -> usize {
+            assert_eq!(
+                src.matches(needle).count(),
+                1,
+                "{needle:?} must appear exactly once in dagron-engine/src/lib.rs"
+            );
+            src.find(needle).expect("counted once above")
+        };
+
+        let success_test = once(concat!("if result.", "success {"));
+        let gate = once(concat!("if result.", "backpressure {"));
+        let call = once(concat!("quota_wait::", "settle("));
+        assert!(
+            success_test < gate && gate < call,
+            "the back-pressure gate belongs in the result loop, after the success test, \
+             with the settle call inside it"
+        );
+
+        for step in [
+            concat!("let actual_", "attempt = result.attempt + 1;"),
+            concat!("fault::", "classify_text"),
+            concat!("metrics.inc_", "fault("),
+            concat!("db::record_task_", "fault("),
+            concat!("should_retry_failed_", "with_class("),
+            concat!("metrics.inc_", "retried()"),
+        ] {
+            assert!(
+                call < once(step),
+                "{step:?} runs before a back-pressure result is settled: a pod the namespace \
+                 quota refused would be numbered, classified or budgeted as a failed attempt"
             );
         }
     }
@@ -4213,6 +6650,263 @@ mod tests {
         assert_eq!(cap(""), 64, "empty → default");
     }
 
+    /// The start-up check names each index an interrupted build left INVALID
+    /// and the statement that rebuilds it, and the gauge counts them. None
+    /// found says nothing and leaves the gauge at zero.
+    #[test]
+    fn invalid_indexes_are_reported_at_start() {
+        use std::sync::atomic::Ordering;
+        let metrics = dagron_core::metrics::Metrics::new();
+        let mut known = std::collections::BTreeSet::new();
+        assert!(report_invalid_indexes(&[], &mut known, &metrics).is_empty());
+        assert_eq!(metrics.db_invalid_indexes.load(Ordering::Relaxed), 0);
+
+        let found = [
+            "idx_task_runs_wake_due".to_string(),
+            "idx_task_runs_fanout_parked".to_string(),
+        ];
+        let lines = report_invalid_indexes(&found, &mut known, &metrics);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].contains("index idx_task_runs_wake_due is INVALID"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[0].ends_with("`REINDEX INDEX CONCURRENTLY idx_task_runs_wake_due`"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].ends_with("`REINDEX INDEX CONCURRENTLY idx_task_runs_fanout_parked`"),
+            "{}",
+            lines[1]
+        );
+        assert_eq!(metrics.db_invalid_indexes.load(Ordering::Relaxed), 2);
+    }
+
+    /// The look is made again every few minutes: an index still INVALID is
+    /// counted and not said again, one rebuilt leaves the count, and the
+    /// copies a `REINDEX INDEX CONCURRENTLY` in flight makes are not counted.
+    #[test]
+    fn invalid_indexes_are_looked_for_again_and_clear() {
+        use std::sync::atomic::Ordering;
+        let metrics = dagron_core::metrics::Metrics::new();
+        let mut known = std::collections::BTreeSet::new();
+        let found = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+
+        let first = found(&["idx_task_runs_wake_due", "idx_task_runs_fanout_parked"]);
+        assert_eq!(
+            report_invalid_indexes(&first, &mut known, &metrics).len(),
+            2
+        );
+
+        // A REINDEX of one is under way: its copies are not counted.
+        let rebuilding = found(&[
+            "idx_task_runs_wake_due",
+            "idx_task_runs_fanout_parked",
+            "idx_task_runs_fanout_parked_ccnew",
+            "idx_task_runs_sub_run_parked_ccnew1",
+            "idx_task_runs_wait_url_due_ccold",
+        ]);
+        assert!(
+            report_invalid_indexes(&rebuilding, &mut known, &metrics).is_empty(),
+            "nothing new to say"
+        );
+        assert_eq!(metrics.db_invalid_indexes.load(Ordering::Relaxed), 2);
+
+        // Rebuilt: the next look clears it.
+        let after = found(&["idx_task_runs_wake_due"]);
+        assert!(report_invalid_indexes(&after, &mut known, &metrics).is_empty());
+        assert_eq!(metrics.db_invalid_indexes.load(Ordering::Relaxed), 1);
+        assert!(report_invalid_indexes(&[], &mut known, &metrics).is_empty());
+        assert_eq!(metrics.db_invalid_indexes.load(Ordering::Relaxed), 0);
+
+        // Left invalid again by a later build: said again.
+        let again = report_invalid_indexes(&after, &mut known, &metrics);
+        assert_eq!(again.len(), 1, "{again:?}");
+        assert!(!super::is_rebuild_copy("idx_ccnew_by_name"));
+    }
+
+    /// The limits over the engine's sessions are gauged at every look,
+    /// and said where its pool and LISTEN are past one, or half of one, the
+    /// first time and when they change, not at every look between.
+    #[test]
+    fn connection_limits_are_gauged_and_said_once_for_each_set() {
+        use dagron_core::connections::Limits;
+        let metrics = dagron_core::metrics::Metrics::new();
+        let mut said = super::SaidLimits::new();
+        let limits = |database| Limits {
+            database,
+            login: None,
+            server: 97,
+            database_sessions: 4,
+            login_sessions: 4,
+            server_sessions: 11,
+        };
+        let report = |limits: &Limits, said: &mut super::SaidLimits| {
+            super::report_connection_limits("", limits, 9, "the engine", &metrics, said)
+        };
+        // The cap every workspace's database had: 9 is over half of 16.
+        assert_eq!(report(&limits(Some(16)), &mut said).len(), 1);
+        assert!(report(&limits(Some(16)), &mut said).is_empty(), "said once");
+        // Raised to 40: within half, and said of nothing.
+        assert!(report(&limits(Some(40)), &mut said).is_empty());
+        // Down again: said again.
+        assert_eq!(report(&limits(Some(8)), &mut said).len(), 1);
+        // The control DB's are their own.
+        let control = super::report_connection_limits(
+            "control_",
+            &limits(Some(8)),
+            6,
+            "the engine's meter and run sink",
+            &metrics,
+            &mut said,
+        );
+        assert_eq!(control.len(), 1, "{control:?}");
+        #[cfg(feature = "ops")]
+        {
+            let out = metrics.render(&Default::default(), None);
+            for line in [
+                "scheduler_db_connection_limit{scope=\"database\"} 8",
+                "scheduler_db_connection_limit{scope=\"server\"} 97",
+                "scheduler_db_connection_limit{scope=\"control_database\"} 8",
+                "scheduler_db_connection_sessions{scope=\"login\"} 4",
+                "scheduler_db_connection_sessions{scope=\"control_server\"} 11",
+            ] {
+                assert!(out.contains(line), "{line} in:\n{out}");
+            }
+            assert!(
+                !out.contains("scheduler_db_connection_limit{scope=\"login\"}"),
+                "none"
+            );
+        }
+    }
+
+    /// A workflow whose spec declares `on_datasets:` is synced, one that
+    /// declares none is cleared, and one whose spec this engine cannot read
+    /// (in a rolling upgrade, a spec a newer engine reads) is neither: its
+    /// triggers are left as they are.
+    #[test]
+    fn a_spec_that_does_not_parse_here_keeps_its_dataset_triggers() {
+        let newer = "name: newer\non_datasets: [\"s3://b/x\"]\ntasks:\n  - name: t\n    \
+                     command: [\"true\"]\n    env_from: [{ name: X, task: a, read: last_line, \
+                     trim: true }]\n";
+        let work = DatasetTriggerWork::of(vec![
+            (
+                "subscribed".to_string(),
+                "name: subscribed\non_datasets: [\"s3://b/a\"]\ntasks: []\n".to_string(),
+            ),
+            (
+                "dropped".to_string(),
+                "name: dropped\ntasks: []\n".to_string(),
+            ),
+            ("newer".to_string(), newer.to_string()),
+            ("broken".to_string(), "{{ not yaml".to_string()),
+        ]);
+        assert_eq!(
+            work.sync,
+            vec![(
+                "subscribed".to_string(),
+                vec!["s3://b/a".to_string()],
+                "any".to_string()
+            )]
+        );
+        assert_eq!(work.clear, vec!["dropped".to_string()]);
+        let unread: Vec<&str> = {
+            let mut unread: Vec<&str> = work.unread.keys().map(String::as_str).collect();
+            unread.sort();
+            unread
+        };
+        assert_eq!(
+            unread,
+            ["broken", "newer"],
+            "a fire of either is rolled back"
+        );
+    }
+
+    /// The loop's own step for a pass that read a full batch
+    /// ([`full_batch`]), driven with what the loop drives it with: a real
+    /// pass of the time sensors on SQLite, and the clock. A full batch makes
+    /// the sweep due again at once, and hands back the slot it was taken
+    /// with (on SQLite, where every sweep is the one engine's, a hand-back
+    /// that changes nothing); the next pass takes the rest, and is not
+    /// full. That the loop calls this when a pass says it was full is the
+    /// `if` beside each batched sweep, which only the whole engine runs; the
+    /// hand-back's effect on Postgres is dagron-api's
+    /// `two_engines_take_a_sweep_slot_once_a_window`.
+    #[tokio::test]
+    async fn a_full_batch_is_due_again_at_once_and_handed_back() {
+        use dagron_core::sweep::Sweep;
+        let path = std::env::temp_dir().join(format!("m54-full-{}.db", uuid::Uuid::new_v4()));
+        let pool = crate::db::init_pool(path.to_str().unwrap()).await.unwrap();
+        let mut yaml = String::from("name: many\ntasks:\n");
+        for i in 0..300 {
+            yaml.push_str(&format!(
+                "  - {{ name: w{i}, type: wait, wait: {{ for: 1h }} }}\n"
+            ));
+        }
+        let graph = dag::DagGraph::from_yaml(&yaml).unwrap();
+        crate::db::create_run(&pool, &graph, &yaml).await.unwrap();
+        crate::db::advance_ready_tasks(&pool).await.unwrap();
+        let claimed = crate::db::claim_ready(&pool, "w", 300).await.unwrap();
+        assert_eq!(claimed.len(), 300);
+        for t in &claimed {
+            let due = "2026-01-01T00:00:00+00:00";
+            assert!(crate::db::park_wait(&pool, &t.id, t.version + 1, due)
+                .await
+                .unwrap());
+        }
+
+        // An interval no test outlasts: only a full batch makes it due again.
+        let hour = std::time::Duration::from_secs(3600);
+        let mut clock = crate::sweeps::SweepClock::new(
+            3_600_000,
+            |_| true,
+            &Default::default(),
+            hour,
+            hour,
+            true,
+        );
+        let slot = crate::db::SweepSlot {
+            name: Sweep::Waits.name().to_string(),
+            turn: 3,
+            cursor: None,
+        };
+        let now = std::time::Instant::now();
+        let due = clock.settle(
+            &clock.due_now(now),
+            std::slice::from_ref(&slot),
+            now,
+            |_| {},
+        );
+        assert_eq!(due.turn(Sweep::Waits), Some(3));
+
+        let first = crate::db::reconcile_waits(&pool).await.unwrap();
+        assert!(first.full);
+        assert!(!clock.due(Sweep::Waits, std::time::Instant::now()));
+        full_batch(&pool, &mut clock, &due, Sweep::Waits)
+            .await
+            .unwrap();
+        assert!(
+            clock.due(Sweep::Waits, std::time::Instant::now()),
+            "due again on the next tick"
+        );
+        assert!(!clock.due(Sweep::Fanouts, std::time::Instant::now()));
+
+        // The slot handed back is taken again, by this engine or another.
+        let slot = crate::db::SweepSlot { turn: 4, ..slot };
+        let now = std::time::Instant::now();
+        let due = clock.settle(&clock.due_now(now), &[slot], now, |_| {});
+        assert!(due.runs(Sweep::Waits) && due.turn(Sweep::Waits) == Some(4));
+        let second = crate::db::reconcile_waits(&pool).await.unwrap();
+        assert_eq!(first.done.len() + second.done.len(), 300);
+        assert!(!second.full);
+        assert!(!clock.due(Sweep::Waits, std::time::Instant::now()));
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A generated traceparent is a valid W3C header: version 00, 32-hex trace
     /// id, 16-hex span id, sampled flag — and the trace id is never all-zero.
     #[test]
@@ -4230,6 +6924,29 @@ mod tests {
         assert_ne!(parts[1], "0".repeat(32), "trace id is never the forbidden all-zero");
         // Two calls produce distinct traces.
         assert_ne!(new_traceparent().0, tp);
+    }
+
+    /// A task whose workflow gives it a `TRACEPARENT` is one the engine adds
+    /// none to. It is told by the variable's name, exactly: another name of
+    /// the trace context's, or the same in another case, is not it.
+    #[test]
+    fn a_task_that_names_its_own_trace_context_is_seen_to() {
+        let var = |name: &str| dag::EnvVar {
+            name: name.to_string(),
+            value: "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
+            value_from: None,
+        };
+        assert!(super::names_its_own_trace(&[
+            var("PATH"),
+            var("TRACEPARENT")
+        ]));
+        assert!(!super::names_its_own_trace(&[]));
+        assert!(!super::names_its_own_trace(&[
+            var("PATH"),
+            var("TRACESTATE")
+        ]));
+        // Names in an environment are told apart by case.
+        assert!(!super::names_its_own_trace(&[var("traceparent")]));
     }
 
     use super::{poll_one, PollPlan};
@@ -4412,4 +7129,144 @@ mod tests {
         assert_eq!(h.cancel.unwrap().method(), "DELETE");
     }
 
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod child_run_tests {
+    use super::{child_trigger, dag, db, models};
+
+    /// The run `call` starts, made as the loop makes it.
+    async fn create_child_run(
+        pool: &db::Pool,
+        child: &dag::DagGraph,
+        child_yaml: &str,
+        call: &models::TaskRun,
+    ) -> anyhow::Result<String> {
+        let trigger = child_trigger(pool, call).await?;
+        db::create_run_triggered(pool, child, child_yaml, &trigger).await
+    }
+
+    /// A `type: workflow` task's child run is recorded as that task's, and
+    /// keeps what its parent's record says of where the work came from: who
+    /// caused it and how far its origin is trusted. A rule that reads those
+    /// then holds for a sub-workflow as it does for the run that called it.
+    #[tokio::test]
+    async fn a_sub_workflow_s_run_is_its_task_s_and_keeps_its_parent_s_provenance() {
+        let path = std::env::temp_dir().join(format!("m54_child_run_{}.db", uuid::Uuid::new_v4()));
+        let pool = db::init_pool(path.to_str().unwrap()).await.unwrap();
+
+        let parent_yaml =
+            "name: parent\ntasks:\n  - name: call\n    type: workflow\n    workflow: child\n";
+        let child_yaml = "name: child\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        // The parent is a member's pull request's run, as a CI service would
+        // have recorded it.
+        let of_a_member = models::RunTrigger {
+            kind: models::trigger_kind::CI.to_string(),
+            principal: "ci:svc@example.com".to_string(),
+            actor: Some("octocat".to_string()),
+            trust: Some("trusted".to_string()),
+            repo: Some("acme/widgets".to_string()),
+            sha: Some("a1".to_string()),
+            pr: Some(7),
+            event_id: Some("e-1".to_string()),
+            ..Default::default()
+        };
+        // A fork's would start no workflow: such a run is not made
+        // (`dagron_core::confine`).
+        let of_a_fork = models::RunTrigger {
+            trust: Some("untrusted".to_string()),
+            ..of_a_member.clone()
+        };
+        let refused = db::create_run_triggered(
+            &pool,
+            &dag::DagGraph::from_yaml(parent_yaml).unwrap(),
+            parent_yaml,
+            &of_a_fork,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            refused
+                .downcast_ref::<dagron_core::confine::ConfinedRefused>()
+                .is_some(),
+            "{refused}"
+        );
+        let parent = db::create_run_triggered(
+            &pool,
+            &dag::DagGraph::from_yaml(parent_yaml).unwrap(),
+            parent_yaml,
+            &of_a_member,
+        )
+        .await
+        .unwrap();
+        db::advance_ready_tasks(&pool).await.unwrap();
+        let claimed = db::claim_ready(&pool, "w", 10).await.unwrap();
+        let call = &claimed[0];
+        assert_eq!(
+            (call.name.as_str(), call.run_id.as_str()),
+            ("call", parent.as_str())
+        );
+
+        let child_dag = dag::DagGraph::from_yaml(child_yaml).unwrap();
+        let child = create_child_run(&pool, &child_dag, child_yaml, call)
+            .await
+            .unwrap();
+        let record = db::run_trigger(&pool, &child)
+            .await
+            .unwrap()
+            .expect("the child has a record");
+        assert_eq!(
+            (
+                record.kind.as_str(),
+                record.principal.as_str(),
+                record.source.as_deref()
+            ),
+            (
+                "workflow",
+                "engine",
+                Some(format!("run:{parent}/call").as_str())
+            )
+        );
+        assert_eq!(
+            (
+                record.actor.as_deref(),
+                record.trust.as_deref(),
+                record.repo.as_deref()
+            ),
+            (Some("octocat"), Some("trusted"), Some("acme/widgets"))
+        );
+        assert_eq!(
+            (record.sha.as_deref(), record.pr, record.event_id.as_deref()),
+            (Some("a1"), Some(7), Some("e-1"))
+        );
+
+        // A parent with no record: its child is recorded as its task's, with
+        // nothing more to say.
+        let old = db::create_run(
+            &pool,
+            &dag::DagGraph::from_yaml(parent_yaml).unwrap(),
+            parent_yaml,
+        )
+        .await
+        .unwrap();
+        db::advance_ready_tasks(&pool).await.unwrap();
+        let claimed = db::claim_ready(&pool, "w", 10).await.unwrap();
+        let call = claimed
+            .iter()
+            .find(|t| t.run_id == old)
+            .expect("the older run's task");
+        let child = create_child_run(&pool, &child_dag, child_yaml, call)
+            .await
+            .unwrap();
+        assert_eq!(
+            db::run_trigger(&pool, &child).await.unwrap(),
+            Some(models::RunTrigger::engine(
+                models::trigger_kind::WORKFLOW,
+                format!("run:{old}/call")
+            ))
+        );
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
 }

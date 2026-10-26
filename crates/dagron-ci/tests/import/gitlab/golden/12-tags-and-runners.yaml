@@ -1,0 +1,44 @@
+# Imported from a GitLab CI pipeline by dagron-import.
+#
+# To do by hand (2):
+#   gpu.image: the job names no image, and had the one its runner (gpu, linux) gave it: name its docker_image, or give the importer one (--image TAG=IMAGE)
+#   default-runner.image: the job names no image, and had its runner's own: name its docker_image
+#
+# Changed on the way (2):
+#   build.script: a job's script ran under bash where its image had bash, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   on.dispatch: a pipeline run from GitLab's page or its API is a run asked for here (dispatch), through the run API
+#
+# Not carried over (2):
+#   build.tags, gpu.tags: a job runs on the engine's capacity: a runner's tags are a runner_class or a pool here, which the operator names
+name: 12-tags-and-runners
+on:
+  push: {}
+  dispatch: {}
+tasks:
+- name: build
+  docker_image: docker.io/library/debian:12
+  steps:
+  - name: script
+    run: make
+- name: gpu
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        gpu.image: the job names no image, and had the one its runner (gpu, linux) gave it: name its docker_image, or give the importer one (--image TAG=IMAGE)
+      DAGRON_IMPORT
+      exit 1
+  - name: script
+    run: nvidia-smi
+- name: default-runner
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        default-runner.image: the job names no image, and had its runner's own: name its docker_image
+      DAGRON_IMPORT
+      exit 1
+  - name: script
+    run: uname -a

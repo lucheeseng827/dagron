@@ -181,8 +181,14 @@ async fn fire(
     }
     let mut params = std::collections::BTreeMap::new();
     crate::schedule_time::insert_logical_date(&mut params, &nominal.to_rfc3339());
+    // The entry, and which of its fires this is.
+    let trigger = crate::models::RunTrigger::engine(
+        crate::models::trigger_kind::SCHEDULE,
+        format!("cron:{}", entry.name),
+    )
+    .of_event(nominal.to_rfc3339());
     match DagGraph::from_yaml_with_params(&entry.dag_yaml, &params) {
-        Ok(dag) => match db::create_run(pool, &dag, &entry.dag_yaml).await {
+        Ok(dag) => match db::create_run_triggered(pool, &dag, &entry.dag_yaml, &trigger).await {
             Ok(run_id) => {
                 metrics.inc_runs_created();
                 info!(schedule = %entry.name, %run_id, name = %dag.spec.name, scheduled_time = %nominal, "cron fired run");
@@ -190,5 +196,55 @@ async fn fire(
             Err(e) => warn!(schedule = %entry.name, error = %e, "cron create_run failed"),
         },
         Err(e) => warn!(schedule = %entry.name, error = %e, "cron DAG no longer parses"),
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod tests {
+    use super::*;
+
+    /// A cron entry's fire is recorded as that entry's, of the time it was
+    /// due. Such a run carried nothing, and read as one a person had made.
+    #[tokio::test]
+    async fn a_fire_is_recorded_as_its_entry_s_of_the_time_it_was_due() {
+        let path = std::env::temp_dir().join(format!("m54_cron_{}.db", uuid::Uuid::new_v4()));
+        let pool = db::init_pool(path.to_str().unwrap()).await.unwrap();
+        let entry = CronEntry {
+            name: "nightly".to_string(),
+            schedule: Schedule::from_str("0 0 2 * * *").unwrap(),
+            tz: chrono_tz::UTC,
+            when: None,
+            dag_yaml: "name: nightly\ntasks:\n  - name: a\n    command: [\"true\"]\n".to_string(),
+            next: Utc::now(),
+        };
+        let due = DateTime::parse_from_rfc3339("2026-03-01T02:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        let gate = crate::pressure::AdmissionGate::default();
+        fire(&pool, &entry, due, &Metrics::new(), &gate).await;
+
+        let record: (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as("SELECT kind, principal, source, event_id, actor FROM run_triggers")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            record,
+            (
+                "schedule".to_string(),
+                "engine".to_string(),
+                Some("cron:nightly".to_string()),
+                Some(due.to_rfc3339()),
+                None,
+            )
+        );
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
     }
 }

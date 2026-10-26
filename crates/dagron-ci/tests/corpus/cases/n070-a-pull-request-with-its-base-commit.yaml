@@ -1,0 +1,12 @@
+shows: A pull request's base commit is among what its run is told
+event: { kind: pull_request, base_sha: 1111111111111111111111111111111111111111 }
+source: |
+  name: ci
+  on:
+    pull_request: {}
+  tasks:
+    - name: diff
+      workspace: { checkout: { depth: 0 } }
+      steps:
+        - env: { BASE: "{{ ci_base_sha }}" }
+          run: git diff --stat "$BASE"...HEAD

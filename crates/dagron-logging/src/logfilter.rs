@@ -562,6 +562,18 @@ impl LogFilter {
         FilterResult { lines, total, matched, truncated }
     }
 
+    /// One line on its own, as [`apply`](Self::apply) sees it: its level and
+    /// stamp, and its text with the stamp split off, where the filter's line
+    /// predicates (`q`, `exclude`, `regex`, `level`, `case`) keep it; `None`
+    /// where they do not. What a reader that has a log a piece at a time asks
+    /// of each line (dagron-api's live log relay): `context`, `limit` and
+    /// `tail` are about a whole text, and nothing is asked of them here.
+    pub fn keep_line<'a>(&self, raw: &'a str) -> Option<(Level, Option<&'a str>, &'a str)> {
+        let (ts, msg) = split_timestamp(raw);
+        let level = Level::infer(msg);
+        self.matches(msg, level).then_some((level, ts, msg))
+    }
+
     /// Does one line survive the filter? `level` is passed in because the caller
     /// has already inferred it.
     fn matches(&self, line: &str, level: Level) -> bool {
@@ -685,8 +697,9 @@ pub fn pairs_have_filter(pairs: &[(String, String)]) -> bool {
     pairs.iter().any(|(k, _)| FILTER_KEYS.contains(&k.as_str()))
 }
 
-/// `1`/`true`/`yes`/`on` (and a bare `?tail` with no value) are true.
-fn truthy(v: &str) -> bool {
+/// `1`/`true`/`yes`/`on` (and a bare `?tail` with no value) are true, in
+/// any case and spacing: what every reader of a log's query takes for true.
+pub fn truthy(v: &str) -> bool {
     matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on" | "")
 }
 
@@ -1055,6 +1068,30 @@ mod tests {
         // And the same token *inside* the window is still found, so the clamp
         // narrows the slice without breaking inference.
         assert_eq!(Level::infer(&format!("é ERROR {}", "é".repeat(40))), Level::Error);
+    }
+
+    /// A line on its own is kept as `apply` keeps it in a text, its stamp
+    /// split off and its level inferred from what follows.
+    #[test]
+    fn a_line_on_its_own_is_kept_as_in_a_text() {
+        let f = LogFilter::builder().levels([Level::Error]).build().unwrap();
+        assert_eq!(
+            f.keep_line("2026-07-26T10:00:03Z ERROR upstream timeout"),
+            Some((
+                Level::Error,
+                Some("2026-07-26T10:00:03Z"),
+                "ERROR upstream timeout"
+            ))
+        );
+        assert_eq!(f.keep_line("INFO all is well"), None);
+        for line in SAMPLE.lines() {
+            assert_eq!(
+                f.keep_line(line).is_some(),
+                f.apply(line).matched == 1,
+                "{line}"
+            );
+        }
+        assert!(LogFilter::default().keep_line("anything").is_some());
     }
 
     #[test]

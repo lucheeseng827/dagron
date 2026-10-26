@@ -1,0 +1,14 @@
+shows: A workflow with a schedule beside its push, run by the push as before; the schedule fires by an event of its own (g042)
+front: github
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on:
+    schedule:
+      - cron: "0 3 * * *"
+    push:
+      branches: [main]
+  jobs:
+    nightly:
+      runs-on: ubuntu-latest
+      steps:
+        - run: make nightly

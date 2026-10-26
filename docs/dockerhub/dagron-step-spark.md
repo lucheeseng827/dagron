@@ -90,7 +90,7 @@ tasks:
 
 Pin in production — pick the newest published tag rather than copying a version from this page, which ages.
 
-> First published in **0.10.0**, with `defer:` itself.
+> Tags exist from **0.9.3**; the repository has been public since 0.10.0.
 
 ## See also
 

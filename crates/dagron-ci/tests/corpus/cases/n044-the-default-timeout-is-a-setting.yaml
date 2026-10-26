@@ -1,0 +1,10 @@
+shows: The timeout a task is given when it names none is the operator's setting
+settings: { default_timeout_secs: 600 }
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: build
+      steps:
+        - run: make

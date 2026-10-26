@@ -56,7 +56,7 @@ cp model.ckpt "$DAGRON_CHECKPOINT_DIR/epoch-$e.ckpt"
 echo "$DAGRON_CHECKPOINT_DIR/epoch-$e.ckpt" > "$DAGRON_CHECKPOINT_DIR/latest"
 ```
 
-On the next attempt (retry after failure/preemption, `Rerun failed` in the UI):
+On the next attempt (a retry after failure or preemption):
 
 ```bash
 if [ -n "$DAGRON_RESUME_FROM" ]; then
@@ -64,6 +64,13 @@ if [ -n "$DAGRON_RESUME_FROM" ]; then
   load_checkpoint "$DAGRON_RESUME_FROM"      # torch.load, flax restore, …
 fi
 ```
+
+A rerun or a clear begins a new round of a task's attempts, and the round's
+first attempt starts from nothing. The `latest` file an earlier round left is
+removed when that attempt is dispatched, so a retry in the round resumes from
+what the round itself wrote, and never from the run before. A pointer reported
+through the API is kept by a rerun of the failed tasks, and its retries may
+resume from it; a rerun of every task and a clear drop it.
 
 ### Cloud checkpoints (multi-cloud resume)
 
@@ -166,6 +173,30 @@ that survives a mid-run kill via checkpoint resume, spot/on-demand pool
 routing, sharded batch inference with a gather step, an LLM content pipeline
 with a human approval gate, and a train→eval→deploy quality gate.
 
+## What a model call spent
+
+A task that calls a model says what the call spent on a line of its own
+output, `dagron::tokens=<n>`, every input token (cached or not) and the
+output's. The engine takes every such line out of the output before it keeps
+it, in every build, so `{{ tasks.X.output }}`, `when:`, `repeat.until` and
+`env_from` read what the task printed and not its report:
+
+```yaml
+- name: summarize
+  command: ["sh", "-c", "my-model-call > summary.txt && echo dagron::tokens=$(cat used)"]
+  tokens: 8192        # what it may spend: the prompt and its max_tokens
+```
+
+`tokens:` is what the task reserves of a token budget each time it is
+dispatched. A budget over a run (`budget: { tokens: N }`), held against the
+run's own tasks and those of the runs it starts (`type: workflow`, a loop's
+turns), is kept by the meter, which is not in this build: the field is refused
+with a pointer rather than dropped, and `tokens:` with no budget over it
+reserves nothing. What holds one call here is the call's own `max_tokens`;
+what holds a run is `budget: { tasks: N }`, or a gateway in front of the
+model that keeps a budget of each run's own, by a claim of the run's OIDC
+token.
+
 ## Limits of this build — AI workloads
 
 The canonical list of what is not in this build, and what to do about it, is
@@ -180,6 +211,10 @@ The primitives above are the programming model and are complete on their own.
   that admits a gang only when every member is ready and capacity fits the
   whole gang is not. Without it, gang members schedule as ordinary independent
   tasks — which is a correct schedule, not a broken one, but it is not a gang.
+- **A token budget** (`budget: { tokens }`). The report line and `tokens:`
+  are open, above; the meter that reserves each task's `tokens:` before it
+  is dispatched, keeps what it reports, and fails, saying so, a task that a
+  budget can no longer fit, is not.
 - **Natural-language spec generation.** `dagron validate` and the parser it
   calls are the open half; the generator that writes a spec against them is
   not in this repository.

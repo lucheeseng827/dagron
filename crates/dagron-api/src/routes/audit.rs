@@ -45,6 +45,11 @@ pub async fn audit_mutations(
             if crate::auth::is_viewer(&claims) {
                 return crate::auth::read_only_refusal();
             }
+            if let Some(refusal) =
+                crate::auth::agent_gate(&claims, req.method(), req.uri().path(), &state).await
+            {
+                return refusal;
+            }
         }
     }
     next.run(req).await

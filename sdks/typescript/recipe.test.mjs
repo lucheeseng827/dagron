@@ -1,6 +1,6 @@
 // The cross-language contract for the content-addressed image tag.
 //
-// Three programs compute this tag: `ee/dagron-build` (Rust, the one that
+// Three programs compute this tag: the image builder (Rust, the one that
 // actually builds and pushes the image), the Python SDK, and this one. An
 // author writes a recipe here, this SDK derives the tag and pins every task's
 // docker_image to it, and the builder produces the image those tasks will pull.

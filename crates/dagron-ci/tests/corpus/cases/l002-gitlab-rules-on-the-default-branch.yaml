@@ -1,0 +1,12 @@
+shows: A GitLab rule that holds on the default branch alone leaves its job out of a feature branch
+front: gitlab
+file: gitlab-ci
+event: { ref: refs/heads/feature }
+source: |
+  image: alpine:3.20
+  test:
+    script: [make test]
+  release:
+    script: [make release]
+    rules:
+      - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

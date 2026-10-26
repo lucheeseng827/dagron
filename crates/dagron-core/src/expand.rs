@@ -120,6 +120,7 @@ pub fn expand(mut spec: DagSpec) -> Result<DagSpec> {
         tags: spec.tags,
         run_timeout_secs: spec.run_timeout_secs,
         max_active_runs: spec.max_active_runs,
+        when_full: spec.when_full,
         concurrency_key: spec.concurrency_key.as_deref().map(|k| substitute(k, &spec.parameters)),
         // Carried through, not consumed here. The local `budget` above is the
         // operator's global anti-blowup ceiling (DAGRON_MAX_TASKS_PER_RUN); this
@@ -173,6 +174,13 @@ fn apply_task_defaults(tasks: &mut [TaskSpec], d: &crate::dag::TaskDefaults) {
         }
         if t.docker_image.is_none() {
             t.docker_image = d.docker_image.clone();
+        }
+        // Not onto a template call: a call hands its template its arguments
+        // and nothing else, and the template's own tasks take the default
+        // themselves, below in [`expand`]. Leaving the call without it is what
+        // lets a policy a call states for itself be told apart, and refused.
+        if t.image_pull_policy.is_none() && t.template.is_none() {
+            t.image_pull_policy = d.image_pull_policy;
         }
         if t.runner_class.is_none() {
             t.runner_class = d.runner_class.clone();
@@ -316,6 +324,12 @@ fn expand_list(
                 if let Some(w) = &task.when {
                     task.when = Some(rename_output_refs(w, &renamed));
                 }
+                // And the task an `env_from` names, the same way.
+                for from in &mut task.env_from {
+                    if let Some(row) = renamed.get(&from.task) {
+                        from.task = row.clone();
+                    }
+                }
             }
             out_tasks.push(task);
         }
@@ -391,6 +405,19 @@ fn expand_one(
             task.name
         );
     }
+    // `image_pull_policy:` on a call would be dropped the same way, and it is
+    // the one executor setting whose loss is not just a surprise: a call that
+    // says `never` would have its template's tasks pull under the default.
+    // Only a policy the call states itself gets here: `task_defaults` does not
+    // put one on a call ([`apply_task_defaults`]).
+    if is_call && task.image_pull_policy.is_some() {
+        bail!(
+            "task '{}' cannot set `image_pull_policy:` on a `template:` call — a call expands \
+             into the template's tasks, so the policy would reach none of them. Set it on the \
+             template's own tasks, or for the whole workflow in `task_defaults`",
+            task.name
+        );
+    }
     // `repeat:` on a call is the same silent drop as `defer:` above, and for the
     // same reason: `expand_call` replaces the call with the template's tasks and
     // the call's own fields go with it, so the loop never reaches a row anything
@@ -407,6 +434,26 @@ fn expand_one(
              template's tasks, so the loop has no leaf to attach to and would be dropped. \
              Loop the template's own task, or fan the call out with `with_items:` to run the \
              sub-DAG more than once",
+            task.name
+        );
+    }
+    // `forge_token:` on a call is dropped the same way: the call's fields go
+    // with it when it expands, and the token would reach no task.
+    if is_call && task.forge_token.is_some() {
+        bail!(
+            "task '{}' cannot set `forge_token:` on a `template:` call — a call expands into \
+             the template's tasks, so the token would reach none of them. Set it on the \
+             template's own command task",
+            task.name
+        );
+    }
+    // `privileged:` likewise: no container of the template's tasks would be
+    // privileged, and the job would fail inside one saying nothing of why.
+    if is_call && task.privileged {
+        bail!(
+            "task '{}' cannot set `privileged:` on a `template:` call — a call expands into \
+             the template's tasks, so no container of them would be privileged. Set it on \
+             the template's own command task",
             task.name
         );
     }
@@ -813,6 +860,7 @@ fn build_leaf(
         retry_budgets: task.retry_budgets.clone(),
         timeout_secs: task.timeout_secs,
         docker_image: task.docker_image.as_ref().map(|s| substitute(s, ctx)),
+        image_pull_policy: task.image_pull_policy,
         env: task
             .env
             .iter()
@@ -822,6 +870,9 @@ fn build_leaf(
                 value_from: e.value_from.clone(),
             })
             .collect(),
+        // As written, like the workflow's own: an environment's name is not a
+        // template, so no parameter chooses which one a task reads.
+        environment: task.environment.clone(),
         resources: task.resources.clone(),
         service_account: task.service_account.as_ref().map(|s| substitute(s, ctx)),
         // Substituted like docker_image so a template can parameterize its
@@ -892,6 +943,51 @@ fn build_leaf(
         // fixed enum, bool or uid, and letting a template interpolate one would
         // make the privileges a task runs under depend on a caller's argument.
         isolation: task.isolation.clone(),
+        // Every instance of a fan-out gets a workspace of its own, of the size
+        // the task states; a size is a budget, not a caller's argument. Its
+        // checkout is the run's: `{{ ci_sha }}` and its like are filled here,
+        // and the result is checked with the rest of the spec.
+        workspace: task.workspace.as_ref().map(|w| {
+            let mut w = w.clone();
+            if let Some(c) = &mut w.checkout {
+                c.repository = substitute(&c.repository, ctx);
+                c.commit = substitute(&c.commit, ctx);
+            }
+            // A cache's names are the run's too (an instance's item, a pull
+            // request's base branch). A base that comes out empty is none: a
+            // push has no base.
+            for cache in &mut w.cache {
+                cache.prefix = substitute(&cache.prefix, ctx);
+                cache.paths = cache.paths.iter().map(|p| substitute(p, ctx)).collect();
+                cache.key_files = cache.key_files.iter().map(|f| substitute(f, ctx)).collect();
+                cache.restore_from = cache
+                    .restore_from
+                    .as_ref()
+                    .map(|r| substitute(r, ctx))
+                    .filter(|r| !r.trim().is_empty());
+            }
+            w
+        }),
+        // Each instance of a fan-out has services of its own, with the
+        // run's parameters filled in as its image and command have them, and
+        // checked with the rest of the spec as they are then.
+        services: task
+            .services
+            .iter()
+            .map(|service| service.filled(|text| substitute(text, ctx)))
+            .collect(),
+        // As written: it names a task and what is read of it, and nothing of
+        // it is a template, so no parameter chooses which task a variable
+        // is given from.
+        env_from: task.env_from.clone(),
+        // As written: an audience is a cloud's name for this installation's
+        // runs, not a caller's argument.
+        identity: task.identity.clone(),
+        forge_token: task.forge_token.clone(),
+        docker_daemon: task.docker_daemon,
+        privileged: task.privileged,
+        tokens: task.tokens,
+        artifact_api: task.artifact_api,
         // Produced datasets template per instance (`{{ item }}` / `{{ params.* }}`),
         // so a fan-out can record per-shard dataset updates.
         produces: task.produces.iter().map(|u| substitute(u, ctx)).collect(),
@@ -1846,6 +1942,39 @@ tasks:
         assert!(eval_when("x in [a] extra").is_err());
     }
 
+    /// `image_pull_policy` is one of three words, written as the rest of a
+    /// task is. Any other is a parse error, Kubernetes' own spelling included:
+    /// a policy that silently meant the default would be a typo nobody saw.
+    #[test]
+    fn an_image_pull_policy_is_one_of_three_words() {
+        use crate::dag::ImagePullPolicy;
+        let with = |policy: &str| {
+            crate::dag::DagGraph::from_yaml(&format!(
+                "name: w
+tasks:
+  - {{ name: a, command: [\"true\"]{policy} }}
+"
+            ))
+        };
+        for (word, policy) in [
+            ("if_not_present", ImagePullPolicy::IfNotPresent),
+            ("always", ImagePullPolicy::Always),
+            ("never", ImagePullPolicy::Never),
+        ] {
+            let dag = with(&format!(", image_pull_policy: {word}")).unwrap();
+            assert_eq!(dag.spec.tasks[0].image_pull_policy, Some(policy));
+            assert_eq!(policy.as_str(), word);
+        }
+        assert_eq!(with("").unwrap().spec.tasks[0].image_pull_policy, None);
+        for bad in ["sometimes", "IfNotPresent", "Always", "\"\""] {
+            let err = with(&format!(", image_pull_policy: {bad}"))
+                .err()
+                .unwrap_or_else(|| panic!("{bad} is not a policy"))
+                .to_string();
+            assert!(err.contains("if_not_present"), "{bad}: {err}");
+        }
+    }
+
     #[test]
     fn task_defaults_fill_unset_fields_and_tasks_win() {
         let yaml = "name: w
@@ -1854,6 +1983,7 @@ task_defaults:
   retry_delay_secs: 5
   timeout_secs: 120
   docker_image: base:1
+  image_pull_policy: always
   priority: 8
   retry_on_timeout: false
   pool: shared
@@ -1865,6 +1995,7 @@ tasks:
     command: [\"true\"]
     max_attempts: 7
     docker_image: special:2
+    image_pull_policy: never
     priority: 2
     retry_on_timeout: true
     pool: special
@@ -1877,6 +2008,7 @@ tasks:
         assert_eq!(a.retry_delay_secs, 5);
         assert_eq!(a.timeout_secs, Some(120));
         assert_eq!(a.docker_image.as_deref(), Some("base:1"));
+        assert_eq!(a.image_pull_policy, Some(crate::dag::ImagePullPolicy::Always));
         assert_eq!(a.priority, 8, "task at default 0 inherits the DAG-level priority");
         assert_eq!(a.retry_on_timeout, Some(false), "unset task inherits the retry_on_timeout default");
         assert_eq!(a.pool.as_deref(), Some("shared"), "unset task inherits the pool default");
@@ -1884,6 +2016,7 @@ tasks:
         let b = dag.spec.tasks.iter().find(|t| t.name == "b").unwrap();
         assert_eq!(b.max_attempts, 7, "explicit task value must win");
         assert_eq!(b.docker_image.as_deref(), Some("special:2"));
+        assert_eq!(b.image_pull_policy, Some(crate::dag::ImagePullPolicy::Never));
         assert_eq!(b.priority, 2, "explicit task priority must win over the default");
         assert_eq!(b.retry_on_timeout, Some(true), "explicit retry_on_timeout must win over the default");
         assert_eq!(b.pool.as_deref(), Some("special"), "explicit task pool must win over the default");
@@ -2228,6 +2361,53 @@ tasks:
             "pass 3 starts after pass 2's last task"
         );
     }
+    /// `image_pull_policy:` on a template call is refused, not dropped: a call
+    /// that says `never` must not have its template's tasks pull. The policy
+    /// reaches a template's tasks from the tasks themselves, or from
+    /// `task_defaults`, which a call does not stand between.
+    #[test]
+    fn an_image_pull_policy_on_a_template_call_is_refused_not_dropped() {
+        use crate::dag::ImagePullPolicy;
+        let workflow = |defaults: &str, call: &str, leaf: &str| -> Result<DagSpec> {
+            let spec: DagSpec = serde_yaml::from_str(&format!(
+                "name: w\n{defaults}templates:\n  - name: body\n    tasks:\n      \
+                 - {{ name: work, command: [\"true\"]{leaf} }}\ntasks:\n  \
+                 - {{ name: go, template: body{call} }}\n"
+            ))
+            .expect("parse");
+            expand(spec)
+        };
+        let policy_of = |spec: DagSpec| spec.tasks[0].image_pull_policy;
+
+        let err = workflow("", ", image_pull_policy: never", "")
+            .expect_err("a policy that would be dropped is an error")
+            .to_string();
+        assert!(
+            err.contains("task 'go' cannot set `image_pull_policy:` on a `template:` call")
+                && err.contains("task_defaults"),
+            "got: {err}"
+        );
+        // Stated where it holds, it reaches the template's task.
+        assert_eq!(
+            policy_of(workflow("", "", ", image_pull_policy: never").unwrap()),
+            Some(ImagePullPolicy::Never)
+        );
+        // For the whole workflow, it reaches a template's task through a call,
+        // and the call is not refused for a default it did not write.
+        let defaults = "task_defaults:\n  image_pull_policy: never\n";
+        assert_eq!(
+            policy_of(workflow(defaults, "", "").unwrap()),
+            Some(ImagePullPolicy::Never)
+        );
+        // A template's task that states its own keeps it over the default.
+        assert_eq!(
+            policy_of(workflow(defaults, "", ", image_pull_policy: always").unwrap()),
+            Some(ImagePullPolicy::Always)
+        );
+        // No policy anywhere: none on the task, and the executor's default.
+        assert_eq!(policy_of(workflow("", "", "").unwrap()), None);
+    }
+
     /// `repeat:` on a template call is refused, not ignored.
     ///
     /// Before this guard the field was dropped during expansion and the run
@@ -2236,6 +2416,52 @@ tasks:
     /// "repeat in place" only on leaf steps for this reason; the engine refusing
     /// it is what keeps a hand-written spec (or an older one) from hitting the
     /// silent path instead.
+    #[test]
+    fn a_forge_token_on_a_template_call_is_refused_not_dropped() {
+        let spec: DagSpec = serde_yaml::from_str(
+            r#"
+name: w
+templates:
+  - name: body
+    tasks:
+      - { name: work, command: ["true"] }
+tasks:
+  - name: go
+    template: body
+    forge_token: { permissions: { contents: read } }
+"#,
+        )
+        .expect("parse");
+        let err = expand(spec)
+            .expect_err("a token that would be dropped is an error")
+            .to_string();
+        assert!(
+            err.contains("cannot set `forge_token:` on a `template:` call"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn privileged_on_a_template_call_is_refused_not_dropped() {
+        let spec: DagSpec = serde_yaml::from_str(
+            r#"
+name: w
+templates:
+  - name: body
+    tasks:
+      - { name: work, command: ["true"] }
+tasks:
+  - { name: go, template: body, privileged: true }
+"#,
+        )
+        .expect("parse");
+        let err = expand(spec).expect_err("privilege that would be dropped").to_string();
+        assert!(
+            err.contains("cannot set `privileged:` on a `template:` call"),
+            "got: {err}"
+        );
+    }
+
     #[test]
     fn repeat_on_a_template_call_is_refused_not_dropped() {
         let spec: DagSpec = serde_yaml::from_str(

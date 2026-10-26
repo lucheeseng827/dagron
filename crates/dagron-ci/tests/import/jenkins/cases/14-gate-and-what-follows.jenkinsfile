@@ -1,0 +1,28 @@
+// A gate on main alone, with a post and a stage after it: where the gate
+// is not asked, what follows still waits for the build.
+pipeline {
+    agent { docker { image 'alpine:3.20' } }
+    stages {
+        stage('Build') {
+            steps { sh './build.sh' }
+        }
+        stage('Release') {
+            when {
+                beforeInput true
+                branch 'main'
+            }
+            input { message 'Release this build?' }
+            steps { sh './release.sh' }
+            post {
+                success { sh './tag-release.sh' }
+                always { sh './notify-release.sh' }
+            }
+        }
+        stage('Smoke') {
+            steps { sh './smoke.sh' }
+        }
+    }
+    post {
+        failure { sh './page-oncall.sh' }
+    }
+}

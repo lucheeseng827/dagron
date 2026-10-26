@@ -1,0 +1,90 @@
+# Imported from a GitLab CI pipeline by dagron-import.
+#
+# To do by hand (4):
+#   include[1]: a file of the project group/shared-ci is not imported: what it holds is not in this file, and no job of it is here. Write what the pipeline needs of it here
+#   include[2]: GitLab's template Security/SAST.gitlab-ci.yml is not imported: what it holds is not in this file, and no job of it is here. Write what the pipeline needs of it here
+#   broken.extends: ".no-such-template" is no job or template of the pipeline: nothing of it is here
+#   broken.image: the job names no image, and had its runner's own: name its docker_image
+#
+# Changed on the way (10):
+#   include[0]: what ci/templates.yml holds is written out here
+#   fmt.variables.CARGO_HOME, clippy.variables.CARGO_HOME, build.variables.CARGO_HOME: its value names other variables: it is set at the head of each script, where the shell expands it as GitLab did
+#   fmt.script, clippy.script, build.script: it reads $CI_PROJECT_DIR: each is set at the head of its script
+#   fmt.script: GitLab's variables a script reads are set at its head from dagron-ci's own (CI_SHA, CI_REF, …): a program it runs that reads one the script does not is not given it
+#   fmt.script: a job's script ran under bash where its image had bash, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   on.dispatch: a pipeline run from GitLab's page or its API is a run asked for here (dispatch), through the run API
+name: 05-includes-and-templates
+on:
+  push: {}
+  dispatch: {}
+tasks:
+- name: fmt
+  docker_image: rust:1.86-bookworm
+  depends_on:
+  - build
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        include[1]: a file of the project group/shared-ci is not imported: what it holds is not in this file, and no job of it is here. Write what the pipeline needs of it here
+        include[2]: GitLab's template Security/SAST.gitlab-ci.yml is not imported: what it holds is not in this file, and no job of it is here. Write what the pipeline needs of it here
+      DAGRON_IMPORT
+      exit 1
+  - name: script
+    run: |-
+      export CI_PROJECT_DIR="$PWD"
+      export CARGO_HOME="$CI_PROJECT_DIR/.cargo"
+      cargo fmt --check
+- name: clippy
+  docker_image: rust:1.86-bookworm
+  depends_on:
+  - build
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        include[1]: a file of the project group/shared-ci is not imported: what it holds is not in this file, and no job of it is here. Write what the pipeline needs of it here
+        include[2]: GitLab's template Security/SAST.gitlab-ci.yml is not imported: what it holds is not in this file, and no job of it is here. Write what the pipeline needs of it here
+      DAGRON_IMPORT
+      exit 1
+  - name: script
+    run: |-
+      export CI_PROJECT_DIR="$PWD"
+      export CARGO_HOME="$CI_PROJECT_DIR/.cargo"
+      rustup component add clippy rustfmt
+      cargo clippy -- -D warnings
+- name: build
+  docker_image: rust:1.86-bookworm
+  timeout_secs: 5400
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        include[1]: a file of the project group/shared-ci is not imported: what it holds is not in this file, and no job of it is here. Write what the pipeline needs of it here
+        include[2]: GitLab's template Security/SAST.gitlab-ci.yml is not imported: what it holds is not in this file, and no job of it is here. Write what the pipeline needs of it here
+      DAGRON_IMPORT
+      exit 1
+  - name: script
+    run: |-
+      export CI_PROJECT_DIR="$PWD"
+      export CARGO_HOME="$CI_PROJECT_DIR/.cargo"
+      cargo build --release
+- name: broken
+  depends_on:
+  - build
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        include[1]: a file of the project group/shared-ci is not imported: what it holds is not in this file, and no job of it is here. Write what the pipeline needs of it here
+        include[2]: GitLab's template Security/SAST.gitlab-ci.yml is not imported: what it holds is not in this file, and no job of it is here. Write what the pipeline needs of it here
+        broken.extends: ".no-such-template" is no job or template of the pipeline: nothing of it is here
+        broken.image: the job names no image, and had its runner's own: name its docker_image
+      DAGRON_IMPORT
+      exit 1
+  - name: script
+    run: echo never

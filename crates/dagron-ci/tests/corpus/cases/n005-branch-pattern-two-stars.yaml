@@ -1,0 +1,10 @@
+shows: Two stars in a branch pattern cross the slashes of a deeper branch
+event: { kind: push, ref: refs/heads/release/1/2 }
+source: |
+  name: ci
+  on:
+    push: { branches: ["release/**"] }
+  tasks:
+    - name: build
+      steps:
+        - run: make

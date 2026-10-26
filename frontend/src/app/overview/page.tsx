@@ -304,7 +304,9 @@ export default function OverviewPage() {
   );
 }
 
-function SourceBadge({ source }: { source: "git" | "manual" }) {
+// This page lists the stored workflows only, so `ci` never reaches it: the
+// type takes it because the row's does.
+function SourceBadge({ source }: { source: "git" | "manual" | "ci" }) {
   const git = source === "git";
   return (
     <span

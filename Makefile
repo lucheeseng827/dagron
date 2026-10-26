@@ -87,7 +87,8 @@ MQTT_WORLD   := -p dagron-source --features mqtt,sqlite
 .PHONY: bin help up up-build down reset logs ps open dev run validate plan config \
         edge-config submit submit-wait swagger login runs run-status run-graph \
         run-logs run-wait watch metrics metrics-trend dead-letters redrive api-submit \
-        build test clippy fmt fmt-check ci mcp mcp-readonly import-argo \
+        build test clippy fmt fmt-check ci mcp mcp-readonly import-argo import-github \
+        import-gitlab import-jenkins \
         pi-smoke pi-smoke-fresh pi-load backup restore helm-template \
         helm-install examples clean
 
@@ -274,6 +275,18 @@ mcp-readonly: ## Same, with all 18 mutating tools hidden from tools/list and ref
 import-argo: ## Convert an Argo Workflows spec to dagron YAML (FILE=…, stdout)
 	@[ -n "$(FILE)" ] || { echo "usage: make import-argo FILE=workflow.yaml"; exit 2; }
 	$(CARGO) run --locked -p dagron-import -- argo $(FILE)
+
+import-github: ## Convert a GitHub Actions workflow to a dagron-ci pipeline (FILE=…, stdout)
+	@[ -n "$(FILE)" ] || { echo "usage: make import-github FILE=.github/workflows/ci.yml"; exit 2; }
+	$(CARGO) run --locked -p dagron-import -- github $(FILE)
+
+import-gitlab: ## Convert a GitLab CI pipeline to a dagron-ci pipeline (FILE=…, stdout)
+	@[ -n "$(FILE)" ] || { echo "usage: make import-gitlab FILE=.gitlab-ci.yml"; exit 2; }
+	$(CARGO) run --locked -p dagron-import -- gitlab $(FILE)
+
+import-jenkins: ## Convert a Jenkins Declarative Pipeline to a dagron-ci pipeline (FILE=…, stdout)
+	@[ -n "$(FILE)" ] || { echo "usage: make import-jenkins FILE=Jenkinsfile"; exit 2; }
+	$(CARGO) run --locked -p dagron-import -- jenkins $(FILE)
 
 examples: ## List the runnable example DAGs
 	@find examples -name '*.yaml' | sort

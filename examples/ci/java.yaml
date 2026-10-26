@@ -1,0 +1,38 @@
+# A starter pipeline for a Java project built with Maven. Copy it to
+# .dagron/ci/ci.yaml in the repository, and check it with
+# `dagron-ci validate`.
+#
+# A push to main and a pull request run one job: `mvn verify`, which
+# compiles the project, runs its tests and checks what its build checks.
+# The job is a container that starts with the commit checked out, and runs
+# its steps in order in that one workspace; a step that fails ends the job.
+#
+# A pull request runs when it comes from one of the repository's own
+# branches and its author is the repository's owner, a member of its
+# organization or a collaborator. One from a fork, or by anyone else, runs
+# nothing: its commit gets one status that says so.
+#
+# The job starts cold. There is no cache between runs yet, so Maven
+# downloads every plugin and dependency every time.
+#
+# Where a job runs as a user who is not root, the image says as it starts
+# that it cannot write to /root/.m2, and carries on: nothing here needs it.
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request: {}
+task_defaults:
+  # A job that runs longer than this is stopped, and fails.
+  timeout_secs: 2700
+tasks:
+  - name: verify
+    docker_image: docker.io/library/maven:3.9-eclipse-temurin-21
+    # A job's env is a list of names and values. (A step's is a map.)
+    env:
+      # Maven's own files and its local repository, kept in the workspace:
+      # a job may run as a user with no home directory, and Maven has
+      # nowhere else to write them.
+      - { name: MAVEN_OPTS, value: "-Duser.home=.home -Dmaven.repo.local=.m2/repository" }
+    steps:
+      - name: verify
+        run: mvn --batch-mode --no-transfer-progress verify

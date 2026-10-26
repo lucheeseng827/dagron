@@ -41,6 +41,9 @@ pub struct HealthResponse {
     /// `DAGRON_READY_REQUIRE_LISTENER`) — so this is where the degradation is
     /// visible to an operator.
     pub event_listener: &'static str,
+    /// How many runs the live log relay follows now, for every stream of them:
+    /// one however many watch a run, none once nobody does.
+    pub log_tails: usize,
 }
 
 #[derive(sqlx::FromRow)]
@@ -62,6 +65,7 @@ pub async fn health(_auth: AuthUser, State(state): State<AppState>) -> Json<Heal
             "down"
         },
         edition: if cfg!(feature = "enterprise") { "enterprise" } else { "oss" },
+        log_tails: state.relay.watched(),
         db: "ok".to_string(),
         scheduler_leader: false,
         leader_holder: None,
@@ -70,12 +74,15 @@ pub async fn health(_auth: AuthUser, State(state): State<AppState>) -> Json<Heal
         dead_letters: 0,
     };
 
-    let counts: Result<(i64, i64, i64), sqlx::Error> = sqlx::query_as(
+    // The live count as dagron-core writes it, which on SQLite reads the
+    // partial index of live runs (migrations/078).
+    let counts: Result<(i64, i64, i64), sqlx::Error> = sqlx::query_as(&format!(
         "SELECT
-            (SELECT COUNT(*) FROM workflow_runs WHERE status IN ('pending','running')),
+            ({}),
             (SELECT COUNT(*) FROM task_runs WHERE status = 'awaiting_approval'),
             (SELECT COUNT(*) FROM dead_letters)",
-    )
+        dagron_core::db::LIVE_RUNS_COUNT
+    ))
     .fetch_one(&state.read_pool)
     .await;
     match counts {
@@ -94,11 +101,17 @@ pub async fn health(_auth: AuthUser, State(state): State<AppState>) -> Json<Heal
     // Leadership: any unexpired lease means an engine is alive. Timestamps are
     // RFC-3339 strings; compare as timestamptz. The table may not exist yet on a
     // fresh DB (engine migrations not run) — treat that as "no leader", not 500.
-    let lease: Result<Option<LeaseRow>, sqlx::Error> = sqlx::query_as(
+    #[cfg(feature = "postgres")]
+    const LIVE: &str = "lease_expires_at::timestamptz > now()";
+    // SQLite reads the same RFC-3339 text as a Julian day.
+    #[cfg(feature = "sqlite")]
+    const LIVE: &str = "julianday(lease_expires_at) > julianday('now')";
+    let sql = format!(
         "SELECT holder, lease_expires_at FROM leader_election
-         WHERE lease_expires_at::timestamptz > now()
-         ORDER BY lease_expires_at DESC LIMIT 1",
-    )
+         WHERE {LIVE}
+         ORDER BY lease_expires_at DESC LIMIT 1"
+    );
+    let lease: Result<Option<LeaseRow>, sqlx::Error> = sqlx::query_as(&sql)
     .fetch_optional(&state.read_pool)
     .await;
     if let Ok(Some(row)) = lease {

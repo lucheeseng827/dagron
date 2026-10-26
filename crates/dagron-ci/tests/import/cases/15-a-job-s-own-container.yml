@@ -1,0 +1,31 @@
+# A job in a container of its own, on a runner of the team's, with a service that needs a login.
+name: container
+on: push
+jobs:
+  build:
+    runs-on: [self-hosted, linux, x64]
+    container:
+      image: ghcr.io/acme/build:1.4
+      options: --cpus 2
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GHCR_TOKEN }}
+    services:
+      cache:
+        image: ghcr.io/acme/cache:2
+        credentials:
+          username: x
+          password: ${{ secrets.GHCR_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: make
+  plain:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - run: uname -a
+  other:
+    runs-on: macos-14
+    steps:
+      - run: xcodebuild -version

@@ -1,0 +1,60 @@
+# With workflow:rules, a job without rules of its own is in every pipeline
+# they let be, a merge request's too. Rules a !reference brings in are read
+# among the job's own; a variable the file sets is read as it sets it,
+# but in a run asked for; a job may fail with one exit code alone; and a
+# job a rule makes manual holds back the stages after it.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+image: rust:1.86-bookworm
+
+stages: [test, deploy, verify]
+
+variables:
+  RUN_E2E: "false"
+
+.rules:
+  mr:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+test:
+  stage: test
+  script: [cargo test]
+
+lint:
+  stage: test
+  script: [cargo clippy]
+  except: [tags]
+
+docs:
+  stage: test
+  script: [cargo doc]
+  rules:
+    - !reference [.rules, mr]
+    - if: $CI_COMMIT_TAG
+
+e2e:
+  stage: test
+  script: [./e2e.sh]
+  allow_failure:
+    exit_codes: [137]
+  rules:
+    - if: $RUN_E2E == "true"
+
+deploy_prod:
+  stage: deploy
+  script: [./deploy.sh prod]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+
+verify_prod:
+  stage: verify
+  script: [./smoke-test.sh prod]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"

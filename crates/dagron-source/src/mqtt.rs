@@ -1247,7 +1247,7 @@ mod tests {
         let pool = dagron_core::db::init_pool(db.to_str().unwrap()).await.unwrap();
         // An earlier process committed seq 3 on this topic with the run it created.
         let dag = dagron_core::dag::DagGraph::from_yaml(SPEC_A).unwrap();
-        dagron_core::db::create_run_with_offset(&pool, &dag, SPEC_A, "mqtt/plant/line1/jobs", "3")
+        dagron_core::db::create_run_with_offset(&pool, &dag, SPEC_A, "mqtt/plant/line1/jobs", "3", None)
             .await
             .unwrap();
 
@@ -1276,7 +1276,7 @@ mod tests {
         // Commit like the actor does, then ack: the cursor cache moves to 4.
         let pp = src.pending_position().unwrap();
         let dag = dagron_core::dag::DagGraph::from_yaml(&msg.payload).unwrap();
-        dagron_core::db::create_run_with_offset(&pool, &dag, &msg.payload, &pp.offset_key("mqtt"), &pp.position)
+        dagron_core::db::create_run_with_offset(&pool, &dag, &msg.payload, &pp.offset_key("mqtt"), &pp.position, None)
             .await
             .unwrap();
         src.ack(&msg.handle).await.unwrap();

@@ -1,0 +1,15 @@
+shows: A dispatch's input in a job's when is refused, as it is in a command
+source: |
+  name: ci
+  on:
+    push: {}
+    dispatch: { inputs: { deploy: { default: "no" } } }
+  tasks:
+    - name: build
+      steps:
+        - run: make
+    - name: deploy
+      depends_on: [build]
+      when: "{{ deploy }} == yes"
+      steps:
+        - run: make deploy

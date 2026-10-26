@@ -1,0 +1,11 @@
+shows: What a step needs of the event is put in its variables, where a shell reads it as data
+event: { kind: pull_request, pr: 31, ref: refs/pull/31/head }
+source: |
+  name: ci
+  on:
+    pull_request: {}
+  tasks:
+    - name: say
+      steps:
+        - env: { SHA: "{{ ci_sha }}", REF: "{{ ci_ref }}", PR: "{{ ci_pr }}" }
+          run: echo "commit $SHA of $REF, pull request $PR"

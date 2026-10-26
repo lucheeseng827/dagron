@@ -14,6 +14,9 @@ Components:
 {{- if .Values.gitops.enabled }}
   gitops      {{ .Values.gitops.image }}   (polls every {{ .Values.gitops.pollSecs }}s)
 {{- end }}
+{{- if .Values.ci.enabled }}
+  dagron-ci   {{ .Values.ci.image }}{{ if eq (include "dagron.ci.inEnginePod" .) "true" }}   (in the engine's pod){{ end }}
+{{- end }}
 {{- if .Values.postgres.enabled }}
   postgres    in-cluster (throwaway — do NOT use for real data)
 {{- end }}
@@ -21,6 +24,47 @@ Components:
 
 Connecting Git repositories? Nothing polls them until the GitOps worker runs:
   --set gitops.enabled=true
+{{- end }}
+{{- if .Values.ci.enabled }}
+
+dagron-ci is up once its database answers. Connect a repository:
+{{- if eq (include "dagron.ci.inEnginePod" .) "true" }}
+    kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "dagron.fullname" . }}-engine -c dagron-ci -- dagron-ci repo add github.com/OWNER/NAME
+{{- if eq (int .Values.engine.replicas) 0 }}
+  ⚠  engine.replicas is 0, and dagron-ci runs in the engine's pod
+     (ci.placement: engine): there is no dagron-ci until the engine has a
+     replica. Nothing takes a webhook or looks for a commit meanwhile.
+{{- end }}
+{{- if not .Values.ci.checkoutTokenSecret.name }}
+  No ci.checkoutTokenSecret: a private repository's checkout is given no
+  credential, and fails. Make a secret for the engine to ask dagron-ci with:
+       kubectl -n {{ .Release.Namespace }} create secret generic dagron-ci-checkout --from-literal=secret="$(openssl rand -hex 32)"
+  Then name it to the chart: upgrade this release with the options it was
+  installed with, and this one added to them:
+       --set ci.checkoutTokenSecret.name=dagron-ci-checkout
+{{- end }}
+{{- else }}
+    kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "dagron.fullname" . }}-ci -- dagron-ci repo add github.com/OWNER/NAME
+{{- if .Values.ci.checkoutTokenSecret.name }}
+  ci.checkoutTokenSecret is named, and dagron-ci has a Deployment of its own
+  (ci.placement: deployment): this release's engine is not told to ask it for
+  a checkout's credential, and a private repository's checkout fails. In the
+  engine's pod (ci.placement: engine) it is.
+{{- end }}
+{{- end }}
+{{- if not .Values.ci.apiTokenSecret.name }}
+  ⚠  ci.apiTokenSecret is not set, so events are taken and stay queued. Make an
+     API token in the console, put it in a Secret, and name it and the
+     dagron-api that runs go to, over TLS:
+       --set ci.apiTokenSecret.name=<secret>
+       --set-string ci.cells=default=https://<dagron-api, behind TLS>
+{{- end }}
+{{- if not .Values.ci.webhookSecret.name }}
+  No ci.webhookSecret: the webhook receiver answers 404, and commits are found
+  by the poll sweep alone.
+{{- else if .Values.ingress.enabled }}
+  The forge's webhook: http{{ if .Values.ingress.tls.enabled }}s{{ end }}://{{ .Values.ingress.host }}/hooks/github
+{{- end }}
 {{- end }}
 
 Reach the UI:

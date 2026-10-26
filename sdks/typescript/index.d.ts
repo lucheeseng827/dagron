@@ -443,6 +443,8 @@ export interface RunResult {
   result: string | null;
   /** Why the run failed, when this wait ended on a failure. */
   failure: RunFailure | null;
+  /** How many times the run was rerun whole (`from: "all"`). */
+  whole_reruns: number;
 }
 
 /** The spec a run was created from, as returned by {@link Client.getRunSpec}. */

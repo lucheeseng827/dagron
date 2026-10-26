@@ -22,10 +22,17 @@ logfilter = ["dep:regex"]
 # `OTEL_EXPORTER_OTLP_ENDPOINT` is set at runtime, `init` also installs an OTLP
 # (HTTP/protobuf) span exporter + a tracing-opentelemetry bridge layer, so the
 # stack's tracing spans are delivered to a collector.
+#
+# 17.6: the same feature sends each log event as an OTLP log record, and gives
+# a process with metrics `otlp_metrics` to push its exposition as OTLP metrics.
 otel = [
     "dep:opentelemetry",
     "dep:opentelemetry_sdk",
     "dep:opentelemetry-otlp",
+    "dep:opentelemetry-proto",
+    "dep:opentelemetry-appender-tracing",
+    "dep:prost",
+    "dep:reqwest",
     "dep:tracing-opentelemetry",
 ]
 
@@ -46,8 +53,24 @@ opentelemetry = { version = "0.32", optional = true }
 opentelemetry_sdk = { version = "0.32", optional = true }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "trace",
+    "logs",
     "http-proto",
     "reqwest-blocking-client",
     "reqwest-rustls",
 ], optional = true }
 tracing-opentelemetry = { version = "0.33", optional = true }
+# OTLP logs: tracing events as OTLP log records.
+opentelemetry-appender-tracing = { version = "0.32", optional = true }
+# OTLP metrics: the exposition, read back and sent as the protobuf
+# request, with the messages, the encoder and the blocking client the span
+# exporter already links. No crate here is new to an `otel` build but the
+# appender above.
+opentelemetry-proto = { version = "0.32", default-features = false, features = [
+    "gen-tonic-messages",
+    "metrics",
+], optional = true }
+prost = { version = "0.14", optional = true }
+reqwest = { version = "0.13", default-features = false, features = [
+    "blocking",
+    "default-tls",
+], optional = true }

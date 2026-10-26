@@ -1,0 +1,13 @@
+-- What a run came from, where that is no repository.
+--
+-- `run_triggers` (072) was made for the runs a CI service submits, and names
+-- a repository, a ref and a commit. Every run has a record now: a schedule's
+-- fire, a backfill, a dataset's update, a message of the engine's source, a
+-- parent run's task, a call on the engine's own API. Those come from
+-- something a repository's columns cannot name, so this one does:
+-- `schedule:<id>`, `cron:<name>`, `dataset:<uri>`, `run:<parent run>/<task>`,
+-- `source:<name>`, `dead-letter:<id>`.
+--
+-- Mirrors migrations/057_run_triggers.sql (SQLite), which makes the whole
+-- table there.
+ALTER TABLE run_triggers ADD COLUMN IF NOT EXISTS source TEXT;

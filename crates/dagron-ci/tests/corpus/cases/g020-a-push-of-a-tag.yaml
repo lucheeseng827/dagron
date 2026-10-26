@@ -1,0 +1,13 @@
+shows: A workflow that takes tags runs for a tag, and reads the tag's name
+front: github
+event: { kind: tag, ref: refs/tags/v3.1.0 }
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on:
+    push:
+      tags: ["v*"]
+  jobs:
+    release:
+      runs-on: ubuntu-latest
+      steps:
+        - run: echo "releasing ${{ github.ref_name }} of ${{ github.repository }}"

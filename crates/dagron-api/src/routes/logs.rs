@@ -214,7 +214,14 @@ pub struct TaskLogs {
     pub task_id: String,
     pub name: String,
     pub status: String,
+    /// The task's attempts so far, counted through its life: a rerun or a
+    /// clear starts the row's own count again and does not set this back.
     pub attempt: i64,
+    /// How many of them are behind the one this response shows: the attempts
+    /// `GET …/attempts` has, less any its window dropped. Not `attempt - 1`
+    /// for a task a rerun put back that has not started again: every attempt
+    /// it made is behind it then.
+    pub earlier_attempts: i64,
     /// When this task started and finished (RFC3339, as stored). A line with no
     /// `ts` of its own was printed somewhere inside this window; the window is
     /// as tight as the task was short, so a caller can show the time and say
@@ -229,6 +236,11 @@ pub struct TaskLogs {
     /// Resume point for the next poll — the char length of the full output.
     /// Always counted on the **raw** text, so a filter can't desync tailing.
     pub next_offset: usize,
+    /// Where this read of the whole log ends, for a stream to go on from
+    /// (`…/logs/stream?cursor=`): the log's attempt, its writing,
+    /// and its bytes. At 0 for a running attempt with no log yet, whose
+    /// `output` is the last attempt's.
+    pub cursor: String,
     /// True once the task is terminal: no more output will arrive.
     pub eof: bool,
     /// The filtered lines. `None` when no filter was requested, which keeps the
@@ -251,20 +263,99 @@ struct TaskLogRow {
     name: String,
     status: String,
     attempt: i64,
+    /// Read by the one-task view. The run's view fills it too: both queries
+    /// decode into this row, and one that left it out would fail the route.
+    earlier_attempts: i64,
     scheduled_at: Option<String>,
     finished_at: Option<String>,
     output: Option<String>,
+    /// The attempt the row's log is of, which writing of it, and the row's
+    /// own `log`: what a log kept in the log store is found by and ends with.
+    fence: i64,
+    gen: i64,
+    row_log: Option<String>,
+    /// How many closed segments the attempt has, read with the row.
+    segments: i64,
+    /// `output` is the log as the log store keeps it, put together.
+    #[sqlx(skip)]
+    kept: bool,
+}
+
+/// Each of `rows`' `output` replaced by its log as the log store keeps it,
+/// where it keeps it: its closed segments and its open part.
+/// A row whose log is not kept there keeps what it read. Only the rows
+/// `wanted` are put together: the others are not the request's. `false`
+/// where a log moved on while it was read: the rows are to be read again.
+async fn with_kept_logs(
+    state: &AppState,
+    rows: &mut [TaskLogRow],
+    wanted: impl Fn(&TaskLogRow) -> bool,
+) -> Result<bool, (StatusCode, String)> {
+    let Some(store) = &state.log_store else {
+        return Ok(true);
+    };
+    // The segments were counted in the statement that read the rows: what is
+    // put together is of one moment.
+    let tasks: Vec<dagron_artifact::log_segments::TaskRow<'_>> = rows
+        .iter()
+        .filter(|r| wanted(r))
+        .map(|r| dagron_artifact::log_segments::TaskRow {
+            task_id: &r.task_id,
+            fence: r.fence,
+            gen: r.gen,
+            log: r.row_log.as_deref(),
+            segments: r.segments,
+        })
+        .collect();
+    let mut kept = match dagron_artifact::log_segments::kept_logs(store, &tasks).await {
+        Ok(kept) => kept,
+        Err(e) if dagron_artifact::log_segments::is_moved(&e) => return Ok(false),
+        Err(e) => {
+            // The store's own words can name its paths: they are the log's,
+            // not the caller's.
+            tracing::error!(error = %format!("{e:#}"), "a task's log could not be read from the log store");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the log store could not be read".to_string(),
+            ));
+        }
+    };
+    for row in rows.iter_mut() {
+        if let Some(text) = kept.remove(&row.task_id) {
+            row.output = Some(text);
+            row.kept = true;
+        }
+    }
+    Ok(true)
+}
+
+/// A log that moved on under every read of it, said so.
+fn moved_on() -> (StatusCode, String) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the log moved on each time it was read: ask again".to_string(),
+    )
 }
 
 /// One superseded attempt, as the history endpoint returns it.
 #[derive(Debug, Serialize)]
 pub struct TaskAttemptLog {
-    /// 1-based, the same counter the task view reports as `attempt`.
+    /// 1-based, the same counter the task view reports as `attempt`: one
+    /// count for the task's life, which a rerun or a clear does not set back.
     pub attempt: i64,
     /// `iteration` — a `repeat:` pass whose `until` had not held yet — or
     /// `failed`, an attempt that errored and was retried. The distinction is
     /// the difference between "this loop is working" and "this keeps crashing".
+    /// `rerun`, `retry` or `clear`: an attempt a person replaced, by that.
     pub reason: String,
+    /// How the attempt had ended, for one a rerun, a retry or a clear
+    /// replaced: `failed`, `cancelled`, `succeeded`, `skipped`. Absent for
+    /// a worker's own retry, whose task was not terminal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// When the attempt was queued. Absent as `status` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduled_at: Option<String>,
     pub output: String,
     /// Whether output was dropped to fit `DAGRON_ATTEMPT_LOG_BYTES`. Stored on
     /// the row, not inferred here: the cap may have changed since.
@@ -285,7 +376,9 @@ pub struct TaskAttempts {
     pub name: String,
     /// The attempt currently on the task row. It is **not** in `attempts` —
     /// its output lives in `task_runs.output`, whole, and the task view reads
-    /// it there. A client showing "iteration N of M" gets M from here.
+    /// it there. A client showing "iteration N of M" gets M from here. For a
+    /// task a rerun or a clear put back that has not started again, it is the
+    /// number its next attempt will have: one past the last in `attempts`.
     pub current_attempt: i64,
     /// Oldest first.
     pub attempts: Vec<TaskAttemptLog>,
@@ -303,6 +396,8 @@ pub struct TaskAttempts {
 struct TaskAttemptRow {
     attempt: i64,
     reason: String,
+    status: Option<String>,
+    scheduled_at: Option<String>,
     output: Option<String>,
     truncated: bool,
     finished_at: String,
@@ -311,9 +406,15 @@ struct TaskAttemptRow {
 /// Task rows for one run, in execution order. `scheduled_at` is NULL for a task
 /// that never started, which must sort *after* the ones that did — otherwise a
 /// run's log view opens on the tasks that produced no output.
-const RUN_TASKS_SQL: &str = "SELECT id AS task_id, name, status, attempt,
-            scheduled_at, finished_at, COALESCE(log, output) AS output
-     FROM task_runs WHERE run_id = $1
+const RUN_TASKS_SQL: &str = "SELECT task_id, name, status, attempt, earlier_attempts, scheduled_at, finished_at,
+            output, fence, gen, row_log,
+            (SELECT COUNT(*) FROM log_segments s WHERE s.task_id = t.task_id AND s.fence = t.fence) AS segments
+     FROM (SELECT id AS task_id, name, status, attempt_base + attempt AS attempt,
+                  attempt_base + CASE WHEN attempt > 1 THEN attempt - 1 ELSE 0 END AS earlier_attempts,
+                  scheduled_at, finished_at, COALESCE(NULLIF(log, ''), output) AS output,
+                  (CASE WHEN log IS NULL THEN version ELSE COALESCE(log_fence, version) END) AS fence,
+                  COALESCE(log_gen, 0) AS gen, log AS row_log
+           FROM task_runs WHERE run_id = $1) t
      ORDER BY scheduled_at IS NULL, scheduled_at, name";
 
 // ── handlers ─────────────────────────────────────────────────────────────────
@@ -331,19 +432,35 @@ pub async fn get_run_logs(
 ) -> Result<Json<RunLogs>, (StatusCode, String)> {
     let (filter, scope, filtered) = parse_request(raw)?;
 
-    let rows = sqlx::query_as::<_, TaskLogRow>(RUN_TASKS_SQL)
-        .bind(&id)
-        .fetch_all(&state.read_pool)
-        .await
-        .map_err(internal)?;
+    // Read again where a log moved on while it was read (a segment closed
+    // twice, or the attempt begun again, between the count and the read).
+    let mut reads = 0;
+    let rows = loop {
+        let mut rows = sqlx::query_as::<_, TaskLogRow>(RUN_TASKS_SQL)
+            .bind(&id)
+            .fetch_all(&state.read_pool)
+            .await
+            .map_err(internal)?;
+        if with_kept_logs(&state, &mut rows, |r| {
+            scope.selects(&r.task_id, &r.name, &r.status)
+        })
+        .await?
+        {
+            break rows;
+        }
+        reads += 1;
+        if reads >= dagron_artifact::log_segments::READS {
+            return Err(moved_on());
+        }
+    };
 
     // A run id that matches no task rows is either unknown or has no tasks yet.
     // Distinguish the two so a mistyped id doesn't look like a quiet run.
     if rows.is_empty() {
-        // `1::bigint` — a bare literal is INT4 and will not decode into i64, so
+        // `CAST(1 AS BIGINT)` — a bare literal is INT4 and will not decode into i64, so
         // a run that exists but has no task rows would 500 instead of returning
         // the empty log list.
-        let exists = sqlx::query_scalar::<_, i64>("SELECT 1::bigint FROM workflow_runs WHERE id = $1")
+        let exists = sqlx::query_scalar::<_, i64>("SELECT CAST(1 AS BIGINT) FROM workflow_runs WHERE id = $1")
             .bind(&id)
             .fetch_optional(&state.read_pool)
             .await
@@ -454,21 +571,51 @@ pub async fn get_task_logs(
 ) -> Result<Json<TaskLogs>, (StatusCode, String)> {
     let (filter, scope, filtered) = parse_request(raw)?;
 
-    let row = sqlx::query_as::<_, TaskLogRow>(
-        "SELECT id AS task_id, name, status, attempt,
-                scheduled_at, finished_at, COALESCE(log, output) AS output
-         FROM task_runs WHERE id = $1 AND run_id = $2",
-    )
-    .bind(&tid)
-    .bind(&id)
-    .fetch_optional(&state.read_pool)
-    .await
-    .map_err(internal)?
-    .ok_or((StatusCode::NOT_FOUND, "task not found in this run".to_string()))?;
+    let mut reads = 0;
+    let row = loop {
+        let row = sqlx::query_as::<_, TaskLogRow>(
+            "SELECT task_id, name, status, attempt, earlier_attempts, scheduled_at, finished_at, output, fence, gen, row_log,
+                    (SELECT COUNT(*) FROM log_segments s WHERE s.task_id = t.task_id AND s.fence = t.fence) AS segments
+             FROM (SELECT id AS task_id, name, status, attempt_base + attempt AS attempt,
+                          attempt_base + CASE WHEN attempt > 1 THEN attempt - 1 ELSE 0 END AS earlier_attempts,
+                          scheduled_at, finished_at, COALESCE(NULLIF(log, ''), output) AS output,
+                          (CASE WHEN log IS NULL THEN version ELSE COALESCE(log_fence, version) END) AS fence,
+                          COALESCE(log_gen, 0) AS gen, log AS row_log
+                   FROM task_runs WHERE id = $1 AND run_id = $2) t",
+        )
+        .bind(&tid)
+        .bind(&id)
+        .fetch_optional(&state.read_pool)
+        .await
+        .map_err(internal)?
+        .ok_or((StatusCode::NOT_FOUND, "task not found in this run".to_string()))?;
+        let mut one = [row];
+        if with_kept_logs(&state, &mut one, |_| true).await? {
+            let [row] = one;
+            break row;
+        }
+        reads += 1;
+        if reads >= dagron_artifact::log_segments::READS {
+            return Err(moved_on());
+        }
+    };
 
+    // A task that is not over and has no log of its own yet shows its last
+    // attempt's `output`, which is not its log: a stream goes on from its
+    // start.
+    let unlogged = !row.kept
+        && row.row_log.as_deref().unwrap_or_default().is_empty()
+        && !is_terminal(&row.status);
     let full = row.output.unwrap_or_default();
     let next_offset = full.chars().count();
     let eof = is_terminal(&row.status);
+    let cursor = format!(
+        "{}:{}:{}:{}",
+        row.task_id,
+        row.fence,
+        row.gen,
+        if unlogged { 0 } else { full.len() }
+    );
     // Slice on a char boundary by skipping whole scalars — never panics on UTF-8.
     let slice = match scope.offset {
         Some(off) if off < next_offset => full.chars().skip(off).collect::<String>(),
@@ -502,11 +649,13 @@ pub async fn get_task_logs(
         name: row.name,
         status: row.status,
         attempt: row.attempt,
+        earlier_attempts: row.earlier_attempts,
         started_at: row.scheduled_at,
         finished_at: row.finished_at,
         output: Some(output),
         offset,
         next_offset,
+        cursor,
         eof,
         lines,
         total: res.total,
@@ -537,7 +686,7 @@ pub async fn get_task_attempts(
 
     let (name, current_attempt) =
         sqlx::query_as::<_, (String, i64)>(
-            "SELECT name, attempt FROM task_runs WHERE id = $1 AND run_id = $2",
+            "SELECT name, attempt_base + CASE WHEN attempt > 1 THEN attempt ELSE 1 END FROM task_runs WHERE id = $1 AND run_id = $2",
         )
         .bind(&tid)
         .bind(&id)
@@ -553,7 +702,7 @@ pub async fn get_task_attempts(
     // history shown does not start at the beginning, whether the cause was the
     // retention window or this cap.
     let mut rows = sqlx::query_as::<_, TaskAttemptRow>(
-        "SELECT attempt, reason, output, truncated, finished_at
+        "SELECT attempt, reason, status, scheduled_at, output, truncated, finished_at
          FROM task_attempts WHERE task_id = $1 ORDER BY attempt DESC LIMIT $2",
     )
     .bind(&tid)
@@ -595,6 +744,8 @@ pub async fn get_task_attempts(
             TaskAttemptLog {
                 attempt: r.attempt,
                 reason: r.reason,
+                status: r.status,
+                scheduled_at: r.scheduled_at,
                 output,
                 retention_truncated: r.truncated,
                 finished_at: r.finished_at,

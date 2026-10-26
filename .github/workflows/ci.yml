@@ -127,6 +127,34 @@ jobs:
           # without a cluster, so the manifest-shaping and label tests run here
           # even though nothing connects to an apiserver.
           cargo test --locked -p dagron-executor --features kubernetes,dagron-core/sqlite
+          # What the published engine and dagron-api images are built with:
+          # object stores and OTLP delivery, behind features no default build
+          # compiles, in images built on a release tag and nowhere else. The
+          # script reads the two sets from docker.yml, compiles both binaries
+          # that way, and runs the tests those features gate.
+          bash scripts/published-features.sh check
+
+      # dagron-ci-exec and dagron-ci-cache run inside whatever image a CI task
+      # uses, so they must link nothing at run time. A changed target default,
+      # or C built by the wrong compiler, would make one dynamic with every test
+      # still green: this builds them as the release does (dagron-ci-cache's C,
+      # zstd and ring, by musl-gcc), refuses an ELF that names an interpreter (a
+      # dynamic loader), and runs what it built.
+      - name: Static dagron-ci-exec (required)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --locked --release -p dagron-ci-exec -p dagron-ci-cache --target x86_64-unknown-linux-musl
+          for name in dagron-ci-exec dagron-ci-cache; do
+            bin=target/x86_64-unknown-linux-musl/release/$name
+            if readelf -l "$bin" | grep -q INTERP; then
+              echo "$name is dynamically linked:"
+              readelf -l "$bin" | grep -A1 INTERP
+              exit 1
+            fi
+            "$bin" --version
+          done
 
   msrv:
     name: MSRV (required) — the declared rust-version actually builds
@@ -176,3 +204,51 @@ jobs:
           cargo check --locked -p dagron-step-spark --features k8s
           cargo check --locked -p dagron-step-sql --features mysql,postgres
           cargo check --locked -p dagron-executor --features kubernetes,dagron-core/sqlite
+          # The engine and dagron-api as their images are built, for the reason
+          # the step crates are above: the object-store and OpenTelemetry trees
+          # are compiled by no default build, and either could raise the floor.
+          cargo check --locked -p dagron --no-default-features --features "$(bash scripts/published-features.sh engine)"
+          cargo check --locked -p dagron-api --features "$(bash scripts/published-features.sh api)"
+
+  kubernetes:
+    name: Kubernetes — workspace tasks in k3s
+    runs-on: ubuntu-24.04
+    # A cold compile of the executor's tests is most of it; the cluster and
+    # the four tests take two minutes.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: kubernetes
+
+      # The check job's Kubernetes tests shape pods and never reach a cluster.
+      # These run task pods in one: k3s in Docker, with the dagron-ci-exec
+      # image built from crates/dagron-ci-exec/Dockerfile. Steps share a
+      # workspace and find the binary its init container installed; a failed
+      # install fails the task in the installer's words; a workspace past its
+      # size is evicted and the task says so; a large one is a volume claim
+      # of its own. The script prints what the cluster held if one fails.
+      - name: workspace tasks in k3s
+        run: crates/dagron-executor/tests/k3s.sh
+
+  chart-ci:
+    name: Kubernetes — dagron-ci installed by the chart
+    runs-on: ubuntu-24.04
+    # The image's release build is most of it; the cluster and the install
+    # take two minutes.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The image a release publishes and the chart's entry for it, together:
+      # dagron-ci built from crates/dagron-ci/Dockerfile, the chart installed
+      # in k3s with `ci.enabled`. Its pod turns ready against the chart's
+      # Postgres, under the chart's NetworkPolicy; its commands run in the
+      # pod; a Secret named for the webhook is mounted and read. The script
+      # prints what the cluster held if a check fails.
+      - name: dagron-ci installed by the chart, in k3s
+        run: crates/dagron-ci/tests/k3s.sh

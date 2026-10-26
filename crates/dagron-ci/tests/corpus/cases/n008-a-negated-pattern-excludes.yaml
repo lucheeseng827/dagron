@@ -1,0 +1,10 @@
+shows: A pattern that starts with a bang takes a branch out of the ones before it
+event: { kind: push, ref: refs/heads/main }
+source: |
+  name: ci
+  on:
+    push: { branches: ["**", "!main"] }
+  tasks:
+    - name: build
+      steps:
+        - run: make

@@ -1,0 +1,12 @@
+shows: Two jobs of one name are refused, since a commit's checks are named by them
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: build
+      steps:
+        - run: make
+    - name: build
+      steps:
+        - run: make again

@@ -1,0 +1,39 @@
+# A starter pipeline for a Node project. Copy it to .dagron/ci/ci.yaml in the
+# repository, and check it with `dagron-ci validate`.
+#
+# A push to main and a pull request run one job: install what the
+# lockfile names, lint if the package has a `lint` script, and test. The job
+# is a container that starts with the commit checked out, and runs its steps
+# in order in that one workspace; a step that fails ends the job.
+#
+# A pull request runs when it comes from one of the repository's own
+# branches and its author is the repository's owner, a member of its
+# organization or a collaborator. One from a fork, or by anyone else, runs
+# nothing: its commit gets one status that says so.
+#
+# The job starts cold. There is no cache between runs yet, so `npm ci`
+# downloads every dependency every time.
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request: {}
+task_defaults:
+  # A job that runs longer than this is stopped, and fails.
+  timeout_secs: 1800
+tasks:
+  - name: test
+    docker_image: docker.io/library/node:22-bookworm-slim
+    # A job's env is a list of names and values. (A step's is a map.)
+    env:
+      - { name: CI, value: "true" }
+      # npm's cache, kept in the workspace: where a job runs as a user with
+      # no home directory, npm has nowhere else to write it.
+      - { name: npm_config_cache, value: .npm }
+    steps:
+      # `npm ci` needs package-lock.json, and installs exactly what it names.
+      - name: install
+        run: npm ci
+      - name: lint
+        run: npm run lint --if-present
+      - name: test
+        run: npm test

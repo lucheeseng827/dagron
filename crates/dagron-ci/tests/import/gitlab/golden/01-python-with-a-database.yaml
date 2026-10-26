@@ -1,0 +1,156 @@
+# Imported from a GitLab CI pipeline by dagron-import.
+#
+# To do by hand (5):
+#   deploy.rules: the pattern /^v\d+/ cannot be read before a run: the job is written to run wherever it might have, which is more than it did. Test it in the job's script, or write the job's when: for what it should run for
+#   deploy.script: the script reads $DEPLOY_TOKEN, which the job is not given in the file: a project's CI/CD variable is an environment's secret here, which the job names (environment:) and is given in its env (value_from: { secret: … })
+#   test, lint, deploy: the files build kept (artifacts) were in its workspace before its script, and a job's files are not handed to the next here: where it reads them, it and build are steps of one job; where it does not, nothing is lost
+#
+# Changed on the way (26):
+#   image: the pipeline's image is each job's that does not set its own
+#   cache: the pipeline's cache is each job's that does not set its own
+#   variables.PIP_CACHE_DIR: its value names other variables: it is set at the head of each script, where the shell expands it as GitLab did
+#   build.cache.key, test.cache.key, lint.cache.key, deploy.cache.key: the variables its key named are not part of it here: a cache is kept for the run's branch, and restored from it and then from a merge request's target
+#   build.cache, test.cache, lint.cache, deploy.cache: the cache is the job's cache "default", under that key alone: restored before the steps and saved after they succeed, by a trusted run, from the run's own branch and then a merge request's target
+#   build.script, test.script, lint.script: it reads $CI_PROJECT_DIR: each is set at the head of its script
+#   test.services[0]: GitLab waited for the service's port to open: here the job waits for `pg_isready -h localhost`
+#   test.artifacts.reports.junit: the test report is the job's report: what it holds is said with the job
+#   lint.allow_failure: the job may fail: a step of it that fails does not end it (continue_on_error), and it ends as a success, which the jobs after it wait for, as on GitLab. The job's log says the step failed, where GitLab marked the job
+#   deploy.script: it reads $CI_COMMIT_SHORT_SHA, $CI_PROJECT_DIR: each is set at the head of its script
+#   deploy.when: a manual job is run by a person's approval here (a gate before it)
+#   workflow.rules: $CI_OPEN_MERGE_REQUESTS is taken as unset: a branch's pipeline runs whether or not the branch has a merge request open, where GitLab left it out for one that had
+#   build.script: GitLab's variables a script reads are set at its head from dagron-ci's own (CI_SHA, CI_REF, …): a program it runs that reads one the script does not is not given it
+#   build.script: a job's script ran under bash where its image had bash, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   test.rules: $CI_DEFAULT_BRANCH is taken to be main: give the importer the project's own (--default-branch) where it is another
+#   test.services[0]: a service is given the job's plain variables, as GitLab gives them, each written in its env
+#   on.pull_request: a merge request's pipeline is a pull request's here; GitLab's merged-results and merge-train pipelines are not told apart from it
+#   on.dispatch: a pipeline run from GitLab's page or its API is a run asked for here (dispatch), through the run API
+#
+# Not carried over (2):
+#   build.artifacts.paths: a job's files are not kept, and not handed to the jobs after it: its workspace goes with it
+#   deploy.script: the script reads $DEPLOY_HOST, which the job is not given in the file: where the project's CI/CD variables set one, give it to the job in its env
+name: 01-python-with-a-database
+on:
+  push: {}
+  pull_request: {}
+  dispatch: {}
+tasks:
+- name: build
+  docker_image: python:3.12-slim
+  env:
+  - name: APP_ENV
+    value: test
+  workspace:
+    cache:
+    - prefix: default
+      paths:
+      - .cache/pip
+  steps:
+  - name: script
+    run: |-
+      export CI_PROJECT_DIR="$PWD"
+      export PIP_CACHE_DIR="$CI_PROJECT_DIR/.cache/pip"
+      pip install -r requirements.txt
+      python -m build
+- name: test
+  docker_image: python:3.12-slim
+  depends_on:
+  - build
+  when: '{{ ci_event }} == pull_request or {{ ci_event }} == push and {{ ci_group }} in [refs/heads/main] or {{ ci_event }} == dispatch and {{ ci_group }} in [refs/heads/main]'
+  env:
+  - name: APP_ENV
+    value: test
+  - name: POSTGRES_PASSWORD
+    value: ci
+  workspace:
+    cache:
+    - prefix: default
+      paths:
+      - .cache/pip
+  services:
+  - name: db
+    image: postgres:16-alpine
+    env:
+    - name: APP_ENV
+      value: test
+    - name: POSTGRES_PASSWORD
+      value: ci
+    ready: pg_isready -h localhost
+  report:
+    junit:
+    - report.xml
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        test: the files build kept (artifacts) were in its workspace before its script, and a job's files are not handed to the next here: where it reads them, it and build are steps of one job; where it does not, nothing is lost
+      DAGRON_IMPORT
+      exit 1
+  - name: script
+    run: |-
+      export CI_PROJECT_DIR="$PWD"
+      export PIP_CACHE_DIR="$CI_PROJECT_DIR/.cache/pip"
+      pytest --junitxml=report.xml
+- name: lint
+  docker_image: python:3.12-slim
+  depends_on:
+  - build
+  env:
+  - name: APP_ENV
+    value: test
+  workspace:
+    cache:
+    - prefix: default
+      paths:
+      - .cache/pip
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        lint: the files build kept (artifacts) were in its workspace before its script, and a job's files are not handed to the next here: where it reads them, it and build are steps of one job; where it does not, nothing is lost
+      DAGRON_IMPORT
+      exit 1
+  - name: script
+    run: |-
+      export CI_PROJECT_DIR="$PWD"
+      export PIP_CACHE_DIR="$CI_PROJECT_DIR/.cache/pip"
+      ruff check .
+    continue_on_error: true
+- name: approve-deploy
+  type: approval
+  depends_on:
+  - lint
+  when: '{{ ci_event }} == tag'
+  approval_message: Run deploy?
+- name: deploy
+  docker_image: python:3.12-slim
+  depends_on:
+  - approve-deploy
+  when: '{{ ci_event }} == tag'
+  environment: production
+  env:
+  - name: APP_ENV
+    value: test
+  workspace:
+    cache:
+    - prefix: default
+      paths:
+      - .cache/pip
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        deploy.rules: the pattern /^v\d+/ cannot be read before a run: the job is written to run wherever it might have, which is more than it did. Test it in the job's script, or write the job's when: for what it should run for
+        deploy.script: the script reads $DEPLOY_TOKEN, which the job is not given in the file: a project's CI/CD variable is an environment's secret here, which the job names (environment:) and is given in its env (value_from: { secret: … })
+        deploy: the files build kept (artifacts) were in its workspace before its script, and a job's files are not handed to the next here: where it reads them, it and build are steps of one job; where it does not, nothing is lost
+      DAGRON_IMPORT
+      exit 1
+  - name: script
+    run: |-
+      export CI_COMMIT_SHORT_SHA="$(printf '%.8s' "$CI_SHA")"
+      export CI_PROJECT_DIR="$PWD"
+      export PIP_CACHE_DIR="$CI_PROJECT_DIR/.cache/pip"
+      echo "deploying $CI_COMMIT_SHORT_SHA to $DEPLOY_HOST"
+      ./deploy.sh --token "$DEPLOY_TOKEN"

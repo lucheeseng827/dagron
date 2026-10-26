@@ -224,6 +224,11 @@ export default function MetricsPage() {
             <Bars title="Runs by status" data={m.runs_by_status} />
             <Bars title="Tasks by status" data={m.tasks_by_status} />
           </div>
+          {m.history_age_secs > 0 && (
+            <p className="dy-subtitle" style={{ marginTop: -6, marginBottom: 14 }}>
+              Finished counts as of {Math.round(m.history_age_secs)} s ago; running and waiting counts are live.
+            </p>
+          )}
           <div className="dy-kpi" style={{ maxWidth: 260 }}>
             <div className="dy-kpi-label">Dead letters</div>
             <div className="dy-kpi-value" style={{ color: m.dead_letters > 0 ? "var(--red)" : undefined }}>

@@ -1,7 +1,7 @@
 //! OpenLineage emitter — emits data-lineage events to an OpenLineage backend.
 //!
 //! On run finalization the engine calls [`OpenLineageClient::emit_run_completed`],
-//! which POSTs an OpenLineage `RunEvent` (`COMPLETE` / `FAIL`) to a lineage backend
+//! which POSTs an OpenLineage `RunEvent` (`COMPLETE` / `FAIL` / `ABORT`) to a lineage backend
 //! (Marquez, etc.). Best-effort: a lineage backend being down never affects run
 //! execution. `runId` reuses dagron's run id (a UUID, as OpenLineage requires);
 //! `job.name` is the workflow name.
@@ -19,6 +19,37 @@ use serde_json::{json, Value};
 
 const PRODUCER: &str = "https://github.com/lucheeseng827/dagron";
 const SCHEMA_URL: &str = "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/RunEvent";
+
+/// How a run ended, as an OpenLineage `eventType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// `COMPLETE`: the run succeeded.
+    Complete,
+    /// `FAIL`: the run failed, its run_timeout_secs included.
+    Fail,
+    /// `ABORT`: the run was cancelled before it finished. Not `COMPLETE`,
+    /// which would tell the lineage graph its outputs were produced.
+    Abort,
+}
+
+impl RunOutcome {
+    /// From a dagron run status: `succeeded`, `cancelled`, else a failure.
+    pub fn from_run_status(status: &str) -> Self {
+        match status {
+            "succeeded" => RunOutcome::Complete,
+            "cancelled" => RunOutcome::Abort,
+            _ => RunOutcome::Fail,
+        }
+    }
+
+    fn event_type(self) -> &'static str {
+        match self {
+            RunOutcome::Complete => "COMPLETE",
+            RunOutcome::Fail => "FAIL",
+            RunOutcome::Abort => "ABORT",
+        }
+    }
+}
 
 /// The dataset URIs a run read and wrote, as dagron names them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -54,15 +85,15 @@ impl OpenLineageClient {
         Some(Self::new(url, namespace))
     }
 
-    /// Emit the terminal RunEvent for a finished run. Best-effort.
+    /// Emit the terminal RunEvent for a run that ended. Best-effort.
     pub async fn emit_run_completed(
         &self,
         run_id: &str,
         job_name: &str,
-        failed: bool,
+        outcome: RunOutcome,
         datasets: &RunDatasets,
     ) -> Result<()> {
-        let event = build_event(&self.namespace, run_id, job_name, failed, datasets);
+        let event = build_event(&self.namespace, run_id, job_name, outcome, datasets);
         let endpoint = format!("{}/api/v1/lineage", self.url.trim_end_matches('/'));
         let resp = self
             .http
@@ -78,12 +109,12 @@ impl OpenLineageClient {
     }
 }
 
-/// Build an OpenLineage `RunEvent` (`COMPLETE` or `FAIL`).
+/// Build an OpenLineage `RunEvent` (`COMPLETE`, `FAIL` or `ABORT`).
 pub fn build_event(
     namespace: &str,
     run_id: &str,
     job_name: &str,
-    failed: bool,
+    outcome: RunOutcome,
     datasets: &RunDatasets,
 ) -> Value {
     let named = |uris: &[String]| -> Vec<Value> {
@@ -95,7 +126,7 @@ pub fn build_event(
             .collect()
     };
     json!({
-        "eventType": if failed { "FAIL" } else { "COMPLETE" },
+        "eventType": outcome.event_type(),
         "eventTime": chrono::Utc::now().to_rfc3339(),
         "producer": PRODUCER,
         "schemaURL": SCHEMA_URL,
@@ -138,7 +169,7 @@ mod tests {
             "dagron",
             "11111111-1111-4111-8111-111111111111",
             "etl",
-            false,
+            RunOutcome::Complete,
             &none,
         );
         assert_eq!(ok["eventType"], "COMPLETE");
@@ -151,8 +182,22 @@ mod tests {
         assert_eq!(ok["inputs"], json!([]));
         assert_eq!(ok["outputs"], json!([]));
 
-        let bad = build_event("dagron", "r2", "etl", true, &none);
+        let bad = build_event("dagron", "r2", "etl", RunOutcome::Fail, &none);
         assert_eq!(bad["eventType"], "FAIL");
+
+        // A cancelled run aborted: COMPLETE would say its outputs exist.
+        let cancelled = build_event("dagron", "r3", "etl", RunOutcome::Abort, &none);
+        assert_eq!(cancelled["eventType"], "ABORT");
+    }
+
+    #[test]
+    fn run_statuses_map_to_outcomes() {
+        assert_eq!(
+            RunOutcome::from_run_status("succeeded"),
+            RunOutcome::Complete
+        );
+        assert_eq!(RunOutcome::from_run_status("failed"), RunOutcome::Fail);
+        assert_eq!(RunOutcome::from_run_status("cancelled"), RunOutcome::Abort);
     }
 
     #[test]
@@ -161,7 +206,7 @@ mod tests {
             inputs: vec!["s3://raw/events/2026-10-03".into()],
             outputs: vec!["clickhouse://analytics/marts/daily_rollup".into()],
         };
-        let ev = build_event("dagron", "r1", "rollup", false, &datasets);
+        let ev = build_event("dagron", "r1", "rollup", RunOutcome::Complete, &datasets);
         assert_eq!(
             ev["inputs"],
             json!([{ "namespace": "s3://raw", "name": "events/2026-10-03" }])

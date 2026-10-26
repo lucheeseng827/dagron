@@ -1,0 +1,18 @@
+shows: A matrix's exclude takes combinations out and its include puts others in
+front: github
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on: push
+  jobs:
+    test:
+      runs-on: ubuntu-latest
+      strategy:
+        matrix:
+          node: [20, 22]
+          os: [linux, alpine]
+          exclude:
+            - { node: 20, os: alpine }
+          include:
+            - { node: 23, os: linux, experimental: true }
+      steps:
+        - run: echo "node ${{ matrix.node }} on ${{ matrix.os }}"

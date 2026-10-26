@@ -60,6 +60,21 @@ EXIT
 "#;
 
 fn main() {
+    // `--version`: the release this binary was built for, on one line, and
+    // nothing else is done. Every dagron binary answers so. This one links none
+    // of their shared crates, so the answer is its own; `dev` is a build no
+    // release made.
+    const VERSION: &str = match option_env!("APP_VERSION") {
+        Some(version) if !version.is_empty() => version,
+        _ => "dev",
+    };
+    let mut asked = std::env::args_os().skip(1);
+    if matches!(asked.next(), Some(arg) if arg == "--version" || arg == "-V")
+        && asked.next().is_none()
+    {
+        println!("dagron-autopsy {VERSION}");
+        return;
+    }
     match run() {
         Ok(code) => std::process::exit(code),
         Err(e) => {

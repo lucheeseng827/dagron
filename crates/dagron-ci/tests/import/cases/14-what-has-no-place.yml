@@ -1,0 +1,28 @@
+# A workflow that is called, scheduled and cancelled in ways a pipeline has no place for.
+name: Nightly & on demand
+run-name: Nightly by @${{ github.actor }}
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_call:
+    inputs:
+      target:
+        type: string
+  pull_request_target:
+    types: [labeled]
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  call:
+    uses: acme/workflows/.github/workflows/build.yml@main
+    with:
+      target: release
+    secrets: inherit
+  nightly:
+    runs-on: ubuntu-latest
+    concurrency: nightly
+    steps:
+      - run: make nightly

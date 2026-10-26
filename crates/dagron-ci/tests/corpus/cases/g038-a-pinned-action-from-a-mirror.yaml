@@ -1,0 +1,17 @@
+shows: An action that is allowed and pinned is fetched from the operator's mirror, once for the two steps that use it
+front: github
+github:
+  runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" }
+  actions_allow: "acme/lint, octo/*"
+  actions_mirror: "https://git.example.internal/github/"
+source: |
+  on: push
+  jobs:
+    build:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: acme/lint/rust@4b4708e725f29891d22b4c96af9f0a403ff51c7c
+        - uses: acme/lint/docs@4b4708e725f29891d22b4c96af9f0a403ff51c7c
+          with:
+            strict: true
+        - run: make

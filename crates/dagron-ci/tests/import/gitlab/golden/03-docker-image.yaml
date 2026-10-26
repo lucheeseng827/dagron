@@ -1,0 +1,42 @@
+# Imported from a GitLab CI pipeline by dagron-import.
+#
+# To do by hand (1):
+#   build-image.script: the script reads $CI_REGISTRY, $CI_REGISTRY_IMAGE, $CI_REGISTRY_PASSWORD, $CI_REGISTRY_USER, which a step here is not given: GitLab's registry and the job's own token are not here, and a registry's credentials are an environment's secrets, named in the job's env
+#
+# Changed on the way (7):
+#   build-image.services[0]: docker:dind is the job's own Docker daemon here (docker_daemon), reached as DOCKER_HOST says, where the engine's operator offers one; a run that is not trusted is refused it
+#   build-image.variables.IMAGE: its value names other variables: it is set at the head of each script, where the shell expands it as GitLab did
+#   build-image.script: it reads $CI_COMMIT_SHORT_SHA: each is set at the head of its script
+#   build-image.rules: $CI_DEFAULT_BRANCH is taken to be main: give the importer the project's own (--default-branch) where it is another
+#   build-image.script: GitLab's variables a script reads are set at its head from dagron-ci's own (CI_SHA, CI_REF, …): a program it runs that reads one the script does not is not given it
+#   build-image.script: a job's script ran under bash where its image had bash, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   on.dispatch: a pipeline run from GitLab's page or its API is a run asked for here (dispatch), through the run API
+#
+# Not carried over (1):
+#   build-image.variables.DOCKER_TLS_CERTDIR: the job's Docker daemon gives the job its own
+name: 03-docker-image
+on:
+  push:
+    branches:
+    - main
+  dispatch: {}
+tasks:
+- name: build-image
+  docker_image: docker:27
+  when: '{{ ci_event }} == push or {{ ci_event }} == dispatch and {{ ci_group }} in [refs/heads/main]'
+  docker_daemon: true
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        build-image.script: the script reads $CI_REGISTRY, $CI_REGISTRY_IMAGE, $CI_REGISTRY_PASSWORD, $CI_REGISTRY_USER, which a step here is not given: GitLab's registry and the job's own token are not here, and a registry's credentials are an environment's secrets, named in the job's env
+      DAGRON_IMPORT
+      exit 1
+  - name: script
+    run: |-
+      export CI_COMMIT_SHORT_SHA="$(printf '%.8s' "$CI_SHA")"
+      export IMAGE="$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+      echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+      docker build -t "$IMAGE" .
+      docker push "$IMAGE"

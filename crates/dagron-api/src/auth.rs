@@ -10,7 +10,10 @@
 //! same header, told apart by its `dgp_` prefix. A token resolves to the same
 //! [`SessionClaims`] a login would produce, with the user's groups read live
 //! rather than copied at mint time — so demoting a user takes effect on their
-//! existing tokens at once.
+//! existing tokens at once. A service's token (a user in `ci:trigger`, such
+//! as dagron-ci's own) is the one exception: who it is is kept for
+//! [`SERVICE_TOKEN_CACHE`], so a change to its user made other than by a
+//! revoke through this process holds within that, not at once.
 //!
 //! [`authenticate`] is the one place either credential is checked. The audit
 //! middleware needs the same answer as the extractor, and it does more than log:
@@ -56,6 +59,18 @@ pub fn is_admin(claims: &SessionClaims) -> bool {
 /// middleware in `routes::audit` before a request reaches any handler.
 pub fn is_viewer(claims: &SessionClaims) -> bool {
     claims.groups.iter().any(|g| g == "viewer")
+}
+
+/// The group whose members may say what started a run they submit.
+pub const TRIGGER_GROUP: &str = "ci:trigger";
+
+/// Whether a caller may set a run's trigger record (`run_triggers`): the
+/// [`TRIGGER_GROUP`] group. It is what lets a list be narrowed to "the runs CI
+/// submitted" and believed, so it is a service's own identity that holds it,
+/// not a person's: anyone else's submit that names a trigger is refused, and a
+/// run nobody could vouch for reads as it always did.
+pub fn may_set_trigger(claims: &SessionClaims) -> bool {
+    claims.groups.iter().any(|g| g == TRIGGER_GROUP)
 }
 
 /// Whether a request is a *control* mutation: the ones a read-only session may not make, and the
@@ -130,18 +145,33 @@ pub async fn authenticate(
 /// whether a guessed token exists.
 async fn authenticate_token(presented: &str, state: &AppState) -> Option<SessionClaims> {
     let prefix = crate::routes::tokens::prefix_of(presented)?;
+    let computed = crate::routes::tokens::hash_token(presented);
+    if let Some(claims) = state.token_cache.get(&computed) {
+        return Some(claims);
+    }
+    // What is read from here on is kept only if no token was revoked
+    // meanwhile: a revoke as this reads would otherwise be undone by it.
+    let generation = state.token_cache.generation();
 
     // The cleartext prefix is a unique index, so this is one row read rather
     // than hashing the presented token against every row in the table.
-    let row: (String, String, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT user_id, token_hash, expires_at, revoked_at, last_used_at
+    #[allow(clippy::type_complexity)]
+    let row: (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT user_id, token_hash, expires_at, revoked_at, last_used_at, agent
          FROM api_tokens WHERE prefix = $1",
     )
     .bind(prefix)
     .fetch_optional(&state.read_pool)
     .await
     .ok()??;
-    let (user_id, stored_hash, expires_at, revoked_at, last_used_at) = row;
+    let (user_id, stored_hash, expires_at, revoked_at, last_used_at, agent) = row;
 
     if revoked_at.is_some() {
         return None;
@@ -159,7 +189,6 @@ async fn authenticate_token(presented: &str, state: &AppState) -> Option<Session
     // Constant-time compare. The prefix already narrowed this to a single row so
     // the timing channel is thin, but a hash comparison that leaks its match
     // length is free to get right and awkward to explain.
-    let computed = crate::routes::tokens::hash_token(presented);
     if computed.as_bytes().ct_eq(stored_hash.as_bytes()).unwrap_u8() != 1 {
         return None;
     }
@@ -185,7 +214,19 @@ async fn authenticate_token(presented: &str, state: &AppState) -> Option<Session
             .await;
     }
 
-    Some(SessionClaims {
+    // An agent's token presents as the agent, never as its owner: its
+    // own subject, no email to be matched as a person's, and its owner's
+    // groups less what no agent holds.
+    if let Some(agent) = agent {
+        return Some(SessionClaims {
+            sub: format!("{AGENT_PREFIX}{agent}"),
+            email: String::new(),
+            name: format!("{agent} (an agent of {email})"),
+            groups: agent_groups(groups),
+            exp: usize::MAX,
+        });
+    }
+    let claims = SessionClaims {
         sub: user_id,
         email,
         name,
@@ -193,7 +234,185 @@ async fn authenticate_token(presented: &str, state: &AppState) -> Option<Session
         // A token's lifetime is `expires_at`, checked above. This field only
         // satisfies the shared claims shape; nothing re-validates it.
         exp: usize::MAX,
-    })
+    };
+    // A service's token, which asks on every call it makes, is answered from
+    // the cache for a while; and only while its own lifetime lasts.
+    if claims.groups.iter().any(|g| g == TRIGGER_GROUP) {
+        let lasts = expires_at
+            .as_deref()
+            .and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok())
+            .map(|t| t.with_timezone(&chrono::Utc));
+        state.token_cache.put(&computed, &claims, lasts, generation);
+    }
+    Some(claims)
+}
+
+/// How long a service's token is taken for who it was without asking the
+/// database again. A token revoked through this dagron-api is
+/// forgotten at once; one revoked through another replica, or a user's
+/// groups changed in the database by hand, is refused or seen within this.
+pub const SERVICE_TOKEN_CACHE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The most tokens the cache holds: past it, it is emptied and fills again.
+const SERVICE_TOKEN_CACHE_MAX: usize = 1024;
+
+/// Who each service token was, by its hash, until when. A service
+/// is a user in [`TRIGGER_GROUP`]: dagron-ci, whose reporter calls on every
+/// run it follows, and was two reads a call. Only such a token is kept;
+/// a person's token, and an agent's, are read every call, as before, so
+/// that what is done to them holds at once.
+#[derive(Default)]
+pub struct TokenCache {
+    seen: std::sync::Mutex<Seen>,
+}
+
+/// What the cache holds, and how many times a revoke emptied it.
+#[derive(Default)]
+struct Seen {
+    tokens: std::collections::HashMap<String, (SessionClaims, std::time::Instant)>,
+    generation: u64,
+}
+
+impl TokenCache {
+    /// Who the token of `hash` was, if that was seen within
+    /// [`SERVICE_TOKEN_CACHE`] and its own time has not passed.
+    pub fn get(&self, hash: &str) -> Option<SessionClaims> {
+        let mut seen = self.seen.lock().ok()?;
+        match seen.tokens.get(hash) {
+            Some((claims, until)) if std::time::Instant::now() < *until => Some(claims.clone()),
+            Some(_) => {
+                seen.tokens.remove(hash);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// How many times a revoke emptied the cache: taken before a token is
+    /// read, and given to [`Self::put`].
+    pub fn generation(&self) -> u64 {
+        self.seen
+            .lock()
+            .map(|seen| seen.generation)
+            .unwrap_or(u64::MAX)
+    }
+
+    /// Keep who the token of `hash` is, for [`SERVICE_TOKEN_CACHE`], or
+    /// until `expires` where that is sooner; and not where a token was
+    /// revoked since `generation`, so that what was read before a revoke is
+    /// not kept after it.
+    pub fn put(
+        &self,
+        hash: &str,
+        claims: &SessionClaims,
+        expires: Option<chrono::DateTime<chrono::Utc>>,
+        generation: u64,
+    ) {
+        let mut lasts = SERVICE_TOKEN_CACHE;
+        if let Some(expires) = expires {
+            match (expires - chrono::Utc::now()).to_std() {
+                Ok(left) => lasts = lasts.min(left),
+                Err(_) => return,
+            }
+        }
+        if let Ok(mut seen) = self.seen.lock() {
+            if seen.generation != generation {
+                return;
+            }
+            if seen.tokens.len() >= SERVICE_TOKEN_CACHE_MAX {
+                seen.tokens.clear();
+            }
+            seen.tokens.insert(
+                hash.to_string(),
+                (claims.clone(), std::time::Instant::now() + lasts),
+            );
+        }
+    }
+
+    /// Forget every token: one was revoked.
+    pub fn clear(&self) {
+        if let Ok(mut seen) = self.seen.lock() {
+            seen.tokens.clear();
+            seen.generation += 1;
+        }
+    }
+}
+
+/// The subject an agent's token presents: `agent:<name>`.
+pub const AGENT_PREFIX: &str = "agent:";
+
+/// Whether a caller is an agent.
+pub fn is_agent(claims: &SessionClaims) -> bool {
+    claims.sub.starts_with(AGENT_PREFIX)
+}
+
+/// An agent's groups: its owner's, less `admin` (an agent administers
+/// nothing) and [`TRIGGER_GROUP`] (an agent never says what started a run).
+pub fn agent_groups(owner: Vec<String>) -> Vec<String> {
+    owner
+        .into_iter()
+        .filter(|g| g != "admin" && g != TRIGGER_GROUP)
+        .collect()
+}
+
+/// What an agent may change through dagron-api: a run it asked for, rerun or
+/// cancelled. The run's id, where `path` is one of those; `None` otherwise.
+pub fn agent_may_touch<'p>(method: &axum::http::Method, path: &'p str) -> Option<&'p str> {
+    if *method != axum::http::Method::POST {
+        return None;
+    }
+    let rest = path.strip_prefix("/api/runs/")?;
+    let (id, what) = rest.split_once('/')?;
+    (matches!(what, "rerun" | "cancel") && !id.is_empty() && !id.contains('/')).then_some(id)
+}
+
+/// The refusal an agent gets for any other change.
+fn agent_refusal(why: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        axum::Json(serde_json::json!({ "error": why })),
+    )
+        .into_response()
+}
+
+/// The gate an agent's control mutation passes, or its refusal. An
+/// agent's token reads, and reruns or cancels the runs it asked for, which
+/// dagron-ci records with it as their actor. It makes no run here (its runs
+/// are made through dagron-ci, as the `agent` trust class), and approves,
+/// triages or configures nothing. `None` for any caller not an agent.
+pub async fn agent_gate(
+    claims: &SessionClaims,
+    method: &axum::http::Method,
+    path: &str,
+    state: &AppState,
+) -> Option<axum::response::Response> {
+    if !is_agent(claims) {
+        return None;
+    }
+    let Some(run_id) = agent_may_touch(method, path) else {
+        return Some(agent_refusal(
+            "an agent's token reads, and reruns or cancels the runs it asked for; \
+             its runs are made through dagron-ci, as the agent trust class",
+        ));
+    };
+    let actor = dagron_core::db::run_trigger(&state.read_pool, run_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|t| t.actor);
+    (actor.as_deref() != Some(claims.sub.as_str()))
+        .then(|| agent_refusal("an agent reruns and cancels the runs it asked for, and no other"))
+}
+
+/// Who an audit line names: the caller's email, or, for an agent, its name,
+/// which names the person whose agent it is.
+pub fn audit_who(claims: &SessionClaims) -> &str {
+    if claims.email.is_empty() {
+        &claims.name
+    } else {
+        &claims.email
+    }
 }
 
 fn decode_session(token: &str, jwt_secret: &str) -> Option<SessionClaims> {
@@ -299,7 +518,7 @@ fn token_from_cookie(parts: &Parts) -> Option<&str> {
 }
 
 /// Pull the token out of a `Bearer <token>` header value (scheme case-insensitive).
-fn extract_bearer(value: &str) -> Option<&str> {
+pub(crate) fn extract_bearer(value: &str) -> Option<&str> {
     let mut parts = value.splitn(2, ' ');
     match (parts.next(), parts.next()) {
         (Some(scheme), Some(token)) if scheme.eq_ignore_ascii_case("Bearer") => {
@@ -373,5 +592,113 @@ mod read_only_tests {
         let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).expect("a JSON envelope");
         assert_eq!(body["error"], "viewer role is read-only");
+    }
+
+    /// An agent holds its owner's groups less `admin` and the trigger group,
+    /// and is known by its subject alone.
+    #[test]
+    fn an_agent_is_its_owner_less_what_no_agent_holds() {
+        let owner = vec![
+            "admin".to_string(),
+            TRIGGER_GROUP.to_string(),
+            "release".to_string(),
+        ];
+        assert_eq!(agent_groups(owner), ["release"]);
+        assert_eq!(
+            agent_groups(vec!["viewer".into()]),
+            ["viewer"],
+            "a viewer's agent reads"
+        );
+        let mut agent = claims(&[]);
+        assert!(!is_agent(&agent));
+        agent.sub = "agent:fixer".into();
+        assert!(is_agent(&agent));
+        // An audit line names a person by email, and an agent by its name,
+        // which names its owner.
+        assert_eq!(audit_who(&agent), "u1@example.com");
+        agent.email.clear();
+        agent.name = "fixer (an agent of u1@example.com)".into();
+        assert_eq!(audit_who(&agent), "fixer (an agent of u1@example.com)");
+    }
+
+    /// What an agent may change is a run, rerun or cancelled: nothing else,
+    /// and nothing by a near miss.
+    #[test]
+    fn an_agent_may_touch_a_run_s_rerun_and_cancel_alone() {
+        assert_eq!(
+            agent_may_touch(&Method::POST, "/api/runs/r-1/rerun"),
+            Some("r-1")
+        );
+        assert_eq!(
+            agent_may_touch(&Method::POST, "/api/runs/r-1/cancel"),
+            Some("r-1")
+        );
+        for (m, p) in [
+            (Method::GET, "/api/runs/r-1/rerun"),
+            (Method::DELETE, "/api/runs/r-1/cancel"),
+            (Method::POST, "/api/runs/r-1/approve"),
+            (Method::POST, "/api/runs/r-1/rerun/x"),
+            (Method::POST, "/api/runs//rerun"),
+            (Method::POST, "/api/runs/r-1"),
+            (Method::POST, "/api/workflows/w1/run"),
+            (Method::POST, "/api/tokens"),
+        ] {
+            assert_eq!(agent_may_touch(&m, p), None, "{m} {p}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod token_cache_tests {
+    use super::*;
+
+    fn service(sub: &str) -> SessionClaims {
+        SessionClaims {
+            sub: sub.into(),
+            email: format!("{sub}@acme.test"),
+            name: sub.into(),
+            groups: vec![TRIGGER_GROUP.into()],
+            exp: usize::MAX,
+        }
+    }
+
+    /// A service token is answered from the cache within its time, never
+    /// past its own expiry, and not at all once one is revoked, nor from
+    /// what was read before the revoke.
+    #[test]
+    fn a_service_token_is_kept_for_a_while_and_forgotten_on_a_revoke() {
+        let cache = TokenCache::default();
+        assert!(cache.get("h-1").is_none());
+        let g = cache.generation();
+        cache.put("h-1", &service("dagron-ci"), None, g);
+        assert_eq!(
+            cache.get("h-1").map(|c| c.sub),
+            Some("dagron-ci".to_string())
+        );
+        // One whose own time has passed is not kept at all, and one that
+        // lapses sooner than the cache is kept no longer than it lasts.
+        let past = chrono::Utc::now() - chrono::Duration::seconds(1);
+        cache.put("h-2", &service("old"), Some(past), g);
+        assert!(cache.get("h-2").is_none());
+        let soon = chrono::Utc::now() + chrono::Duration::milliseconds(50);
+        cache.put("h-3", &service("soon"), Some(soon), g);
+        assert!(cache.get("h-3").is_some());
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(cache.get("h-3").is_none(), "gone with the token's own time");
+        cache.clear();
+        assert!(cache.get("h-1").is_none(), "a revoke forgets every one");
+        // A lookup that read the token before the revoke does not put it
+        // back after.
+        cache.put("h-1", &service("dagron-ci"), None, g);
+        assert!(
+            cache.get("h-1").is_none(),
+            "read before the revoke, put after it"
+        );
+        // A cache that is full starts again rather than grow.
+        let g = cache.generation();
+        for n in 0..=SERVICE_TOKEN_CACHE_MAX {
+            cache.put(&format!("h-{n}"), &service("many"), None, g);
+        }
+        assert!(cache.seen.lock().unwrap().tokens.len() <= SERVICE_TOKEN_CACHE_MAX);
     }
 }

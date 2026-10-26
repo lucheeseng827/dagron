@@ -1,0 +1,12 @@
+shows: A service is checked as dagron checks one, here for the image it lacks
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: test
+      services:
+        - name: db
+          ready: pg_isready
+      steps:
+        - run: make test

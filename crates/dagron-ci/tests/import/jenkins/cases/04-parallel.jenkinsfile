@@ -1,0 +1,31 @@
+// Parallel stages: two on the pipeline's agent, one on an agent of its own.
+pipeline {
+    agent { docker { image 'python:3.12' } }
+    stages {
+        stage('Install') {
+            steps {
+                sh 'pip install -r requirements.txt'
+            }
+        }
+        stage('Checks') {
+            failFast true
+            parallel {
+                stage('Lint') {
+                    steps { sh 'ruff check .' }
+                }
+                stage('Unit') {
+                    steps { sh 'pytest tests/unit' }
+                }
+                stage('Docs') {
+                    agent { docker { image 'squidfunk/mkdocs-material:9' } }
+                    steps { sh 'mkdocs build --strict' }
+                }
+            }
+        }
+        stage('Package') {
+            steps {
+                sh 'python -m build'
+            }
+        }
+    }
+}

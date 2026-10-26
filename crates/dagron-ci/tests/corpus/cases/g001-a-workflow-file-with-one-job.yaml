@@ -1,0 +1,15 @@
+shows: A workflow file's job is a task, in the image its runs-on label means here
+front: github
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  name: CI
+  on:
+    push:
+      branches: [main]
+  jobs:
+    build:
+      runs-on: ubuntu-latest
+      steps:
+        - run: make
+        - name: Test
+          run: make test

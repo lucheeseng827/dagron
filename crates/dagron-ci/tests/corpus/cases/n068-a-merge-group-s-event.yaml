@@ -1,0 +1,11 @@
+shows: A merge group is told what kind of event it is, and the group its runs are keyed by
+event: { kind: merge_group, base_ref: main, sha: 9f2c1e7a5b3d4c6e8f0a1b2c3d4e5f6a7b8c9d0e }
+source: |
+  name: ci
+  on:
+    merge_group: {}
+  tasks:
+    - name: test
+      steps:
+        - env: { GROUP: "{{ ci_group }}", EVENT: "{{ ci_event }}" }
+          run: echo "a $EVENT, queued in $GROUP"

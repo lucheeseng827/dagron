@@ -1,0 +1,62 @@
+# Imported from a Jenkinsfile by dagron-import.
+#
+# To do by hand (1):
+#   stage('Groovy').steps[1]: a script block is Groovy, which is not run here (def version = readFile('VERSION').trim() currentBuild.displayName = version): write what it does as steps
+#
+# Changed on the way (9):
+#   on: a multibranch pipeline's builds are each branch and tag pushed, each pull request, and a run asked for (dispatch) here: say on: where it ran for fewer
+#   stage('Frontend').steps[0][0][0]: the time is each step's of the block, where Jenkins gave it to the block as a whole
+#   stage('Frontend').steps[0][0][0][0]: it reads $WORKSPACE: each is set at the head of its script
+#   stage('Frontend').steps[1]: the job is tried 3 times, as a whole, where Jenkins tried the block again
+#   stage('Frontend').steps[2]: the block is one step here, which ends at the first of its steps that fails, as the block did, and does not fail the job (continue_on_error): the job goes on after it, and is not marked for it
+#   stage('Groovy').steps[0]: the script block held steps alone, which are steps here
+#   stage('Groovy').steps[4]: it reads $BRANCH_NAME: each is set at the head of its script
+#   stage('Frontend').steps[0][0][0][0]: Jenkins's variables a step reads are set at its head from dagron-ci's own (CI_SHA, CI_REF, …): a program it runs that reads one the step does not is not given it
+#   stage('Groovy').steps[4]: $BRANCH_NAME is a branch's or a tag's name, and PR-<number> for a pull request, as a multibranch pipeline has it
+name: 09-wrappers
+on:
+  push: {}
+  pull_request: {}
+  dispatch: {}
+tasks:
+- name: frontend
+  docker_image: node:22-bookworm-slim
+  max_attempts: 3
+  steps:
+  - name: Frontend
+    env:
+      NODE_ENV: production
+    run: |-
+      export WORKSPACE="$PWD"
+      export BUILD_DIR="${WORKSPACE}/dist"
+      mkdir -p 'web' && cd 'web'
+      npm ci && npm run build
+    timeout_secs: 600
+  - name: Frontend
+    run: npm run flaky-test
+  - name: Frontend
+    run: npm audit
+    continue_on_error: true
+  - name: Groovy
+    run: echo only steps here
+  - name: Groovy
+    run: printf '%s\n' 'and a message'
+  - name: 'Groovy: script'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        stage('Groovy').steps[1]: a script block is Groovy, which is not run here (def version = readFile('VERSION').trim() currentBuild.displayName = version): write what it does as steps
+      DAGRON_IMPORT
+      exit 1
+  - name: Groovy
+    run: sleep 5
+  - name: Groovy
+    run: printf '%s' 'done' > 'out.txt'
+  - name: Groovy
+    run: |-
+      case "$CI_EVENT" in pull_request) export BRANCH_NAME="PR-$CI_PR" ;; *) export BRANCH_NAME="${CI_REF#refs/*/}" ;; esac
+      printf '%s\n' "Built ${BRANCH_NAME}"
+  - name: Groovy
+    run: |-
+      printf '%s\n' 'stop here' >&2
+      exit 1

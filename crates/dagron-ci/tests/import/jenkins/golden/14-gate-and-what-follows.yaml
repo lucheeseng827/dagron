@@ -1,0 +1,68 @@
+# Imported from a Jenkinsfile by dagron-import.
+#
+# Changed on the way (11):
+#   on: a multibranch pipeline's builds are each branch and tag pushed, each pull request, and a run asked for (dispatch) here: say on: where it ran for fewer
+#   stage('Release').when: its when is a test at the head of each of its steps, which end there where it is false: the job passes, where Jenkins skipped the stage
+#   stage('Release').input: the stage's input is a gate before it (type: approval), which a person approves or rejects
+#   stage('Release'): its stages start in a workspace of their own, a checkout of the event's commit, where on Jenkins they had what the stages before them left in the agent's: what they need of it is made again, or the stages are steps of one job
+#   stage('Release').steps[0], stage('Release').post.success[0], stage('Release').post.always[0]: it reads $BRANCH_NAME: each is set at the head of its script
+#   stage('Release').post.always: what runs after the stage's steps runs where they succeeded, and not after one that failed: a step here runs only after the steps before it succeed
+#   post.failure: what ran on failure is a job of its own, after the others, where a job before it failed, in a workspace of its own
+#   stage('Build').steps[0]: Jenkins's variables a step reads are set at its head from dagron-ci's own (CI_SHA, CI_REF, …): a program it runs that reads one the step does not is not given it
+#   stage('Release').steps[0]: $BRANCH_NAME is a branch's or a tag's name, and PR-<number> for a pull request, as a multibranch pipeline has it
+#
+# Not carried over (1):
+#   stage('Release').when.beforeInput: a gate before the stage is given its when where it can be said, and asks only where the when holds, as beforeInput true had it
+name: 14-gate-and-what-follows
+on:
+  push: {}
+  pull_request: {}
+  dispatch: {}
+tasks:
+- name: build
+  docker_image: alpine:3.20
+  steps:
+  - name: Build
+    run: ./build.sh
+- name: approve-release
+  type: approval
+  depends_on:
+  - build
+  when: '{{ ci_group }} in [refs/heads/main, refs/tags/main]'
+  approval_message: Release this build?
+- name: release
+  docker_image: alpine:3.20
+  depends_on:
+  - build
+  - approve-release
+  steps:
+  - name: Release
+    run: |-
+      case "$CI_EVENT" in pull_request) export BRANCH_NAME="PR-$CI_PR" ;; *) export BRANCH_NAME="${CI_REF#refs/*/}" ;; esac
+      # when { beforeInput true branch 'main' }
+      { case "$BRANCH_NAME" in 'main') true ;; *) false ;; esac; } || exit 0
+      ./release.sh
+  - name: Release
+    run: |-
+      case "$CI_EVENT" in pull_request) export BRANCH_NAME="PR-$CI_PR" ;; *) export BRANCH_NAME="${CI_REF#refs/*/}" ;; esac
+      # when { beforeInput true branch 'main' }
+      { case "$BRANCH_NAME" in 'main') true ;; *) false ;; esac; } || exit 0
+      ./tag-release.sh
+  - name: Release
+    run: |-
+      case "$CI_EVENT" in pull_request) export BRANCH_NAME="PR-$CI_PR" ;; *) export BRANCH_NAME="${CI_REF#refs/*/}" ;; esac
+      # when { beforeInput true branch 'main' }
+      { case "$BRANCH_NAME" in 'main') true ;; *) false ;; esac; } || exit 0
+      ./notify-release.sh
+  - name: Smoke
+    run: ./smoke.sh
+- name: post-failure
+  docker_image: alpine:3.20
+  depends_on:
+  - build
+  - approve-release
+  - release
+  trigger_rule: one_failed
+  steps:
+  - name: post failure
+    run: ./page-oncall.sh

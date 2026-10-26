@@ -7,8 +7,8 @@
 // they are not the same question:
 //
 //   ACTIVITY  what has arrived through the API, live. This is the honest
-//             answer to "what is the agent working on" until G-AG4 puts the
-//             calling principal on the run record: a run's `trigger_kind` is
+//             answer to "what is the agent working on" until the calling
+//             principal is put on the run record: a run's `trigger_kind` is
 //             `manual | schedule | backfill`, and everything an MCP client
 //             submits lands as `manual` alongside anything a human posted.
 //             The caption says so rather than implying attribution we do not

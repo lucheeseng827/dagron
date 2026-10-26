@@ -2,7 +2,7 @@
 // Hold the console's recipe implementation to the same contract as the builder
 // and the two SDKs.
 //
-// `sdks/recipe-vectors.json` is generated from `ee/dagron-build` — the program
+// `sdks/recipe-vectors.json` is generated from the image builder — the program
 // that actually produces the image — and every implementation of the
 // content-addressed tag is checked against it. This one exists separately from
 // the SDKs because the console runs in a browser and cannot use `node:crypto`;

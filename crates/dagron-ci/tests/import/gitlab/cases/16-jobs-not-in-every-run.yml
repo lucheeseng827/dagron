@@ -1,0 +1,41 @@
+# Jobs in some pipelines and not others. Where the scan is left out, the
+# deploy still waits for the build; a job that may fail is waited for, and
+# its failure holds nothing back; a rollback runs where the deploy failed,
+# and is in no pipeline the deploy is not in.
+image: alpine:3.20
+
+stages: [build, scan, deploy, rollback]
+
+build:
+  stage: build
+  script: [make]
+
+security_scan:
+  stage: scan
+  script: [make scan]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+review_app:
+  stage: scan
+  script: [make review-app]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+flaky_e2e:
+  stage: scan
+  script: [make e2e]
+  allow_failure: true
+
+deploy:
+  stage: deploy
+  script: [make deploy]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+rollback:
+  stage: rollback
+  when: on_failure
+  needs: [deploy]
+  script: [make rollback]

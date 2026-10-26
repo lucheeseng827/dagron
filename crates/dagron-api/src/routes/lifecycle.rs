@@ -82,7 +82,7 @@ pub struct WorkflowVersion {
 ///
 /// Returns the version number written.
 pub async fn record_version(
-    conn: &mut sqlx::PgConnection,
+    conn: &mut <crate::db::Db as sqlx::Database>::Connection,
     workflow_id: &str,
     name: &str,
     spec: &str,

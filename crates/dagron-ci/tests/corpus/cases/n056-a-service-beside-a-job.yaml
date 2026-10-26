@@ -1,0 +1,19 @@
+shows: A job's services pass through to the task, each with what makes it ready
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: test
+      docker_image: docker.io/library/rust:1-bookworm
+      services:
+        - name: db
+          image: docker.io/library/postgres:16-alpine
+          env:
+            - { name: POSTGRES_PASSWORD, value: pw }
+          ready: pg_isready -h localhost -U postgres
+        - name: cache
+          image: docker.io/library/redis:7-alpine
+      steps:
+        - env: { DATABASE_URL: "postgres://postgres:pw@db:5432/postgres" }
+          run: cargo test

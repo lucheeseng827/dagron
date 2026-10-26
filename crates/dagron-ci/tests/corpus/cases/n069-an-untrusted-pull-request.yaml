@@ -1,0 +1,10 @@
+shows: A pull request that runs as untrusted is told so, in what its run is given
+event: { kind: pull_request, trust: untrusted, pr: 44, ref: refs/pull/44/head }
+source: |
+  name: ci
+  on:
+    pull_request: {}
+  tasks:
+    - name: test
+      steps:
+        - run: make test

@@ -1,0 +1,13 @@
+shows: GitLab services are reached by their alias, or by a name made of their image, with the job's variables
+front: gitlab
+file: gitlab-ci
+source: |
+  image: python:3.12
+  variables:
+    POSTGRES_PASSWORD: secret
+  test:
+    services:
+      - postgres:16
+      - name: redis:7
+        alias: cache
+    script: [pytest]

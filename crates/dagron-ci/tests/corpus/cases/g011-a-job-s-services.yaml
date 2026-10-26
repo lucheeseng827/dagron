@@ -1,0 +1,20 @@
+shows: A workflow job's services are the task's, each with its image and variables
+front: github
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on: push
+  jobs:
+    test:
+      runs-on: ubuntu-latest
+      services:
+        postgres:
+          image: postgres:16-alpine
+          env:
+            POSTGRES_PASSWORD: pw
+          options: >-
+            --health-cmd pg_isready
+            --health-interval 10s
+      steps:
+        - run: make test
+          env:
+            DATABASE_URL: postgres://postgres:pw@postgres:5432/postgres

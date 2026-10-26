@@ -1,0 +1,2 @@
+not a pipeline:
+  tasks[0] (say).steps[0].run: a branch name is its pusher's text; read $CI_REF in the step instead

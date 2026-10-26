@@ -1,0 +1,10 @@
+shows: An event of the agent class is compiled as any other, with its class among what it is told
+event: { kind: push, trust: agent }
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: build
+      steps:
+        - run: make

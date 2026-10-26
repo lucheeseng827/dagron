@@ -1,0 +1,10 @@
+shows: A tag that tags_ignore names is passed over
+event: { kind: tag, ref: refs/tags/v2.0.0-rc.1 }
+source: |
+  name: release
+  on:
+    push: { tags_ignore: ["*-rc.*"] }
+  tasks:
+    - name: publish
+      steps:
+        - run: make publish

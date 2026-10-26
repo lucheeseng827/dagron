@@ -8,6 +8,8 @@ import DagGraph from "@/components/dag/DagGraph";
 import RunTimeline from "@/components/dag/RunTimeline";
 import TaskPanel from "@/components/dag/TaskPanel";
 import RunLogsView from "@/components/logview/RunLogsView";
+import JobsGrid from "@/components/ci/JobsGrid";
+import WorkflowArtifacts from "@/components/ci/WorkflowArtifacts";
 import LiveToggle from "@/components/LiveToggle";
 import RerunDialog from "@/components/RerunDialog";
 import RerunMenu from "@/components/RerunMenu";
@@ -22,13 +24,15 @@ import {
   getMe,
   getRun,
   getRunGraph,
+  listRuns,
   listWorkflows,
   rejectTask,
   rerunRun,
   retryTask,
 } from "@/lib/dagron-api";
 import { subscribeRun } from "@/lib/dagron-stream";
-import { statusColor, waitingOn } from "@/lib/adapter";
+import { runColor, runDuration, runReads, runWaits, statusColor, waitingOn } from "@/lib/adapter";
+import { hasInstances, jobRows } from "@/lib/ci-jobs";
 import { useLiveUpdates, type ConnStatus } from "@/lib/live";
 import {
   EMPTY_FILTER,
@@ -38,10 +42,17 @@ import {
   toParams,
   type LogFilterState,
 } from "@/lib/log-filter";
-import { absTime, duration } from "@/lib/time";
-import type { GraphResponse, RunDetail } from "@/types/dagron";
+import { absTime } from "@/lib/time";
+import type { GraphResponse, RunDetail, RunSummary } from "@/types/dagron";
 
-type View = "graph" | "timeline" | "logs";
+type View = "graph" | "jobs" | "timeline" | "logs";
+
+const VIEW_TITLES: Record<View, string> = {
+  graph: "Show the run as a graph",
+  jobs: "Each job, and each instance of a job that ran as several",
+  timeline: "Show the run as a timeline",
+  logs: "Every task's output in one filterable stream",
+};
 
 const TERMINAL = new Set(["succeeded", "failed", "cancelled"]);
 const CLEARABLE = new Set(["succeeded", "failed", "skipped", "cancelled"]);
@@ -83,6 +94,9 @@ function RunPageInner() {
   const [view, setView] = useState<View>("graph");
   // Saved-workflow id matching this run's name, for the header backlink.
   const [workflowId, setWorkflowId] = useState<string | null>(null);
+  // The other runs of this run's event: a CI event starts one for each of
+  // the repository's pipelines that takes it.
+  const [siblings, setSiblings] = useState<RunSummary[]>([]);
   // The log filter, shared by the workflow log view and the task drawer so
   // switching between them never silently changes what's being shown.
   const [filter, setFilter] = useState<LogFilterState>(EMPTY_FILTER);
@@ -160,7 +174,7 @@ function RunPageInner() {
     // view would show zero matches with no pill looking active — an empty
     // screen with nothing to explain it.
     const v = p.get("view");
-    setView(v === "logs" || v === "timeline" ? v : "graph");
+    setView(v === "logs" || v === "timeline" || v === "jobs" ? v : "graph");
     const fromUrl = fromParams(p);
     setFilter(hasAnyFilterParam(p) ? fromUrl : loadFilter());
     const scope = p.get("logTask");
@@ -209,6 +223,24 @@ function RunPageInner() {
       alive = false;
     };
   }, [run?.name]);
+
+  // The repository this run's record names, as a list is narrowed to it.
+  const trigger = run?.trigger;
+  const repo = trigger?.repo ? `${trigger.forge_host ? `${trigger.forge_host}/` : ""}${trigger.repo}` : null;
+  const eventId = trigger?.event_id ?? null;
+
+  // The event's other runs (best-effort: the header is whole without them).
+  useEffect(() => {
+    setSiblings([]);
+    if (!repo || !eventId) return;
+    let alive = true;
+    listRuns({ repo, event: eventId, limit: 50 })
+      .then((rows) => alive && setSiblings(rows.filter((r) => r.id !== id)))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [id, repo, eventId]);
 
   // Who is signed in, for the admin-only Archive action. Failure leaves it
   // false — the button is hidden and the route would refuse anyway.
@@ -267,8 +299,9 @@ function RunPageInner() {
   };
 
   const onCancel = () => {
-    if (!confirm("Cancel this run? Non-terminal tasks will be cancelled.")) return;
-    void act(() => cancelRun(id), "Run cancelled");
+    if (!confirm("Cancel this run? Tasks that have not started are cancelled; running ones are stopped.")) return;
+    // A cancel asks: the run ends once its running tasks' work has stopped.
+    void act(() => cancelRun(id), "Cancel requested");
   };
   const onRerun = () => {
     if (!confirm("Rerun from failure? Failed/cancelled tasks re-run; succeeded tasks are kept.")) return;
@@ -314,6 +347,11 @@ function RunPageInner() {
   // facts the logs endpoint doesn't carry (a parked task has no logs at all).
   const selectedTask = selected ? run?.tasks.find((t) => t.id === selected) : undefined;
 
+  // The grid is offered where it says more than the graph: a job ran as
+  // several instances, or the run is CI's, whose tasks are jobs.
+  const showJobs = graph ? run?.trigger_kind === "ci" || hasInstances(jobRows(graph.nodes)) : false;
+  const views: View[] = showJobs || view === "jobs" ? ["graph", "jobs", "timeline", "logs"] : ["graph", "timeline", "logs"];
+
   const runActive = run ? !TERMINAL.has(run.status) : false;
   // A failed/cancelled run can resume from its failure frontier.
   const runRerunnable = run ? run.status === "failed" || run.status === "cancelled" : false;
@@ -324,7 +362,11 @@ function RunPageInner() {
         style={{
           display: "flex",
           alignItems: "center",
+          // What does not fit goes to a second line: a button squeezed to
+          // one word a line reads worse than a header two lines tall.
+          flexWrap: "wrap",
           gap: 14,
+          rowGap: 8,
           padding: "14px 24px",
           borderBottom: "1px solid var(--border)",
           background: "var(--side)",
@@ -347,35 +389,93 @@ function RunPageInner() {
           </span>
         </strong>
         {run && (
-          <span style={{ display: "inline-flex", alignItems: "center", gap: 7, color: statusColor(run.status) }}>
-            <span className="dy-dot" style={{ background: statusColor(run.status) }} />
-            {run.status}
+          <span
+            style={{ display: "inline-flex", alignItems: "center", gap: 7, color: runColor(run) }}
+            title={
+              run.status === "running" && run.stopping_as
+                ? `Asked to stop${run.stop_requested_at ? ` at ${run.stop_requested_at}` : ""}: it ends ${run.stopping_as} once its running tasks' work is gone`
+                : runWaits(run)
+                  ? `Waiting since ${run.queued_at} for a run of its workflow to end (max_active_runs): it has started nothing`
+                  : undefined
+            }
+          >
+            <span className="dy-dot" style={{ background: runColor(run) }} />
+            {runReads(run)}
           </span>
         )}
         {run && <TriggerBadge kind={run.trigger_kind} />}
+        {/* What the run's record says it is for: the repository, the pull
+            request or ref, and the commit, where a CI service submitted it;
+            what it came from, or who asked, where it names no repository.
+            Text, never a link: it is the submitter's word about another
+            system. */}
+        {run?.trigger && (
+          <span
+            className="mono"
+            style={{ fontSize: 12, color: "var(--muted)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", minWidth: 0 }}
+            title={[
+              run.trigger.repo && `${run.trigger.forge_host ? `${run.trigger.forge_host}/` : ""}${run.trigger.repo}`,
+              run.trigger.ref,
+              run.trigger.sha,
+              run.trigger.source && `from ${run.trigger.source}`,
+              run.trigger.actor && `by ${run.trigger.actor}`,
+              `submitted by ${run.trigger.principal}`,
+            ]
+              .filter(Boolean)
+              .join("\n")}
+          >
+            {[
+              run.trigger.repo ?? run.trigger.source ?? (run.trigger.actor && `by ${run.trigger.actor}`),
+              run.trigger.pr != null ? `#${run.trigger.pr}` : run.trigger.ref?.replace(/^refs\/(heads|tags)\//, ""),
+              run.trigger.sha?.slice(0, 10),
+            ]
+              .filter(Boolean)
+              .join(" · ")}
+          </span>
+        )}
+        {/* This console's own pages for it: the repository's branches and
+            pull requests, and the event's other pipelines. */}
+        {repo && (
+          <Link
+            href={`/repos/detail/?repo=${encodeURIComponent(repo)}`}
+            className="dy-pill"
+            title="This repository's branches and pull requests, with their latest runs"
+            style={{ whiteSpace: "nowrap" }}
+          >
+            repository
+          </Link>
+        )}
+        {siblings.map((s) => (
+          <Link
+            key={s.id}
+            href={`/runs/detail/?id=${s.id}`}
+            className="dy-pill"
+            title={`The same event's run of ${s.name ?? "another pipeline"}: ${runReads(s)}`}
+            style={{ display: "inline-flex", alignItems: "center", gap: 6, whiteSpace: "nowrap" }}
+          >
+            <span className="dy-dot dy-dot-sm" style={{ background: runColor(s) }} />
+            {s.name ?? s.id.slice(0, 8)}
+          </Link>
+        ))}
         {run && (
           <span
             className="mono"
             style={{ fontSize: 12, color: "var(--muted)", whiteSpace: "nowrap" }}
             title={`started ${absTime(run.created_at)}${run.finished_at ? `\nfinished ${absTime(run.finished_at)}` : ""}`}
           >
-            {duration(run.created_at, run.finished_at)}
+            {runDuration(run)}
           </span>
         )}
         <LiveToggle status={conn} onRefresh={refetch} />
         <div style={{ flex: 1 }} />
         <div style={{ display: "flex", gap: 3, background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: 3 }}>
-          {(["graph", "timeline", "logs"] as const).map((v) => (
+          {views.map((v) => (
             <button
               key={v}
               onClick={() => setView(v)}
               className={`dy-pill ${view === v ? "dy-pill-active" : ""}`}
               style={{ cursor: "pointer", textTransform: "capitalize" }}
-              title={
-                v === "logs"
-                  ? "Every task's output in one filterable stream"
-                  : `Show the run as a ${v}`
-              }
+              title={VIEW_TITLES[v]}
             >
               {v}
             </button>
@@ -428,6 +528,8 @@ function RunPageInner() {
 
       {error && <p style={{ color: "var(--red)", padding: "8px 24px" }}>{error}</p>}
 
+      <WorkflowArtifacts runId={id} status={run?.status} />
+
       <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
         <div style={{ flex: 1, minHeight: 0 }}>
           {/* The log view doesn't need the graph — it's the view you reach for
@@ -447,6 +549,8 @@ function RunPageInner() {
             graph &&
             (view === "graph" ? (
               <DagGraph graph={graph} runStatus={run?.status} onNodeClick={setSelected} />
+            ) : view === "jobs" ? (
+              <JobsGrid tasks={graph.nodes} selected={selected} onTaskClick={setSelected} />
             ) : (
               run && (
                 <RunTimeline

@@ -19,6 +19,16 @@ spec:
         {{- include "dagron.labels" . | nindent 8 }}
         app.kubernetes.io/component: postgres
     spec:
+      {{- $openshift := include "dagron.openshift" . }}
+      {{- if $openshift }}
+      # OpenShift: the restricted SCC gives the pod a uid and an fsGroup.
+      # The image's entrypoint runs as that uid, never root, and the data
+      # directory it makes on the volume is that uid's.
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -26,6 +36,12 @@ spec:
       containers:
         - name: postgres
           image: {{ include "dagron.image" (dict "image" $.Values.postgres.image "root" $) | quote }}
+          {{- if $openshift }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          {{- end }}
           env:
             - name: POSTGRES_USER
               value: {{ .Values.postgres.user | quote }}

@@ -1,0 +1,5 @@
+shows: A file with no jobs is no workflow, and is told what it lacks
+front: github
+source: |
+  name: Empty
+  on: push

@@ -1,0 +1,9 @@
+shows: A task that names no timeout is given the setting's, an hour unless set
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: build
+      steps:
+        - run: make

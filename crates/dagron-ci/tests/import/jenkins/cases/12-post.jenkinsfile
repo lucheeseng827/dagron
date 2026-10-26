@@ -1,0 +1,37 @@
+// What runs after: a stage's post, and the pipeline's.
+pipeline {
+    agent { docker { image 'python:3.12' } }
+    stages {
+        stage('Test') {
+            steps {
+                sh 'pytest --junitxml=reports/junit.xml'
+            }
+            post {
+                always {
+                    junit 'reports/junit.xml'
+                    sh 'coverage report'
+                }
+                failure {
+                    sh 'cat pytest.log'
+                }
+            }
+        }
+    }
+    post {
+        success {
+            sh './notify.sh ok'
+        }
+        failure {
+            sh './notify.sh failed'
+        }
+        always {
+            sh './collect-logs.sh'
+        }
+        cleanup {
+            cleanWs()
+        }
+        unstable {
+            sh './notify.sh unstable'
+        }
+    }
+}

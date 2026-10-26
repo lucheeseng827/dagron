@@ -17,6 +17,10 @@ use dagron_step_sql::ndjson_line;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `--version` first: for it nothing is read and nothing is started.
+    if dagron_logging::version_requested("dagron-step-sql") {
+        return Ok(());
+    }
     dagron_logging::init("dagron-step-sql");
 
     let engine = Engine::parse(&std::env::var("SQL_ENGINE").unwrap_or_default())?;

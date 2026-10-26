@@ -1,0 +1,2 @@
+src/**,!src/**/*.md
+src/a/b.md

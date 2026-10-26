@@ -1,0 +1,42 @@
+// A matrix of JDKs and platforms, less one combination.
+pipeline {
+    agent none
+    stages {
+        stage('BuildAndTest') {
+            matrix {
+                agent { docker { image "eclipse-temurin:${JDK}" } }
+                axes {
+                    axis {
+                        name 'JDK'
+                        values '17', '21'
+                    }
+                    axis {
+                        name 'PLATFORM'
+                        values 'linux', 'alpine'
+                    }
+                }
+                excludes {
+                    exclude {
+                        axis {
+                            name 'JDK'
+                            values '17'
+                        }
+                        axis {
+                            name 'PLATFORM'
+                            values 'alpine'
+                        }
+                    }
+                }
+                stages {
+                    stage('Build') {
+                        steps { sh './gradlew build -Pplatform=$PLATFORM' }
+                    }
+                    stage('Test') {
+                        when { environment name: 'PLATFORM', value: 'linux' }
+                        steps { sh "./gradlew test -Pjdk=${JDK}" }
+                    }
+                }
+            }
+        }
+    }
+}

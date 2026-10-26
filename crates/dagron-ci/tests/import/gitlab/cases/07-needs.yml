@@ -1,0 +1,47 @@
+# A graph of jobs, past the stages: needs.
+image: alpine:3.20
+
+stages: [build, test, deploy]
+
+build-a:
+  stage: build
+  script: [make a]
+
+build-b:
+  stage: build
+  script: [make b]
+  artifacts:
+    paths: [out/b]
+
+test-a:
+  stage: test
+  needs: [build-a]
+  script: [make test-a]
+
+test-b:
+  stage: test
+  needs:
+    - job: build-b
+      artifacts: false
+  script: [make test-b]
+
+lint:
+  stage: test
+  needs: []
+  script: [make lint]
+
+deploy:
+  stage: deploy
+  needs:
+    - test-a
+    - job: test-b
+    - job: nightly-only
+      optional: true
+  dependencies: []
+  script: [make deploy]
+
+nightly-only:
+  stage: test
+  script: [make nightly]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"

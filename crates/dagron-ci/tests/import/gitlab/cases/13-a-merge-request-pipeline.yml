@@ -1,0 +1,22 @@
+# GitLab's own template for merge request pipelines.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+image: rust:1.86-bookworm
+
+check:
+  script:
+    - cargo check
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"
+    - if: $CI_COMMIT_BRANCH
+
+audit:
+  script:
+    - cargo audit
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"

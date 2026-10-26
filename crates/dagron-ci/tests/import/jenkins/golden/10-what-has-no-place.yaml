@@ -1,0 +1,128 @@
+# Imported from a Jenkinsfile by dagron-import.
+#
+# To do by hand (12):
+#   outside the pipeline: `@Library('shared-pipeline@v2') _`: a shared library is not here: what the pipeline calls of it is left to do where it is called
+#   outside the pipeline: `def helper() { return 'x' }`: Groovy outside the pipeline is not run here
+#   stage('Windows').agent.label: no image is known for the agent windows: name the job's docker_image (an image that holds what its steps use), or give the importer one (--image windows=IMAGE)
+#   stage('Windows').steps[0]: a Windows command is not run here: a job is a Linux container
+#   stage('Image').agent.dockerfile: an image built from the repository's Dockerfile is not built here: build it and push it, and name it as the job's docker_image
+#   stage('Pod').agent.kubernetes: a pod of a Kubernetes agent is not read: name the job's docker_image, and give it services for the pod's other containers
+#   stage('Pod').steps[0]: a container of a Kubernetes agent's pod is not here: the job's image is its one container
+#   pipeline.agent: no image is known for the agent any: name the job's docker_image (an image that holds what its steps use), or give the importer one (--image any=IMAGE)
+#   stage('Notify').steps[0]: a mail is not sent from here: dagron's notify sends word of a run, or a step calls the service
+#   stage('Notify').steps[1]: another Jenkins job is not started here: make what it runs a job of this pipeline, or a pipeline of its own
+#   stage('Notify').steps[2]: `someStep 'x'` is a step that is not imported: write the commands it stood for in its place
+#   stage('Notify').steps[3]: withMaven is a plugin's, which is not here: give the job what it set up another way. Its steps follow
+#
+# Changed on the way (3):
+#   on: a multibranch pipeline's builds are each branch and tag pushed, each pull request, and a run asked for (dispatch) here: say on: where it ran for fewer
+#   stage('Notify'): its stages start in a workspace of their own, a checkout of the event's commit, where on Jenkins they had what the stages before them left in the agent's: what they need of it is made again, or the stages are steps of one job
+#   stage('Image').steps[0]: Jenkins's variables a step reads are set at its head from dagron-ci's own (CI_SHA, CI_REF, …): a program it runs that reads one the step does not is not given it
+#
+# Not carried over (4):
+#   triggers.cron: a pipeline has no schedule: ask for a run from a scheduler of your own, through the run API (on.dispatch)
+#   triggers.pollSCM: nothing to poll: dagron-ci looks at a connected repository itself, and takes a webhook
+#   tools.maven: a tool Jenkins installed (maven M3) is not here: the job's image has to hold it
+#   tools.jdk: a tool Jenkins installed (jdk jdk17) is not here: the job's image has to hold it
+name: 10-what-has-no-place
+on:
+  push: {}
+  pull_request: {}
+  dispatch: {}
+tasks:
+- name: windows
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        outside the pipeline: `@Library('shared-pipeline@v2') _`: a shared library is not here: what the pipeline calls of it is left to do where it is called
+        outside the pipeline: `def helper() { return 'x' }`: Groovy outside the pipeline is not run here
+        stage('Windows').agent.label: no image is known for the agent windows: name the job's docker_image (an image that holds what its steps use), or give the importer one (--image windows=IMAGE)
+      DAGRON_IMPORT
+      exit 1
+  - name: 'Windows: bat'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        stage('Windows').steps[0]: a Windows command is not run here: a job is a Linux container
+      DAGRON_IMPORT
+      exit 1
+- name: image
+  depends_on:
+  - windows
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        outside the pipeline: `@Library('shared-pipeline@v2') _`: a shared library is not here: what the pipeline calls of it is left to do where it is called
+        outside the pipeline: `def helper() { return 'x' }`: Groovy outside the pipeline is not run here
+        stage('Image').agent.dockerfile: an image built from the repository's Dockerfile is not built here: build it and push it, and name it as the job's docker_image
+      DAGRON_IMPORT
+      exit 1
+  - name: Image
+    run: make
+- name: pod
+  depends_on:
+  - image
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        outside the pipeline: `@Library('shared-pipeline@v2') _`: a shared library is not here: what the pipeline calls of it is left to do where it is called
+        outside the pipeline: `def helper() { return 'x' }`: Groovy outside the pipeline is not run here
+        stage('Pod').agent.kubernetes: a pod of a Kubernetes agent is not read: name the job's docker_image, and give it services for the pod's other containers
+      DAGRON_IMPORT
+      exit 1
+  - name: 'Pod: container'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        stage('Pod').steps[0]: a container of a Kubernetes agent's pod is not here: the job's image is its one container
+      DAGRON_IMPORT
+      exit 1
+- name: notify
+  depends_on:
+  - pod
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        outside the pipeline: `@Library('shared-pipeline@v2') _`: a shared library is not here: what the pipeline calls of it is left to do where it is called
+        outside the pipeline: `def helper() { return 'x' }`: Groovy outside the pipeline is not run here
+        pipeline.agent: no image is known for the agent any: name the job's docker_image (an image that holds what its steps use), or give the importer one (--image any=IMAGE)
+      DAGRON_IMPORT
+      exit 1
+  - name: 'Notify: mail'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        stage('Notify').steps[0]: a mail is not sent from here: dagron's notify sends word of a run, or a step calls the service
+      DAGRON_IMPORT
+      exit 1
+  - name: 'Notify: build'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        stage('Notify').steps[1]: another Jenkins job is not started here: make what it runs a job of this pipeline, or a pipeline of its own
+      DAGRON_IMPORT
+      exit 1
+  - name: 'Notify: someStep'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        stage('Notify').steps[2]: `someStep 'x'` is a step that is not imported: write the commands it stood for in its place
+      DAGRON_IMPORT
+      exit 1
+  - name: 'Notify: withMaven'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        stage('Notify').steps[3]: withMaven is a plugin's, which is not here: give the job what it set up another way. Its steps follow
+      DAGRON_IMPORT
+      exit 1
+  - name: Notify
+    run: mvn verify

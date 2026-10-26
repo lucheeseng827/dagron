@@ -1,0 +1,10 @@
+shows: A change that touches only what paths_ignore names leaves the pipeline unrun
+event: { kind: push, ref: refs/heads/main, changed: [docs/guide.md, docs/api/index.md] }
+source: |
+  name: ci
+  on:
+    push: { paths_ignore: ["docs/**"] }
+  tasks:
+    - name: build
+      steps:
+        - run: make

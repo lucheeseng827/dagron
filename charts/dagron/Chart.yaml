@@ -57,6 +57,11 @@ annotations:
       platforms:
         - linux/amd64
         - linux/arm64
+    - name: ci
+      image: mancube/dagron-ci:0.10.0
+      platforms:
+        - linux/amd64
+        - linux/arm64
     - name: postgres-test
       image: postgres:16-alpine
       whitelisted: true

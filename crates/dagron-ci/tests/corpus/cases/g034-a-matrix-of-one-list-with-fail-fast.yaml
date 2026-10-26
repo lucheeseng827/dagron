@@ -1,0 +1,15 @@
+shows: A matrix's fail-fast is read, and a matrix of one list is a task for each of its values
+front: github
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on: push
+  jobs:
+    test:
+      runs-on: ubuntu-latest
+      strategy:
+        fail-fast: false
+        matrix:
+          shard: [1, 2, 3]
+      name: shard ${{ matrix.shard }}
+      steps:
+        - run: make test SHARD=${{ matrix.shard }}

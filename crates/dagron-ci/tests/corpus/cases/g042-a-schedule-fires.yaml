@@ -1,0 +1,15 @@
+shows: A schedule's event runs its workflow at the default branch's head, the cron its github.event.schedule
+front: github
+event: { kind: schedule, inputs: { schedule: "0 3 * * *" } }
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on:
+    schedule:
+      - cron: "0 3 * * *"
+    push:
+      branches: [main]
+  jobs:
+    nightly:
+      runs-on: ubuntu-latest
+      steps:
+        - run: make nightly ${{ github.event.schedule }}

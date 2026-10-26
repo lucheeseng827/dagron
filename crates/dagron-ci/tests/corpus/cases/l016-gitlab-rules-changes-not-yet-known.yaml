@@ -1,0 +1,10 @@
+shows: GitLab rules changes ask for the files a push changed before the pipeline is made
+front: gitlab
+file: gitlab-ci
+event: { base_sha: "1111111111111111111111111111111111111111" }
+source: |
+  image: alpine:3.20
+  docs:
+    script: [mkdocs build]
+    rules:
+      - changes: [docs/**/*]

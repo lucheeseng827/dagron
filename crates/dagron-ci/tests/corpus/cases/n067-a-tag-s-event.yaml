@@ -1,0 +1,11 @@
+shows: A tag's run is told it is a tag, with the tag as its ref
+event: { kind: tag, ref: refs/tags/v2.0.0 }
+source: |
+  name: release
+  on:
+    push: { tags: ["v*"] }
+  tasks:
+    - name: publish
+      steps:
+        - env: { TAG: "{{ ci_ref }}", EVENT: "{{ ci_event }}" }
+          run: echo "$EVENT $TAG"

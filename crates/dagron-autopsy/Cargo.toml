@@ -16,9 +16,8 @@ path = "src/lib.rs"
 
 [features]
 # dagron-core is here for one thing — the shared fault taxonomy — but it also
-# carries the datastore facade, which insists on exactly one backend. Forwarded
-# the same way ee/dagron-placement does, defaulting to the workspace's sqlite so
-# `cargo build --workspace` resolves.
+# carries the datastore facade, which insists on exactly one backend. Forwarded,
+# defaulting to the workspace's sqlite so `cargo build --workspace` resolves.
 #
 # Nothing in the collect → correlate → emit path touches a database: the tool's
 # whole premise is that it installs on a cluster that has never heard of dagron.

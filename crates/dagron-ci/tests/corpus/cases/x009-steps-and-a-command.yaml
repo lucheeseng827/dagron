@@ -1,0 +1,10 @@
+shows: A task has steps or dagron's own command, and never both
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: build
+      command: make
+      steps:
+        - run: make

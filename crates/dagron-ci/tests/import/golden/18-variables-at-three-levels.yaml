@@ -1,0 +1,58 @@
+# Imported from a GitHub Actions workflow by dagron-import.
+#
+# To do by hand (4):
+#   jobs.show.steps[1].env.TOKEN: the variable TOKEN held the secret DEPLOY_KEY: a secret is given under its own name here, so the scripts read $DEPLOY_KEY
+#   jobs.show.env.API_TOKEN: the variable API_TOKEN held the secret STAGING_API_TOKEN: a secret is given under its own name here, so the scripts read $STAGING_API_TOKEN
+#   jobs.show.env.ACTOR: the variable's value: `github.actor` has nothing to stand for it here. The variable is left out
+#   jobs.show.env.CI_MODE: a variable that begins CI_ is set from the event here: give it another name
+#
+# Changed on the way (5):
+#   jobs.show.runs-on: ubuntu-latest is the image docker.io/library/ubuntu:24.04: an operating system, with none of the tools a hosted runner holds
+#   jobs.show: what was read from `secrets` (DEPLOY_KEY, STAGING_API_TOKEN) is read from the job's environment, as deploy_key, staging_api_token: keep it there, in dagron-api
+#   jobs.show: DEPLOY_KEY: given to the job, and so to every step of it, where the workflow gave it to the steps that read it. A step that must not hold it is a job of its own
+#   jobs: a step that named no shell ran under bash on a runner GitHub hosts, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   jobs: a job that set no timeout had GitHub's six hours, and has dagron-ci's own here (an hour, unless CI_DEFAULT_TIMEOUT_SECS says another): say timeout_secs where a job needs longer
+#
+# Not carried over (1):
+#   jobs.show.environment.url: an environment is named here, and has no such setting
+name: variables
+on:
+  dispatch:
+    inputs:
+      region:
+        default: eu-west-1
+tasks:
+- name: show
+  docker_image: docker.io/library/ubuntu:24.04
+  environment: staging
+  env:
+  - name: APP
+    value: widgets
+  - name: COMMIT
+    value: '{{ ci_sha }}'
+  - name: LEVEL
+    value: job
+  - name: REGION
+    value: '{{ region }}'
+  - name: DEPLOY_KEY
+    value_from:
+      secret: deploy_key
+  - name: STAGING_API_TOKEN
+    value_from:
+      secret: staging_api_token
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        jobs.show.steps[1].env.TOKEN: the variable TOKEN held the secret DEPLOY_KEY: a secret is given under its own name here, so the scripts read $DEPLOY_KEY
+        jobs.show.env.API_TOKEN: the variable API_TOKEN held the secret STAGING_API_TOKEN: a secret is given under its own name here, so the scripts read $STAGING_API_TOKEN
+        jobs.show.env.ACTOR: the variable's value: `github.actor` has nothing to stand for it here. The variable is left out
+        jobs.show.env.CI_MODE: a variable that begins CI_ is set from the event here: give it another name
+      DAGRON_IMPORT
+      exit 1
+  - run: echo "$APP $LEVEL $COMMIT $REGION"
+  - env:
+      LEVEL: step
+      PR: '{{ ci_pr }}'
+    run: ./deploy.sh

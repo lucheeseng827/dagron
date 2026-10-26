@@ -1,0 +1,12 @@
+shows: A step timeout below a second and a continue_on_error that is no boolean are each refused
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: build
+      depends_on: { after: lint }
+      steps:
+        - run: make
+          timeout_secs: -5
+          continue_on_error: "yes"

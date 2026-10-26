@@ -83,6 +83,7 @@ function shortDetail(w: WaitingOn): string {
   if (w.runLink) return "sub-workflow";
   if (w.label === "Waiting until") return fromNow(w.detail);
   if (w.label === "Waiting on dataset") return "dataset";
+  if (w.label === "Waiting on quota") return "quota";
   return "endpoint";
 }
 

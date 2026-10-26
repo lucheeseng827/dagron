@@ -1,0 +1,11 @@
+shows: Where a cache restores from is dagron-ci's to say, so a pipeline (a fork's, say) cannot point it at another branch's caches
+source: |
+  name: ci
+  on:
+    pull_request: {}
+  tasks:
+    - name: build
+      workspace:
+        cache: [{ prefix: cargo, paths: [/usr/local/cargo/registry], restore_from: refs/heads/release }]
+      steps:
+        - run: make

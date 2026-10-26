@@ -1,0 +1,15 @@
+# A pipeline that runs for a schedule alone: a schedule here asks for a
+# run through the run API, and the pipeline is one asked for.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+
+image: alpine:3.20
+
+nightly-scan:
+  script: [./scan.sh]
+
+weekly-report:
+  script: [./report.sh]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $REPORT == "weekly"

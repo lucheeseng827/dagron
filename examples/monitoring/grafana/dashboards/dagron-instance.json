@@ -1383,7 +1383,7 @@
     {
       "type": "timeseries",
       "title": "Scrape duration",
-      "description": "How long /metrics takes to answer. The datastore gauges are queried on every scrape, so this follows datastore latency.",
+      "description": "How long /metrics takes to answer. The datastore gauges of what has not finished are re-queried once per METRICS_CACHE_SECS (10 s by default), so a spike here is a cache miss and follows datastore latency; scrapes in between are cheap. The history (the finished statuses and the recent runs that have finished) is read again once per METRICS_HISTORY_CACHE_SECS (300 s) behind the scrape that finds it stale, which is served the last one, so that read does not show here: the scrapes before a read of it has succeeded wait for it (the first after a start, and each after a first read that failed or was given up), and so does every scrape where its TTL is 0 (METRICS_HISTORY_CACHE_SECS=0, or METRICS_CACHE_SECS=0 with it unset).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"

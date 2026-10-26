@@ -9,8 +9,7 @@
 //! process holds.
 //!
 //! That was measured rather than reasoned about. Against the pool's own
-//! `run_command`, with the environment `ee/compose.image-build.yaml` gives the
-//! build pool:
+//! `run_command`, with the environment the build pool's compose file gives it:
 //!
 //! ```text
 //! command: ["sh", "-c", "echo $DAGRON_BUILD_ATTEST_KEY $DAGRON_REGISTRY_PASSWORD"]
@@ -56,7 +55,7 @@
 //! *which program* runs, not what that program does. `dagron-build` builds an
 //! image from a recipe, and a recipe installs packages, which runs those
 //! packages' code. The allowlist keeps a task from reaching for `sh`; the
-//! builder's own refusals (`ee/dagron-build`'s recipe validation, the base
+//! builder's own refusals (its recipe validation, the base
 //! allow-list) are what bound the build.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -503,7 +502,7 @@ mod tests {
         let pool: BTreeMap<&str, &str> = [
             ("PATH", "/usr/bin"),
             ("HOME", "/root"),
-            // The build pool's environment, from ee/compose.image-build.yaml.
+            // The build pool's environment, from its compose file.
             ("DATABASE_URL", "postgres://dagron:dagron@postgres:5432/workflow"),
             ("DAGRON_ENV_SECRET_KEY", "dev-insecure-env-secret-key"),
             ("DAGRON_BUILD_ATTEST_KEY", "1111111111111111111111111111111111111111111111111111111111111111"),

@@ -1,0 +1,45 @@
+# Imported from a GitHub Actions workflow by dagron-import.
+#
+# To do by hand (5):
+#   jobs.version.steps[1]: the script reads $GITHUB_OUTPUT, which a step here is not given
+#   jobs.version.steps[1]: a later step reads this one's outputs (steps.read): a step hands a later one a value through a file in the workspace
+#   jobs.version.steps[2]: `steps.read.outputs.tag` in the script has nothing to stand for it here: the step stops where it is read
+#   jobs.version.outputs: a job hands a later one its status, and no value it made: jobs that share a value are steps of one job, or the value is in a file both can reach
+#   jobs.publish.steps[0]: `needs.version.outputs.tag` in the script has nothing to stand for it here: the step stops where it is read
+#
+# Changed on the way (4):
+#   jobs.version.runs-on, jobs.publish.runs-on: ubuntu-latest is the image docker.io/library/ubuntu:24.04: an operating system, with none of the tools a hosted runner holds
+#   jobs: a step that named no shell ran under bash on a runner GitHub hosts, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   jobs: a job that set no timeout had GitHub's six hours, and has dagron-ci's own here (an hour, unless CI_DEFAULT_TIMEOUT_SECS says another): say timeout_secs where a job needs longer
+name: outputs
+on:
+  push: {}
+tasks:
+- name: version
+  docker_image: docker.io/library/ubuntu:24.04
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        jobs.version.steps[1]: the script reads $GITHUB_OUTPUT, which a step here is not given
+        jobs.version.steps[1]: a later step reads this one's outputs (steps.read): a step hands a later one a value through a file in the workspace
+        jobs.version.steps[2]: `steps.read.outputs.tag` in the script has nothing to stand for it here: the step stops where it is read
+        jobs.version.outputs: a job hands a later one its status, and no value it made: jobs that share a value are steps of one job, or the value is in a file both can reach
+      DAGRON_IMPORT
+      exit 1
+  - run: echo "tag=v$(cat VERSION)" >> "$GITHUB_OUTPUT"
+  - run: echo "read ${IMPORT_TODO:?not imported, steps.read.outputs.tag}"
+- name: publish
+  docker_image: docker.io/library/ubuntu:24.04
+  depends_on:
+  - version
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        jobs.publish.steps[0]: `needs.version.outputs.tag` in the script has nothing to stand for it here: the step stops where it is read
+      DAGRON_IMPORT
+      exit 1
+  - run: echo "publishing ${IMPORT_TODO:?not imported, needs.version.outputs.tag}"

@@ -1,0 +1,39 @@
+// Steps inside other steps.
+pipeline {
+    agent { docker { image 'node:22-bookworm-slim' } }
+    stages {
+        stage('Frontend') {
+            steps {
+                dir('web') {
+                    withEnv(['NODE_ENV=production', "BUILD_DIR=${env.WORKSPACE}/dist"]) {
+                        timeout(time: 10, unit: 'MINUTES') {
+                            sh 'npm ci && npm run build'
+                        }
+                    }
+                }
+                retry(3) {
+                    sh 'npm run flaky-test'
+                }
+                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                    sh 'npm audit'
+                }
+            }
+        }
+        stage('Groovy') {
+            steps {
+                script {
+                    sh 'echo only steps here'
+                    echo 'and a message'
+                }
+                script {
+                    def version = readFile('VERSION').trim()
+                    currentBuild.displayName = version
+                }
+                sleep time: 5, unit: 'SECONDS'
+                writeFile file: 'out.txt', text: 'done'
+                echo "Built ${env.BRANCH_NAME}"
+                error 'stop here'
+            }
+        }
+    }
+}

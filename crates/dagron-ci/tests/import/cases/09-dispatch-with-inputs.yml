@@ -1,0 +1,26 @@
+# A deploy that someone asks for, with inputs of several kinds.
+name: Deploy
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Where to deploy
+        type: choice
+        options: [dev, staging, production]
+        default: dev
+        required: true
+      dry-run:
+        description: Say what would be done, and do nothing
+        type: boolean
+        default: true
+      version:
+        required: true
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      TARGET: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./deploy.sh "${{ inputs.version }}" --dry-run="${{ inputs.dry-run }}"
+      - run: echo "deployed $TARGET by ${{ github.actor }}"

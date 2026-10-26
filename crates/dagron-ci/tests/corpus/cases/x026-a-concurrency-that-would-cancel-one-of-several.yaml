@@ -1,0 +1,12 @@
+shows: A newer run takes the place of one run, so a concurrency that cancels beside a cap of several is refused
+event: { kind: pull_request, pr: 9, ref: refs/pull/9/head }
+source: |
+  name: ci
+  on:
+    pull_request: {}
+  concurrency: { key: "{{ ci_group }}", cancel_superseded: true }
+  max_active_runs: 2
+  tasks:
+    - name: test
+      steps:
+        - run: make test

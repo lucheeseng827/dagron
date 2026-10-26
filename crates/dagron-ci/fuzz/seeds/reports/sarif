@@ -1,0 +1,6 @@
+{"version": "2.1.0", "runs": [{"tool": {"driver": {"name": "lint"}}, "results": [
+  {"ruleId": "no-square", "level": "warning", "message": {"text": "a widget is not square"},
+   "locations": [{"physicalLocation": {"artifactLocation": {"uri": "src/lib.rs"}, "region": {"startLine": 1, "endLine": 2}}}]},
+  {"ruleId": "outside", "level": "error", "message": {"text": "not in the repository"},
+   "locations": [{"physicalLocation": {"artifactLocation": {"uri": "../../etc/passwd"}, "region": {"startLine": 1}}}]}
+]}]}

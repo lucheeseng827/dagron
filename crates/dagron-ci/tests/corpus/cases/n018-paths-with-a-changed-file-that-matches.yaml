@@ -1,0 +1,10 @@
+shows: A paths filter runs the pipeline when one changed file matches it
+event: { kind: push, ref: refs/heads/main, changed: [docs/guide.md, src/lib.rs] }
+source: |
+  name: ci
+  on:
+    push: { branches: [main], paths: ["src/**"] }
+  tasks:
+    - name: build
+      steps:
+        - run: make

@@ -1,0 +1,12 @@
+shows: A step that uses an image is handed to the step runner, which has the engine run it beside the job; it is no action to fetch
+front: github
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on: push
+  jobs:
+    build:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: docker://docker.io/library/node:22
+          with:
+            args: npm test

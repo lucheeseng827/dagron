@@ -1,0 +1,378 @@
+{{- if .Values.ci.enabled }}
+{{- $ci := .Values.ci }}
+{{- $name := printf "%s-ci" (include "dagron.fullname" .) }}
+{{- /* Where it runs: a container in the engine's pod (engine.yaml), or the
+       Deployment below. Its container and its volumes are the same in both
+       (_ci.tpl), and so is what is refused here. */}}
+{{- $placement := include "dagron.ci.placement" . }}
+{{- /* What dagron-ci itself refuses to start on is refused here, at render
+       time, rather than by a pod that restarts for ever. */}}
+{{- if and $ci.githubApp.id (not $ci.githubApp.keySecret.name) }}{{ fail "ci.githubApp.id needs ci.githubApp.keySecret.name, the Secret holding the App's private key" }}{{- end }}
+{{- if and $ci.githubApp.keySecret.name (not $ci.githubApp.id) }}{{ fail "ci.githubApp.keySecret.name needs ci.githubApp.id" }}{{- end }}
+{{- /* Where runs go. dagron-ci sends its token for dagron-api to a cell, and
+       the credential of each caller of its run API, so it takes a cell over
+       TLS, or on its own machine, and starts on no other. This chart's
+       dagron-api Service serves no TLS, so no cell is made up here: one is
+       named, at an address something terminates TLS for. */}}
+{{- $cells := $ci.cells }}
+{{- if and $ci.apiTokenSecret.name (not $cells) }}{{ fail "ci.apiTokenSecret.name is set and ci.cells is not: name the dagron-api that runs go to, as name=https://host. dagron-ci takes no cell over plain http, and this chart's dagron-api Service serves no TLS: name what terminates TLS before it (the ingress host, with ingress.tls.enabled)" }}{{- end }}
+{{- if and $cells (not $ci.apiTokenSecret.name) }}{{ fail "ci.cells needs ci.apiTokenSecret.name: dagron-api takes no run without a token" }}{{- end }}
+{{- /* Each cell's URL is read as dagron-ci reads it, part by part: what
+       this takes dagron-ci starts on, and what this refuses it would refuse.
+       A prefix would take http://localhost:80@elsewhere, whose host is
+       elsewhere. */}}
+{{- $named := dict }}
+{{- range (splitList "," $cells) }}
+{{- $pair := trim . }}
+{{- if $pair }}
+{{- $name := trim (regexFind "^[^=]*" $pair) }}
+{{- $url := urlParse (trim (regexReplaceAll "^[^=]*=" $pair "")) }}
+{{- $host := lower $url.hostname }}
+{{- $here := or (eq $host "localhost") (eq $host "::1") (regexMatch `^127\.[0-9]+\.[0-9]+\.[0-9]+$` $host) }}
+{{- $taken := or (eq $url.scheme "https") (and (eq $url.scheme "http") $here) }}
+{{- if hasKey $named $name }}{{ fail (printf "ci.cells names the cell %q twice" $name) }}{{- end }}
+{{- $_ := set $named $name true }}
+{{- if not (and (contains "=" $pair) (regexMatch "^[A-Za-z0-9._-]{1,64}$" $name) $host $taken) }}{{ fail (printf "ci.cells: %q is not name=https://host. dagron-ci starts on no cell over plain http, unless it is on its own machine (a sidecar): its token for dagron-api is sent there" $pair) }}{{- end }}
+{{- end }}
+{{- end }}
+{{- /* The one checkout secret answers for every cell. With two cells an
+       engine of either could ask for the credential of the other's run, and
+       dagron-ci does not start on it. */}}
+{{- if and $ci.checkoutTokenSecret.name (gt (len $named) 1) }}{{ fail "ci.checkoutTokenSecret is one secret, which answers for every cell, and ci.cells names more than one: an engine of one cell could ask for the credential of another's run, and dagron-ci does not start so. Each cell takes a secret of its own (CI_CHECKOUT_TOKEN_SECRETS_DIR: a directory with a file a cell), which this chart does not mount yet" }}{{- end }}
+{{- /* The same secret by another road: set as a variable, it would render,
+       and dagron-ci would not start on it. */}}
+{{- range $ci.extraEnv }}
+{{- if eq (toString .name) "CI_CELLS" }}{{ fail "ci.extraEnv sets CI_CELLS: name the cells in ci.cells, which this chart checks as dagron-ci would, and which that variable would be set over" }}{{- end }}
+{{- if and (eq (toString .name) "CI_CHECKOUT_TOKEN_SECRET_FILE") (gt (len $named) 1) }}{{ fail "ci.extraEnv sets CI_CHECKOUT_TOKEN_SECRET_FILE, one secret that answers for every cell, and ci.cells names more than one: dagron-ci does not start so. Each cell takes a secret of its own (CI_CHECKOUT_TOKEN_SECRETS_DIR: a directory with a file a cell)" }}{{- end }}
+{{- end }}
+{{- /* Fleet mode's label map (ci.fleet.labels), which the chart writes to a
+       file for dagron-ci. dagron-ci starts on no fleet it has nowhere to
+       start a runner for, and on none without the App that registers each
+       runner. It hears of a job by its delivery alone, and every replica
+       this chart runs is set alike: with no webhook secret none of them
+       would take one, and a job would wait for a runner that never comes. */}}
+{{- $labels := $ci.fleet.labels }}
+{{- if $labels }}
+{{- if not (and $cells $ci.apiTokenSecret.name) }}{{ fail "ci.fleet.labels needs ci.cells and ci.apiTokenSecret.name: a cell to start each runner in, and dagron-ci's token for it" }}{{- end }}
+{{- if not $ci.githubApp.id }}{{ fail "ci.fleet.labels needs ci.githubApp (its id and its keySecret.name): the App registers each runner" }}{{- end }}
+{{- if not $ci.webhookSecret.name }}{{ fail "ci.fleet.labels needs ci.webhookSecret.name: a job is heard of by its delivery alone, and with no webhook secret no delivery is taken" }}{{- end }}
+{{- range $ci.extraEnv }}
+{{- if eq (toString .name) "CI_GITHUB_FLEET_FILE" }}{{ fail "ci.extraEnv sets CI_GITHUB_FLEET_FILE, and ci.fleet.labels names the map too: the chart writes that map to a file and names it to dagron-ci, which the variable would be set over. Keep one" }}{{- end }}
+{{- end }}
+{{- /* The map itself, read as dagron-ci reads the file (its fleet.rs): what
+       it would not start on is refused here. A label's name is a runner
+       label of GitHub's, and none that GitHub gives every runner. */}}
+{{- if not (kindIs "map" $labels) }}{{ fail "ci.fleet.labels is a map: each label a job's runs-on may ask for, with the image its runner is run from" }}{{- end }}
+{{- if gt (len $labels) 64 }}{{ fail (printf "ci.fleet.labels names %d labels, and a fleet takes 64" (len $labels)) }}{{- end }}
+{{- $isLabel := "^[A-Za-z0-9._-]{1,64}$" }}
+{{- $classes := dict }}
+{{- range $label, $class := $labels }}
+{{- $at := printf "ci.fleet.labels.%s" $label }}
+{{- $lower := lower $label }}
+{{- if not (regexMatch $isLabel $label) }}{{ fail (printf "%s: a label is letters, digits, '-', '_' and '.', at most 64" $at) }}{{- end }}
+{{- if has $lower (list "self-hosted" "linux" "windows" "macos" "x64" "arm" "arm64") }}{{ fail (printf "%s: is a label GitHub gives every such runner, and a job that asks for it alone is not this fleet's to take: name a label of your own" $at) }}{{- end }}
+{{- if hasKey $classes $lower }}{{ fail (printf "%s: is named twice, in two cases, and GitHub takes them for one label" $at) }}{{- end }}
+{{- if not (kindIs "map" $class) }}{{ fail (printf "%s: is a map, with the image its runner is run from" $at) }}{{- end }}
+{{- range $key, $_ := $class }}
+{{- if not (has $key (list "image" "with" "runner_class" "pool" "priority" "timeout_secs" "command" "scope" "runner_group" "max_runners" "max_per_repository" "untrusted" "untrusted_runner_class" "docker" "retry" "warm" "warm_for_secs")) }}{{ fail (printf "%s.%s: is no key of a label's, which takes image, with, runner_class, pool, priority, timeout_secs, command, scope, runner_group, max_runners, max_per_repository, untrusted, untrusted_runner_class, docker, retry, warm and warm_for_secs" $at $key) }}{{- end }}
+{{- end }}
+{{- if not (and (kindIs "string" $class.image) (regexMatch `^\S+$` (toString $class.image))) }}{{ fail (printf "%s.image: is the image the runner is run from" $at) }}{{- end }}
+{{- if hasKey $class "timeout_secs" }}
+{{- $t := $class.timeout_secs }}
+{{- if not (and (has (kindOf $t) (list "int" "int64" "float64")) (eq (float64 (int64 $t)) (float64 $t)) (ge (int64 $t) 60) (le (int64 $t) 432000)) }}{{ fail (printf "%s.timeout_secs: is a whole number of seconds from 60 to 432000, which is five days, and not %#v" $at $t) }}{{- end }}
+{{- end }}
+{{- if and (hasKey $class "priority") (not (kindIs "invalid" $class.priority)) }}
+{{- $p := $class.priority }}
+{{- if not (and (has (kindOf $p) (list "int" "int64" "float64")) (eq (float64 (int64 $p)) (float64 $p))) }}{{ fail (printf "%s.priority: is a whole number, and not %#v" $at $p) }}{{- end }}
+{{- end }}
+{{- range $what := list "runner_class" "pool" "untrusted_runner_class" }}
+{{- $v := index $class $what }}
+{{- if and (hasKey $class $what) (not (kindIs "invalid" $v)) }}
+{{- if not (and (kindIs "string" $v) (regexMatch $isLabel (toString $v))) }}{{ fail (printf "%s.%s: is a name of letters, digits, '-', '_' and '.'" $at $what) }}{{- end }}
+{{- end }}
+{{- end }}
+{{- if and (hasKey $class "command") (not (kindIs "invalid" $class.command)) }}
+{{- $command := $class.command }}
+{{- if not (and (kindIs "slice" $command) $command) }}{{ fail (printf "%s.command: is what the runner is started with, a list of words, and has a first word" $at) }}{{- end }}
+{{- range $command }}
+{{- if not (kindIs "string" .) }}{{ fail (printf "%s.command: each of its words is a string, and %v is not" $at .) }}{{- end }}
+{{- end }}
+{{- if not (first $command) }}{{ fail (printf "%s.command: is what the runner is started with, a list of words, and has a first word" $at) }}{{- end }}
+{{- end }}
+{{- /* Where its runners are registered, how many may be out, what a
+       fork's job is given, and a Docker daemon beside the runner. */}}
+{{- $scope := "repository" }}
+{{- if hasKey $class "scope" }}
+{{- if not (and (kindIs "string" $class.scope) (has $class.scope (list "repository" "organization"))) }}{{ fail (printf "%s.scope: is repository or organization, and not %#v" $at $class.scope) }}{{- end }}
+{{- $scope = $class.scope }}
+{{- end }}
+{{- if and (hasKey $class "runner_group") (not (kindIs "invalid" $class.runner_group)) }}
+{{- $g := $class.runner_group }}
+{{- if ne $scope "organization" }}{{ fail (printf "%s.runner_group: is an organization's, and a repository's runner has none: say scope: organization" $at) }}{{- end }}
+{{- if not (and (has (kindOf $g) (list "int" "int64" "float64")) (eq (float64 (int64 $g)) (float64 $g)) (ge (int64 $g) 1)) }}{{ fail (printf "%s.runner_group: is GitHub's id for a group, a whole number from 1, and not %#v" $at $g) }}{{- end }}
+{{- end }}
+{{- $most := dict }}
+{{- range $what := list "max_runners" "max_per_repository" }}
+{{- $n := index $class $what }}
+{{- if and (hasKey $class $what) (not (kindIs "invalid" $n)) }}
+{{- if not (and (has (kindOf $n) (list "int" "int64" "float64")) (eq (float64 (int64 $n)) (float64 $n)) (ge (int64 $n) 1) (le (int64 $n) 10000)) }}{{ fail (printf "%s.%s: is a whole number from 1 to 10000, and not %#v" $at $what $n) }}{{- end }}
+{{- $_ := set $most $what (int64 $n) }}
+{{- end }}
+{{- end }}
+{{- if and (hasKey $most "max_runners") (hasKey $most "max_per_repository") (gt $most.max_per_repository $most.max_runners) }}{{ fail (printf "%s.max_per_repository: is more than max_runners lets out for every repository together" $at) }}{{- end }}
+{{- $untrusted := "refuse" }}
+{{- if hasKey $class "untrusted" }}
+{{- if not (and (kindIs "string" $class.untrusted) (has $class.untrusted (list "refuse" "floor" "serve"))) }}{{ fail (printf "%s.untrusted: is refuse, floor or serve, and not %#v" $at $class.untrusted) }}{{- end }}
+{{- $untrusted = $class.untrusted }}
+{{- end }}
+{{- if and (hasKey $class "untrusted_runner_class") (not (kindIs "invalid" $class.untrusted_runner_class)) (ne $untrusted "floor") }}{{ fail (printf "%s.untrusted_runner_class: is the runner class of a fork's job's runner, which is started only with untrusted: floor" $at) }}{{- end }}
+{{- $warm := 0 }}
+{{- if hasKey $class "warm" }}
+{{- $w := $class.warm }}
+{{- if not (and (has (kindOf $w) (list "int" "int64" "float64")) (eq (float64 (int64 $w)) (float64 $w)) (ge (int64 $w) 0) (le (int64 $w) 64)) }}{{ fail (printf "%s.warm: is a whole number from 0 to 64, and not %#v" $at $w) }}{{- end }}
+{{- $warm = int64 $w }}
+{{- end }}
+{{- if and (hasKey $class "warm_for_secs") (not (kindIs "invalid" $class.warm_for_secs)) }}
+{{- $f := $class.warm_for_secs }}
+{{- if eq $warm 0 }}{{ fail (printf "%s.warm_for_secs: is how long runners are kept warm, and warm keeps none" $at) }}{{- end }}
+{{- if not (and (has (kindOf $f) (list "int" "int64" "float64")) (eq (float64 (int64 $f)) (float64 $f)) (ge (int64 $f) 60) (le (int64 $f) 604800)) }}{{ fail (printf "%s.warm_for_secs: is a whole number of seconds from 60 to 604800, which is a week, and not %#v" $at $f) }}{{- end }}
+{{- end }}
+{{- /* A warm runner is a trusted run waiting idle, which GitHub would give a
+       fork's job. */}}
+{{- if and (gt $warm 0) (ne $untrusted "serve") (or (not (hasKey $class "runner_group")) (kindIs "invalid" $class.runner_group)) }}{{ fail (printf "%s.warm: keeps trusted runners idle, which the forge would give a fork's job: say untrusted: serve, or name a runner_group restricted to selected workflows, which is given no pull request's job" $at) }}{{- end }}
+{{- range $what := list "docker" "retry" }}
+{{- if and (hasKey $class $what) (not (kindIs "bool" (index $class $what))) }}{{ fail (printf "%s.%s: is true or false, and not %#v" $at $what (index $class $what)) }}{{- end }}
+{{- end }}
+{{- /* The labels a job may name beside this one: GitHub's own three unless
+       the label says. */}}
+{{- $with := list "self-hosted" "linux" "x64" }}
+{{- if hasKey $class "with" }}
+{{- if not (kindIs "slice" $class.with) }}{{ fail (printf "%s.with: is a list of the labels a job may name beside this one" $at) }}{{- end }}
+{{- $with = list }}
+{{- range $class.with }}
+{{- if not (and (kindIs "string" .) (regexMatch $isLabel (toString .))) }}{{ fail (printf "%s.with: %v is not a label" $at .) }}{{- end }}
+{{- $with = append $with (lower .) }}
+{{- end }}
+{{- end }}
+{{- if has $lower $with }}{{ fail (printf "%s.with: names the label itself" $at) }}{{- end }}
+{{- $_ := set $classes $lower $with }}
+{{- end }}
+{{- /* A label one goes with is not another's name: a job that asked for both
+       would be either's. */}}
+{{- range $label, $with := $classes }}
+{{- range $with }}
+{{- if hasKey $classes . }}{{ fail (printf "ci.fleet.labels.%s.with: %q is a label of this map's own" $label .) }}{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- /* In the engine's pod it has the engine's replicas and the engine's place
+       on a node, and shares the engine's address: a setting of its own for
+       any of them would be set and not used. */}}
+{{- if eq $placement "engine" }}
+{{- if ne (int $ci.replicas) 1 }}{{ fail "ci.replicas is set, and dagron-ci runs in the engine's pod (ci.placement: engine), where it has the engine's replicas: set engine.replicas, or give dagron-ci a Deployment of its own (ci.placement: deployment)" }}{{- end }}
+{{- range $knob := list "nodeSelector" "tolerations" "affinity" "priorityClassName" }}
+{{- if index $ci $knob }}{{ fail (printf "ci.%s is set, and dagron-ci runs in the engine's pod (ci.placement: engine), where the engine's applies: set engine.%s, or give dagron-ci a Deployment of its own (ci.placement: deployment)" $knob $knob) }}{{- end }}
+{{- end }}
+{{- if eq (int $ci.port) (int .Values.engine.port) }}{{ fail (printf "ci.port and engine.port are both %d, and dagron-ci runs in the engine's pod (ci.placement: engine), where the two share one address" (int $ci.port)) }}{{- end }}
+{{- /* With a checkout secret named, the chart tells the engine where to ask
+       for a checkout's credential. Named again in engine.extraEnv, the
+       engine would be given two, and take the last. */}}
+{{- if $ci.checkoutTokenSecret.name }}
+{{- range .Values.engine.extraEnv }}
+{{- if has (toString .name) (list "DAGRON_CHECKOUT_TOKEN_URL" "DAGRON_CHECKOUT_TOKEN_SECRET_FILE") }}{{ fail (printf "engine.extraEnv sets %s, and the chart sets it too: with dagron-ci in the engine's pod (ci.placement: engine) and ci.checkoutTokenSecret named, the engine asks dagron-ci at the pod's own address. Take it out of engine.extraEnv, or leave ci.checkoutTokenSecret unnamed to ask a token service of your own" .name) }}{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+# dagron-ci — the CI service: it takes a forge's events (a GitHub webhook, a
+# poll sweep, a dispatch through its run API), turns each into runs in
+# dagron-api, and reports them back as commit statuses.
+#
+# OFF BY DEFAULT. It keeps its queue in the release's database, in a schema of
+# its own, and is ready once that database answers: its probes ask /readyz.
+# Everything else it does waits on a setting (values.yaml, `ci`).
+#
+# This Deployment is where it runs with `ci.placement: deployment`. By default
+# it is a container in the engine's pod instead (engine.yaml), and only its
+# Service is made here.
+{{- if eq $placement "deployment" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "dagron.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dagron-ci
+spec:
+  replicas: {{ $ci.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: dagron-ci
+  template:
+    metadata:
+      {{- with (include "dagron.ci.podAnnotations" . | trim) }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "dagron.labels" . | nindent 8 }}
+        app.kubernetes.io/component: dagron-ci
+    spec:
+      # It asks the cluster for nothing: its work is the forge, dagron-api and
+      # its database.
+      automountServiceAccountToken: false
+      # The uid the image defines (crates/dagron-ci/Dockerfile: distroless
+      # nonroot), or on OpenShift the one its SCC gives. The mounted Secret
+      # files are readable by the pod's group either way.
+      securityContext:
+        {{- include "dagron.podSecurityContext" (dict "root" $ "uid" 65532 "fsGroup" true) | nindent 8 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $ci.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $ci.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $ci.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $ci.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      containers:
+        {{- include "dagron.ci.container" . | nindent 8 }}
+      {{- with (include "dagron.ci.volumes" . | trim) }}
+      volumes:
+        {{- . | nindent 8 }}
+      {{- end }}
+---
+{{- end }}
+{{- with (include "dagron.ci.fleetFile" .) }}
+# Fleet mode's label map (values.yaml, ci.fleet.labels): each label a job of
+# GitHub Actions' own may ask for in `runs-on`, and what its runner is run
+# with. dagron-ci's container mounts it and reads it as it starts, in either
+# place it runs; its pod is annotated with this file's checksum, so that a
+# map that changed starts it again.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-fleet
+  labels:
+    {{- include "dagron.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: dagron-ci
+data:
+  fleet.json: |
+    {{- . | nindent 4 }}
+---
+{{- end }}
+{{- with $ci.fleet.prepull }}
+{{- if .enabled }}
+{{- /* Each label's image, pulled onto each node a runner may be started on
+       before one is: an init container a label, which runs the image's
+       `true` and is done, and then a pause. The image is kept by the node,
+       so that a runner of the label starts without the pull. */}}
+{{- $images := list }}
+{{- range $label, $class := $ci.fleet.labels }}
+{{- $images = append $images (toString $class.image) }}
+{{- end }}
+{{- range .images }}
+{{- $images = append $images (toString .) }}
+{{- end }}
+{{- $images = uniq $images }}
+{{- if not $images }}{{ fail "ci.fleet.prepull.enabled is set, and there is no image to pull: ci.fleet.labels names none, nor does ci.fleet.prepull.images" }}{{- end }}
+{{- range $images }}
+{{- if not (regexMatch `^\S+$` .) }}{{ fail (printf "ci.fleet.prepull.images: %q is not an image" .) }}{{- end }}
+{{- end }}
+# Fleet mode's warm capacity (values.yaml, ci.fleet.prepull): each label's
+# runner image, pulled onto each node a runner may be started on before one
+# is, and kept there.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ $name }}-fleet-prepull
+  labels:
+    {{- include "dagron.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: dagron-ci-fleet-prepull
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: dagron-ci-fleet-prepull
+  template:
+    metadata:
+      labels:
+        {{- include "dagron.labels" $ | nindent 8 }}
+        app.kubernetes.io/component: dagron-ci-fleet-prepull
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        seccompProfile: {type: RuntimeDefault}
+      {{- with .nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        {{- /* As the label map names them: the engine pulls a runner's
+               image by that name, which global.imageRegistry does not
+               move. */}}
+        {{- range $i, $image := $images }}
+        - name: pull-{{ $i }}
+          image: {{ $image | quote }}
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "true"]
+          resources:
+            requests: {cpu: 1m, memory: 8Mi}
+            limits: {memory: 64Mi}
+          # As the image's own user, which a runner image may make root.
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+        {{- end }}
+      containers:
+        - name: pause
+          image: {{ include "dagron.image" (dict "image" .pauseImage "root" $) }}
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests: {cpu: 1m, memory: 4Mi}
+            limits: {memory: 16Mi}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65535
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+---
+{{- end }}
+{{- end }}
+# The webhook receiver, the run API and the checkout credentials an engine
+# asks for, in the cluster. A forge's webhook reaches it from outside through
+# the ingress (ingress.yaml routes /hooks/github here), or one of your own.
+# With dagron-ci in the engine's pod, it is the engine's pods this selects.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "dagron.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dagron-ci
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: {{ ternary "engine" "dagron-ci" (eq $placement "engine") }}
+  ports:
+    - port: {{ $ci.port }}
+      targetPort: http
+      name: http
+{{- end }}

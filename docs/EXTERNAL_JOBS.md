@@ -339,6 +339,15 @@ reason: deleting it would drop the only record of a job running on someone's
 cluster. The debt settles itself within the give-up window, so collection is
 deferred by that and no longer.
 
+**A run that still owes a teardown is not rerun whole either** (`{"from":
+"all"}` on `POST /api/runs/{id}/rerun` and the engine's `POST
+/runs/{id}/rerun`). A cancel ends a run whose only live task is a parked job
+at once, with the job still running, and the rerun would reset the task's
+handle with the rest of its result: the sweep would never reach the job, and
+no orphan would be counted for it. So the rerun answers `409`, with nothing
+written, and goes ahead once the engine has torn the job down or given up on
+it.
+
 An engine with no poller for a kind hands the row back **without** consuming an
 attempt — a `RUNNER_CLASSES` pool runs the same binary with different seams, so
 the replica that cannot do the work must not spend the budget of the one that

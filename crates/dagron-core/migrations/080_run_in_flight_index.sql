@@ -1,0 +1,35 @@
+-- The running runs of a concurrency key, for the reads by `status =
+-- 'running'` that every run was scanned for: the run cap's count
+-- (db::sqlite::RUNS_IN_FLIGHT, at each create_run of a capped workflow),
+-- supersede's read of the runs a new one takes the place of
+-- (SUPERSEDED_RUNS), and the count of active runs (ACTIVE_RUNS_COUNT, the
+-- MAX_INFLIGHT_RUNS gate of each POST /runs where it is set). On a file of
+-- the enterprise build its own index of (status, created_at) served them;
+-- on OSS each was a scan of every run kept.
+--
+-- 076's rule: led by `status`, and partial, of the running runs alone. The
+-- cap and supersede constrain `concurrency_key IS ?`, which SQLite takes as
+-- an equality on an index's column: their loop on this index uses `status`
+-- and `concurrency_key`, a strict superset of the terms of any index of
+-- `status` alone (the enterprise build's, or one added later), so it is
+-- taken whichever is the newer. `created_at` third gives supersede its order
+-- but for the last term (`id`). `definition_id` is not a key: the definition
+-- is read by its name, inner to the run, so a key of it would not be used.
+--
+-- The count of active runs uses `status` alone here, and ties with any
+-- index of `status` alone whose WHERE it carries (on the enterprise build,
+-- its own): either is a read of the running runs, the same rows.
+--
+-- What else it takes, on OSS, from a scan of every run: the reclass near a
+-- deadline's read of running runs, the drift mark, and the runs listed by
+-- `status = 'running'`; on the enterprise build the same, by a tie with its
+-- own index, where it is the newer. It takes none of the plans 078 and 079
+-- made, and no read of the live index (a list of two statuses does not
+-- carry its WHERE). The plan tests in db/sqlite.rs (sweep_plan_tests:
+-- in_flight_reads_plan_on_their_index, run_plans_hold_against_new_indexes,
+-- what_080_moves) hold this on both builds and in both orders.
+--
+-- Postgres has statistics to plan these reads by, and its own 048
+-- (status, created_at) and 063 (the running runs' keys); it gets no twin.
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_in_flight
+    ON workflow_runs (status, concurrency_key, created_at) WHERE status = 'running';

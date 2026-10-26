@@ -1,0 +1,3 @@
+not a pipeline:
+  jobs.build.steps[0].uses: uses octo/hello, which is not among the actions this dagron-ci allows (CI_ACTIONS_ALLOW)
+  jobs.build.steps[1].uses: uses acme/lint@main: where the actions that may be used are listed (CI_ACTIONS_ALLOW), each is pinned to a commit's full id, which no one can move

@@ -1,0 +1,1 @@
+{"action":"rerequested","check_run":{"id":1,"name":"dagron-ci/ci/build (push)","head_sha":"4b4708e725f29891d22b4c96af9f0a403ff51c7c","external_id":"0d9c4f2e-58a1-4a67-9d3b-2f1e6c7a8b90","app":{"id":7}},"repository":{"id":7,"full_name":"acme/widgets","html_url":"https://github.com/acme/widgets"},"sender":{"login":"octo","type":"User"}}

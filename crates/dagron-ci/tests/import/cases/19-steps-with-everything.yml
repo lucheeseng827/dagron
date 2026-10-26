@@ -1,0 +1,21 @@
+# A step with each of the keys a workflow's step may have.
+name: steps
+on: push
+jobs:
+  all:
+    name: Every key
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Slow, and allowed to fail
+        id: slow
+        run: make slow
+        timeout-minutes: 2.5
+        continue-on-error: true
+        shell: bash
+        working-directory: tools
+      - name: In Python
+        shell: python
+        run: print("hello")
+      - run: make report
+        if: always()

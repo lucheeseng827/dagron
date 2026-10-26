@@ -1,0 +1,104 @@
+runs
+
+parameters:
+  ci_base_ref: ""
+  ci_base_sha: ""
+  ci_event: "push"
+  ci_forge_host: "github.com"
+  ci_group: "refs/heads/main"
+  ci_pr: ""
+  ci_ref: "refs/heads/main"
+  ci_repo: "acme/widgets"
+  ci_sha: "4b4708e725f29891d22b4c96af9f0a403ff51c7c"
+  ci_trust: "trusted"
+
+workflow:
+name: ci
+parameters:
+  ci_event: ''
+  ci_ref: ''
+  ci_sha: ''
+  ci_base_sha: ''
+  ci_base_ref: ''
+  ci_pr: ''
+  ci_repo: ''
+  ci_forge_host: ''
+  ci_group: ''
+  ci_trust: ''
+  ci_braces: '{{'
+tags:
+- ci
+task_defaults:
+  timeout_secs: 3600
+  env:
+  - name: CI_EVENT
+    value: '{{ ci_event }}'
+  - name: CI_REF
+    value: '{{ ci_ref }}'
+  - name: CI_SHA
+    value: '{{ ci_sha }}'
+  - name: CI_BASE_SHA
+    value: '{{ ci_base_sha }}'
+  - name: CI_BASE_REF
+    value: '{{ ci_base_ref }}'
+  - name: CI_PR
+    value: '{{ ci_pr }}'
+  - name: CI_REPO
+    value: '{{ ci_repo }}'
+  - name: CI_FORGE_HOST
+    value: '{{ ci_forge_host }}'
+  - name: CI_GROUP
+    value: '{{ ci_group }}'
+  - name: CI_TRUST
+    value: '{{ ci_trust }}'
+tasks:
+- name: build
+  docker_image: docker.io/library/ubuntu:24.04
+  command:
+  - sh
+  - -c
+  - |
+    # dagron-ci: this task's steps, run by dagron-ci-exec (step protocol 4), at
+    # /dagron/bin or on PATH. They name what a shell alone cannot run for them.
+    for ci_exec in /dagron/bin/dagron-ci-exec "$(command -v dagron-ci-exec 2>/dev/null)"; do
+      if [ -x "$ci_exec" ] && "$ci_exec" --speaks 4 >/dev/null 2>&1; then
+        exec "$ci_exec"
+      fi
+    done
+    printf '%s\n' "::dagron-ci::error::this job's steps need dagron-ci-exec (step protocol 4), and none is at /dagron/bin or on PATH: the engine installs it where its operator set DAGRON_CI_EXEC_IMAGE" >&2
+    exit 125
+  workspace:
+    actions:
+    - path: actions/setup-node/v4
+      ref: v4
+      repository: https://github.com/actions/setup-node.git
+    checkout:
+      commit: '{{ ci_sha }}'
+      repository: https://{{ ci_forge_host }}/{{ ci_repo }}.git
+    tools:
+    - node
+  env:
+  - name: CI_CONTEXT
+    value: '{"env":{},"github":{"actor":"","api_url":"https://api.github.com","base_ref":"","event":{"after":"4b4708e725f29891d22b4c96af9f0a403ff51c7c","before":"0000000000000000000000000000000000000000","repository":{"full_name":"acme/widgets"}},"event_name":"push","graphql_url":"https://api.github.com/graphql","head_ref":"","job":"build","ref":"refs/heads/main","ref_name":"main","ref_type":"branch","repository":"acme/widgets","repository_owner":"acme","run_attempt":"1","run_id":"","run_number":"","server_url":"https://github.com","sha":"4b4708e725f29891d22b4c96af9f0a403ff51c7c","triggering_actor":"","workflow":"ci"},"inputs":{},"matrix":{},"strategy":{"fail-fast":true,"job-index":0,"job-total":1}}'
+  - name: CI_STEP_PROTOCOL
+    value: '4'
+  - name: CI_STEP_COUNT
+    value: '2'
+  - name: CI_STEP_1_NAME
+    value: Run actions/setup-node@v4
+  - name: CI_STEP_1_RUN
+    value: ''
+  - name: CI_STEP_1_USES
+    value: actions/setup-node@v4
+  - name: CI_STEP_1_WITH_1_NAME
+    value: node-version
+  - name: CI_STEP_1_WITH_1_VALUE
+    value: '22'
+  - name: CI_STEP_2_NAME
+    value: npm test
+  - name: CI_STEP_2_RUN
+    value: npm test
+  - name: CI_STEP_2_SHELL
+    value: auto
+  - name: DAGRON_ACTIONS_CACHE_RESTORE_FROM
+    value: '{{ ci_base_ref }}'

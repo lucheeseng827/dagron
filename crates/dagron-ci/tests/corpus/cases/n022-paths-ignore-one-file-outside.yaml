@@ -1,0 +1,10 @@
+shows: One changed file outside what paths_ignore names is enough to run the pipeline
+event: { kind: push, ref: refs/heads/main, changed: [docs/guide.md, src/main.rs] }
+source: |
+  name: ci
+  on:
+    push: { paths_ignore: ["docs/**"] }
+  tasks:
+    - name: build
+      steps:
+        - run: make

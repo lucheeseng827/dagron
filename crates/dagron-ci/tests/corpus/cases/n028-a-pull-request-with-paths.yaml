@@ -1,0 +1,10 @@
+shows: A pull request's paths filter reads the files the pull request changed
+event: { kind: pull_request, changed: [src/widget.rs] }
+source: |
+  name: ci
+  on:
+    pull_request: { paths: ["src/**"] }
+  tasks:
+    - name: test
+      steps:
+        - run: make test

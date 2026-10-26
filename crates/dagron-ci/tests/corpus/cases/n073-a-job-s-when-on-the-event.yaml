@@ -1,0 +1,15 @@
+shows: A job's when may name what kind of event runs it, and passes through to dagron
+event: { kind: tag }
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: build
+      steps:
+        - run: make
+    - name: publish
+      depends_on: [build]
+      when: "{{ ci_event }} == tag"
+      steps:
+        - run: make publish

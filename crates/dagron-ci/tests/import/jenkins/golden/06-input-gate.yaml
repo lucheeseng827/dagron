@@ -1,0 +1,53 @@
+# Imported from a Jenkinsfile by dagron-import.
+#
+# To do by hand (1):
+#   stage('Release').input.submitter: who may answer is named here by an email, or `group:<name>` (approvers): write the gate's approvers
+#
+# Changed on the way (8):
+#   on: a multibranch pipeline's builds are each branch and tag pushed, each pull request, and a run asked for (dispatch) here: say on: where it ran for fewer
+#   stage('Release').when: its when is a test at the head of each of its steps, which end there where it is false: the job passes, where Jenkins skipped the stage
+#   stage('Release').input: the stage's input is a gate before it (type: approval), which a person approves or rejects
+#   stage('Release').input: the gate asks only where the stage's when holds, where Jenkins asked first and tested the when after (as it does unless told beforeInput true)
+#   stage('Release'): its stages start in a workspace of their own, a checkout of the event's commit, where on Jenkins they had what the stages before them left in the agent's: what they need of it is made again, or the stages are steps of one job
+#   stage('Release').steps[0]: it reads $BRANCH_NAME: each is set at the head of its script
+#   stage('Build').steps[0]: Jenkins's variables a step reads are set at its head from dagron-ci's own (CI_SHA, CI_REF, …): a program it runs that reads one the step does not is not given it
+#   stage('Release').steps[0]: $BRANCH_NAME is a branch's or a tag's name, and PR-<number> for a pull request, as a multibranch pipeline has it
+#
+# Not carried over (1):
+#   stage('Release').input.ok: a gate here asks its question and takes a yes or a no
+name: 06-input-gate
+on:
+  push: {}
+  pull_request: {}
+  dispatch: {}
+tasks:
+- name: build
+  docker_image: alpine:3.20
+  steps:
+  - name: Build
+    run: ./build.sh
+- name: approve-release
+  type: approval
+  depends_on:
+  - build
+  when: '{{ ci_group }} in [refs/heads/main, refs/tags/main]'
+  approval_message: Release this build?
+- name: release
+  docker_image: alpine:3.20
+  depends_on:
+  - build
+  - approve-release
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        stage('Release').input.submitter: who may answer is named here by an email, or `group:<name>` (approvers): write the gate's approvers
+      DAGRON_IMPORT
+      exit 1
+  - name: Release
+    run: |-
+      case "$CI_EVENT" in pull_request) export BRANCH_NAME="PR-$CI_PR" ;; *) export BRANCH_NAME="${CI_REF#refs/*/}" ;; esac
+      # when { branch 'main' }
+      { case "$BRANCH_NAME" in 'main') true ;; *) false ;; esac; } || exit 0
+      ./release.sh

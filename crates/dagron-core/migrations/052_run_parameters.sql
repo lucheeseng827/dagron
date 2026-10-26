@@ -1,0 +1,13 @@
+-- The parameters a run was created with, as a JSON object of strings: the
+-- spec's declared defaults with the caller's overrides merged over them, which
+-- is exactly the substitution scope its tasks were expanded with
+-- (`DagGraph::parameters`).
+--
+-- Templates resolved after submit read them. `notify.git`'s
+-- `sha: "{{ commit_sha }}"` is resolved when the run ends, from the stored YAML,
+-- whose `parameters:` block holds only the defaults; without this column a SHA
+-- passed at submit never reached the commit status.
+--
+-- NULL for runs created before this column existed: their templates resolve
+-- against the spec's defaults, as they always did.
+ALTER TABLE workflow_runs ADD COLUMN parameters TEXT;

@@ -53,16 +53,27 @@ impl PlanSubmitter for ApiSubmitter {
             // planner resolved every model name and partition list before dagron
             // saw it, so there is nothing left to substitute.
             let params = BTreeMap::new();
-            crate::routes::control::submit_yaml_with_params(&state, &yaml, &yaml, &params)
-                .await
-                .map_err(|(status, message)| match status {
-                    // The spec was rejected by the validator: the caller's plan or
-                    // command template is at fault, and the status must stay 4xx
-                    // rather than becoming a 500 the caller cannot act on.
-                    StatusCode::BAD_REQUEST => SubmitError::Rejected(message),
-                    StatusCode::SERVICE_UNAVAILABLE => SubmitError::Unavailable(message),
-                    _ => SubmitError::Internal(message),
-                })
+            // A plan's submission. The component is handed the plan and not
+            // its caller, whom this gateway has authenticated by then, so the
+            // record says what submitted the run and names nobody.
+            let trigger = dagron_core::models::RunTrigger {
+                kind: dagron_core::models::trigger_kind::API.to_string(),
+                principal: "plan".to_string(),
+                source: Some("plan".to_string()),
+                ..Default::default()
+            };
+            crate::routes::control::submit_yaml_recorded(
+                &state, &yaml, &yaml, &params, None, &trigger,
+            )
+            .await
+            .map_err(|(status, message)| match status {
+                // The spec was rejected by the validator: the caller's plan or
+                // command template is at fault, and the status must stay 4xx
+                // rather than becoming a 500 the caller cannot act on.
+                StatusCode::BAD_REQUEST => SubmitError::Rejected(message),
+                StatusCode::SERVICE_UNAVAILABLE => SubmitError::Unavailable(message),
+                _ => SubmitError::Internal(message),
+            })
         }
     }
 }

@@ -1,0 +1,12 @@
+shows: A job asks for OIDC tokens a cloud trades for credentials, for the audiences it names, and holds no cloud's secret
+source: |
+  name: deploy
+  on:
+    push: { branches: [main] }
+  tasks:
+    - name: publish
+      docker_image: amazon/aws-cli:2.17.0
+      environment: production
+      identity: { oidc: { audience: sts.amazonaws.com } }
+      steps:
+        - run: aws sts get-caller-identity

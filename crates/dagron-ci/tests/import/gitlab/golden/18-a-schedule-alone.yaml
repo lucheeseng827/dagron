@@ -1,0 +1,31 @@
+# Imported from a GitLab CI pipeline by dagron-import.
+#
+# To do by hand (1):
+#   weekly-report.rules: $REPORT cannot be read before a run: the job is written to run wherever it might have, which is more than it did. Test it in the job's script, or write the job's when: for what it should run for
+#
+# Changed on the way (4):
+#   image: the pipeline's image is each job's that does not set its own
+#   workflow.rules: the pipeline runs for nothing here but a schedule pipeline, which is a run asked for here (dispatch): a schedule asks for one through the run API. What its rules say of a schedule pipeline is said of every run asked for
+#   nightly-scan.script: a job's script ran under bash where its image had bash, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   on.dispatch: a pipeline run from GitLab's page or its API is a run asked for here (dispatch), through the run API
+name: 18-a-schedule-alone
+on:
+  dispatch: {}
+tasks:
+- name: nightly-scan
+  docker_image: alpine:3.20
+  steps:
+  - name: script
+    run: ./scan.sh
+- name: weekly-report
+  docker_image: alpine:3.20
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        weekly-report.rules: $REPORT cannot be read before a run: the job is written to run wherever it might have, which is more than it did. Test it in the job's script, or write the job's when: for what it should run for
+      DAGRON_IMPORT
+      exit 1
+  - name: script
+    run: ./report.sh

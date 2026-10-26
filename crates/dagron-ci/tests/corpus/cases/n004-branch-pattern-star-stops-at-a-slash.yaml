@@ -1,0 +1,10 @@
+shows: A single star does not cross a slash, so a deeper branch is passed over
+event: { kind: push, ref: refs/heads/release/1/2 }
+source: |
+  name: ci
+  on:
+    push: { branches: ["release/*"] }
+  tasks:
+    - name: build
+      steps:
+        - run: make

@@ -1,0 +1,10 @@
+shows: A workspace's cache is a list of mappings that each name a prefix and paths, so a bare path is refused
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: build
+      workspace: { cache: [target] }
+      steps:
+        - run: make

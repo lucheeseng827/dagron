@@ -59,6 +59,8 @@ pub mod cloud;
 /// ledger + dedup) — the capture → uplink primitive for units on a metered
 /// link. Opted in via `DAGRON_ARTIFACT_TIER=1` (see [`store_from_env`]).
 pub mod tiered;
+/// Where a task's log is kept out of the scheduling database.
+pub mod log_segments;
 pub use tiered::{TieredStore, UplinkBudget};
 
 /// Sanitize one artifact path component the way every backend keys artifacts —
@@ -80,6 +82,55 @@ fn sanitize(s: &str) -> String {
         .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
         .collect()
 }
+
+/// Which way bytes go through a presigned URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transfer {
+    /// Into the store: an upload.
+    Put,
+    /// Out of it: a download.
+    Get,
+}
+
+/// A URL an artifact's bytes go to, or come from, directly: whoever holds it
+/// may make that one request until it expires, with no other credential. It
+/// is a secret for as long as it lasts.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Presigned {
+    /// `PUT` or `GET`: the one request the URL is signed for.
+    pub method: &'static str,
+    pub url: String,
+    /// Headers the request must carry for the store to take it, beyond what
+    /// any client sends. Empty for most stores; Azure Blob takes an upload
+    /// only with its blob type named.
+    pub headers: Vec<(&'static str, &'static str)>,
+}
+
+impl std::fmt::Debug for Presigned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The query carries the signature: only what comes before it is shown.
+        let shown = self.url.split('?').next().unwrap_or_default();
+        f.debug_struct("Presigned")
+            .field("method", &self.method)
+            .field("url", &shown)
+            .field("headers", &self.headers)
+            .finish()
+    }
+}
+
+/// What a store answers when asked for something it does not do: a caller
+/// tells "this store never will" from "it failed this once" by this type
+/// (`err.downcast_ref::<Unsupported>()`), and stops asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unsupported(pub &'static str);
+
+impl std::fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for Unsupported {}
 
 /// Where a run's artifacts live + how to read/write them by key.
 #[async_trait]
@@ -130,6 +181,35 @@ pub trait ArtifactStore: Send + Sync {
     /// (rotation). Default: unsupported — only the encrypting store rotates.
     async fn rotate_from(&self, _old: &dyn dagron_crypto::KeyProvider) -> Result<usize> {
         anyhow::bail!("key rotation requires an encrypted artifact store")
+    }
+
+    /// Remove what is stored under `key`. `false` when nothing was. Default:
+    /// unsupported, and an error that says so: a store that cannot delete must
+    /// not look as though it had.
+    async fn delete(&self, _key: &ArtifactKey) -> Result<bool> {
+        Err(Unsupported("this artifact store deletes nothing").into())
+    }
+
+    /// How many bytes `key` holds, as a reader of it is given them, without
+    /// reading them. `None` when nothing is stored under it. Default:
+    /// unsupported. A store that keeps an artifact in another shape than it
+    /// was given (one that encrypts it) cannot say, and does not guess.
+    async fn size(&self, _key: &ArtifactKey) -> Result<Option<u64>> {
+        Err(Unsupported("this artifact store cannot say an artifact's size without reading it").into())
+    }
+
+    /// A URL `key`'s bytes can be sent to or fetched from directly, good for
+    /// `expires_in`, so that they need not pass through this process. `None`
+    /// where the store has none to give: a directory, a store with no signing
+    /// credentials, and any store that must see the bytes itself (one that
+    /// encrypts them, one that tiers them). The caller then relays the bytes.
+    async fn presign(
+        &self,
+        _key: &ArtifactKey,
+        _how: Transfer,
+        _expires_in: std::time::Duration,
+    ) -> Result<Option<Presigned>> {
+        Ok(None)
     }
 
     /// Drain deferred work — for the tiered store, the budgeted upload of
@@ -217,6 +297,21 @@ impl ArtifactStore for LocalFsStore {
     fn run_location(&self, run_id: &str) -> Option<String> {
         Some(self.base.join(sanitize(run_id)).to_string_lossy().into_owned())
     }
+    async fn delete(&self, key: &ArtifactKey) -> Result<bool> {
+        match tokio::fs::remove_file(self.path(key)).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+    async fn size(&self, key: &ArtifactKey) -> Result<Option<u64>> {
+        match tokio::fs::metadata(self.path(key)).await {
+            Ok(m) if m.is_file() => Ok(Some(m.len())),
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
 
     async fn list(&self) -> Result<Vec<ArtifactKey>> {
         let mut out = Vec::new();
@@ -275,7 +370,7 @@ impl ArtifactStore for LocalFsStore {
     }
 }
 
-/// Envelope-encrypting decorator (G-C2): wraps any [`ArtifactStore`] so artifacts
+/// Envelope-encrypting decorator: wraps any [`ArtifactStore`] so artifacts
 /// are **ciphertext at rest** and opaque to the storage backend. `put` envelope-
 /// encrypts with a fresh per-object data key (wrapped by the [`KeyProvider`]'s
 /// KEK — BYOK/KMS); `get` decrypts. The backend (and anyone with disk/bucket
@@ -322,6 +417,12 @@ impl<S: ArtifactStore> ArtifactStore for EncryptedStore<S> {
     async fn exists(&self, key: &ArtifactKey) -> Result<bool> {
         self.inner.exists(key).await
     }
+    async fn delete(&self, key: &ArtifactKey) -> Result<bool> {
+        self.inner.delete(key).await
+    }
+    // `presign` stays the default, `None`: a URL to the inner store would
+    // take plaintext past the encryption on the way in, and hand out
+    // ciphertext on the way out.
     fn run_location(&self, _run_id: &str) -> Option<String> {
         // No task-visible plaintext directory under encryption — see the type docs.
         None
@@ -522,6 +623,20 @@ macro_rules! forward_artifact_store {
             }
             async fn sync(&self) -> Result<usize> {
                 (**self).sync().await
+            }
+            async fn delete(&self, key: &ArtifactKey) -> Result<bool> {
+                (**self).delete(key).await
+            }
+            async fn size(&self, key: &ArtifactKey) -> Result<Option<u64>> {
+                (**self).size(key).await
+            }
+            async fn presign(
+                &self,
+                key: &ArtifactKey,
+                how: Transfer,
+                expires_in: std::time::Duration,
+            ) -> Result<Option<Presigned>> {
+                (**self).presign(key, how, expires_in).await
             }
         }
     };
@@ -803,6 +918,63 @@ mod tests {
         assert!(Path::new(&run_dir).is_dir());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn a_store_deletes_what_it_holds_and_says_what_it_cannot() {
+        let base = std::env::temp_dir().join(format!("dagron-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let local = LocalFsStore::new(&base);
+        let key = ArtifactKey::new("r", "t", "report.xml");
+        local.put(&key, b"x").await.unwrap();
+        assert!(local.delete(&key).await.unwrap());
+        assert!(!local.exists(&key).await.unwrap());
+        assert!(!local.delete(&key).await.unwrap(), "nothing was there the second time");
+
+        // Under encryption the inner store's bytes go, by the same key.
+        let sealed = EncryptedStore::new(
+            LocalFsStore::new(&base),
+            Box::new(dagron_crypto::LocalKekProvider::new([7u8; 32])),
+        );
+        sealed.put(&key, b"secret").await.unwrap();
+        assert!(sealed.delete(&key).await.unwrap());
+        assert!(!local.exists(&key).await.unwrap());
+
+        // A directory has no URL to give, and neither has a store that
+        // must see the bytes: the caller relays.
+        let hour = std::time::Duration::from_secs(3600);
+        assert_eq!(local.presign(&key, Transfer::Put, hour).await.unwrap(), None);
+        assert_eq!(sealed.presign(&key, Transfer::Get, hour).await.unwrap(), None);
+        // A store that cannot delete says so, and does not answer "gone":
+        // in a type a caller can tell from a failure of this once.
+        let never = NoopStore.delete(&key).await.unwrap_err();
+        assert!(never.downcast_ref::<Unsupported>().is_some(), "{never:#}");
+        // A directory says how much an artifact holds without reading it. A
+        // store that seals it holds another length, and does not guess.
+        assert_eq!(local.size(&key).await.unwrap(), None, "nothing is there");
+        local.put(&key, b"four").await.unwrap();
+        assert_eq!(local.size(&key).await.unwrap(), Some(4));
+        let cannot = sealed.size(&key).await.unwrap_err();
+        assert!(cannot.downcast_ref::<Unsupported>().is_some(), "{cannot:#}");
+        local.delete(&key).await.unwrap();
+        // And a pointer to a store is that store.
+        let boxed: Box<dyn ArtifactStore> = Box::new(LocalFsStore::new(&base));
+        boxed.put(&key, b"x").await.unwrap();
+        assert_eq!(boxed.size(&key).await.unwrap(), Some(1));
+        assert!(boxed.delete(&key).await.unwrap());
+        assert_eq!(boxed.presign(&key, Transfer::Get, hour).await.unwrap(), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_presigned_url_is_not_printed_with_its_signature() {
+        let url = Presigned {
+            method: "PUT",
+            url: "https://bucket.example/run/t/a?X-Amz-Signature=5ecret".into(),
+            headers: Vec::new(),
+        };
+        let shown = format!("{url:?}");
+        assert!(shown.contains("bucket.example/run/t/a") && !shown.contains("5ecret"), "{shown}");
     }
 
     #[tokio::test]

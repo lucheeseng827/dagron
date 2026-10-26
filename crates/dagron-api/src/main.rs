@@ -4,16 +4,27 @@
 //! schedulers write, plus issues control mutations (cancel/retry/submit) and
 //! bridges Postgres `LISTEN/NOTIFY` to browser SSE for live updates.
 //!
+//! Built with `sqlite` instead, it is one process beside
+//! one engine on the same SQLite file: sign-in, users, tokens, workflows, runs
+//! and their logs, and live updates by polling; the rest of `/api` answers 501
+//! (`one_node_not_served`).
+//!
 //! Auth is self-contained: dagron-api owns login (`POST /api/login`) and both
 //! signs and validates its own HS256 session JWT (`DAGRON_JWT_SECRET`) — no
 //! external IdP.
 //! The token is delivered to browsers as an HttpOnly `dagron_session` cookie;
 //! non-browser clients may instead send it as `Authorization: Bearer <jwt>`.
 
+// The one-node build compiles the helpers of routes it does not serve; the
+// Postgres build serves them all, so its lint is the one that finds dead code.
+#![cfg_attr(feature = "sqlite", allow(dead_code, unused_imports))]
+
 mod auth;
 // Settings governance (LOW_LATENCY §5): the knob registry, effective-config
 // startup log, and the fleet-drift fingerprint (also surfaced by /api/health).
 mod config;
+// The datastore: Postgres, or SQLite for one node.
+mod db;
 mod expand;
 mod identity;
 // `{{ }}` templating mirror for the submit path (core semantics, no core dep).
@@ -21,8 +32,16 @@ mod tmpl;
 // Cloud archive URL → object_store dispatch (s3/gs/az) for /api/archive fetches.
 #[cfg(feature = "archive-cloud")]
 mod objstore;
+mod oidc;
+// The one-node (SQLite) build's HTTP surface, end to end.
+#[cfg(all(test, feature = "sqlite"))]
+mod one_node_tests;
+// The live log relay, through its routes, on the one-node build.
+#[cfg(all(test, feature = "sqlite"))]
+mod relay_tests;
 mod pwhash;
 mod ratelimit;
+mod relay;
 mod routes;
 mod state;
 mod state_plane;
@@ -36,7 +55,6 @@ use axum::{
     routing::{any, get, post},
     Json, Router,
 };
-use sqlx::postgres::PgPoolOptions;
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
@@ -94,12 +112,79 @@ async fn api_not_found() -> (axum::http::StatusCode, Json<serde_json::Value>) {
     )
 }
 
+/// What a one-node (SQLite) build does not serve. It
+/// serves sign-in, users, tokens, workflows, runs, their logs and live updates;
+/// each family of routes below is the Postgres build's, and answers 501 here,
+/// saying so, rather than a 404 that reads as no such route.
+#[cfg(feature = "sqlite")]
+fn one_node_not_served(app: Router<AppState>) -> Router<AppState> {
+    const POSTGRES_ONLY: &[&str] = &[
+        "/api/search",
+        "/api/outbox/{*rest}",
+        "/api/settings/{*rest}",
+        "/api/environments",
+        "/api/environments/{*rest}",
+        "/api/runs/{id}/graph",
+        "/api/runs/{id}/triage",
+        "/api/runs/{id}/archive",
+        "/api/runs/{id}/workflow-artifacts",
+        "/api/runs/{id}/workflow-artifacts/{*rest}",
+        "/api/runs/{id}/artifacts",
+        "/api/runs/{id}/artifacts/{*rest}",
+        "/api/workflow-artifacts/{*rest}",
+        "/api/archive/{*rest}",
+        "/api/metrics",
+        "/api/metrics/{*rest}",
+        "/api/approvals",
+        "/api/datasets",
+        "/api/datasets/{*rest}",
+        "/api/dead-letters",
+        "/api/dead-letters/{*rest}",
+        "/api/workflows/bundle",
+        "/api/workflows/{id}/sync-to-git",
+        "/api/badges/{*rest}",
+        "/api/git-repos",
+        "/api/git-repos/{*rest}",
+        "/api/schedules",
+        "/api/schedules/{*rest}",
+        "/api/backfills",
+        "/api/backfills/{*rest}",
+        "/api/fleet",
+        "/api/link",
+        "/api/link/{*rest}",
+        "/api/artifacts/{*rest}",
+        "/api/runners",
+        "/api/runners/{*rest}",
+        "/api/audit",
+        "/runner/v1",
+        "/runner/v1/{*rest}",
+        "/task/v1/{*rest}",
+    ];
+    POSTGRES_ONLY
+        .iter()
+        .fold(app, |app, path| app.route(path, any(not_served_on_one_node)))
+}
+
+#[cfg(feature = "sqlite")]
+async fn not_served_on_one_node() -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    (
+        axum::http::StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "error": "not served by a one-node (SQLite) dagron-api: this route is its Postgres build's"
+        })),
+    )
+}
+
 /// Body cap for the core API surface (submit YAML and friends). Shared by the
 /// blanket layer and by any router nested after it, which the layer cannot reach.
 const CORE_BODY_LIMIT: usize = 1024 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `--version` first: for it nothing is read and nothing is started.
+    if dagron_logging::version_requested("dagron-api") {
+        return Ok(());
+    }
     // Tunable, structured logging (RUST_LOG / LOG_LEVEL / LOG_FORMAT / …); see
     // the shared `dagron_logging` crate for the full env knob list.
     dagron_logging::init("api");
@@ -108,7 +193,7 @@ async fn main() -> Result<()> {
     config::log_effective();
 
     let database_url = std::env::var("DATABASE_URL")
-        .context("DATABASE_URL must be set (postgres connection string)")?;
+        .context("DATABASE_URL must be set (a Postgres connection string, or the SQLite file of a one-node build)")?;
     // dagron-api signs and validates its own session JWT — no external IdP.
     // Require a present, non-empty secret of at least 32 bytes (256-bit) so HS256
     // session tokens can't be signed with a trivially brute-forceable key.
@@ -125,50 +210,16 @@ async fn main() -> Result<()> {
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8080);
 
     // One pool serves both read and write roles for now; a read replica can be
-    // wired into read_pool later without changing handlers.
-    //
-    // Pool discipline (LOW_LATENCY R-2). Every knob defaults to the previous
-    // hard-coded behaviour; the low-latency profile is what changes them:
-    //  - DAGRON_DB_MAX_CONNECTIONS (default 8)
-    //  - DAGRON_DB_MIN_CONNECTIONS (default 0) — a floor of warm connections;
-    //    also acquired once at startup below, so a replica is never marked
-    //    Ready with a cold pool (market open must not pay TLS + auth
-    //    handshakes on the first N requests).
-    //  - DAGRON_DB_ACQUIRE_TIMEOUT_MS (default 10000) — the profile sets
-    //    ~250 so a saturated pool fails fast (503 + Retry-After via /readyz
-    //    flipping) instead of queueing requests for ten seconds.
-    //  - DAGRON_DB_TEST_BEFORE_ACQUIRE (default true) — sqlx's per-checkout
-    //    liveness round trip; the profile turns it off and lets the query
-    //    itself surface a dead connection.
-    let db_max: u32 = env_parse("DAGRON_DB_MAX_CONNECTIONS", 8).max(1);
-    let db_min: u32 = env_parse("DAGRON_DB_MIN_CONNECTIONS", 0).min(db_max);
-    let db_acquire_ms: u64 = env_parse("DAGRON_DB_ACQUIRE_TIMEOUT_MS", 10_000).max(50);
-    let db_test_before_acquire = std::env::var("DAGRON_DB_TEST_BEFORE_ACQUIRE")
-        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"))
-        .unwrap_or(true);
-    let pool = PgPoolOptions::new()
-        .max_connections(db_max)
-        .min_connections(db_min)
-        .acquire_timeout(Duration::from_millis(db_acquire_ms))
-        .test_before_acquire(db_test_before_acquire)
-        .connect(&database_url)
-        .await
-        .context("connecting to Postgres")?;
-    info!(
-        max = db_max,
-        min = db_min,
-        acquire_timeout_ms = db_acquire_ms,
-        test_before_acquire = db_test_before_acquire,
-        "db pool configured"
-    );
-    // Warm the floor eagerly: hold min_connections checkouts at once so the
-    // pool actually opens them, then release. Best-effort — a partially warmed
-    // pool is not a startup failure, and /readyz still gates on a live acquire.
-    if db_min > 0 {
-        let held: Vec<_> = futures::future::join_all((0..db_min).map(|_| pool.acquire())).await;
-        let warmed = held.iter().filter(|c| c.is_ok()).count();
-        info!(warmed, target = db_min, "db pool warmed");
-    }
+    // wired into read_pool later without changing handlers. Its knobs, and the
+    // SQLite build's single connection, are `db::connect`'s.
+    let pool = db::connect(&database_url).await?;
+    // The limits over this replica's sessions: read now and every few
+    // minutes after, answered by `GET /api/metrics`, and said where its pool
+    // and LISTEN are past one, or half of one. Never a stop.
+    #[cfg(feature = "postgres")]
+    let db_connections = Arc::new(db::ConnectionGauge::default());
+    #[cfg(feature = "postgres")]
+    db::spawn_connection_check(pool.clone(), Arc::clone(&db_connections));
 
     // Broadcast channel for live task events; the listener that feeds it is added in 01-04.
     let (tx, _rx) = broadcast::channel::<TaskEvent>(1024);
@@ -181,12 +232,30 @@ async fn main() -> Result<()> {
     // Programmatic artifact store (put/get by key), transparently envelope-
     // encrypted when a KEK provider is configured. A *misconfigured* provider
     // fails startup here rather than silently storing plaintext.
+    // Where the engine keeps task logs: the same setting as its.
+    let log_store = dagron_artifact::log_segments::from_env()
+        .context("configuring the log store (DAGRON_LOG_STORE)")?
+        .map(|(store, _)| Arc::new(store));
+    if let Some(store) = &log_store {
+        info!(store = ?store, "task logs are read from the log store");
+    }
+    // The live log relay's knobs: one that cannot be what it means stops the
+    // start.
+    let relay = Arc::new(relay::Relay::new(
+        relay::Settings::from_env().map_err(|why| anyhow::anyhow!(why))?,
+    ));
     let artifact_store = dagron_artifact::store_from_env()
         .context("configuring the artifact store (DAGRON_ARTIFACT_DIR / KEK provider)")?;
     if artifact_store.is_some() {
         let encrypted = matches!(dagron_crypto::provider_from_env(), Ok(Some(_)));
         info!(encrypted, "artifact API enabled (PUT/GET /api/runs/*/artifacts/*)");
     }
+    // A knob of these that cannot be what it means stops the start: a
+    // retention that was mistyped must not read as "keep everything".
+    #[cfg(feature = "postgres")]
+    let artifact_settings = routes::artifact_index::Settings::from_env()
+        .map_err(|why| anyhow::anyhow!(why))
+        .context("configuring the artifact routes")?;
     // Tiered store drain: move locally-captured artifacts to the remote tier
     // under the daily uplink budget. A no-op (`Ok(0)`) for every other store, so
     // the loop is harmless when tiering is off; `DAGRON_ARTIFACT_SYNC_SECS=0`
@@ -226,8 +295,18 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Task identity: the OIDC issuer, where DAGRON_OIDC_ISSUER is set.
+    let oidc_issuer = oidc::Issuer::from_env()?.map(Arc::new);
+    if let Some(issuer) = &oidc_issuer {
+        info!(issuer = %issuer.issuer, token_secs = issuer.token_secs, "OIDC issuer enabled");
+    }
+    let oidc_path = oidc_issuer
+        .as_ref()
+        .map(|i| i.path.clone())
+        .unwrap_or_default();
     let listener_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let state = AppState {
+        token_cache: Default::default(),
         read_pool: pool.clone(),
         write_pool: pool.clone(),
         tx: tx.clone(),
@@ -235,14 +314,30 @@ async fn main() -> Result<()> {
         cookie_secure,
         identity,
         artifact_store,
+        log_store,
+        #[cfg(feature = "postgres")]
+        artifacts: artifact_settings,
         rotation_lock: Arc::clone(&rotation_lock),
         login_limiter: Arc::new(ratelimit::RateLimiter::from_env()),
         listener_ready: Arc::clone(&listener_ready),
+        oidc: oidc_issuer,
+        relay: Arc::clone(&relay),
+        #[cfg(feature = "postgres")]
+        metrics_cache: Arc::new(routes::ops::metrics_cache_from_env()),
+        #[cfg(feature = "postgres")]
+        db_connections: Arc::clone(&db_connections),
     };
 
     // Bring the tables dagron-api owns into existence, tolerating a concurrent
     // migrator creating the same ones (see `ensure_schemas`).
+    // On SQLite they are migrations of the engine's (dagron-core
+    // migrations/069), which `db::connect` has applied.
+    #[cfg(feature = "postgres")]
     ensure_schemas(&pool).await?;
+    // Artifacts that have expired, and uploads that never finished, are
+    // deleted on a timer (`DAGRON_ARTIFACT_SWEEP_SECS`): after the table is there.
+    #[cfg(feature = "postgres")]
+    routes::artifact_index::spawn_sweep(state.clone());
     // Seed a first admin from env (idempotent) so the first login needs no manual
     // DB step. No-op when DAGRON_ADMIN_EMAIL / DAGRON_ADMIN_PASSWORD are unset.
     if let Err(e) = routes::login::bootstrap_admin(&pool).await {
@@ -252,8 +347,72 @@ async fn main() -> Result<()> {
     // One shared listener fans task_events NOTIFY out to all SSE clients.
     stream::spawn_listener(pool, tx, listener_ready);
 
+    let app = build_app(state, &oidc_path)?;
+
+    let addr = format!("0.0.0.0:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr).await.context("binding listener")?;
+    info!(%addr, "dagron-api listening");
+    // Rolling restarts drain: on SIGTERM/ctrl-c axum stops accepting and lets
+    // in-flight requests finish instead of severing them mid-response
+    // (LOW_LATENCY R-1). The drain is BOUNDED (DAGRON_SHUTDOWN_DRAIN_MS,
+    // default 15 s): open SSE streams and long-polls never finish on their
+    // own, so an unbounded graceful shutdown would hang every rollout until
+    // the kubelet's SIGKILL — better to close the stragglers ourselves,
+    // on our schedule, after the real requests have drained. Keep the knob
+    // under the pod's terminationGracePeriodSeconds (default 30 s) so the
+    // orderly path always wins over the SIGKILL.
+    let drain_ms: u64 = env_parse("DAGRON_SHUTDOWN_DRAIN_MS", 15_000);
+    let (drained_tx, drained_rx) = tokio::sync::oneshot::channel::<()>();
+    // with_connect_info so the login limiter can key on the socket peer — the
+    // one client identifier a caller cannot forge (see `ratelimit::client_key`).
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        // Log streams end now, not at the drain's end: each client goes on
+        // from its cursor, with another replica.
+        relay.stop();
+        let _ = drained_tx.send(());
+    });
+    let served = tokio::select! {
+        res = server => res.context("serving"),
+        _ = async {
+            // Arms only once the signal has fired; dropping the server future
+            // closes the connections the drain window could not flush.
+            let _ = drained_rx.await;
+            tokio::time::sleep(Duration::from_millis(drain_ms)).await;
+        } => {
+            tracing::warn!(
+                drain_ms,
+                "shutdown drain deadline reached — closing remaining connections \
+                 (long-lived SSE/long-poll clients reconnect to the next replica)"
+            );
+            Ok(())
+        }
+    };
+    // An `otel` build's exporter holds spans between exports, so without this
+    // the last of them die with the process: the ones about the shutdown.
+    // Nothing to do in any other build, or with no collector named.
+    dagron_logging::shutdown();
+    served
+}
+
+/// The whole HTTP surface over `state`: the API, the runner protocol, the
+/// state plane and the console. `oidc_path` is where the OIDC issuer's
+/// documents are served (`DAGRON_OIDC_ISSUER`'s path), or empty.
+fn build_app(state: AppState, oidc_path: &str) -> Result<Router> {
     let app = Router::new()
         .route("/healthz", get(healthz))
+        // The OIDC issuer: its two documents at its own path, and the
+        // token a task asks for with its request credential. No session.
+        .route(
+            &format!("{oidc_path}/.well-known/openid-configuration"),
+            get(oidc::discovery),
+        )
+        .route(&format!("{oidc_path}/.well-known/jwks"), get(oidc::jwks))
+        .route("/oidc/token", get(oidc::token))
         // Readiness: unlike /healthz (static liveness), 200 here means the
         // pool answers within a bounded budget AND the SSE listener is
         // subscribed. Point the orchestrator's readinessProbe at this
@@ -269,8 +428,74 @@ async fn main() -> Result<()> {
         // Rich health (DB + scheduler leadership + attention counters) for the
         // sidebar widget; /healthz below stays the bare liveness probe.
         .route("/api/health", get(routes::health::health))
+        .route("/api/runs", get(routes::runs::list_runs))
+        .route("/api/runs/{id}", get(routes::runs::get_run))
+        // Static, so it must be declared alongside `/api/runs/{id}` rather than
+        // under it: axum matches a literal segment ahead of a parameter, and
+        // run ids are uuids, so nothing can be shadowed by it. Covered by
+        // `specs_route_is_not_shadowed_by_the_run_id_route` in `routes::runs`.
+        .route("/api/runs/specs", get(routes::runs::get_run_specs))
+        // The repositories runs came from, and one's refs with their latest
+        // runs: what a console's repository pages are made of.
+        .route("/api/runs/sources", get(routes::runs::list_sources))
+        .route("/api/runs/refs", get(routes::runs::list_refs))
+        .route("/api/runs/{id}/spec", get(routes::runs::get_run_spec))
+        .route("/api/runs/{id}/wait", get(routes::runs::wait_run))
+        // Log views: the whole run's output as one filtered stream, and one
+        // task's output (live-tailable) under the same filter grammar.
+        .route("/api/runs/{id}/logs", get(routes::logs::get_run_logs))
+        .route("/api/runs/{id}/tasks/{tid}/logs", get(routes::logs::get_task_logs))
+        // Followed live, from a cursor: the run's, or one task's.
+        .route("/api/runs/{id}/logs/stream", get(routes::logstream::run_log_stream))
+        .route("/api/runs/{id}/tasks/{tid}/logs/stream", get(routes::logstream::task_log_stream))
+        .route("/api/runs/{id}/tasks/{tid}/attempts", get(routes::logs::get_task_attempts))
+        .route("/api/runs/{id}/stream", get(routes::stream::stream_run))
+        // Account-wide activity stream: feeds the list pages' live-updates mode.
+        .route("/api/events/stream", get(routes::stream::stream_events))
+        .route("/api/runs", post(routes::control::submit_run))
+        .route("/api/runs/{id}/cancel", post(routes::control::cancel_run))
+        .route("/api/runs/{id}/rerun", post(routes::control::rerun_run))
+        .route("/api/runs/{id}/resubmit", post(routes::control::resubmit_run))
+        .route("/api/runs/{id}/tasks/{tid}/retry", post(routes::control::retry_task))
+        .route("/api/runs/{id}/tasks/{tid}/clear", post(routes::control::clear_task))
+        .route("/api/runs/{id}/tasks/{tid}/approve", post(routes::control::approve_task))
+        .route("/api/runs/{id}/tasks/{tid}/reject", post(routes::control::reject_task))
+        // Personal access tokens: long-lived credentials for CI and the SDKs,
+        // so automation never has to store a password. Managing them requires a
+        // password session (see auth::SessionAuth).
+        .route(
+            "/api/tokens",
+            get(routes::tokens::list_tokens).post(routes::tokens::create_token),
+        )
+        .route("/api/tokens/{id}", axum::routing::delete(routes::tokens::revoke_token))
+        // First-class workflows (named, reusable DAG definitions).
+        .route(
+            "/api/workflows",
+            get(routes::workflows::list_workflows).post(routes::workflows::create_workflow),
+        )
+        .route(
+            "/api/workflows/{id}",
+            get(routes::workflows::get_workflow)
+                .put(routes::workflows::update_workflow)
+                .delete(routes::workflows::delete_workflow),
+        )
+        .route("/api/workflows/{id}/run", post(routes::workflows::run_workflow))
+        // Lifecycle: version history, and a state that is not deletion. Pausing
+        // leaves the workflow's schedules intact — that is the whole difference
+        // from DELETE, which cascades them away.
+        .route("/api/workflows/{id}/versions", get(routes::lifecycle::list_versions))
+        .route("/api/workflows/{id}/state", post(routes::lifecycle::set_state))
+        .route("/api/workflows/{id}/runs", get(routes::workflows::workflow_runs));
+
+    // Everything else a Postgres build serves. A one-node (SQLite) build
+    // answers 501 for it instead (`one_node_not_served`, below).
+    #[cfg(feature = "postgres")]
+    let app = app
         // Global search behind the ⌘K palette (capped, parameterized).
         .route("/api/search", get(routes::search::search))
+        // The engine's outbox, handed to dagron-ci.
+        .route("/api/outbox/ci/claim", post(routes::outbox::claim))
+        .route("/api/outbox/ci/ack", post(routes::outbox::ack))
         // Instance-wide notification defaults (engine merges them per run).
         .route(
             "/api/settings/notifications",
@@ -291,42 +516,40 @@ async fn main() -> Result<()> {
                 .delete(routes::environments::delete),
         )
         .route(
+            "/api/environments/{id}/policy",
+            axum::routing::put(routes::environments::put_policy)
+                .delete(routes::environments::delete_policy),
+        )
+        .route(
             "/api/environments/{id}/secrets/{name}",
             axum::routing::put(routes::environments::put_secret)
                 .delete(routes::environments::delete_secret),
         )
-        .route("/api/runs", get(routes::runs::list_runs))
-        .route("/api/runs/{id}", get(routes::runs::get_run))
-        // Static, so it must be declared alongside `/api/runs/{id}` rather than
-        // under it: axum matches a literal segment ahead of a parameter, and
-        // run ids are uuids, so nothing can be shadowed by it. Covered by
-        // `specs_route_is_not_shadowed_by_the_run_id_route` in `routes::runs`.
-        .route("/api/runs/specs", get(routes::runs::get_run_specs))
-        .route("/api/runs/{id}/spec", get(routes::runs::get_run_spec))
-        .route("/api/runs/{id}/wait", get(routes::runs::wait_run))
+        // A GitHub workflow's artifacts, which the engine's results service
+        // keeps: listed, and each one's zip and signed provenance.
+        .route(
+            "/api/runs/{run_id}/workflow-artifacts",
+            get(routes::workflow_artifacts::list),
+        )
+        .route(
+            "/api/runs/{run_id}/workflow-artifacts/{name}",
+            get(routes::workflow_artifacts::download),
+        )
+        .route(
+            "/api/runs/{run_id}/workflow-artifacts/{name}/provenance",
+            get(routes::workflow_artifacts::provenance),
+        )
+        .route(
+            "/api/workflow-artifacts/{id}",
+            get(routes::workflow_artifacts::by_number),
+        )
         .route("/api/runs/{id}/graph", get(routes::graph::get_graph))
-        // Log views: the whole run's output as one filtered stream, and one
-        // task's output (live-tailable) under the same filter grammar.
-        .route("/api/runs/{id}/logs", get(routes::logs::get_run_logs))
-        .route("/api/runs/{id}/tasks/{tid}/logs", get(routes::logs::get_task_logs))
-        .route("/api/runs/{id}/tasks/{tid}/attempts", get(routes::logs::get_task_attempts))
-        .route("/api/runs/{id}/stream", get(routes::stream::stream_run))
-        // Account-wide activity stream: feeds the list pages' live-updates mode.
-        .route("/api/events/stream", get(routes::stream::stream_events))
-        .route("/api/runs", post(routes::control::submit_run))
-        .route("/api/runs/{id}/cancel", post(routes::control::cancel_run))
-        .route("/api/runs/{id}/rerun", post(routes::control::rerun_run))
         // Failure triage: what a *human* decided about a failed run, which
         // `status` (what the engine did) cannot express.
         .route(
             "/api/runs/{id}/triage",
             post(routes::triage::set_triage).delete(routes::triage::clear_triage),
         )
-        .route("/api/runs/{id}/resubmit", post(routes::control::resubmit_run))
-        .route("/api/runs/{id}/tasks/{tid}/retry", post(routes::control::retry_task))
-        .route("/api/runs/{id}/tasks/{tid}/clear", post(routes::control::clear_task))
-        .route("/api/runs/{id}/tasks/{tid}/approve", post(routes::control::approve_task))
-        .route("/api/runs/{id}/tasks/{tid}/reject", post(routes::control::reject_task))
         // Observability + dead-letter queue (authed UI edge over engine ops surface).
         .route("/api/archive/runs", get(routes::archive::list_archived_runs))
         .route("/api/archive/runs/{id}", get(routes::archive::get_archived_run))
@@ -352,36 +575,10 @@ async fn main() -> Result<()> {
             "/api/settings/dead-letters",
             get(routes::settings::get_dead_letters).put(routes::settings::put_dead_letters),
         )
-        // Personal access tokens: long-lived credentials for CI and the SDKs,
-        // so automation never has to store a password. Managing them requires a
-        // password session (see auth::SessionAuth).
-        .route(
-            "/api/tokens",
-            get(routes::tokens::list_tokens).post(routes::tokens::create_token),
-        )
-        .route("/api/tokens/{id}", axum::routing::delete(routes::tokens::revoke_token))
-        // First-class workflows (named, reusable DAG definitions).
-        .route(
-            "/api/workflows",
-            get(routes::workflows::list_workflows).post(routes::workflows::create_workflow),
-        )
-        .route(
-            "/api/workflows/{id}",
-            get(routes::workflows::get_workflow)
-                .put(routes::workflows::update_workflow)
-                .delete(routes::workflows::delete_workflow),
-        )
         // Signed bundle apply (verification is open; staged rollout by cohort is
         // not in this build - the handler signposts it). Static segment, so it
         // sits before the `{id}` routes to keep the ordering obvious.
         .route("/api/workflows/bundle", post(routes::bundles::apply_bundle))
-        .route("/api/workflows/{id}/run", post(routes::workflows::run_workflow))
-        // Lifecycle: version history, and a state that is not deletion. Pausing
-        // leaves the workflow's schedules intact — that is the whole difference
-        // from DELETE, which cascades them away.
-        .route("/api/workflows/{id}/versions", get(routes::lifecycle::list_versions))
-        .route("/api/workflows/{id}/state", post(routes::lifecycle::set_state))
-        .route("/api/workflows/{id}/runs", get(routes::workflows::workflow_runs))
         .route("/api/workflows/{id}/sync-to-git", post(routes::gitsync::sync_to_git))
         // Public run-status badge (embeds in READMEs; status label only, no auth).
         .route("/api/badges/{name}", get(routes::badge::workflow_badge))
@@ -422,25 +619,45 @@ async fn main() -> Result<()> {
     // only means anything where a KEK exists, and KEKs need the `enterprise` feature
     // (`dagron_crypto::build_provider`) — so the route is absent from an open
     // build rather than present and guaranteed to fail.
-    #[cfg(feature = "enterprise")]
+    #[cfg(all(feature = "enterprise", feature = "postgres"))]
     let app = app.route("/api/artifacts/rotate", post(routes::artifacts::rotate_artifacts));
 
     // Feature-gated routes: the audit trail read.
     // OSS builds answer 404 here, matching the feature being absent.
-    #[cfg(feature = "enterprise")]
+    #[cfg(all(feature = "enterprise", feature = "postgres"))]
     let app = app.route("/api/audit", get(routes::audit::list_audit));
 
     // Fleet plane (unit registry, cohorts, fan-out). Registered in EVERY build:
     // the open build answers with a signpost naming the edition, not a 404 —
     // the user hits it at the exact moment they feel the need.
+    #[cfg(feature = "postgres")]
     let app = app.route("/api/fleet", get(routes::fleet::list_fleet));
     // Fleet link (enrol this instance as a unit; licence state). Same shape as
     // /api/fleet: registered everywhere, signposted on the open build.
+    #[cfg(feature = "postgres")]
     let app = app
         .route("/api/link", get(routes::link::get_link))
         .route("/api/link/enrol", post(routes::link::enrol));
     // Tiered artifact drain on demand (the periodic loop below is the default).
+    #[cfg(feature = "postgres")]
     let app = app.route("/api/artifacts/sync", post(routes::artifacts::sync_artifacts));
+    // Remote runners: join tokens, the runners and their sessions,
+    // drain and revoke, and the work there is for each label.
+    #[cfg(feature = "postgres")]
+    let app = app
+        .route("/api/runners", get(routes::runner::admin::list_runners))
+        .route("/api/runners/queue", get(routes::runner::admin::queue))
+        .route(
+            "/api/runners/join-tokens",
+            get(routes::runner::admin::list_join_tokens)
+                .post(routes::runner::admin::create_join_token),
+        )
+        .route(
+            "/api/runners/join-tokens/{id}/revoke",
+            post(routes::runner::admin::revoke_join_token),
+        )
+        .route("/api/runners/{id}/drain", post(routes::runner::admin::drain_runner))
+        .route("/api/runners/{id}/revoke", post(routes::runner::admin::revoke_runner));
 
     // Core routes keep the tight 1 MiB body cap (submit YAML etc.) to resist abuse.
     let app = app.layer(tower_http::limit::RequestBodyLimitLayer::new(CORE_BODY_LIMIT));
@@ -449,24 +666,76 @@ async fn main() -> Result<()> {
     // exceed the core cap, so its routes get a larger, separately-configured limit
     // (`DAGRON_ARTIFACT_MAX_BYTES`, default 128 MiB). NOTE: bodies are buffered in
     // memory — streaming very large artifacts is a follow-up.
+    #[cfg(feature = "postgres")]
     let artifact_max = std::env::var("DAGRON_ARTIFACT_MAX_BYTES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(128 * 1024 * 1024);
+    #[cfg(feature = "postgres")]
     let artifacts = Router::new()
         .route(
             "/api/runs/{run_id}/artifacts/{task}/{name}",
             axum::routing::put(routes::artifacts::put_artifact)
-                .get(routes::artifacts::get_artifact),
+                .get(routes::artifacts::get_artifact)
+                .delete(routes::artifact_index::delete_artifact),
         )
         .route(
             "/api/runs/{run_id}/artifacts/{task}/{name}/exists",
             get(routes::artifacts::artifact_exists),
         )
+        // The index: what the run has, and where an artifact's bytes go when
+        // the store can take them itself.
+        .route("/api/runs/{run_id}/artifacts", get(routes::artifact_index::list_artifacts))
+        .route(
+            "/api/runs/{run_id}/artifacts/{task}/{name}/upload",
+            post(routes::artifact_index::artifact_upload),
+        )
+        .route(
+            "/api/runs/{run_id}/artifacts/{task}/{name}/complete",
+            post(routes::artifact_index::artifact_complete),
+        )
+        .route(
+            "/api/runs/{run_id}/artifacts/{task}/{name}/download",
+            get(routes::artifact_index::artifact_download),
+        )
+        // A task's door into its run's artifacts, with its attempt's
+        // credential and no session, under the same body ceiling.
+        .route(
+            "/task/v1/artifacts/{task}/{name}",
+            axum::routing::put(routes::task_artifacts::put).get(routes::task_artifacts::get),
+        )
+        // Before the console fallback, as /api's: an unknown route here (a
+        // name with a `/` in it, say) is a 404 a task can read, never the
+        // console's index page taken for an artifact's bytes.
+        .route("/task/v1/{*rest}", any(api_not_found))
         // Disable the extractor's default 2 MiB cap so the tower limit below is the
         // single, explicit body ceiling for artifacts.
         .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(tower_http::limit::RequestBodyLimitLayer::new(artifact_max));
+
+    // The remote runner protocol: what a `dagron-runner` dials, outside
+    // /api, with its own body ceiling (a task's result carries the end of its
+    // output) and RFC 9457 errors. Read as dagron-api starts, so that a
+    // setting it cannot read (POOLS above all) stops it here.
+    #[cfg(feature = "postgres")]
+    let runner_settings =
+        routes::runner::settings_from_env().context("reading the runner protocol's settings")?;
+    #[cfg(feature = "postgres")]
+    let runner = Router::new()
+        .route("/runner/v1", get(routes::runner::about))
+        .route("/runner/v1/register", post(routes::runner::register))
+        .route("/runner/v1/sessions", post(routes::runner::open_session))
+        .route("/runner/v1/sessions/{id}", axum::routing::delete(routes::runner::close_session))
+        .route("/runner/v1/sessions/{id}/claim", post(routes::runner::claim))
+        .route("/runner/v1/sessions/{id}/heartbeat", post(routes::runner::heartbeat))
+        .route("/runner/v1/tasks/{id}/logs/{seq}", post(routes::runner::logs))
+        .route("/runner/v1/tasks/{id}/result", post(routes::runner::result))
+        .route("/runner/v1/queue", get(routes::runner::queue))
+        // Before the console fallback, as /api's: an unknown route here is a
+        // 404 a runner can read, never the console's index page.
+        .route("/runner/v1/{*rest}", any(routes::runner::not_found))
+        .layer(axum::extract::DefaultBodyLimit::disable())
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(runner_settings.body_limit));
 
     // Login is the one unauthenticated route that costs an Argon2 verify per
     // call, so it carries a per-client budget the other routes don't need. Its
@@ -478,9 +747,14 @@ async fn main() -> Result<()> {
             ratelimit::login_rate_limit,
         ));
 
+    let app = app.merge(login);
+    #[cfg(feature = "postgres")]
+    let app = app.merge(artifacts).merge(runner);
+    // What a one-node (SQLite) build does not serve: a 501 that says so,
+    // ahead of the not-found catch-all below, for each family of routes.
+    #[cfg(feature = "sqlite")]
+    let app = one_node_not_served(app);
     let app = app
-        .merge(login)
-        .merge(artifacts)
         // The `state` noun (dagron-state): compile a backfill planner's state plan
         // into a run graph. Nested as a service, not merged, because the component
         // owns mount-relative paths and its own state — the two lines here plus
@@ -515,47 +789,7 @@ async fn main() -> Result<()> {
         // Dev CORS: permissive. Tighten to the frontend origin in production.
         .layer(CorsLayer::permissive())
         .with_state(state);
-
-    let addr = format!("0.0.0.0:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr).await.context("binding listener")?;
-    info!(%addr, "dagron-api listening");
-    // Rolling restarts drain: on SIGTERM/ctrl-c axum stops accepting and lets
-    // in-flight requests finish instead of severing them mid-response
-    // (LOW_LATENCY R-1). The drain is BOUNDED (DAGRON_SHUTDOWN_DRAIN_MS,
-    // default 15 s): open SSE streams and long-polls never finish on their
-    // own, so an unbounded graceful shutdown would hang every rollout until
-    // the kubelet's SIGKILL — better to close the stragglers ourselves,
-    // on our schedule, after the real requests have drained. Keep the knob
-    // under the pod's terminationGracePeriodSeconds (default 30 s) so the
-    // orderly path always wins over the SIGKILL.
-    let drain_ms: u64 = env_parse("DAGRON_SHUTDOWN_DRAIN_MS", 15_000);
-    let (drained_tx, drained_rx) = tokio::sync::oneshot::channel::<()>();
-    // with_connect_info so the login limiter can key on the socket peer — the
-    // one client identifier a caller cannot forge (see `ratelimit::client_key`).
-    let server = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        shutdown_signal().await;
-        let _ = drained_tx.send(());
-    });
-    tokio::select! {
-        res = server => res.context("serving")?,
-        _ = async {
-            // Arms only once the signal has fired; dropping the server future
-            // closes the connections the drain window could not flush.
-            let _ = drained_rx.await;
-            tokio::time::sleep(Duration::from_millis(drain_ms)).await;
-        } => {
-            tracing::warn!(
-                drain_ms,
-                "shutdown drain deadline reached — closing remaining connections \
-                 (long-lived SSE/long-poll clients reconnect to the next replica)"
-            );
-        }
-    }
-    Ok(())
+    Ok(app)
 }
 
 /// Create the tables dagron-api owns, retrying past a concurrent migrator.
@@ -580,23 +814,33 @@ async fn main() -> Result<()> {
 ///
 /// The other collision is a deadlock. `ALTER TABLE workflow_runs` here queues
 /// for an exclusive lock behind the migrator's `CREATE INDEX CONCURRENTLY` on the
-/// same table (migrations_pg 047, 048), and the index build in turn waits out
-/// every transaction with an older snapshot — including that queued ALTER.
-/// Postgres breaks the cycle by failing one side with `deadlock_detected`, and
-/// it is usually this one, which started waiting first:
+/// same table (migrations_pg 047, 048, 069, 071, 075 and 083), and the index
+/// build in turn waits out every transaction with an older snapshot — including
+/// that queued ALTER.
+/// Postgres breaks the cycle by failing one side with `deadlock_detected`: the
+/// one whose own check, a `deadlock_timeout` (1 s) into its wait, finds the
+/// cycle closed. That is this one when the build reaches its snapshot wait
+/// within that second, as over a fresh install's empty table:
 ///
 /// ```text
 /// Error: ensuring environments schema
 /// Caused by: deadlock detected
 /// ```
 ///
+/// Over a populated table the build is still scanning when this one checks,
+/// and the build is the victim, which leaves its index INVALID. So the ALTER is
+/// run only where its column is missing (`routes::environments::ensure_schema`),
+/// as it is not on an upgrade (migration 026 added it).
+///
 /// Every step below is idempotent, so the whole sequence is simply replayed: by
 /// the retry the other side has committed, `IF NOT EXISTS` sees the object and
 /// the no-op path is taken. Retries are bounded. A duplicate or a deadlock
 /// clears once the migration behind it commits, which the next attempt finds
-/// done; two index builds touch `workflow_runs`, so four attempts cover a
-/// duplicate and both. Anything still failing after that is a real error worth
-/// dying on.
+/// done. With the ALTER run only where the column is missing, it meets one of
+/// those index builds only if migration 026 and a build after it come in the
+/// moment between its check and the ALTER; the four attempts are kept.
+/// Anything still failing after that is a real error worth dying on.
+#[cfg(feature = "postgres")]
 async fn ensure_schemas(pool: &sqlx::postgres::PgPool) -> Result<()> {
     const MAX_ATTEMPTS: u32 = 4;
     let mut attempt = 1;
@@ -619,6 +863,7 @@ async fn ensure_schemas(pool: &sqlx::postgres::PgPool) -> Result<()> {
 
 /// One pass of the schema bootstrap. Every statement is idempotent so the caller
 /// can replay it wholesale.
+#[cfg(feature = "postgres")]
 async fn ensure_schemas_once(pool: &sqlx::postgres::PgPool) -> Result<()> {
     // dagron-api owns the users table; ensure it exists before serving login.
     routes::login::ensure_schema(pool)
@@ -633,6 +878,12 @@ async fn ensure_schemas_once(pool: &sqlx::postgres::PgPool) -> Result<()> {
     routes::audit::ensure_schema(pool)
         .await
         .context("ensuring audit_log schema")?;
+    // … and the licence's cap on runs running at once, which every submit
+    // path holds.
+    #[cfg(feature = "enterprise")]
+    routes::link::hold_licence_cap(pool)
+        .await
+        .context("holding the licence's cap on concurrent runs")?;
     // … and the UI-configurable instance settings (notification defaults).
     routes::settings::ensure_schema(pool)
         .await
@@ -641,6 +892,10 @@ async fn ensure_schemas_once(pool: &sqlx::postgres::PgPool) -> Result<()> {
     routes::environments::ensure_schema(pool)
         .await
         .context("ensuring environments schema")?;
+    // … and the index of the artifacts it takes.
+    routes::artifact_index::ensure_schema(pool)
+        .await
+        .context("ensuring artifacts schema")?;
     // Additive `description` column on the engine-owned `workflows` table (the UI
     // owns this field). Idempotent + tolerant of the table not existing yet (the
     // engine creates it on first migrate); mirrors migrations_pg/010.
@@ -659,6 +914,7 @@ async fn ensure_schemas_once(pool: &sqlx::postgres::PgPool) -> Result<()> {
 /// writes. Next are the DDL-specific codes Postgres raises when an object
 /// appears between the existence check and the create. Last is the deadlock
 /// with a concurrent index build described on [`ensure_schemas`].
+#[cfg(feature = "postgres")]
 fn is_concurrent_ddl_race(err: &anyhow::Error) -> bool {
     err.chain()
         .filter_map(|cause| cause.downcast_ref::<sqlx::Error>())
@@ -771,9 +1027,10 @@ async fn me(AuthUser(claims): AuthUser) -> Json<auth::SessionClaims> {
     Json(claims)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "postgres"))]
 mod tests {
     use super::*;
+    use sqlx::postgres::PgPoolOptions;
 
     /// The server `TEST_DATABASE_URL` names, or `None` (with a note) so a live test skips.
     fn test_database_url() -> Option<String> {
@@ -876,5 +1133,183 @@ mod tests {
             .unwrap();
         bootstrapped.expect("the bootstrap replays past the deadlock");
         indexed.expect("the index build finishes");
+    }
+
+    /// The same start over a `workflow_runs` that has its `environment` column, as on an upgrade:
+    /// the bootstrap queues for no lock on the table, so it finishes while the index build waits,
+    /// and the build, which a queued ALTER makes the victim once it outlasts deadlock_timeout,
+    /// meets no cycle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_bootstrap_takes_no_lock_on_workflow_runs_where_its_column_is_there() {
+        let Some(url) = test_database_url() else {
+            return;
+        };
+        let schema = format!("bootstrap_no_alter_{}", uuid::Uuid::new_v4().simple());
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect_with(options.options([("search_path", schema.as_str())]))
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE workflow_runs (id TEXT PRIMARY KEY, created_at TEXT, environment TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // An open write holds the index build at its first wait, its lock on the table taken.
+        let mut writer = pool.begin().await.unwrap();
+        sqlx::query("INSERT INTO workflow_runs (id, created_at) VALUES ('r1', 'now')")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        let index = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "CREATE INDEX CONCURRENTLY idx_runs_created ON workflow_runs (created_at)",
+                )
+                .execute(&pool)
+                .await
+            }
+        });
+        wait_for_lock(&pool, &schema, "ShareUpdateExclusiveLock", true).await;
+        let bootstrapped =
+            tokio::time::timeout(Duration::from_secs(10), ensure_schemas(&pool)).await;
+        writer.commit().await.unwrap();
+
+        let indexed = index.await.unwrap();
+        pool.close().await;
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        bootstrapped
+            .expect("the bootstrap finishes while the index build waits")
+            .expect("the bootstrap succeeds");
+        indexed.expect("the index build finishes");
+    }
+
+    /// `url` with its connections' `search_path` set to `schema`, other parameters kept.
+    fn with_search_path(url: &str, schema: &str) -> String {
+        let sep = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{sep}options%5Bsearch_path%5D={schema}")
+    }
+
+    /// The engine's side of the same start. Its migrator creates `users` in migration 008, as this
+    /// bootstrap does. When the bootstrap's `CREATE TABLE` commits first, the migration fails on a
+    /// catalog constraint instead of taking the `IF NOT EXISTS` no-op, and the engine exited before
+    /// it served. `init_pool` must replay the migration and finish, and leave no migration lock
+    /// held behind it: a second migrator, started while the first pool is still open, must not
+    /// wait on one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_engines_migrations_replay_past_a_table_the_bootstrap_made_first() {
+        let Some(url) = test_database_url() else {
+            return;
+        };
+        // A private schema: the engine's tables and its `_sqlx_migrations` land here.
+        let schema = format!("migrate_race_{}", uuid::Uuid::new_v4().simple());
+        let admin = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let schema_url = with_search_path(&url, &schema);
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&schema_url)
+            .await
+            .unwrap();
+
+        // The bootstrap's `users`, created and not yet committed.
+        let mut bootstrap = pool.begin().await.unwrap();
+        let bootstrap_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *bootstrap)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS users (
+                id          TEXT PRIMARY KEY NOT NULL,
+                email       TEXT NOT NULL UNIQUE,
+                name        TEXT NOT NULL,
+                pw_hash     TEXT NOT NULL,
+                groups      TEXT NOT NULL DEFAULT '[]',
+                created_at  TEXT NOT NULL
+            )",
+        )
+        .execute(&mut *bootstrap)
+        .await
+        .unwrap();
+        let engine = tokio::spawn({
+            let url = schema_url.clone();
+            async move { dagron_core::db::init_pool(&url).await }
+        });
+        // Migration 008 queues behind the uncommitted table; then the bootstrap commits.
+        let mut queued = false;
+        for _ in 0..1000 {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+            )
+            .bind(bootstrap_pid)
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+            if blocked > 0 {
+                queued = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        bootstrap.commit().await.unwrap();
+
+        let migrated = engine.await.unwrap();
+        let again = match &migrated {
+            Ok(_) => Some(
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    dagron_core::db::init_pool(&schema_url),
+                )
+                .await,
+            ),
+            Err(_) => None,
+        };
+        if let Ok(engine_pool) = &migrated {
+            engine_pool.close().await;
+        }
+        if let Some(Ok(Ok(second))) = &again {
+            second.close().await;
+        }
+        pool.close().await;
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        assert!(
+            queued,
+            "migration 008 never queued behind the uncommitted table"
+        );
+        migrated.expect("the engine replays migration 008 and finishes");
+        let again = again.unwrap();
+        assert!(
+            again.is_ok(),
+            "a second migrator waited on a lock the first left behind"
+        );
+        again
+            .unwrap()
+            .expect("a second migrator finds every migration applied");
     }
 }

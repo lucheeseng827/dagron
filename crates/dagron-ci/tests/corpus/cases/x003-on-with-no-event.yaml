@@ -1,0 +1,8 @@
+shows: An on that maps no event to its filters is refused, with the events there are
+source: |
+  name: ci
+  on: true
+  tasks:
+    - name: build
+      steps:
+        - run: make

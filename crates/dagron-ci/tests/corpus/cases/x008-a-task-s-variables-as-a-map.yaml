@@ -1,0 +1,10 @@
+shows: A task's env written as a map, as a step's is, is refused with how to write it
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: test
+      env: { CI: "true" }
+      steps:
+        - run: make test

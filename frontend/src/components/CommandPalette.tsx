@@ -21,6 +21,7 @@ const PAGES: { label: string; href: string; keywords: string }[] = [
   { label: "Overview", href: "/overview", keywords: "overview home dashboard" },
   { label: "Workflows", href: "/workflows", keywords: "workflows definitions dags" },
   { label: "Runs", href: "/runs", keywords: "runs executions history" },
+  { label: "Repositories", href: "/repos", keywords: "repositories repos ci branches pull requests prs" },
   { label: "Approvals", href: "/approvals", keywords: "approvals gates pending human" },
   { label: "Submit", href: "/submit", keywords: "submit new run yaml" },
   { label: "GitOps", href: "/gitops", keywords: "gitops repos git sync" },

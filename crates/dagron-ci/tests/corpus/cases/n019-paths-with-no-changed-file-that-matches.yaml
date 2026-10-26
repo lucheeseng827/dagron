@@ -1,0 +1,14 @@
+shows: A paths filter that no changed file matches leaves the pipeline unrun, and names its jobs
+event: { kind: push, ref: refs/heads/main, changed: [docs/guide.md, README.md] }
+source: |
+  name: ci
+  on:
+    push: { branches: [main], paths: ["src/**", "Cargo.*"] }
+  tasks:
+    - name: build
+      steps:
+        - run: make
+    - name: test
+      depends_on: [build]
+      steps:
+        - run: make test

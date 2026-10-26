@@ -1,0 +1,107 @@
+# The five-minute durable tool: a script, registered once, becomes a durable tool
+# an agent calls by name. See README.md next to this file for the run of show.
+#
+# Every step is a stand-in for something a team already has (an incident store,
+# a summariser, a status page). Swap the commands for yours; the durability is
+# the engine's, not the script's, which is the point of the demo.
+name: summarise-incident
+description: >-
+  Summarise an incident for an engineer or an exec audience and post it to the
+  status page once a person has approved the text. Arguments: incident_id
+  (plain identifier such as INC-4471) and audience (engineer or exec).
+
+# The tag is how an agent finds the tool (dagron_list_workflows tag=agent-callable).
+# It is ergonomics, not authorization: the caller's token decides what it may run.
+tags: [agent-callable]
+
+parameters:
+  incident_id: ""
+  audience: "engineer"          # engineer | exec
+
+tasks:
+  # Refuse a half-specified call here, before anything runs. When the caller is
+  # an agent these values are model output, so they reach the shell through env
+  # vars and are checked, never pasted into the command.
+  - name: validate
+    command:
+      - sh
+      - -c
+      - >-
+        case "$INCIDENT" in
+        "" | *[!A-Za-z0-9-]*) echo "incident_id must be a plain identifier such as INC-4471, got '$INCIDENT'" >&2; exit 1 ;;
+        esac;
+        case "$AUDIENCE" in
+        engineer|exec) ;;
+        *) echo "audience must be engineer or exec, got '$AUDIENCE'" >&2; exit 1 ;;
+        esac;
+        echo ok
+    env:
+      - { name: INCIDENT, value: "{{ incident_id }}" }
+      - { name: AUDIENCE, value: "{{ audience }}" }
+
+  # The slow step: pulling the timeline takes a while, which is where the demo
+  # restarts the engine. The attempt the restart kills is reclaimed and run
+  # again (OPERATIONS.md, "Task ran twice after a crash/restart"), so the step
+  # is written to be safe to repeat.
+  - name: gather
+    depends_on: [validate]
+    max_attempts: 3
+    retry_delay_secs: 2
+    timeout_secs: 120
+    command:
+      - sh
+      - -c
+      - >-
+        echo "pulling the timeline for $INCIDENT";
+        sleep "${GATHER_SECS:-20}";
+        echo "09:12 checkout p99 rises past 2s; 09:15 pager fires; 09:31 pool ceiling raised; 09:38 recovered"
+    env:
+      - { name: INCIDENT, value: "{{ incident_id }}" }
+
+  # A stand-in summariser, so the demo needs no model key. In your copy this is
+  # your own script or a model call; the engine treats it the same either way.
+  - name: summarise
+    depends_on: [gather]
+    max_attempts: 3
+    retry_delay_secs: 5
+    command:
+      - sh
+      - -c
+      - >-
+        if [ "$AUDIENCE" = exec ]; then
+        echo "$INCIDENT: checkout was slow for 26 minutes (09:12-09:38). Cause: the database pool hit its ceiling. Fix: ceiling raised; an alert on pool use now fires first.";
+        else
+        echo "$INCIDENT: pool saturation drove checkout p99 past 2s at 09:12; paged 09:15; ceiling raised 100->400 at 09:31; recovered 09:38. Follow-up: alert at 80% pool use.";
+        fi
+    env:
+      - { name: INCIDENT, value: "{{ incident_id }}" }
+      - { name: AUDIENCE, value: "{{ audience }}" }
+
+  # A person signs off before anything leaves the building. The run parks here
+  # holding no worker slot, for minutes or days.
+  - name: review
+    type: approval
+    depends_on: [summarise]
+    approval_message: "Post this incident summary to the status page?"
+
+  # The side effect. It fails while the status page is down (the demo simulates
+  # that with a flag file), and a rerun then repeats only this step: the
+  # timeline is not pulled again and the approval is not asked for twice.
+  - name: publish
+    depends_on: [review]
+    max_attempts: 1
+    command:
+      - sh
+      - -c
+      - >-
+        if [ -e /tmp/dagron-mcp-demo/statuspage-down ]; then
+        echo "status page unreachable: connection refused (statuspage.internal:443)" >&2; exit 1;
+        fi;
+        echo "posted the $AUDIENCE summary of $INCIDENT to the status page"
+    env:
+      - { name: INCIDENT, value: "{{ incident_id }}" }
+      - { name: AUDIENCE, value: "{{ audience }}" }
+
+# The tool's return value: the agent gets the summary, not a run id to poll. A
+# run only succeeds once `publish` has, so a returned value means it was posted.
+result_from: summarise

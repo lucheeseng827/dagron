@@ -18,6 +18,11 @@ RUN mkdir src \
     && : > src/lib.rs \
     && cargo build --release --bin dagron-mcp
 COPY crates/dagron-mcp/src ./src
+# The release this is built for, which the binary answers `--version` with. A
+# release's build passes it, and any other build says `dev`. Declared here,
+# just before the build, so that the layers above are reused across versions.
+ARG APP_VERSION=dev
+ENV APP_VERSION=$APP_VERSION
 # Bust the stub mtime so cargo rebuilds the real binary (deps stay cached).
 RUN touch src/main.rs src/lib.rs && cargo build --release --bin dagron-mcp
 

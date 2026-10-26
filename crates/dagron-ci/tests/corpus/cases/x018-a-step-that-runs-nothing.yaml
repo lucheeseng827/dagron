@@ -1,0 +1,11 @@
+shows: A step with no script, and a job with no steps in its list, are refused
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: build
+      steps:
+        - name: nothing
+    - name: empty
+      steps: []

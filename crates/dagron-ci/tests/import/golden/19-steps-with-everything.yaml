@@ -1,0 +1,37 @@
+# Imported from a GitHub Actions workflow by dagron-import.
+#
+# To do by hand (1):
+#   jobs.all.steps[2]: its condition, `always()`, could not be read as a test: write it in the script
+#
+# Changed on the way (4):
+#   jobs.all.steps[0]: the step ran under bash, and a step here is `sh -e`: call bash in the script where it needs one
+#   jobs.all.steps[1]: the step ran under python, and a step here is `sh -e`: call python in the script where it needs one
+#   jobs.all.runs-on: ubuntu-latest is the image docker.io/library/ubuntu:24.04: an operating system, with none of the tools a hosted runner holds
+#   jobs: a step that named no shell ran under bash on a runner GitHub hosts, and a step here is run by `sh -e`: a script that is bash's calls bash
+#
+# Not carried over (1):
+#   jobs.all.name: the job is called all, by its id: a commit's checks are named by it
+name: steps
+on:
+  push: {}
+tasks:
+- name: all
+  docker_image: docker.io/library/ubuntu:24.04
+  timeout_secs: 1800
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        jobs.all.steps[2]: its condition, `always()`, could not be read as a test: write it in the script
+      DAGRON_IMPORT
+      exit 1
+  - name: Slow, and allowed to fail
+    run: |-
+      cd 'tools'
+      make slow
+    timeout_secs: 150
+    continue_on_error: true
+  - name: In Python
+    run: print("hello")
+  - run: make report

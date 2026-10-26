@@ -1,0 +1,2 @@
+not a pipeline:
+  task_default: a pipeline has no key "task_default"; did you mean "task_defaults"?

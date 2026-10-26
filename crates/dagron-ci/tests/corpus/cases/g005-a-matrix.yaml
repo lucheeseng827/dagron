@@ -1,0 +1,14 @@
+shows: A job's matrix is written out, one task for each of its combinations
+front: github
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on: push
+  jobs:
+    test:
+      runs-on: ubuntu-latest
+      strategy:
+        matrix:
+          toolchain: [stable, beta]
+          features: [default, all]
+      steps:
+        - run: cargo +${{ matrix.toolchain }} test --features ${{ matrix.features }}

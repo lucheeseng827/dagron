@@ -1,0 +1,17 @@
+shows: A GitLab manual job waits for an approval, and the stages after it do not wait for it
+front: gitlab
+file: gitlab-ci
+source: |
+  image: alpine:3.20
+  stages: [build, deploy, verify]
+  build:
+    stage: build
+    script: [make]
+  deploy:
+    stage: deploy
+    when: manual
+    environment: production
+    script: [make deploy]
+  verify:
+    stage: verify
+    script: [make verify]

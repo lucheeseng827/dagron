@@ -1,0 +1,38 @@
+// A Maven build: one agent, three stages, a deploy from main.
+pipeline {
+    agent {
+        docker { image 'maven:3.9-eclipse-temurin-21' }
+    }
+    environment {
+        MAVEN_OPTS = '-Xmx1g'
+    }
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+    stages {
+        stage('Build') {
+            steps {
+                sh 'mvn -B -DskipTests package'
+            }
+        }
+        stage('Test') {
+            steps {
+                sh 'mvn -B test'
+            }
+        }
+        stage('Deploy') {
+            when { branch 'main' }
+            steps {
+                sh './deploy.sh target/app.jar'
+            }
+        }
+    }
+    post {
+        always {
+            junit 'target/surefire-reports/TEST-app.xml'
+            archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+        }
+    }
+}

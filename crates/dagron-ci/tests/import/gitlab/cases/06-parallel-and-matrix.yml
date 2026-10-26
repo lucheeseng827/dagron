@@ -1,0 +1,30 @@
+# Instances of one job: by count, and by a matrix of variables.
+stages: [test, deploy]
+
+test:
+  image: python:3.12
+  parallel: 3
+  script:
+    - pytest --splits "$CI_NODE_TOTAL" --group "$CI_NODE_INDEX"
+
+deploy:
+  stage: deploy
+  image: $DEPLOY_IMAGE
+  parallel:
+    matrix:
+      - PROVIDER: aws
+        STACK: [monitoring, app]
+        DEPLOY_IMAGE: amazon/aws-cli:2
+      - PROVIDER: gcp
+        STACK: app
+        DEPLOY_IMAGE: google/cloud-sdk:slim
+  script:
+    - ./deploy.sh "$PROVIDER" "$STACK"
+
+single:
+  parallel:
+    matrix:
+      - RUBY: ["3.2", "3.3"]
+  image: ruby:$RUBY
+  script:
+    - bundle exec rake

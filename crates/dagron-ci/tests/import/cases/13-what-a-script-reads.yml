@@ -1,0 +1,23 @@
+# Scripts that read the event as GitHub's runner gives it, in expressions and in variables.
+name: scripts
+on: [push, pull_request]
+env:
+  REGISTRY: registry.example.com
+jobs:
+  say:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "commit ${{ github.sha }} of ${{ github.repository }}"
+          echo "ref ${{ github.ref }}, event ${{ github.event_name }}"
+          echo "pull request ${{ github.event.pull_request.number }} against ${{ github.event.pull_request.base.sha }}"
+          echo "on ${{ runner.os }}, from ${{ github.server_url }}/${{ github.repository }}"
+          echo "registry ${{ env.REGISTRY }}"
+      - run: |
+          echo "sha $GITHUB_SHA ref $GITHUB_REF repo $GITHUB_REPOSITORY event ${GITHUB_EVENT_NAME}"
+          echo "## Built" >> "$GITHUB_STEP_SUMMARY"
+          echo "MY_GITHUB_SHA_COPY is not GITHUB_SHA2"
+      - run: |
+          echo "branch ${{ github.head_ref }} run ${{ github.run_id }}"
+          echo "FOO=bar" >> "$GITHUB_ENV"
+          echo "hash ${{ hashFiles('**/package-lock.json') }}"

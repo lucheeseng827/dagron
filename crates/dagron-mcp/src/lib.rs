@@ -23,6 +23,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::time::Duration;
 
+mod bundle;
 mod tools;
 
 pub use tools::{
@@ -91,6 +92,36 @@ pub fn progress_notification(token: &Value, progress: u64, total: u64) -> Value 
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 pub const SERVER_NAME: &str = "dagron-mcp";
 
+/// The release this server was built for: `APP_VERSION` as a release's build
+/// sets it, and what it tells a client it is. `dev` is a build no release
+/// made. (As every dagron binary says it; this crate links none of their
+/// shared crates, so the reading is its own.)
+pub const VERSION: &str = match option_env!("APP_VERSION") {
+    Some(version) if !version.is_empty() => version,
+    _ => "dev",
+};
+
+/// Answer `--version` (or `-V`), alone: print `binary` and [`VERSION`] on one
+/// line and return `true`. The caller then returns, having started nothing.
+/// `binary` is the build's own name, whatever it was run as.
+pub fn version_requested(binary: &str) -> bool {
+    let mut asked = std::env::args_os().skip(1);
+    let asks = matches!(asked.next(), Some(arg) if arg == "--version" || arg == "-V")
+        && asked.next().is_none();
+    if asks {
+        println!("{binary} {VERSION}");
+    }
+    asks
+}
+
+/// Whether this process's log lines, which go to stderr, carry ANSI colour:
+/// when stderr is a terminal and `NO_COLOR` is not set. An MCP client reads
+/// this process's stderr into a log, where the escape codes are noise.
+pub fn stderr_takes_colour() -> bool {
+    use std::io::IsTerminal;
+    std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+}
+
 /// Inline cap for [`DagronClient::max_artifact_bytes`], overridable with
 /// `DAGRON_MCP_MAX_ARTIFACT_BYTES`. Matches the SSE window's cap: comfortably
 /// past a log file or a JSON result, far short of a context window.
@@ -151,17 +182,25 @@ impl BytesResponse {
 pub struct DagronClient {
     http: reqwest::Client,
     base: String,
+    /// dagron-ci's run API (`DAGRON_CI_URL`), which the `dagron_ci_*` tools
+    /// call with the same token: dagron-ci asks its cell's dagron-api who the
+    /// caller is. `None`: those tools say it is not set.
+    ci_base: Option<String>,
     token: Option<String>,
     readonly: bool,
     allow_approve: bool,
     max_artifact_bytes: usize,
     progress_poll: Duration,
+    /// The one directory `dagron_ci_run`'s `bundle_from` may name a tree
+    /// under (`DAGRON_MCP_WORKTREE`). `None`: the one this server runs in.
+    worktree: Option<std::path::PathBuf>,
 }
 
 impl DagronClient {
     /// `DAGRON_API_URL` (default `http://localhost:8080`) + optional
     /// `DAGRON_MCP_TOKEN` (sent as `Authorization: Bearer …`),
-    /// `DAGRON_MCP_READONLY` and `DAGRON_MCP_MAX_ARTIFACT_BYTES`.
+    /// `DAGRON_MCP_READONLY`, `DAGRON_MCP_MAX_ARTIFACT_BYTES` and
+    /// `DAGRON_MCP_WORKTREE`.
     ///
     /// Fails when the token would cross the network in the clear — see
     /// [`plaintext_token_verdict`] for the reasoning and the opt-out.
@@ -171,6 +210,13 @@ impl DagronClient {
         let token = std::env::var("DAGRON_MCP_TOKEN").ok().filter(|t| !t.is_empty());
         let opted_in = env_flag("DAGRON_MCP_ALLOW_PLAINTEXT_TOKEN");
         plaintext_token_verdict(&base, token.is_some(), opted_in)?;
+        let ci_base = std::env::var("DAGRON_CI_URL")
+            .ok()
+            .map(|u| u.trim().trim_end_matches('/').to_string())
+            .filter(|u| !u.is_empty());
+        if let Some(ci) = &ci_base {
+            plaintext_token_verdict(ci, token.is_some(), opted_in)?;
+        }
         let max_artifact_bytes = std::env::var("DAGRON_MCP_MAX_ARTIFACT_BYTES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -179,11 +225,15 @@ impl DagronClient {
         Ok(Self {
             http: reqwest::Client::new(),
             base,
+            ci_base,
             token,
             readonly: env_flag("DAGRON_MCP_READONLY"),
             allow_approve: env_flag("DAGRON_MCP_ALLOW_APPROVE"),
             max_artifact_bytes,
             progress_poll: PROGRESS_POLL,
+            worktree: std::env::var_os("DAGRON_MCP_WORKTREE")
+                .filter(|v| !v.is_empty())
+                .map(std::path::PathBuf::from),
         })
     }
 
@@ -193,12 +243,33 @@ impl DagronClient {
         Self {
             http: reqwest::Client::new(),
             base: base.into(),
+            ci_base: None,
             token,
             readonly: false,
             allow_approve: false,
             max_artifact_bytes: DEFAULT_MAX_ARTIFACT_BYTES,
             progress_poll: PROGRESS_POLL,
+            worktree: None,
         }
+    }
+
+    /// The directory a patch bundle may be made under (`bundle_from`).
+    pub fn with_worktree(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.worktree = Some(dir.into());
+        self
+    }
+
+    pub(crate) fn worktree(&self) -> Result<std::path::PathBuf> {
+        match &self.worktree {
+            Some(dir) => Ok(dir.clone()),
+            None => std::env::current_dir().context("this server's directory cannot be read"),
+        }
+    }
+
+    /// Where dagron-ci's run API is, for the `dagron_ci_*` tools.
+    pub fn with_ci(mut self, base: impl Into<String>) -> Self {
+        self.ci_base = Some(base.into().trim_end_matches('/').to_string());
+        self
     }
 
     /// Re-read a waited-on run this often, so a test need not wait 5 s a tick.
@@ -255,7 +326,18 @@ impl DagronClient {
         payload: Option<(String, &'static str)>,
         headers: &[(&str, String)],
     ) -> reqwest::RequestBuilder {
-        let url = format!("{}{path}", self.base);
+        self.build_at(&self.base, method, path, payload, headers)
+    }
+
+    fn build_at(
+        &self,
+        base: &str,
+        method: Method,
+        path: &str,
+        payload: Option<(String, &'static str)>,
+        headers: &[(&str, String)],
+    ) -> reqwest::RequestBuilder {
+        let url = format!("{base}{path}");
         let mut rb = match method {
             Method::Get => self.http.get(url),
             Method::Post => self.http.post(url),
@@ -295,6 +377,56 @@ impl DagronClient {
         // `{"status":200,"ok":true}` — telling the agent the call succeeded and
         // simply returned nothing. A transport failure has to stay a failure.
         let body = r.text().await.context("dagron-api response body read failed")?;
+        Ok(ApiResponse { status, body })
+    }
+
+    /// One request against dagron-ci's run API (`DAGRON_CI_URL`), with the
+    /// same token, status preserved.
+    pub async fn ci_request(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<(String, &'static str)>,
+        headers: &[(&str, String)],
+    ) -> Result<ApiResponse> {
+        let base = self.ci_base()?;
+        let r = self
+            .build_at(base, method, path, payload, headers)
+            .send()
+            .await
+            .context("dagron-ci request failed")?;
+        Self::ci_answer(r).await
+    }
+
+    /// A POST of bytes to dagron-ci's run API: a patch bundle.
+    pub async fn ci_upload(&self, path: &str, bytes: Vec<u8>) -> Result<ApiResponse> {
+        let base = self.ci_base()?;
+        let r = self
+            .build_at(base, Method::Post, path, None, &[])
+            .header("content-type", "application/octet-stream")
+            .body(bytes)
+            .send()
+            .await
+            .context("dagron-ci request failed")?;
+        Self::ci_answer(r).await
+    }
+
+    fn ci_base(&self) -> Result<&str> {
+        match &self.ci_base {
+            Some(base) => Ok(base),
+            None => anyhow::bail!(
+                "the dagron_ci_* tools need DAGRON_CI_URL: where dagron-ci's run API is \
+                 (its /ci/v1 routes), which takes this server's DAGRON_MCP_TOKEN"
+            ),
+        }
+    }
+
+    async fn ci_answer(r: reqwest::Response) -> Result<ApiResponse> {
+        let status = r.status().as_u16();
+        let body = r
+            .text()
+            .await
+            .context("dagron-ci response body read failed")?;
         Ok(ApiResponse { status, body })
     }
 
@@ -487,7 +619,7 @@ pub async fn handle_with_progress(
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": { "tools": {} },
-                "serverInfo": { "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") }
+                "serverInfo": { "name": SERVER_NAME, "version": VERSION }
             }),
         )),
         "ping" => Some(ok(id, json!({}))),

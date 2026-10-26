@@ -36,6 +36,11 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then \
       rustup target add aarch64-unknown-linux-gnu; \
     fi
 
+# The release this is built for, which the binary answers `--version` with. A
+# release's build passes it, and any other build says `dev`. Declared here,
+# just before the build, so that the layers above are reused across versions.
+ARG APP_VERSION=dev
+ENV APP_VERSION=$APP_VERSION
 RUN if [ "$TARGETARCH" = "arm64" ]; then \
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
       CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
@@ -53,7 +58,9 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then \
 # and it then silently skips DAGRON_ARTIFACTS ("could not prepare artifact dir"), which
 # an approval gate's `binds` needs. A volume first mounted over a directory the image
 # ships inherits that directory's owner.
-RUN mkdir -p /seed/workflows /seed/artifacts && chown -R 65532:65532 /seed
+# Group 0, and the group's rights the owner's: OpenShift runs the image as a uid
+# from its namespace's range, never 65532, in group 0.
+RUN mkdir -p /seed/workflows /seed/artifacts && chown -R 65532:0 /seed && chmod -R g=u /seed
 
 # ── Local-dev runtime: debian-slim. Has coreutils + /bin/sh, so example tasks
 # whose command is `echo`/`sh -c ...` actually resolve (the distroless prod image
@@ -63,7 +70,8 @@ RUN apt-get update -q && apt-get install -y -q --no-install-recommends ca-certif
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /dagron /usr/local/bin/dagron
 COPY examples/ /etc/dagron/examples/
-RUN mkdir -p /workflows /artifacts && chown -R 65532:65532 /workflows /artifacts
+RUN mkdir -p /workflows /artifacts && chown -R 65532:0 /workflows /artifacts \
+    && chmod -R g=u /workflows /artifacts
 VOLUME /workflows
 # Run as the same nonroot uid as the distroless prod image — good habit even in dev.
 USER 65532:65532
@@ -81,9 +89,11 @@ COPY --from=builder /dagron /usr/local/bin/dagron
 # Bundle example workflows — the binary seeds /workflows from here on first start.
 COPY examples/ /etc/dagron/examples/
 # Pre-created, nonroot-owned GitOps volume mount point (distroless can't mkdir).
-COPY --from=builder --chown=65532:65532 /seed/workflows /workflows
+# --chmod: a directory COPY makes is 0755 whatever its source's mode, and
+# OpenShift's uid writes here as group 0.
+COPY --from=builder --chown=65532:0 --chmod=775 /seed/workflows /workflows
 # Same for the artifact store, so a volume mounted at /artifacts is writable.
-COPY --from=builder --chown=65532:65532 /seed/artifacts /artifacts
+COPY --from=builder --chown=65532:0 --chmod=775 /seed/artifacts /artifacts
 
 # /workflows is the GitOps-managed volume mount point. Override the path with the
 # WORKFLOW_DIR env var (the binary seeds it from /etc/dagron/examples when empty).

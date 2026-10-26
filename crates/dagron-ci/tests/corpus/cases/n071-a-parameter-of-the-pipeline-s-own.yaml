@@ -1,0 +1,12 @@
+shows: A pipeline's own parameters are dagron's, beside those the event gives
+source: |
+  name: ci
+  on:
+    push: {}
+  parameters:
+    profile: release
+  tasks:
+    - name: build
+      steps:
+        - env: { PROFILE: "{{ profile }}" }
+          run: cargo build --profile "$PROFILE"

@@ -1,0 +1,14 @@
+shows: A GitLab local include is merged under the file that includes it
+front: gitlab
+file: gitlab-ci
+gitlab:
+  included:
+    ci/templates.yml: |
+      .test:
+        image: golang:1.23
+        script: [go test ./...]
+source: |
+  include:
+    - local: /ci/templates.yml
+  unit:
+    extends: .test

@@ -1,0 +1,10 @@
+shows: A pull request being closed runs no pipeline
+event: { kind: pull_request_closed, ref: refs/pull/7/head }
+source: |
+  name: ci
+  on:
+    pull_request: {}
+  tasks:
+    - name: test
+      steps:
+        - run: make test

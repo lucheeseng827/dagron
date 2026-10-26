@@ -65,6 +65,24 @@ pub struct CreateToken {
     pub name: String,
     /// Days until the token expires. Omit for a token that never expires.
     pub expires_in_days: Option<i64>,
+    /// An agent's token: the agent's name. The token presents as the
+    /// caller `agent:<name>`, with its owner's groups less `admin` and
+    /// `ci:trigger`, and may read, and rerun or cancel the runs it asked for:
+    /// its work is run through dagron-ci, as the `agent` trust class. Unset:
+    /// a token of the person's own.
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
+/// Whether `name` is an agent's name: 1 to 64 lowercase letters, digits and
+/// `-`, beginning with a letter or a digit.
+pub fn is_agent_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !name.starts_with('-')
 }
 
 /// The **only** response that ever carries the plaintext token.
@@ -76,6 +94,9 @@ pub struct CreatedToken {
     /// Shown once. There is no way to retrieve it later.
     pub token: String,
     pub expires_at: Option<String>,
+    /// The agent the token is for, where it is an agent's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -88,6 +109,8 @@ pub struct TokenRow {
     pub expires_at: Option<String>,
     pub last_used_at: Option<String>,
     pub revoked_at: Option<String>,
+    /// The agent the token is for, where it is an agent's.
+    pub agent: Option<String>,
 }
 
 // ── minting ──────────────────────────────────────────────────────────────────
@@ -171,6 +194,41 @@ pub async fn create_token(
         }
     }
 
+    let agent = body
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .map(str::to_string);
+    if let Some(agent) = &agent {
+        if !is_agent_name(agent) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("agent {agent:?} is not an agent's name: 1 to 64 lowercase letters, digits and '-'"),
+            ));
+        }
+        // An agent's name is its first owner's for good: its runs are
+        // recorded as `agent:<name>`, and are what it may rerun and cancel.
+        sqlx::query("INSERT INTO agent_names (name, user_id, created_at) VALUES ($1, $2, $3) ON CONFLICT (name) DO NOTHING")
+            .bind(agent)
+            .bind(&auth.0.sub)
+            .bind(now())
+            .execute(&state.write_pool)
+            .await
+            .map_err(internal_msg)?;
+        let (owner,): (String,) = sqlx::query_as("SELECT user_id FROM agent_names WHERE name = $1")
+            .bind(agent)
+            .fetch_one(&state.write_pool)
+            .await
+            .map_err(internal_msg)?;
+        if owner != auth.0.sub {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("the agent {agent:?} is another person's: name yours otherwise"),
+            ));
+        }
+    }
+
     let minted = mint();
     let id = uuid::Uuid::new_v4().to_string();
     // Bound the expiry against chrono's range before converting: an unchecked
@@ -191,8 +249,8 @@ pub async fn create_token(
 
     sqlx::query(
         "INSERT INTO api_tokens
-            (id, name, user_id, user_email, prefix, token_hash, created_at, expires_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            (id, name, user_id, user_email, prefix, token_hash, created_at, expires_at, agent)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(&id)
     .bind(&name)
@@ -202,13 +260,14 @@ pub async fn create_token(
     .bind(&minted.hash)
     .bind(now())
     .bind(&expires_at)
+    .bind(&agent)
     .execute(&state.write_pool)
     .await
     .map_err(internal_msg)?;
 
     // Deliberately not logged, at any level: the whole point of hashing the
     // stored copy is defeated if the plaintext lands in a log aggregator.
-    tracing::info!(token_id = %id, name = %name, user = %auth.0.email, "api token created");
+    tracing::info!(token_id = %id, name = %name, user = %auth.0.email, agent = ?agent, "api token created");
 
     Ok((
         StatusCode::CREATED,
@@ -218,6 +277,7 @@ pub async fn create_token(
             prefix: format!("{TOKEN_PREFIX}{}", minted.prefix),
             token: minted.plaintext,
             expires_at,
+            agent,
         }),
     ))
 }
@@ -231,7 +291,7 @@ pub async fn list_tokens(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<TokenRow>>, (StatusCode, String)> {
     let rows = sqlx::query_as::<_, TokenRow>(
-        "SELECT id, name, prefix, created_at, expires_at, last_used_at, revoked_at
+        "SELECT id, name, prefix, created_at, expires_at, last_used_at, revoked_at, agent
          FROM api_tokens WHERE user_id = $1 ORDER BY created_at DESC",
     )
     .bind(&auth.0.sub)
@@ -271,15 +331,17 @@ pub async fn revoke_token(
     .execute(&state.write_pool)
     .await
     .map_err(internal_msg)?;
+    // A service's token is not taken from the cache once it is revoked.
+    state.token_cache.clear();
 
     if res.rows_affected() == 0 {
         // Either it never existed, belongs to someone else, or is already
         // revoked. One answer for all three: which of them it is would tell an
         // attacker whether a token id is real.
-        // `1::bigint` — a bare literal is INT4 and will not decode into i64, so
+        // `CAST(1 AS BIGINT)` — a bare literal is INT4 and will not decode into i64, so
         // revoking an already-revoked token would 500 rather than 404/409.
         let exists = sqlx::query_scalar::<_, i64>(
-            "SELECT 1::bigint FROM api_tokens WHERE id = $1 AND user_id = $2",
+            "SELECT CAST(1 AS BIGINT) FROM api_tokens WHERE id = $1 AND user_id = $2",
         )
         .bind(&id)
         .bind(&auth.0.sub)
@@ -363,6 +425,25 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_s_name_is_lowercase_letters_digits_and_dashes() {
+        for name in ["fixer", "review-bot", "a", "0day", &"a".repeat(64)] {
+            assert!(is_agent_name(name), "{name}");
+        }
+        for name in [
+            "",
+            "-lead",
+            "Fixer",
+            "fix er",
+            "fix:er",
+            "fix/er",
+            "fixé",
+            &"a".repeat(65),
+        ] {
+            assert!(!is_agent_name(name), "{name:?}");
+        }
+    }
+
+    #[test]
     fn touch_throttles_but_never_skips_a_first_use() {
         assert!(should_touch(None), "a token never used must record its first use");
         let just_now = chrono::Utc::now().to_rfc3339();
@@ -371,5 +452,154 @@ mod tests {
             .to_rfc3339();
         assert!(should_touch(Some(&stale)));
         assert!(should_touch(Some("not a timestamp")));
+    }
+}
+
+/// Agents' tokens against a real datastore: who may mint one of a name, what
+/// it presents as, and what it may change. Skipped without
+/// `TEST_DATABASE_URL`.
+#[cfg(all(test, feature = "postgres"))]
+mod agent_live_tests {
+    use std::collections::BTreeMap;
+
+    use axum::http::{HeaderMap, HeaderValue, Method};
+
+    use super::*;
+    use crate::auth::{agent_gate, authenticate, SessionClaims};
+    use crate::routes::ops::redrive_tests::test_state;
+
+    /// A person of `groups`, made for this test alone: their session.
+    async fn person(state: &AppState, groups: &[&str]) -> SessionClaims {
+        let id = uuid::Uuid::new_v4().to_string();
+        let email = format!("{id}@example.com");
+        sqlx::query(
+            "INSERT INTO users (id, email, name, pw_hash, groups, created_at) VALUES ($1, $2, $3, 'x', $4, $5)",
+        )
+        .bind(&id)
+        .bind(&email)
+        .bind("Someone")
+        .bind(serde_json::to_string(groups).unwrap())
+        .bind(now())
+        .execute(&state.write_pool)
+        .await
+        .unwrap();
+        SessionClaims {
+            sub: id,
+            email,
+            name: "Someone".into(),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            exp: 0,
+        }
+    }
+
+    async fn mint_for(
+        state: &AppState,
+        owner: &SessionClaims,
+        agent: &str,
+    ) -> Result<CreatedToken, (StatusCode, String)> {
+        let body = CreateToken {
+            name: "an agent's".into(),
+            expires_in_days: Some(1),
+            agent: Some(agent.into()),
+        };
+        create_token(SessionAuth(owner.clone()), State(state.clone()), Json(body))
+            .await
+            .map(|(_, Json(created))| created)
+    }
+
+    /// A run recorded as asked for by `actor`, of `trust`. Its one task is in
+    /// a runner class of its own, which no other test claims from.
+    async fn run_by(state: &AppState, actor: &str, trust: &str) -> String {
+        let name = format!("agent-{}", uuid::Uuid::new_v4().simple());
+        let yaml = format!(
+            "name: {name}\nrunner_class: {name}\ntasks:\n  - name: t\n    command: [\"true\"]\n"
+        );
+        let trigger = dagron_core::models::RunTrigger {
+            kind: "ci".into(),
+            principal: "ci:dagron-ci".into(),
+            actor: Some(actor.into()),
+            trust: Some(trust.into()),
+            ..Default::default()
+        };
+        crate::routes::control::submit_yaml_triggered(
+            state,
+            &yaml,
+            &yaml,
+            &BTreeMap::new(),
+            actor,
+            Some(&trigger),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_agent_s_token_presents_as_the_agent_and_changes_its_own_runs_alone() {
+        let Some(state) = test_state("agent-tokens").await else {
+            return;
+        };
+        let agent = format!("fixer-{}", uuid::Uuid::new_v4().simple());
+        let owner = person(&state, &["admin", crate::auth::TRIGGER_GROUP, "release"]).await;
+
+        let created = mint_for(&state, &owner, &agent).await.unwrap();
+        assert_eq!(created.agent.as_deref(), Some(agent.as_str()));
+        // Presented, it is the agent: never its owner, and never an admin.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {}", created.token)).unwrap(),
+        );
+        let claims = authenticate(&headers, &state)
+            .await
+            .expect("the token is good");
+        assert_eq!(claims.sub, format!("agent:{agent}"));
+        assert_eq!(claims.email, "");
+        assert_eq!(
+            claims.name,
+            format!("{agent} (an agent of {})", owner.email)
+        );
+        assert_eq!(claims.groups, ["release"]);
+
+        // The name is its owner's for good: another person may not have it,
+        // and its owner may mint it another token.
+        let other = person(&state, &[]).await;
+        let (status, _) = mint_for(&state, &other, &agent).await.unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        mint_for(&state, &owner, &agent).await.unwrap();
+        let (status, _) = mint_for(&state, &owner, "Not A Name").await.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // It reruns and cancels the runs it asked for, and changes nothing
+        // else.
+        let mine = run_by(&state, &claims.sub, "agent").await;
+        let theirs = run_by(&state, &owner.email, "trusted").await;
+        for what in ["rerun", "cancel"] {
+            let path = format!("/api/runs/{mine}/{what}");
+            assert!(
+                agent_gate(&claims, &Method::POST, &path, &state)
+                    .await
+                    .is_none(),
+                "{path}"
+            );
+            let path = format!("/api/runs/{theirs}/{what}");
+            let refused = agent_gate(&claims, &Method::POST, &path, &state)
+                .await
+                .expect("not its run");
+            assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        }
+        for (method, path) in [
+            (Method::POST, "/api/workflows".to_string()),
+            (Method::POST, format!("/api/runs/{mine}/approve")),
+            (Method::DELETE, format!("/api/tokens/{}", created.id)),
+        ] {
+            let refused = agent_gate(&claims, &method, &path, &state)
+                .await
+                .expect("refused");
+            assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        }
+        // A person is not gated.
+        assert!(agent_gate(&owner, &Method::POST, "/api/workflows", &state)
+            .await
+            .is_none());
     }
 }

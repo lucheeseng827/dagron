@@ -1,0 +1,13 @@
+shows: Every problem of a file is said at once, each at its place
+source: |
+  name: ""
+  on:
+    push: { branches: main, paths: [] }
+    pushes: {}
+  tasks:
+    - name: a
+      steps:
+        - run: ""
+          timeout_secs: 0
+    - steps:
+        - run: make

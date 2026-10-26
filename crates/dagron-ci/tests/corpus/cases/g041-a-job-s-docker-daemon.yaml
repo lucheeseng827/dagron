@@ -1,0 +1,13 @@
+shows: A repository that asks has a Docker daemon beside each job of a trusted run, which a docker build sends its context to
+front: github
+github:
+  runs_on: { ubuntu-latest: "docker.io/library/docker:27-cli" }
+  docker: true
+source: |
+  on: [push, pull_request]
+  jobs:
+    image:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+        - run: docker build . --file Dockerfile --tag my-image-name:$(date +%s)

@@ -1,0 +1,10 @@
+shows: A question mark is one character of a path and a bracket is a class of them
+event: { kind: push, ref: refs/heads/main, changed: [chapters/ch7.md] }
+source: |
+  name: book
+  on:
+    push: { paths: ["chapters/ch?.md", "figures/fig[0-9].svg"] }
+  tasks:
+    - name: render
+      steps:
+        - run: make book

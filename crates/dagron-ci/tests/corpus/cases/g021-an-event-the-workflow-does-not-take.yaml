@@ -1,0 +1,10 @@
+shows: A workflow that takes only pull requests is passed over for a push
+front: github
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on: pull_request
+  jobs:
+    test:
+      runs-on: ubuntu-latest
+      steps:
+        - run: make test

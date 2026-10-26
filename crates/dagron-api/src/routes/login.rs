@@ -233,8 +233,10 @@ pub async fn list_users(
 /// Ensure the `users` table exists. dagron-api is its sole owner (the engine
 /// never reads it), so it creates the table itself rather than depending on the
 /// engine's migration having run first — removing any startup ordering race.
-/// Mirrors migrations_pg/008_users.sql.
-pub async fn ensure_schema(pool: &sqlx::postgres::PgPool) -> anyhow::Result<()> {
+/// Mirrors migrations_pg/008_users.sql. On SQLite the engine's migration 069
+/// makes it.
+#[cfg(feature = "postgres")]
+pub async fn ensure_schema(pool: &crate::db::Pool) -> anyhow::Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS users (
             id          TEXT PRIMARY KEY NOT NULL,
@@ -255,7 +257,7 @@ pub async fn ensure_schema(pool: &sqlx::postgres::PgPool) -> anyhow::Result<()> 
 /// Seed a first admin from DAGRON_ADMIN_EMAIL / DAGRON_ADMIN_PASSWORD (and
 /// optional DAGRON_ADMIN_NAME) if both are set. Idempotent: an existing email is
 /// left untouched, so the password is not reset on every restart.
-pub async fn bootstrap_admin(pool: &sqlx::postgres::PgPool) -> anyhow::Result<()> {
+pub async fn bootstrap_admin(pool: &crate::db::Pool) -> anyhow::Result<()> {
     let (Ok(email), Ok(password)) = (
         std::env::var("DAGRON_ADMIN_EMAIL"),
         std::env::var("DAGRON_ADMIN_PASSWORD"),

@@ -1,0 +1,14 @@
+shows: GitLab rules changes run a job whose files the event changed, and leave out one whose did not
+front: gitlab
+file: gitlab-ci
+event: { base_sha: "1111111111111111111111111111111111111111", changed: [docs/index.md] }
+source: |
+  image: alpine:3.20
+  docs:
+    script: [mkdocs build]
+    rules:
+      - changes: [docs/**/*]
+  code:
+    script: [make]
+    rules:
+      - changes: [src/**/*]

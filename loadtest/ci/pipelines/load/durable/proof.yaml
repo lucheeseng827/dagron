@@ -1,0 +1,59 @@
+# The durability demo's pipeline, the one pipeline of the
+# repository load/durable. Three jobs in a line, build, then test, then ship,
+# each lasting as long as the branch says:
+#
+#   proof/<build seconds>/<test seconds>/<ship seconds>/<anything>
+#
+# Each execution of a job writes a line to /marks/marks as it starts and as
+# it ends: a volume every engine of the cell shares, which outlives an
+# engine killed and started again. A line is
+#
+#   start|done <execution> <ns> <container> <run id> <task id> <job>
+#
+# where the execution is the container, the shell's pid and its start, so
+# that a start whose end never came (the job was killed with its engine) is
+# told from one that ended. `run.sh durable` reads these to say which jobs
+# ran, how often, and in what order.
+#
+# No checkout: the harness's forge holds no git objects to fetch.
+name: proof
+on:
+  push: { branches: ["proof/**"] }
+task_defaults:
+  timeout_secs: 600
+tasks:
+  - name: build
+    workspace: { checkout: false }
+    steps:
+      - name: work
+        run: |
+          now=$(date +%s%N); host=$(cat /etc/hostname); ex="$host.$$.$now"
+          echo "proof-job-started $now"
+          echo "start $ex $now $host $DAGRON_RUN_ID $DAGRON_TASK_ID build" >> /marks/marks
+          shape=${CI_REF#*proof/}; set -f; IFS=/; set -- $shape; unset IFS; set +f
+          sleep "${1:-10}"
+          echo "done $ex $(date +%s%N) $host $DAGRON_RUN_ID $DAGRON_TASK_ID build" >> /marks/marks
+  - name: test
+    depends_on: [build]
+    workspace: { checkout: false }
+    steps:
+      - name: work
+        run: |
+          now=$(date +%s%N); host=$(cat /etc/hostname); ex="$host.$$.$now"
+          echo "proof-job-started $now"
+          echo "start $ex $now $host $DAGRON_RUN_ID $DAGRON_TASK_ID test" >> /marks/marks
+          shape=${CI_REF#*proof/}; set -f; IFS=/; set -- $shape; unset IFS; set +f
+          sleep "${2:-30}"
+          echo "done $ex $(date +%s%N) $host $DAGRON_RUN_ID $DAGRON_TASK_ID test" >> /marks/marks
+  - name: ship
+    depends_on: [test]
+    workspace: { checkout: false }
+    steps:
+      - name: work
+        run: |
+          now=$(date +%s%N); host=$(cat /etc/hostname); ex="$host.$$.$now"
+          echo "proof-job-started $now"
+          echo "start $ex $now $host $DAGRON_RUN_ID $DAGRON_TASK_ID ship" >> /marks/marks
+          shape=${CI_REF#*proof/}; set -f; IFS=/; set -- $shape; unset IFS; set +f
+          sleep "${3:-5}"
+          echo "done $ex $(date +%s%N) $host $DAGRON_RUN_ID $DAGRON_TASK_ID ship" >> /marks/marks

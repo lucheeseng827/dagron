@@ -1,0 +1,85 @@
+# Imported from a Jenkinsfile by dagron-import.
+#
+# To do by hand (2):
+#   stage('Test').post.failure: what ran on the stage's failure is not here: a step runs after the steps before it succeed, and a job of trigger_rule: one_failed runs where one before it failed
+#   post.unstable: what ran on unstable is not here: a job runs after the others whatever became of them (trigger_rule: all_done), where one failed (one_failed), or where all succeeded
+#
+# Changed on the way (7):
+#   on: a multibranch pipeline's builds are each branch and tag pushed, each pull request, and a run asked for (dispatch) here: say on: where it ran for fewer
+#   stage('Test').post.always: what runs after the stage's steps runs where they succeeded, and not after one that failed: a step here runs only after the steps before it succeed
+#   stage('Test').post.always[0]: the test report is the job's report: what it holds is said with the job
+#   post.success: what ran on success is a job of its own, after the others, where every job before it succeeded, in a workspace of its own
+#   post.failure: what ran on failure is a job of its own, after the others, where a job before it failed, in a workspace of its own
+#   post.always: what ran on always is a job of its own, after the others, whatever became of the jobs before it, in a workspace of its own
+#   stage('Test').steps[0]: Jenkins's variables a step reads are set at its head from dagron-ci's own (CI_SHA, CI_REF, …): a program it runs that reads one the step does not is not given it
+#
+# Not carried over (1):
+#   post.cleanup: a job's workspace goes with it, and is not cleaned
+name: 12-post
+on:
+  push: {}
+  pull_request: {}
+  dispatch: {}
+tasks:
+- name: test
+  docker_image: python:3.12
+  report:
+    junit:
+    - reports/junit.xml
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        post.unstable: what ran on unstable is not here: a job runs after the others whatever became of them (trigger_rule: all_done), where one failed (one_failed), or where all succeeded
+        stage('Test').post.failure: what ran on the stage's failure is not here: a step runs after the steps before it succeed, and a job of trigger_rule: one_failed runs where one before it failed
+      DAGRON_IMPORT
+      exit 1
+  - name: Test
+    run: pytest --junitxml=reports/junit.xml
+  - name: Test
+    run: coverage report
+- name: post-success
+  docker_image: python:3.12
+  depends_on:
+  - test
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        post.unstable: what ran on unstable is not here: a job runs after the others whatever became of them (trigger_rule: all_done), where one failed (one_failed), or where all succeeded
+      DAGRON_IMPORT
+      exit 1
+  - name: post success
+    run: ./notify.sh ok
+- name: post-failure
+  docker_image: python:3.12
+  depends_on:
+  - test
+  trigger_rule: one_failed
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        post.unstable: what ran on unstable is not here: a job runs after the others whatever became of them (trigger_rule: all_done), where one failed (one_failed), or where all succeeded
+      DAGRON_IMPORT
+      exit 1
+  - name: post failure
+    run: ./notify.sh failed
+- name: post-always
+  docker_image: python:3.12
+  depends_on:
+  - test
+  trigger_rule: all_done
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        post.unstable: what ran on unstable is not here: a job runs after the others whatever became of them (trigger_rule: all_done), where one failed (one_failed), or where all succeeded
+      DAGRON_IMPORT
+      exit 1
+  - name: post always
+    run: ./collect-logs.sh

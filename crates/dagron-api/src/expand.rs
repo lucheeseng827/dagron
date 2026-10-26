@@ -115,9 +115,10 @@ async fn collect_referenced_specs(
         if frontier.is_empty() {
             break;
         }
+        let sql = format!("SELECT name, spec FROM workflows WHERE name {}", crate::db::in_list("$1"));
         let rows: Vec<(String, String)> =
-            sqlx::query_as("SELECT name, spec FROM workflows WHERE name = ANY($1)")
-                .bind(&frontier)
+            sqlx::query_as(&sql)
+                .bind(crate::db::list(&frontier))
                 .fetch_all(&state.read_pool)
                 .await
                 .map_err(|e| {
@@ -509,9 +510,10 @@ pub(crate) async fn resolve_template_uses<'y>(
     }
     names.sort();
     names.dedup();
+    let sql = format!("SELECT name, spec FROM workflows WHERE name {}", crate::db::in_list("$1"));
     let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT name, spec FROM workflows WHERE name = ANY($1)")
-            .bind(&names)
+        sqlx::query_as(&sql)
+            .bind(crate::db::list(&names))
             .fetch_all(&state.read_pool)
             .await
             .map_err(|e| {

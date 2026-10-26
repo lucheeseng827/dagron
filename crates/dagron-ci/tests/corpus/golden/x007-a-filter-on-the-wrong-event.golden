@@ -1,0 +1,3 @@
+not a pipeline:
+  on.merge_group.paths: on.merge_group has no key "paths"
+  on.pull_request.tags: on.pull_request has no key "tags"

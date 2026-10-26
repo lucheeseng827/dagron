@@ -1,0 +1,12 @@
+shows: A job's report files are named to the step runner, which reads them when the steps are over
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: test
+      steps:
+        - run: make test lint
+      report:
+        junit: target/junit.xml
+        sarif: [lint.sarif, audit.sarif]

@@ -37,6 +37,10 @@ anyhow = "1"
 # Signed workflow bundles (`bundle` module): ed25519 verification of a manifest
 # over content-addressed specs. Pure Rust; verification ships in every build.
 ed25519-dalek = "2"
+# Signed build provenance (`provenance` module): ECDSA P-256 over SHA-256,
+# the signature cosign verifies a DSSE envelope with. Already in every build
+# that speaks TLS (rustls), so it adds no crate to one.
+ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"

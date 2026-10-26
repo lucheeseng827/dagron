@@ -1,0 +1,77 @@
+# Imported from a Jenkinsfile by dagron-import.
+#
+# To do by hand (3):
+#   stage('Tagged').when: expression { env.TAG_NAME ==~ /v\d+\.\d+\.\d+/ } cannot be read before the stage runs: it is taken to hold, or not, whichever runs the stage, and the stage runs where it might have, which is more than it did. Test it in the stage's steps
+#   stage('Not docs').when: changeset, which reads what the build changed cannot be read before the stage runs: it is taken to hold, or not, whichever runs the stage, and the stage runs where it might have, which is more than it did. Test it in the stage's steps
+#   stage('Release branch').when: changeRequest target: 'release-\\d+', comparator: 'REGEXP' cannot be read before the stage runs: it is taken to hold, or not, whichever runs the stage, and the stage runs where it might have, which is more than it did. Test it in the stage's steps
+#
+# Changed on the way (10):
+#   parameters: a parameter is a dispatch's input, and every other run is given its default: each job is given it as a variable of the same name
+#   on: a multibranch pipeline's builds are each branch and tag pushed, each pull request, and a run asked for (dispatch) here: say on: where it ran for fewer
+#   stage('Deploy').when, stage('Release').when, stage('Pull request').when, stage('Tagged').when, stage('Not docs').when, stage('Release branch').when: its when is a test at the head of each of its steps, which end there where it is false: the job passes, where Jenkins skipped the stage
+#   stage('Pull request').steps[0]: it reads $CHANGE_ID: each is set at the head of its script
+#   stage('Always').steps[0]: Jenkins's variables a step reads are set at its head from dagron-ci's own (CI_SHA, CI_REF, …): a program it runs that reads one the step does not is not given it
+name: 16-expressions
+on:
+  push: {}
+  pull_request: {}
+  dispatch:
+    inputs:
+      DEPLOY:
+        default: 'false'
+      RELEASE_VERSION:
+        default: ''
+parameters:
+  DEPLOY: 'false'
+  RELEASE_VERSION: ''
+tasks:
+- name: always
+  docker_image: alpine:3.20
+  env:
+  - name: DEPLOY
+    value: '{{ DEPLOY }}'
+  - name: RELEASE_VERSION
+    value: '{{ RELEASE_VERSION }}'
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        stage('Tagged').when: expression { env.TAG_NAME ==~ /v\d+\.\d+\.\d+/ } cannot be read before the stage runs: it is taken to hold, or not, whichever runs the stage, and the stage runs where it might have, which is more than it did. Test it in the stage's steps
+        stage('Not docs').when: changeset, which reads what the build changed cannot be read before the stage runs: it is taken to hold, or not, whichever runs the stage, and the stage runs where it might have, which is more than it did. Test it in the stage's steps
+        stage('Release branch').when: changeRequest target: 'release-\\d+', comparator: 'REGEXP' cannot be read before the stage runs: it is taken to hold, or not, whichever runs the stage, and the stage runs where it might have, which is more than it did. Test it in the stage's steps
+      DAGRON_IMPORT
+      exit 1
+  - name: Always
+    run: ./always.sh
+  - name: Deploy
+    run: |-
+      # when { expression { params.DEPLOY } }
+      { [ "${DEPLOY:-}" = 'true' ]; } || exit 0
+      ./deploy.sh
+  - name: Release
+    run: |-
+      # when { expression { params.RELEASE_VERSION } }
+      { [ -n "${RELEASE_VERSION:-}" ]; } || exit 0
+      ./release.sh "$RELEASE_VERSION"
+  - name: Pull request
+    run: |-
+      [ -z "$CI_PR" ] || export CHANGE_ID="$CI_PR"
+      # when { expression { env.CHANGE_ID } }
+      { [ -n "${CHANGE_ID:-}" ]; } || exit 0
+      ./pr.sh
+  - name: Tagged
+    run: |-
+      # when { expression { env.TAG_NAME ==~ /v\d+\.\d+\.\d+/ } }
+      { true; } || exit 0
+      ./tagged.sh
+  - name: Not docs
+    run: |-
+      # when { not { changeset 'docs/**' } }
+      { ! { false; }; } || exit 0
+      ./full-tests.sh
+  - name: Release branch
+    run: |-
+      # when { changeRequest target: 'release-\\d+', comparator: 'REGEXP' }
+      { true; } || exit 0
+      ./release-checks.sh

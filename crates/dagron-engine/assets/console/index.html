@@ -166,7 +166,14 @@ async function apiText(path) {
 }
 
 /* ---- shared ---------------------------------------------------------- */
-const status = (s) => el("span", { class: "st st-" + esc(s), text: esc(s) });
+// A run or a task that was asked to stop is still running until its work is
+// gone: it keeps its status, and reads "stopping". A run that waits for its
+// workflow's max_active_runs has started nothing: it reads "queued".
+const status = (s, asked, waits) => {
+  const queued = s === "running" && waits && !asked;
+  return el("span", { class: "st st-" + (queued ? "pending" : esc(s)), text: queued ? "queued" : s === "running" && asked ? "stopping" : esc(s) });
+};
+const waits = (run) => !!run.queued_at && !run.admitted_at;
 function when(ts) {
   if (!ts) return "—";
   const d = new Date(ts);
@@ -230,7 +237,7 @@ async function viewRuns(main) {
     else {
       host.appendChild(card([tbl(["", "Workflow", "Run", "Started", "Duration"], runs.map((r) =>
         el("tr", {}, [
-          el("td", {}, [status(r.status)]),
+          el("td", {}, [status(r.status, r.stopping_as, waits(r))]),
           el("td", {}, [el("b", { text: esc(r.name) || "—" })]),
           el("td", {}, [el("button", { class: "lk mono", text: String(r.id).slice(0, 8),
             onclick: () => go("run", r.id) })]),
@@ -274,7 +281,7 @@ async function viewRun(main, id) {
   ]));
 
   main.appendChild(el("div", { class: "grid" }, [
-    el("div", { class: "kv" }, [el("div", { class: "k", text: "Status" }), el("div", { class: "v" }, [status(run.status)])]),
+    el("div", { class: "kv" }, [el("div", { class: "k", text: "Status" }), el("div", { class: "v" }, [status(run.status, run.stopping_as, waits(run))])]),
     el("div", { class: "kv" }, [el("div", { class: "k", text: "Started" }), el("div", { class: "v mono", text: when(run.created_at) })]),
     el("div", { class: "kv" }, [el("div", { class: "k", text: "Duration" }), el("div", { class: "v mono", text: took(run.created_at, run.finished_at) })]),
     el("div", { class: "kv" }, [el("div", { class: "k", text: "Definition" }), el("div", { class: "v mono", text: esc(run.definition_id).slice(0, 12) || "—" })]),
@@ -291,7 +298,7 @@ async function viewRun(main, id) {
       btns.push(el("button", { class: "act", text: "Clear + rerun", onclick: () => act("Task cleared", p + "/clear") }));
     }
     return el("tr", {}, [
-      el("td", {}, [status(t.status)]),
+      el("td", {}, [status(t.status, t.stop_requested_at)]),
       el("td", {}, [el("b", { text: esc(t.name) })]),
       el("td", { class: "mono", text: String(t.attempt == null ? "—" : t.attempt) }),
       el("td", { class: "mono", text: when(t.finished_at) }),

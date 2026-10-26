@@ -1,0 +1,15 @@
+shows: A job whose if is false for the event is left out, and said to be
+front: github
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on: [push, pull_request]
+  jobs:
+    test:
+      runs-on: ubuntu-latest
+      steps:
+        - run: make test
+    deploy:
+      runs-on: ubuntu-latest
+      if: github.event_name == 'pull_request'
+      steps:
+        - run: make preview

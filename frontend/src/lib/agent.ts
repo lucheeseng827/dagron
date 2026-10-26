@@ -15,8 +15,8 @@
 //     whatever agent the operator drives dagron with.
 //
 //  2. **A run does not yet say which agent submitted it.** `trigger_kind` is
-//     `manual | schedule | backfill`; the principal that G-AG4 adds is not on
-//     the run record. Until it is, "what the agent is working on" can only
+//     `manual | schedule | backfill`; the calling principal is not on the run
+//     record. Until it is, "what the agent is working on" can only
 //     honestly mean "what arrived through the API" — which is what the activity
 //     list shows, and what its caption says.
 

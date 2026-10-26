@@ -1,0 +1,20 @@
+# Sweeps that scale: what the reconcile loop's sweeps cost
+# as the jobs, and the work that waits beside them, grow. Run with REPLICAS=3
+# and WORKERS=700, so that three engines hold 2,100 jobs, and with this file
+# for every image compared, each in a fresh cell, in one session.
+#
+# The quiet steps hold jobs and nothing else: a sweep that costs what is due
+# costs the same at 500 jobs and at 2,000. `park` holds 1,000 jobs beside
+# 5,000 time sensors of an hour, 200 approval gates that time out in an hour
+# and 50 fan-outs whose instances run for an hour, none of it due in the
+# step; the fan-outs' 100 instances hold job slots (1,100 of the 2,100 in
+# all), the sensors and gates none. `due` holds 1,000 jobs while ten time sensors a second park and come
+# due 30 s later, beside 200 HTTP sensors on the forge's /_load/wait, which
+# answers 503 and counts each poll.
+#
+# NAME JOBS SECS HOLD [LPS] [KIB] [PARK]
+quiet-500    500 120 180
+quiet-1000  1000 120 180
+quiet-2000  2000 120 180
+park        1000 120 180 0 0 waits=5000:3600,approvals=200:3600,fanouts=50:3600
+due         1000 120 180 0 0 due=10:30,urls=200

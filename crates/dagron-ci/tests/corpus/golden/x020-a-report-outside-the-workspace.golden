@@ -1,0 +1,3 @@
+not a pipeline:
+  tasks[0] (test).report.junit: "../../etc/passwd" is not a path in the workspace: letters, digits, '.', '_', '-' and '/', with no '..', at most 240
+  tasks[0] (test).report.sarif: "/tmp/lint.sarif" is not a path in the workspace: letters, digits, '.', '_', '-' and '/', with no '..', at most 240

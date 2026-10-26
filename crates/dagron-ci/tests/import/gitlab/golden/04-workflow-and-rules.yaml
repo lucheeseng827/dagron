@@ -1,0 +1,53 @@
+# Imported from a GitLab CI pipeline by dagron-import.
+#
+# To do by hand (1):
+#   docs.rules: exists:, rules:changes cannot be read before a run: the job is written to run wherever it might have, which is more than it did. Test it in the job's script, or write the job's when: for what it should run for
+#
+# Changed on the way (4):
+#   image: the pipeline's image is each job's that does not set its own
+#   test.script: a job's script ran under bash where its image had bash, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   on.pull_request: a merge request's pipeline is a pull request's here; GitLab's merged-results and merge-train pipelines are not told apart from it
+#   on.dispatch: a pipeline run from GitLab's page or its API is a run asked for here (dispatch), through the run API
+#
+# Not carried over (2):
+#   workflow.name: a run is named by its pipeline and its event
+#   workflow.rules: no pipeline here is a schedule pipeline: a condition that names one never holds here (a schedule asks for a run through the run API, as a dispatch)
+name: 04-workflow-and-rules
+on:
+  push:
+    branches:
+    - main
+    tags:
+    - '**'
+  pull_request:
+    branches:
+    - main
+  dispatch: {}
+tasks:
+- name: test
+  docker_image: golang:1.23
+  when: '{{ ci_event }} in [push, pull_request] or {{ ci_event }} == dispatch and {{ ci_group }} in [refs/heads/main]'
+  steps:
+  - name: script
+    run: go test ./...
+- name: docs
+  docker_image: golang:1.23
+  when: '{{ ci_event }} in [push, tag, pull_request] or {{ ci_event }} == dispatch and {{ ci_group }} in [refs/heads/main]'
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        docs.rules: exists:, rules:changes cannot be read before a run: the job is written to run wherever it might have, which is more than it did. Test it in the job's script, or write the job's when: for what it should run for
+      DAGRON_IMPORT
+      exit 1
+  - name: script
+    run: go run ./cmd/docs
+- name: release
+  docker_image: golang:1.23
+  depends_on:
+  - docs
+  when: '{{ ci_event }} == tag and {{ ci_group }} in [refs/tags/v1, refs/tags/v2]'
+  steps:
+  - name: script
+    run: go build -o app ./cmd/app

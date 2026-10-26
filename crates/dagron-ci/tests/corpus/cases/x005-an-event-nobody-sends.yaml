@@ -1,0 +1,10 @@
+shows: An event that is not one of the four is refused by name
+source: |
+  name: ci
+  on:
+    push: {}
+    schedule: { cron: "0 3 * * *" }
+  tasks:
+    - name: build
+      steps:
+        - run: make

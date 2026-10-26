@@ -1,0 +1,18 @@
+shows: GitLab when always and on_failure become the trigger rules that say the same
+front: gitlab
+file: gitlab-ci
+source: |
+  image: alpine:3.20
+  stages: [test, cleanup]
+  test:
+    stage: test
+    script: [make test]
+    after_script: [make logs]
+  cleanup:
+    stage: cleanup
+    when: always
+    script: [make clean]
+  page:
+    stage: cleanup
+    when: on_failure
+    script: [./page-oncall]

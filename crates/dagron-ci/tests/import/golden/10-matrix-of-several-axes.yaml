@@ -1,0 +1,45 @@
+# Imported from a GitHub Actions workflow by dagron-import.
+#
+# To do by hand (2):
+#   jobs.test.steps[2]: its condition, `matrix.coverage == 'true'`, could not be read as a test: write it in the script
+#   jobs.test.runs-on: no image is known for ${{ matrix.os }}: name the job's docker_image, or give the importer one (--image LABEL=IMAGE)
+#
+# Changed on the way (3):
+#   jobs.test.steps[1]: what the script read in `${{ }}` is a variable of the shell's here, which the shell fills in as it runs the script
+#   jobs: a step that named no shell ran under bash on a runner GitHub hosts, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   jobs: a job that set no timeout had GitHub's six hours, and has dagron-ci's own here (an hour, unless CI_DEFAULT_TIMEOUT_SECS says another): say timeout_secs where a job needs longer
+#
+# Not carried over (1):
+#   jobs.test.strategy.max-parallel: how many instances run at once is the engine's to say (a pool's size), and not a job's
+name: matrix
+on:
+  push: {}
+tasks:
+- name: test
+  with_items:
+  - os: ubuntu-latest
+    node: 20
+    coverage: ''
+  - os: ubuntu-latest
+    node: 22
+    coverage: true
+  - os: windows-latest
+    node: 22
+    coverage: ''
+  - os: macos-latest
+    node: 22
+    coverage: ''
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        jobs.test.steps[2]: its condition, `matrix.coverage == 'true'`, could not be read as a test: write it in the script
+        jobs.test.runs-on: no image is known for $[[ matrix.os ]]: name the job's docker_image, or give the importer one (--image LABEL=IMAGE)
+      DAGRON_IMPORT
+      exit 1
+  - env:
+      MATRIX_NODE: '{{ item.node }}'
+      MATRIX_OS: '{{ item.os }}'
+    run: echo "node ${MATRIX_NODE} on ${MATRIX_OS}"
+  - run: npm run coverage

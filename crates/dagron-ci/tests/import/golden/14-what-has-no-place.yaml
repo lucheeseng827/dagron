@@ -1,0 +1,52 @@
+# Imported from a GitHub Actions workflow by dagron-import.
+#
+# To do by hand (3):
+#   on.pull_request_target: no event here runs a pull request's pipeline as its base branch has it: a pull request's trust is decided by who sent it (docs/CI.md)
+#   on: none of the workflow's events is one a pipeline runs for: it is given a dispatch, so that it can be asked for
+#   jobs.call: the job calls the workflow acme/workflows/.github/workflows/build.yml@main: no workflow is called here, so its jobs are written out as this pipeline's own, or it is a pipeline of its own
+#
+# Changed on the way (6):
+#   name: "Nightly & on demand" is "nightly-on-demand": a pipeline's name is letters, digits, '.', '_' and '-', and its checks are called by it
+#   concurrency: `github.event.pull_request.number || github.ref` in the group is the run's own group, {{ ci_group }}: the branch, or the pull request
+#   concurrency: the group is keyed by {{ ci_group }}: the branch, or the pull request
+#   jobs.nightly.runs-on: ubuntu-latest is the image docker.io/library/ubuntu:24.04: an operating system, with none of the tools a hosted runner holds
+#   jobs: a step that named no shell ran under bash on a runner GitHub hosts, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   jobs: a job that set no timeout had GitHub's six hours, and has dagron-ci's own here (an hour, unless CI_DEFAULT_TIMEOUT_SECS says another): say timeout_secs where a job needs longer
+#
+# Not carried over (7):
+#   on.schedule: a pipeline has no schedule: ask for a run from a scheduler of your own, through the run API (on.dispatch)
+#   on.workflow_call: no such event is sent here: a pipeline runs for a push, a pull request, a merge group or a dispatch
+#   jobs.call.with, jobs.call.secrets: it is the call's, and goes with it: nothing of the workflow that was called is here to take it
+#   jobs.nightly.concurrency: a concurrency key is a pipeline's, and not one job's
+#   permissions: a job is given no token for its forge, so there is nothing to narrow
+#   run-name: a run is named by its pipeline and its event
+name: nightly-on-demand
+on:
+  dispatch: {}
+concurrency:
+  key: nightly-on-demand-{{ ci_group }}
+  cancel_superseded: true
+tasks:
+- name: call
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        on.pull_request_target: no event here runs a pull request's pipeline as its base branch has it: a pull request's trust is decided by who sent it (docs/CI.md)
+        on: none of the workflow's events is one a pipeline runs for: it is given a dispatch, so that it can be asked for
+        jobs.call: the job calls the workflow acme/workflows/.github/workflows/build.yml@main: no workflow is called here, so its jobs are written out as this pipeline's own, or it is a pipeline of its own
+      DAGRON_IMPORT
+      exit 1
+- name: nightly
+  docker_image: docker.io/library/ubuntu:24.04
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        on.pull_request_target: no event here runs a pull request's pipeline as its base branch has it: a pull request's trust is decided by who sent it (docs/CI.md)
+        on: none of the workflow's events is one a pipeline runs for: it is given a dispatch, so that it can be asked for
+      DAGRON_IMPORT
+      exit 1
+  - run: make nightly

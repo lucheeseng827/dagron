@@ -14,7 +14,7 @@ because it is derived from the recipe — which is also why re-running an
 unchanged recipe finds the image already built instead of building it again.
 
 REQUIREMENT: a runner pool that has `dagron-build` on it and claims the `build`
-runner class (`ee/compose.image-build.yaml`, or the chart's `build` pool). This
+runner class (the build pool's compose file, or the chart's `build` pool). This
 is an enterprise capability — the SDK can describe the build, but it cannot
 perform one. Without such a pool the build task sits pending, which is the
 honest failure rather than a confusing one.

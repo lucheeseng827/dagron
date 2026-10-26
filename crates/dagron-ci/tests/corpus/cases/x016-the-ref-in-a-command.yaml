@@ -1,0 +1,9 @@
+shows: A step's script that pastes what an outsider chose, a ref, is refused with where it belongs
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: say
+      steps:
+        - run: echo "building {{ ci_ref }}"

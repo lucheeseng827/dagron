@@ -1,0 +1,36 @@
+# The migration guide's own example: a lint, a matrix of tests, a publish.
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request: { branches: [main] }
+concurrency: { group: "${{ github.ref }}" }
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm ci
+      - run: npm run lint
+  test:
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: { node: [18, 20, 22] }
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "${{ matrix.node }}" }
+      - run: npm ci
+      - run: npm test
+  publish:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm publish
+        env: { NPM_TOKEN: "${{ secrets.NPM_TOKEN }}" }

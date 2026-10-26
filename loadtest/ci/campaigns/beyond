@@ -1,0 +1,10 @@
+# Past stage 0's thousand, to where this machine's cell stops keeping up, and
+# jobs that write a great deal more log. Run with WORKERS=700, so that three
+# engines hold two thousand jobs.
+#
+# NAME JOBS SECS HOLD [LPS] [KIB]
+quiet-2000  2000 120 180
+logs-1500   1500 120 180 10
+logs-2000   2000 120 180 10
+heavy-100    100 120 180 200
+heavy-300    300 120 180 200

@@ -25,8 +25,10 @@ import type {
   NotificationSettings,
   NotifyTestResult,
   PendingApproval,
+  RefRuns,
   RunDetail,
   RunLogs,
+  RunSource,
   SearchResponse,
   RunSpecGroup,
   RunSummary,
@@ -131,8 +133,13 @@ export function listRuns(params?: {
   status?: string;
   /// Workflow (definition) name, exact match.
   name?: string;
-  /// Trigger kind: manual | schedule | backfill.
+  /// Trigger kind: manual | schedule | backfill | ci.
   trigger?: string;
+  /// The repository a run's trigger record names, `host/owner/name`.
+  repo?: string;
+  /// The event a run's trigger record names, by its id at its source: a CI
+  /// event's runs, one for each pipeline it started.
+  event?: string;
   limit?: number;
   offset?: number;
 }): Promise<RunSummary[]> {
@@ -140,17 +147,60 @@ export function listRuns(params?: {
   if (params?.status) qs.set("status", params.status);
   if (params?.name) qs.set("name", params.name);
   if (params?.trigger) qs.set("trigger", params.trigger);
+  if (params?.repo) qs.set("repo", params.repo);
+  if (params?.event) qs.set("event", params.event);
   if (params?.limit != null) qs.set("limit", String(params.limit));
   if (params?.offset != null) qs.set("offset", String(params.offset));
   const q = qs.toString();
   return apiFetch(`/runs${q ? `?${q}` : ""}`);
 }
 
+/// The repositories runs came from, the one with the latest run first.
+export const listRunSources = (limit?: number): Promise<RunSource[]> =>
+  apiFetch(`/runs/sources${limit != null ? `?limit=${limit}` : ""}`);
+
+/// A repository's refs, each with the runs for its latest commit, the ref
+/// with the latest run first. `repo` is `host/owner/name`, as
+/// `listRunSources` gives it.
+export const listRepoRefs = (repo: string, limit?: number): Promise<RefRuns[]> => {
+  const qs = new URLSearchParams({ repo });
+  if (limit != null) qs.set("limit", String(limit));
+  return apiFetch(`/runs/refs?${qs.toString()}`);
+};
+
 export const getRun = (id: string): Promise<RunDetail> =>
   apiFetch(`/runs/${encodeURIComponent(id)}`);
 
 export const getRunGraph = (id: string): Promise<GraphResponse> =>
   apiFetch(`/runs/${encodeURIComponent(id)}/graph`);
+
+/// One of the artifacts a GitHub workflow's jobs uploaded, which the
+/// engine keeps, complete.
+export interface WorkflowArtifact {
+  id: number;
+  name: string;
+  size_bytes: number | null;
+  sha256: string | null;
+  created_at: string;
+  expires_at: string;
+  /// Whether the engine signed its SLSA provenance as it was finalized.
+  provenance: boolean;
+}
+
+/// A run's workflow artifacts, by name.
+export const listWorkflowArtifacts = (id: string): Promise<WorkflowArtifact[]> =>
+  apiFetch<{ run_id: string; artifacts: WorkflowArtifact[] }>(
+    `/runs/${encodeURIComponent(id)}/workflow-artifacts`,
+  ).then((r) => r.artifacts);
+
+/// Where a run's workflow artifact's zip is downloaded from.
+export const workflowArtifactUrl = (id: string, name: string): string =>
+  `${BASE}/runs/${encodeURIComponent(id)}/workflow-artifacts/${encodeURIComponent(name)}`;
+
+/// Where its signed provenance is downloaded from, for `cosign
+/// verify-blob-attestation` against the zip.
+export const workflowArtifactProvenanceUrl = (id: string, name: string): string =>
+  `${workflowArtifactUrl(id, name)}/provenance`;
 
 /// The stored DAG spec (YAML) this run was created from — used to pre-fill the
 /// "re-run with changes" editor.
@@ -225,7 +275,10 @@ export const getRunLogs = (
 export const submitRun = (yaml: string): Promise<{ run_id: string }> =>
   apiFetch(`/runs`, { method: "POST", body: JSON.stringify({ yaml }) });
 
-export const cancelRun = (id: string): Promise<{ cancelled: number }> =>
+/// `cancelled`: tasks called off. `stopping`: how many of them a worker still
+/// holds, asked to stop; the run reads running until their work is gone.
+/// Absent from an API older than the stop request.
+export const cancelRun = (id: string): Promise<{ cancelled: number; stopping?: number }> =>
   apiFetch(`/runs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
 
 /// Re-trigger: start a fresh run from this run's stored definition (any state).
@@ -342,7 +395,11 @@ export const listDatasetEvents = (uri?: string, limit = 100): Promise<DatasetEve
   apiFetch(`/datasets/events?limit=${limit}${uri ? `&uri=${encodeURIComponent(uri)}` : ""}`);
 
 // ── workflows (first-class) ──────────────────────────────────────────────────
-export const listWorkflows = (): Promise<WorkflowRow[]> => apiFetch(`/workflows`);
+/// The stored workflows. `includeCi` adds, after them, the pipelines a CI
+/// service compiled (`source: "ci"`): rows to read, with no detail behind them,
+/// so a caller that links every row to a workflow's page must not ask for them.
+export const listWorkflows = (opts?: { includeCi?: boolean }): Promise<WorkflowRow[]> =>
+  apiFetch(`/workflows${opts?.includeCi ? "?include=ci" : ""}`);
 
 /// One workflow's run history (matched by definition name), newest first.
 export const listWorkflowRuns = (

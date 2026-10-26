@@ -116,7 +116,7 @@ SpecLike = Union["Dag", Mapping[str, Any], str]
 #: Identifies the recipe format *and* the Dockerfile the builder synthesises from
 #: it. It is hashed with the recipe, so bumping it re-tags every image on
 #: purpose: two images with the same tag must have been built the same way.
-#: Must equal ``GENERATOR_VERSION`` in ``ee/dagron-build/src/recipe.rs``.
+#: Must equal the image builder's ``GENERATOR_VERSION``.
 BUILD_GENERATOR_VERSION = "dagron-build/v2"
 
 #: Fields of a recipe, in the order the builder serialises them. **Declaration
@@ -225,10 +225,10 @@ class Recipe:
     rather than a build.
 
     That also makes this class a *contract*, not a convenience. The builder that
-    actually produces the image is a separate program in a separate language
-    (``ee/dagron-build``), and if the two disagree about the canonical form by
-    one byte, an author pins their task to an image no build will ever push and
-    nothing fails until the run does. ``sdks/recipe-vectors.json`` holds golden
+    actually produces the image is a separate program in a separate language,
+    and if the two disagree about the canonical form by one byte, an author
+    pins their task to an image no build will ever push and nothing fails
+    until the run does. ``sdks/recipe-vectors.json`` holds golden
     vectors generated from the builder; the test suite asserts against them.
 
     This describes the *image*, not the build: a ``run`` line is arbitrary code
@@ -384,8 +384,7 @@ class Recipe:
         where it was written rather than in a build log twenty minutes later.
         The builder still runs them; being *laxer* here would only mean the
         error arrives late, and being *stricter* would block something legal, so
-        this list tracks `Recipe::validate` in `ee/dagron-build/src/recipe.rs`
-        rule for rule.
+        this list tracks the builder's `Recipe::validate` rule for rule.
         """
         # A lone surrogate is representable in a Python str and not in UTF-8, so
         # `canonical_json().encode()` raises a UnicodeEncodeError naming a byte
@@ -1454,7 +1453,8 @@ class Client:
         """List runs newest-first, optionally filtered and paged.
 
         ``name`` is the workflow/DAG name (exact match) and ``trigger`` is what
-        started the run — ``manual``, ``schedule`` or ``backfill``.
+        started the run — ``manual``, ``schedule``, ``backfill`` or ``ci`` (a CI
+        service's runs).
         """
         return self._request(
             "GET",
@@ -1564,7 +1564,13 @@ class Client:
         return self._request("GET", f"/api/runs/{_seg(run_id)}/logs", params=params)
 
     def cancel_run(self, run_id: str) -> int:
-        """Cancel a run; returns the number of tasks flipped to ``cancelled``."""
+        """Cancel a run; returns the number of tasks it called off.
+
+        A cancel asks: a task that had not started is ``cancelled`` at once, and
+        a running one is stopped and reads ``running`` until its work is gone.
+        The run reads ``cancelled`` once every such task has stopped, so wait
+        for a terminal status rather than assuming one from this call.
+        """
         return self._request("POST", f"/api/runs/{_seg(run_id)}/cancel")["cancelled"]
 
     def rerun_run(self, run_id: str, *, params: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:

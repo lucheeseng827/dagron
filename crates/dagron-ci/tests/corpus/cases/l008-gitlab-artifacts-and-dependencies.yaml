@@ -1,0 +1,23 @@
+shows: GitLab artifacts are uploaded by their job and fetched by the jobs after it that take them
+front: gitlab
+file: gitlab-ci
+source: |
+  image: alpine:3.20
+  stages: [build, test, deploy]
+  build:
+    stage: build
+    script: [make]
+    artifacts:
+      paths: [out/]
+      exclude: [out/tmp/**/*]
+      expire_in: 2 days
+      when: always
+      reports:
+        junit: report.xml
+  test:
+    stage: test
+    script: [make test]
+  deploy:
+    stage: deploy
+    dependencies: []
+    script: [make deploy]

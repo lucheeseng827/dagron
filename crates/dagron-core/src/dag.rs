@@ -220,12 +220,29 @@ pub struct TaskSpec {
     /// Docker image for this task. Used by DockerExecutor; ignored by LocalExecutor.
     /// If absent, DockerExecutor falls back to its configured default image.
     pub docker_image: Option<String>,
+    /// When the executor fetches the task's image: see [`ImagePullPolicy`].
+    /// Absent, the Docker executor pulls an image its host lacks, and on
+    /// Kubernetes the kubelet's own default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_pull_policy: Option<ImagePullPolicy>,
     /// Environment variables injected into the task container. Honoured by the
     /// Local (subprocess), Docker, and Kubernetes executors. This is how a
     /// parameterised task image (e.g. the load-test ETL image) is told what to do
     /// — object size, sleep/CPU/mem profile, S3 bucket, DB DSN, etc.
     #[serde(default)]
     pub env: Vec<EnvVar>,
+    /// The **environment** this task's secrets come from, in place of the
+    /// workflow's own (`environment:` at the top): its
+    /// `value_from: {secret: NAME}` entries are resolved from that one's
+    /// store at dispatch. Whether the run may use it is that environment's
+    /// policy to say ([`crate::envpolicy`]). So a pipeline's deploy job
+    /// can read a deploy environment's secrets while its other jobs name none.
+    ///
+    /// The workflow's variables (`{{ env.NAME }}`) are still the workflow's
+    /// own environment's: they are put in when the run is made, before there
+    /// are tasks to ask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
     /// Per-task CPU/memory `requests`/`limits` applied to the task **pod** so the
     /// Kubernetes scheduler packs pods realistically (pod headroom, eviction, and
     /// OOMKill become observable). Ignored by the Local and Docker executors.
@@ -317,6 +334,66 @@ pub struct TaskSpec {
     /// run attestation records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolation: Option<crate::isolation::IsolationSpec>,
+    /// A **workspace**: a directory this task starts in, empty at the start
+    /// of each attempt and removed after it (`/workspace` in a container or
+    /// pod), with `dagron-ci-exec` installed beside it where the operator set
+    /// `DAGRON_CI_EXEC_IMAGE`. `{}` asks for one of no particular size. See
+    /// [`crate::workspace`]. Command tasks only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<crate::workspace::WorkspaceSpec>,
+    /// **Services**: containers this task has beside it for as long as it
+    /// runs, each from an image of its own, started before the task and seen
+    /// ready, reached by its `name`, and removed with the task. See
+    /// [`crate::service`]. Command tasks only, and not on the local
+    /// executor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<crate::service::ServiceSpec>,
+    /// **Variables from earlier tasks**: each is given an earlier task's
+    /// status or the last line it printed, when this task is claimed. See
+    /// [`EnvFrom`]. Command tasks only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_from: Vec<EnvFrom>,
+    /// **An identity**: OpenID Connect tokens for the audiences named, which a
+    /// cloud's federation trades for credentials. See [`crate::oidc`].
+    /// Command tasks of trusted runs, and of an agent's where its
+    /// environment's policy says so (`allowed_identity`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<crate::oidc::TaskIdentity>,
+    /// **A forge token**: a credential to call the task's repository's forge
+    /// with, as `GITHUB_TOKEN`, minted for each attempt by the operator's
+    /// token service and revoked after it. See [`crate::forge_token`].
+    /// Command tasks with a checkout only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge_token: Option<crate::forge_token::ForgeTokenSpec>,
+    /// **A Docker daemon**: one of the task's own, beside it as a service
+    /// named `docker`, which it reaches as `DOCKER_HOST`. Where the engine's
+    /// operator offers one. See [`crate::docker_daemon`]. Command tasks of
+    /// trusted runs only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub docker_daemon: bool,
+    /// **Privileged**: the task's own container runs privileged, root on its
+    /// host with every device and capability. Where the engine's operator
+    /// allows it, on a dedicated pool, which the task reaches by its
+    /// `runner_class`. See [`crate::privileged`]. Command tasks of trusted
+    /// runs only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub privileged: bool,
+    /// **The model tokens it may spend**: what it reserves of a token budget
+    /// (`budget: { tokens }`, its run's and its parent runs') each time it is
+    /// dispatched, given back as what it reports it spent once it ends (a
+    /// line `dagron::tokens=<n>` of its output; [`crate::tokens`]). A task
+    /// that names none is not held by a budget, and what it reports is
+    /// still counted. Command tasks only. Must be >= 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
+    /// **Its run's artifacts over dagron-api's API**: for a task that does not
+    /// see the store's directory (in a container, a pod, on a remote
+    /// runner), `DAGRON_ARTIFACTS_API` and a credential of its attempt's
+    /// own, `DAGRON_ARTIFACTS_TOKEN`, with which it reads its run's artifacts
+    /// and writes its own while it runs. See [`crate::artifact_api`].
+    /// Command tasks only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub artifact_api: bool,
 }
 
 /// `gang:` — all-or-nothing co-scheduling for one task (see [`TaskSpec::gang`]).
@@ -681,6 +758,49 @@ pub struct CacheSpec {
 /// A single environment variable for a task container. Either a literal `value`
 /// or a `value_from` secret reference resolved at dispatch (never persisted
 /// resolved). Omitting `value` defaults it to empty (used with `value_from`).
+/// When an executor fetches a task's image (`image_pull_policy`), in
+/// Kubernetes' three words, written as the rest of a task is:
+/// `if_not_present`, `always`, `never`.
+///
+/// - `if_not_present`: pulled when the host does not hold it. What the Docker
+///   executor does for a task that states no policy.
+/// - `always`: pulled before every attempt, so a tag that has moved runs as
+///   what it now names. An attempt whose pull fails does not run on what the
+///   host already holds.
+/// - `never`: never pulled. An attempt on a host that does not hold the image
+///   fails, saying so.
+///
+/// On Kubernetes it is the pod's `imagePullPolicy`, and the kubelet acts on
+/// it; a task that states none leaves the kubelet its own default. The local
+/// executor runs no image, and ignores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImagePullPolicy {
+    IfNotPresent,
+    Always,
+    Never,
+}
+
+impl ImagePullPolicy {
+    /// As a task writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ImagePullPolicy::IfNotPresent => "if_not_present",
+            ImagePullPolicy::Always => "always",
+            ImagePullPolicy::Never => "never",
+        }
+    }
+
+    /// As a pod's `imagePullPolicy` writes it.
+    pub fn as_kubernetes(self) -> &'static str {
+        match self {
+            ImagePullPolicy::IfNotPresent => "IfNotPresent",
+            ImagePullPolicy::Always => "Always",
+            ImagePullPolicy::Never => "Never",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EnvVar {
     pub name: String,
@@ -697,9 +817,135 @@ pub struct EnvVar {
 /// resolver (in `dagron-executor`) reads `DAGRON_SECRET_<NAME>` from the engine
 /// process environment, or a file `<DAGRON_SECRETS_DIR>/<NAME>` (the SOPS /
 /// External-Secrets-Operator mount convention) — whichever is configured.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SecretRef {
     pub secret: String,
+    /// **Its environment's alone, and empty where it has none of the name**:
+    /// the task's environment is read, and never the engine's own store, and
+    /// a secret the environment does not hold (or an environment not made)
+    /// is the empty string rather than a failed task. A workflow file's
+    /// `secrets.NAME` is read so, as GitHub reads an undefined secret: a
+    /// repository's secrets are its environment's, and no repository reads
+    /// the engine's by naming one. Unset: the secret has to be there.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
+}
+
+/// A variable a task is given from what an earlier task of its run came to
+/// (`env_from: [{ name: BUILT, task: build, read: last_line }]`): the
+/// earlier task's status, or the last line it printed. It is how one task
+/// hands a value to another.
+///
+/// The engine reads it when the task is claimed, so a rerun reads what the
+/// earlier task came to then. Nothing of it is a template: the task it names
+/// and what is read of it are written, and the value becomes a variable's
+/// value and is read as nothing else. That is the difference from a
+/// `{{ tasks.x.output }}` in a `when:`, which is filled into text; a
+/// variable is given the whole of what it is given.
+///
+/// The task it names is one this task depends on, so that what is read is
+/// there to read.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvFrom {
+    /// The variable's name.
+    pub name: String,
+    /// The earlier task, by its name in the run.
+    pub task: String,
+    /// What of it the variable is given.
+    pub read: Read,
+}
+
+/// What a variable is given of an earlier task ([`EnvFrom`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Read {
+    /// Its status as the run has it: `succeeded`, `failed`, `skipped`,
+    /// `cancelled`. A task that runs whatever became of the ones before it
+    /// (`trigger_rule: all_done`) can read which it was.
+    Status,
+    /// The last line it printed that is not empty, without its line ending:
+    /// [`last_line`]. Empty for a task that printed nothing. A line longer
+    /// than [`LAST_LINE_MAX`] fails the task that reads it, and says so.
+    LastLine,
+}
+
+/// The most variables a task may be given from earlier tasks.
+pub const MAX_ENV_FROM: usize = 256;
+
+/// The longest last line a task hands on, in bytes. A variable's value is an
+/// argument of the kernel's (128 KiB at most on Linux) and a field of a pod's
+/// spec, and a task is given several.
+pub const LAST_LINE_MAX: usize = 32 * 1024;
+
+/// The most a task is given from earlier tasks, all its `env_from` values
+/// together, in bytes. A process's arguments and variables share one
+/// allowance (2 MiB on Linux by default), and a pod's spec is held whole by
+/// the cluster's store.
+pub const ENV_FROM_MAX: usize = 256 * 1024;
+
+/// The last line of `output` that is not empty, without its line ending.
+/// What an executor keeps of what a task printed is every line of it, of
+/// both streams where the executor cannot tell them apart: the last line is
+/// the one thing of it that a task can be sure is its own last word.
+pub fn last_line(output: &str) -> &str {
+    output
+        .lines()
+        .rev()
+        .map(|line| line.trim_end_matches('\r'))
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+}
+
+/// What is wrong with a task's `env_from`, if anything.
+fn env_from_refusal(task: &TaskSpec) -> Option<String> {
+    if task.env_from.len() > MAX_ENV_FROM {
+        return Some(format!(
+            "has {} entries, and a task may have {MAX_ENV_FROM}",
+            task.env_from.len()
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for from in &task.env_from {
+        if !crate::service::is_variable(&from.name) {
+            return Some(format!("{:?} is not a variable's name", from.name));
+        }
+        if !seen.insert(from.name.as_str()) || task.env.iter().any(|e| e.name == from.name) {
+            return Some(format!(
+                "{} is set twice: by `env_from`, and again or by `env`",
+                from.name
+            ));
+        }
+        if !task.depends_on.contains(&from.task) {
+            // A task that was fanned out, or a call of a template with more
+            // than one last task, is several tasks here, each named after
+            // it: the name as it was written is none of them, though the
+            // task does depend on it.
+            let under = format!("{}.", from.task);
+            let became: Vec<&str> = task
+                .depends_on
+                .iter()
+                .filter(|dep| dep.starts_with(&under))
+                .map(String::as_str)
+                .collect();
+            if let Some(first) = became.first() {
+                return Some(format!(
+                    "{} reads task '{}', which is {} tasks in this run ('{first}'{}): a \
+                     variable is given from one task. Name the one it reads, or iterate what \
+                     they printed with `with_output_of:`",
+                    from.name,
+                    from.task,
+                    became.len(),
+                    if became.len() > 1 { ", …" } else { "" }
+                ));
+            }
+            return Some(format!(
+                "{} reads task '{}', which this task does not depend on: add it to depends_on",
+                from.name, from.task
+            ));
+        }
+    }
+    None
 }
 
 /// Kubernetes-style resource requests/limits (e.g. `cpu: "250m"`, `memory:
@@ -908,6 +1154,40 @@ pub fn validate_tag(tag: &str) -> Result<()> {
     Ok(())
 }
 
+/// Named concurrency pools, as an operator sets them (`POOLS=etl:4,db:2`):
+/// each pool's name and how many of its tasks may run at once (#21). Names are
+/// validated as the spec's are; a slot count that is not a whole number of at
+/// least 1, an entry with none, or a pool named twice is an error, never a
+/// limit silently ignored. Empty: no pools.
+///
+/// Read by the engine as it starts, and by dagron-api for the claims it makes
+/// for remote runners, which count against the same pools.
+pub fn parse_pools(raw: &str) -> anyhow::Result<std::collections::BTreeMap<String, i64>> {
+    let mut m = std::collections::BTreeMap::new();
+    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (name, slots) = entry
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("invalid POOLS entry '{entry}': expected name:slots"))?;
+        let name = name.trim();
+        validate_pool(name).map_err(|e| anyhow::anyhow!("invalid POOLS entry: {e}"))?;
+        let slots: i64 = slots
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid POOLS slots for '{name}': '{slots}'"))?;
+        if slots < 1 {
+            anyhow::bail!("POOLS slots for '{name}' must be >= 1, got {slots}");
+        }
+        // Every other malformed POOLS input is an error; a silently-overwritten
+        // duplicate would be the odd one out.
+        if let Some(prev) = m.insert(name.to_string(), slots) {
+            anyhow::bail!(
+                "duplicate POOLS entry for '{name}' (slots {prev} then {slots}) — declare each pool once"
+            );
+        }
+    }
+    Ok(m)
+}
+
 /// Validate a `pool` name: lowercase `[a-z0-9_-]`, 1–64 chars — the same
 /// conservative charset as [`validate_runner_class`]. Strict on purpose: the
 /// name becomes a claim-path SQL filter value and is matched against the
@@ -944,15 +1224,17 @@ pub fn validate_dataset_uri(uri: &str) -> Result<()> {
 /// full template expansion or graph validation. The engine's dataset-trigger
 /// sweep calls this per registered workflow to keep `dataset_triggers` rows in
 /// sync cheaply; the full [`DagGraph::from_yaml_with_params`] pipeline (and its
-/// validation) still runs at fire time. `None` = the spec doesn't parse or
-/// subscribes to nothing. Mode defaults to `"any"`.
-pub fn dataset_subscriptions(yaml: &str) -> Option<(Vec<String>, String)> {
-    let spec: DagSpec = serde_yaml::from_str(yaml).ok()?;
+/// validation) still runs at fire time. `Ok(None)` = the spec subscribes to
+/// nothing; an error = it does not parse here, which in a rolling upgrade
+/// may be a spec a newer engine reads, and is not the same thing. Mode
+/// defaults to `"any"`.
+pub fn dataset_subscriptions(yaml: &str) -> Result<Option<(Vec<String>, String)>> {
+    let spec: DagSpec = serde_yaml::from_str(yaml)?;
     if spec.on_datasets.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mode = spec.datasets_mode.unwrap_or_else(|| "any".to_string());
-    Some((spec.on_datasets, mode))
+    Ok(Some((spec.on_datasets, mode)))
 }
 
 /// A soft SLA deadline (`deadline:` block). See [`DagSpec::deadline`].
@@ -1008,15 +1290,19 @@ pub struct TemplateSpec {
 ///
 /// **Every field here is arithmetic on numbers already known at run creation,
 /// and that is a statement about the data rather than about ambition.**
-/// `AGENT_SCHEDULER_PLAN.md` §G-S3 asks for a "spend/token/task budget per
-/// run". A task count is exact and knowable at creation — dagron expands
-/// `with_items` fan-out and templates at submit, so the number of rows a run
-/// will insert is already decided before anything runs.
+/// What is asked for is a "spend/token/task budget per run". A task count is
+/// exact and knowable at creation — dagron expands `with_items` fan-out and
+/// templates at submit, so the number of rows a run will insert is already
+/// decided before anything runs.
 ///
 /// Spend is not, and this struct still refuses to pretend otherwise. Nothing in
-/// the engine meters currency or model tokens against a run, so a `spend:`
-/// field — a cap on what a run *actually costs* — would be a promise with no
-/// measurement behind it, which is worse than no field. That decision stands.
+/// the engine meters currency against a run, so a `spend:` field — a cap on
+/// what a run *actually costs* — would be a promise with no measurement behind
+/// it, which is worse than no field. That decision stands.
+///
+/// Model tokens are measured, where the build keeps the meter
+/// ([`RunBudget::tokens`]): each task reports what it spent, and a task that
+/// says what it may spend reserves it before it is dispatched.
 ///
 /// [`RunBudget::external_cost`] is **not** that field, and the distinction is
 /// the whole reason it can exist. It caps a sum of costs the **author
@@ -1055,6 +1341,24 @@ pub struct RunBudget {
     /// drop.
     #[serde(default, skip_serializing_if = "is_false")]
     pub external_cost_attribution: bool,
+    /// Ceiling on the model tokens this run, and the runs it starts
+    /// (`type: workflow`, a loop's turns), may spend. `None` = no cap. Must be
+    /// >= 1.
+    ///
+    /// Held at dispatch, not at creation: what a model call costs is known
+    /// only once it returns. A task that names `tokens:` reserves that many
+    /// against this budget and every budget above it before it is
+    /// dispatched, and its reservation becomes what it reports it spent when
+    /// it ends; one that reports nothing is taken to have spent all it
+    /// reserved. So spent and reserved together never pass the budget, and
+    /// a run stays within it as long as no task spends more than it
+    /// reserved. A task the budget cannot fit waits while reservations are
+    /// out, and fails, saying so, once what was spent leaves it no room.
+    ///
+    /// The meter is the enterprise build's ([`crate::tokens`]); this build
+    /// refuses the field rather than letting a run go unmetered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
 }
 
 /// Constraints on one top-level workflow parameter (`param_schema:`).
@@ -1106,6 +1410,64 @@ impl ParamRule {
 
 fn compile_param_pattern(p: &str) -> std::result::Result<regex::Regex, regex::Error> {
     regex::Regex::new(&format!(r"\A(?:{p})\z"))
+}
+
+/// What becomes of a run that arrives while its workflow has
+/// [`DagSpec::max_active_runs`] runs in flight (`when_full`), counted under
+/// its [`DagSpec::concurrency_key`] where it has one.
+///
+/// - `refuse`: it is not made, and its caller is told
+///   ([`crate::models::MaxActiveRunsReached`]). What a workflow that states
+///   nothing gets.
+/// - `queue`: it is made, and waits. Its tasks are held until a run before it
+///   has ended, and the runs that wait are let in oldest first.
+/// - `supersede`: it is made, and every run of its key that is before it is
+///   cancelled, the ones that wait as the ones that run. It waits for what
+///   they had running to stop, and is then let in. Needs
+///   `max_active_runs: 1`.
+///
+/// A run that waits is a run: it reads `running`, with `queued_at` and no
+/// `admitted_at`, and it is cancelled as any other.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WhenFull {
+    #[default]
+    Refuse,
+    Queue,
+    Supersede,
+}
+
+impl WhenFull {
+    /// As a workflow writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WhenFull::Refuse => "refuse",
+            WhenFull::Queue => "queue",
+            WhenFull::Supersede => "supersede",
+        }
+    }
+
+    /// Whether a run over the cap is made and waits.
+    pub fn waits(self) -> bool {
+        !matches!(self, WhenFull::Refuse)
+    }
+}
+
+/// How many runs may wait for one workflow, or for one concurrency key of
+/// it: `DAGRON_MAX_WAITING_RUNS` (default 100, floor 1). A run past it is
+/// refused as one is by `when_full: refuse`, so a schedule that fires faster
+/// than its runs end fills a queue this long and no longer.
+///
+/// Read once and kept: a run's admission reads it every time.
+pub fn max_waiting_runs() -> i64 {
+    static MAX: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("DAGRON_MAX_WAITING_RUNS")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(100)
+            .max(1)
+    })
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1165,7 +1527,12 @@ pub struct DagSpec {
     /// run creation only — it caps concurrent runs, not per-task concurrency.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_active_runs: Option<u32>,
-    /// Per-run resource budget (G-AG3). A run that would exceed it is refused at
+    /// What becomes of a run that arrives at that cap: refused (the default),
+    /// made to wait its turn, or made and the runs before it cancelled
+    /// ([`WhenFull`]). Requires `max_active_runs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when_full: Option<WhenFull>,
+    /// Per-run resource budget. A run that would exceed it is refused at
     /// creation with a [`crate::models::TaskBudgetExceeded`] error, before
     /// anything executes.
     ///
@@ -1284,6 +1651,9 @@ pub struct TaskDefaults {
     pub timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docker_image: Option<String>,
+    /// DAG-wide [`TaskSpec::image_pull_policy`] for tasks that set none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_pull_policy: Option<ImagePullPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_class: Option<String>,
     /// DAG-wide dispatch priority default; applies to any task that leaves its
@@ -1410,8 +1780,16 @@ impl DagSpec {
     }
 }
 
+#[derive(Clone)]
 pub struct DagGraph {
     pub spec: DagSpec,
+    /// The parameter values this graph was expanded with: the spec's declared
+    /// defaults, with any overrides merged over them. Expansion consumes them
+    /// (`spec.parameters` is empty afterwards), so they are kept here for the
+    /// run row, which stores them for templates resolved after submit:
+    /// `notify.git`'s `sha: "{{ commit_sha }}"` is read when the run ends.
+    /// Empty for a graph built by [`Self::from_spec`].
+    pub parameters: BTreeMap<String, String>,
     graph: DiGraph<String, ()>,
     node_index: HashMap<String, petgraph::graph::NodeIndex>,
 }
@@ -1427,8 +1805,12 @@ impl DagGraph {
         // enforced, but a rule that is malformed or contradicts its own default
         // is still an error.
         spec.check_params(false)?;
+        let parameters = spec.parameters.clone();
         let spec = crate::expand::expand(spec)?;
-        Self::from_spec(spec)
+        Ok(Self {
+            parameters,
+            ..Self::from_spec(spec)?
+        })
     }
 
     /// [`from_yaml`](Self::from_yaml) with parameter overrides merged in before
@@ -1449,8 +1831,45 @@ impl DagGraph {
         // Checked on the merged values and before expansion substitutes them
         // into task fields, so a refused value never reaches a command line.
         spec.check_params(true)?;
+        let parameters = spec.parameters.clone();
         let spec = crate::expand::expand(spec)?;
-        Self::from_spec(spec)
+        Ok(Self {
+            parameters,
+            ..Self::from_spec(spec)?
+        })
+    }
+
+    /// `max_active_runs` as a stored spec has it: what [`DagSpec`] would read,
+    /// taken from the YAML alone. A run that is set running again asks its
+    /// concurrency key as a new run does, and has only its definition's text
+    /// to read the cap from. `None` for no cap, a cap of 0 (which is none),
+    /// or text that is not a mapping.
+    pub fn stored_max_active_runs(yaml: &str) -> Option<u32> {
+        let doc: serde_yaml::Value = serde_yaml::from_str(yaml).ok()?;
+        let max = doc.get("max_active_runs")?.as_u64()?;
+        u32::try_from(max).ok().filter(|max| *max > 0)
+    }
+
+    /// `run_timeout_secs` and `deadline.in` as a stored spec has them, in
+    /// seconds: what [`DagSpec`] would read, taken from the YAML alone. A run
+    /// that is set running again after it ended counts both again from then,
+    /// as a new run counts them from when it is made, and has only its
+    /// definition's text to read them from. `None` for one the text does not
+    /// set, or sets as nothing [`DagSpec`] would take.
+    pub fn stored_deadlines(yaml: &str) -> (Option<u64>, Option<u64>) {
+        let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+            return (None, None);
+        };
+        let timeout = doc
+            .get("run_timeout_secs")
+            .and_then(serde_yaml::Value::as_u64)
+            .filter(|secs| *secs > 0);
+        let alert = doc
+            .get("deadline")
+            .and_then(|deadline| deadline.get("in"))
+            .and_then(serde_yaml::Value::as_str)
+            .and_then(|within| parse_duration_secs(within).ok());
+        (timeout, alert)
     }
 
     /// Build the graph from an already-expanded (leaf-only) [`DagSpec`].
@@ -1477,6 +1896,24 @@ impl DagGraph {
             if spec.max_active_runs.unwrap_or(0) == 0 {
                 bail!(
                     "concurrency_key in DAG '{}' needs max_active_runs >= 1: it only scopes that cap",
+                    spec.name
+                );
+            }
+        }
+        if let Some(when_full) = spec.when_full {
+            let cap = spec.max_active_runs.unwrap_or(0);
+            if cap == 0 {
+                bail!(
+                    "when_full in DAG '{}' needs max_active_runs >= 1: it says what that cap does",
+                    spec.name
+                );
+            }
+            // Which of several runs a new one would cancel is not said, so
+            // it is not guessed: one run, and the new one takes its place.
+            if when_full == WhenFull::Supersede && cap != 1 {
+                bail!(
+                    "when_full: supersede in DAG '{}' needs max_active_runs: 1 (it is {cap}): \
+                     a new run takes the place of the one before it",
                     spec.name
                 );
             }
@@ -1580,6 +2017,54 @@ impl DagGraph {
                      seams on dagron_engine::Seams.",
                     spec.name,
                 );
+            }
+            // A token budget is held by the meter, which this build may not
+            // keep: refused rather than dropped, as the flag above.
+            match budget.tokens {
+                Some(0) => {
+                    bail!(
+                        "invalid budget.tokens=0 in DAG '{}'; expected >= 1 (or omit)",
+                        spec.name
+                    )
+                }
+                Some(n) if n > crate::tokens::MOST => {
+                    bail!(
+                        "invalid budget.tokens={n} in DAG '{}'; expected at most {}",
+                        spec.name,
+                        crate::tokens::MOST
+                    )
+                }
+                Some(_) if !cfg!(feature = "enterprise") => {
+                    crate::metrics::record_signpost_hit(crate::metrics::SignpostGate::TokenBudget);
+                    bail!(
+                        "DAG '{}' sets a token budget (`budget: {{ tokens }}`): the meter that \
+                         reserves each task's `tokens:` at dispatch and keeps what it reports \
+                         spent is not in this build — \
+                         https://github.com/lucheeseng827/dagron#what-this-build-does-not-do. \
+                         A task's own `max_tokens` bounds one call, `budget: {{ tasks: N }}` \
+                         bounds how many a run makes, and a gateway in front of the model can \
+                         hold a budget of the run's own (a `run_id` claim of its OIDC token).",
+                        spec.name,
+                    );
+                }
+                Some(max) => {
+                    // A task that reserves more than its own run may spend can
+                    // never be dispatched: said now, not at its turn.
+                    if let Some(task) = spec
+                        .tasks
+                        .iter()
+                        .find(|t| t.tokens.is_some_and(|n| n > max))
+                    {
+                        bail!(
+                            "task '{}' in DAG '{}' reserves {} tokens, more than the run's \
+                             budget.tokens={max}",
+                            task.name,
+                            spec.name,
+                            task.tokens.unwrap_or_default(),
+                        );
+                    }
+                }
+                None => {}
             }
         }
         if let Some(d) = &spec.deadline {
@@ -1870,6 +2355,169 @@ impl DagGraph {
             // that is correct now rather than by accident: `resolve_external`
             // records through the same `record_produces` the other two paths
             // use. It was refused outright until that wiring existed.
+            // A workspace is where a command runs. An approval gate, a
+            // sub-workflow trigger and a wait sensor run none, so one there
+            // would be a volume nobody ever mounts.
+            if let Some(ws) = &task.workspace {
+                if task.is_approval() || task.is_workflow() || task.is_wait() {
+                    bail!(
+                        "task '{}' (type: {}) cannot have a `workspace:` in DAG '{}' — only command tasks run in one",
+                        task.name,
+                        task.task_type.as_deref().unwrap_or("task"),
+                        spec.name
+                    );
+                }
+                ws.validate()
+                    .map_err(|e| anyhow::anyhow!("task '{}' in DAG '{}': {e}", task.name, spec.name))?;
+            }
+            // What a task may spend of a token budget is a command's: the
+            // turns of a `type: workflow` reserve their own.
+            if let Some(tokens) = task.tokens {
+                if task.is_approval() || task.is_workflow() || task.is_wait() {
+                    bail!(
+                        "task '{}' (type: {}) cannot have `tokens:` in DAG '{}' — only command tasks spend them",
+                        task.name,
+                        task.task_type.as_deref().unwrap_or("task"),
+                        spec.name
+                    );
+                }
+                if tokens == 0 {
+                    bail!(
+                        "invalid tokens=0 on task '{}' in DAG '{}'; expected >= 1 (or omit)",
+                        task.name,
+                        spec.name
+                    );
+                }
+                if tokens > crate::tokens::MOST {
+                    bail!(
+                        "invalid tokens={tokens} on task '{}' in DAG '{}'; expected at most {}",
+                        task.name,
+                        spec.name,
+                        crate::tokens::MOST
+                    );
+                }
+            }
+            // The artifact API is a command's to use, likewise.
+            if task.artifact_api && (task.is_approval() || task.is_workflow() || task.is_wait()) {
+                bail!(
+                    "task '{}' (type: {}) cannot have `artifact_api:` in DAG '{}' — only command tasks are given it",
+                    task.name,
+                    task.task_type.as_deref().unwrap_or("task"),
+                    spec.name
+                );
+            }
+            // An identity is a command's to use, likewise.
+            if let Some(identity) = &task.identity {
+                if task.is_approval() || task.is_workflow() || task.is_wait() {
+                    bail!(
+                        "task '{}' (type: {}) cannot have an `identity:` in DAG '{}' — only command tasks are given one",
+                        task.name,
+                        task.task_type.as_deref().unwrap_or("task"),
+                        spec.name
+                    );
+                }
+                identity.validate().map_err(|e| {
+                    anyhow::anyhow!("task '{}' in DAG '{}': {e}", task.name, spec.name)
+                })?;
+            }
+            // A forge token is for the repository of the task's checkout:
+            // a command's, with one.
+            if let Some(token) = &task.forge_token {
+                if task.is_approval() || task.is_workflow() || task.is_wait() {
+                    bail!(
+                        "task '{}' (type: {}) cannot have a `forge_token:` in DAG '{}' — only command tasks are given one",
+                        task.name,
+                        task.task_type.as_deref().unwrap_or("task"),
+                        spec.name
+                    );
+                }
+                if task
+                    .workspace
+                    .as_ref()
+                    .and_then(|ws| ws.checkout.as_ref())
+                    .is_none()
+                {
+                    bail!(
+                        "task '{}' in DAG '{}' has a `forge_token:` and no workspace.checkout: the token is for the repository it checks out",
+                        task.name,
+                        spec.name
+                    );
+                }
+                token.validate().map_err(|e| {
+                    anyhow::anyhow!("task '{}' in DAG '{}': {e}", task.name, spec.name)
+                })?;
+            }
+            // A service is beside a command while it runs, likewise.
+            if !task.services.is_empty() {
+                if task.is_approval() || task.is_workflow() || task.is_wait() {
+                    bail!(
+                        "task '{}' (type: {}) cannot have `services:` in DAG '{}' — only command tasks run beside one",
+                        task.name,
+                        task.task_type.as_deref().unwrap_or("task"),
+                        spec.name
+                    );
+                }
+                crate::service::validate(&task.services).map_err(|e| {
+                    anyhow::anyhow!("task '{}' in DAG '{}': {e}", task.name, spec.name)
+                })?;
+            }
+            // The daemon is a service of the task's, likewise, and the
+            // engine adds it to those the task names.
+            if task.docker_daemon {
+                if task.is_approval() || task.is_workflow() || task.is_wait() {
+                    bail!(
+                        "task '{}' (type: {}) cannot have `docker_daemon:` in DAG '{}' — only command tasks run beside one",
+                        task.name,
+                        task.task_type.as_deref().unwrap_or("task"),
+                        spec.name
+                    );
+                }
+                let name = crate::docker_daemon::NAME;
+                if task.services.iter().any(|s| s.name == name) {
+                    bail!(
+                        "task '{}' in DAG '{}' has `docker_daemon: true` and a service named '{name}': the daemon is the service of that name",
+                        task.name,
+                        spec.name
+                    );
+                }
+                if task.services.len() >= crate::service::MAX_SERVICES {
+                    bail!(
+                        "task '{}' in DAG '{}' has `docker_daemon: true` and {} services: the daemon is one more, and a task may have {}",
+                        task.name,
+                        spec.name,
+                        task.services.len(),
+                        crate::service::MAX_SERVICES
+                    );
+                }
+            }
+            // Privilege is a container's, and a command task's alone.
+            if task.privileged && (task.is_approval() || task.is_workflow() || task.is_wait()) {
+                bail!(
+                    "task '{}' (type: {}) cannot have `privileged:` in DAG '{}' — only command tasks run in a container of their own",
+                    task.name,
+                    task.task_type.as_deref().unwrap_or("task"),
+                    spec.name
+                );
+            }
+            // A variable is a command's, likewise, and what it reads is a
+            // task this one waits for.
+            if !task.env_from.is_empty() {
+                if task.is_approval() || task.is_workflow() || task.is_wait() {
+                    bail!(
+                        "task '{}' (type: {}) cannot have `env_from:` in DAG '{}' — only command tasks have variables",
+                        task.name,
+                        task.task_type.as_deref().unwrap_or("task"),
+                        spec.name
+                    );
+                }
+                if let Some(why) = env_from_refusal(task) {
+                    bail!(
+                        "task '{}' in DAG '{}': env_from: {why}",
+                        task.name,
+                        spec.name
+                    );
+                }
+            }
             if !task.produces.is_empty() {
                 if task.is_approval() || task.is_workflow() || task.is_wait() {
                     bail!(
@@ -2357,7 +3005,12 @@ impl DagGraph {
             }
         }
 
-        Ok(Self { spec, graph, node_index })
+        Ok(Self {
+            spec,
+            parameters: BTreeMap::new(),
+            graph,
+            node_index,
+        })
     }
 
     /// Number of incoming edges (direct dependencies) for a task.
@@ -2395,6 +3048,352 @@ mod tests {
     /// Runner-class validation: charset/length rules plus the reserved `other`
     /// (the metrics tail bucket) — a spec-level `other` would collide with the
     /// aggregated `runner_class="other"` series.
+    /// `services:` are kept on a command task and on every instance of a
+    /// fan-out, with the run's parameters filled in, are stored with the task,
+    /// and are refused where one could not be run or found, or where the task
+    /// runs no command to be beside.
+    #[test]
+    fn a_task_s_services_are_a_command_task_s_and_each_is_checked() {
+        let y = |tasks: &str| format!("name: svc\nparameters: {{ pg: \"16\" }}\ntasks:\n{tasks}");
+        let g = DagGraph::from_yaml(&y(r#"  - name: test
+    command: ["make", "test"]
+    services:
+      - name: pg
+        image: "postgres:{{ pg }}-alpine"
+        env: [{ name: POSTGRES_PASSWORD, value: pw }]
+        ready: pg_isready -h localhost -U postgres
+      - { name: cache, image: "redis:7", ready: [redis-cli, ping] }
+  - name: each
+    command: ["true"]
+    with_items: [a, b]
+    services: [{ name: db, image: "db:{{ item }}" }]
+  - { name: plain, command: ["true"] }
+"#))
+        .expect("services parse");
+        let test = g.task_spec("test").unwrap();
+        assert_eq!(test.services.len(), 2);
+        assert_eq!(
+            test.services[0].image, "postgres:16-alpine",
+            "the run's parameter"
+        );
+        assert_eq!(
+            test.services[1].ready,
+            Some(crate::service::Ready::Exec(vec![
+                "redis-cli".into(),
+                "ping".into()
+            ]))
+        );
+        let leaves: Vec<_> = g
+            .spec
+            .tasks
+            .iter()
+            .filter(|t| t.name.starts_with("each"))
+            .collect();
+        let images: Vec<&str> = leaves
+            .iter()
+            .map(|t| t.services[0].image.as_str())
+            .collect();
+        assert_eq!(images, ["db:a", "db:b"], "each instance its own");
+        assert!(g.task_spec("plain").unwrap().services.is_empty());
+        // As a run stores a task, and reads it back.
+        let stored = serde_json::to_value(g.task_spec("test").unwrap()).unwrap();
+        assert_eq!(
+            stored["services"][0]["ready"],
+            "pg_isready -h localhost -U postgres"
+        );
+        let back: TaskSpec = serde_json::from_value(stored).unwrap();
+        assert_eq!(back.services[0].name, "pg");
+        let plain = serde_json::to_value(g.task_spec("plain").unwrap()).unwrap();
+        assert!(plain.get("services").is_none());
+
+        for (task, why) in [
+            ("    command: [\"x\"]\n    services: [{ name: Pg, image: x }]\n", "not a service's name"),
+            ("    command: [\"x\"]\n    services: [{ name: pg, image: \"{{ nope }}\" }]\n", "a parameter the run does not have"),
+            ("    command: [\"x\"]\n    services: [{ name: pg, image: x }, { name: pg, image: y }]\n", "two are named 'pg'"),
+            ("    command: [\"x\"]\n    services: [{ name: pg, image: x, ports: [5432] }]\n", "unknown field `ports`"),
+            ("    command: [\"x\"]\n    services: [{ name: pg, image: x, env: [{ name: P, value_from: { secret: S } }] }]\n", "no secret is given to a service"),
+            ("    type: approval\n    services: [{ name: pg, image: x }]\n", "only command tasks"),
+            ("    type: wait\n    wait: { for: 10s }\n    services: [{ name: pg, image: x }]\n", "only command tasks"),
+        ] {
+            let err = DagGraph::from_yaml(&y(&format!("  - name: t\n{task}")))
+                .err()
+                .unwrap_or_else(|| panic!("{task:?} was taken"));
+            assert!(format!("{err:#}").contains(why), "{task:?}: {err:#}");
+        }
+    }
+
+    /// `docker_daemon:` is kept on a command task and each instance of it,
+    /// written back only where it is set, and is refused where the daemon
+    /// would not be one more service of a command task.
+    #[test]
+    fn a_task_s_docker_daemon_is_one_more_service_of_a_command_task() {
+        let y = |tasks: &str| format!("name: dind\ntasks:\n{tasks}");
+        let g = DagGraph::from_yaml(&y(r#"  - name: image
+    command: ["docker", "build", "."]
+    docker_daemon: true
+  - name: each
+    command: ["true"]
+    with_items: [a, b]
+    docker_daemon: true
+  - { name: plain, command: ["true"] }
+"#))
+        .expect("docker_daemon parses");
+        assert!(g.task_spec("image").unwrap().docker_daemon);
+        assert!(g
+            .spec
+            .tasks
+            .iter()
+            .filter(|t| t.name.starts_with("each"))
+            .all(|t| t.docker_daemon));
+        let stored = serde_json::to_value(g.task_spec("image").unwrap()).unwrap();
+        assert_eq!(stored["docker_daemon"], true);
+        let plain = serde_json::to_value(g.task_spec("plain").unwrap()).unwrap();
+        assert!(plain.get("docker_daemon").is_none());
+
+        let eight: Vec<String> = (0..crate::service::MAX_SERVICES)
+            .map(|i| format!("{{ name: s{i}, image: x }}"))
+            .collect();
+        let eight = format!(
+            "    command: [\"x\"]\n    docker_daemon: true\n    services: [{}]\n",
+            eight.join(", ")
+        );
+        for (task, why) in [
+            ("    type: approval\n    docker_daemon: true\n", "only command tasks"),
+            ("    command: [\"x\"]\n    docker_daemon: true\n    services: [{ name: docker, image: x }]\n", "the daemon is the service of that name"),
+            (eight.as_str(), "the daemon is one more"),
+            // Only the engine says a service is the daemon.
+            ("    command: [\"x\"]\n    services: [{ name: d, image: x, daemon: true }]\n", "unknown field `daemon`"),
+        ] {
+            let err = DagGraph::from_yaml(&y(&format!("  - name: t\n{task}")))
+                .err()
+                .unwrap_or_else(|| panic!("{task:?} was taken"));
+            assert!(format!("{err:#}").contains(why), "{task:?}: {err:#}");
+        }
+    }
+
+    /// `env_from:` is kept on a command task as it is written, names a task
+    /// the task depends on, follows that task where a template renames it,
+    /// and is refused where it could not be given.
+    #[test]
+    fn a_task_s_env_from_names_what_it_reads_of_a_task_it_depends_on() {
+        let g = DagGraph::from_yaml(
+            "name: w\ntasks:\n  - { name: build, command: [\"x\"] }\n  - name: use\n    command: [\"y\"]\n    \
+             depends_on: [build]\n    env_from:\n      - { name: BUILT, task: build, read: last_line }\n      \
+             - { name: HOW, task: build, read: status }\n",
+        )
+        .expect("env_from parses");
+        let used = g.task_spec("use").unwrap();
+        assert_eq!(
+            used.env_from,
+            [
+                EnvFrom {
+                    name: "BUILT".into(),
+                    task: "build".into(),
+                    read: Read::LastLine
+                },
+                EnvFrom {
+                    name: "HOW".into(),
+                    task: "build".into(),
+                    read: Read::Status
+                },
+            ]
+        );
+        // As the run stores it, and absent where a task has none.
+        let stored = serde_json::to_value(used).unwrap();
+        assert_eq!(
+            stored["env_from"][0],
+            serde_json::json!({ "name": "BUILT", "task": "build", "read": "last_line" })
+        );
+        let back: TaskSpec = serde_json::from_value(stored).unwrap();
+        assert_eq!(back.env_from, used.env_from);
+        assert!(serde_json::to_value(g.task_spec("build").unwrap())
+            .unwrap()
+            .get("env_from")
+            .is_none());
+
+        // Inside a template the task it names is renamed with its sibling.
+        let g = DagGraph::from_yaml(
+            "name: w\ntemplates:\n  - name: stage\n    tasks:\n      - { name: check, command: [\"decide\"] }\n      \
+             - name: ship\n        command: [\"ship\"]\n        depends_on: [check]\n        \
+             env_from: [{ name: DECIDED, task: check, read: last_line }]\n\
+             tasks:\n  - { name: dev, template: stage }\n",
+        )
+        .expect("a template's env_from expands");
+        assert_eq!(
+            g.task_spec("dev.ship").unwrap().env_from[0].task,
+            "dev.check"
+        );
+
+        for (task, why) in [
+            ("    command: [\"y\"]\n    env_from: [{ name: B, task: build, read: status }]\n", "does not depend on"),
+            ("    command: [\"y\"]\n    depends_on: [build]\n    env_from: [{ name: B, task: nobody, read: status }]\n", "reads task 'nobody'"),
+            ("    command: [\"y\"]\n    depends_on: [build]\n    env_from: [{ name: 1B, task: build, read: status }]\n", "not a variable's name"),
+            ("    command: [\"y\"]\n    depends_on: [build]\n    env_from: [{ name: B, task: build, read: output }]\n", "unknown variant `output`"),
+            ("    command: [\"y\"]\n    depends_on: [build]\n    env_from: [{ name: B, task: build, read: status, when: x }]\n", "unknown field `when`"),
+            ("    command: [\"y\"]\n    depends_on: [build]\n    env: [{ name: B, value: x }]\n    env_from: [{ name: B, task: build, read: status }]\n", "B is set twice"),
+            ("    command: [\"y\"]\n    depends_on: [build]\n    env_from: [{ name: B, task: build, read: status }, { name: B, task: build, read: last_line }]\n", "B is set twice"),
+            ("    type: approval\n    depends_on: [build]\n    env_from: [{ name: B, task: build, read: status }]\n", "only command tasks"),
+        ] {
+            let yaml = format!("name: w\ntasks:\n  - {{ name: build, command: [\"x\"] }}\n  - name: use\n{task}");
+            let err = DagGraph::from_yaml(&yaml)
+                .err()
+                .unwrap_or_else(|| panic!("{task:?} was taken"));
+            assert!(format!("{err:#}").contains(why), "{task:?}: {err:#}");
+        }
+    }
+
+    /// A task that was fanned out is several tasks, and a variable is given
+    /// from one: the refusal says that, and not that the task is not depended
+    /// on. One of them is read by its own name.
+    #[test]
+    fn env_from_reads_one_task_of_a_fan_out_by_its_name() {
+        let with = |env_from: &str| {
+            format!(
+                "name: w\ntasks:\n  - {{ name: build, command: [\"x\", \"{{{{ item }}}}\"], with_items: [a, b] }}\n  \
+                 - name: use\n    command: [\"y\"]\n    depends_on: [build]\n    env_from: [{env_from}]\n"
+            )
+        };
+        let err = DagGraph::from_yaml(&with("{ name: B, task: build, read: status }"))
+            .err()
+            .expect("the name as written is none of the tasks");
+        let said = format!("{err:#}");
+        assert!(
+            said.contains("B reads task 'build', which is 2 tasks in this run ('build.0', …)")
+                && said.contains("with_output_of")
+                && !said.contains("does not depend on"),
+            "{said}"
+        );
+        let g = DagGraph::from_yaml(&with("{ name: B, task: build.1, read: status }"))
+            .expect("one of them is read by its name");
+        assert_eq!(g.task_spec("use").unwrap().env_from[0].task, "build.1");
+    }
+
+    /// A task's last line is the last it printed that is not empty, whatever
+    /// ended its lines.
+    #[test]
+    fn the_last_line_is_the_last_that_is_not_empty() {
+        for (output, last) in [
+            ("a\nb\n", "b"),
+            ("a\r\nb\r\n\r\n", "b"),
+            ("only", "only"),
+            ("a\n  \n\t\n", "a"),
+            ("x\n b \n", " b "),
+            ("", ""),
+            ("\n\n", ""),
+        ] {
+            assert_eq!(last_line(output), last, "{output:?}");
+        }
+    }
+
+    /// `workspace:` is kept on a command task, and on every instance of a
+    /// fan-out, and refused where it could mean nothing: a size that is not
+    /// one, a key it does not take, a task that runs no command.
+    #[test]
+    fn a_workspace_is_a_command_task_s_and_its_size_is_a_size() {
+        let g = DagGraph::from_yaml(
+            r#"
+name: ws
+tasks:
+  - name: build
+    command: ["make"]
+    workspace: { size: 20Gi }
+  - name: test
+    command: ["make", "test-{{ item }}"]
+    with_items: [unit, e2e]
+    workspace: {}
+  - name: plain
+    command: ["true"]
+"#,
+        )
+        .expect("workspaces parse");
+        let build = g.task_spec("build").unwrap().workspace.as_ref().unwrap();
+        assert_eq!(build.size_bytes(), Some(20 << 30));
+        let leaves: Vec<_> = g.spec.tasks.iter().filter(|t| t.name.starts_with("test")).collect();
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.iter().all(|t| t.workspace == Some(Default::default())), "each instance its own");
+        assert!(g.task_spec("plain").unwrap().workspace.is_none());
+        // Not written back when absent, so a stored spec without one is unchanged.
+        let stored = serde_json::to_value(g.task_spec("plain").unwrap()).unwrap();
+        assert!(stored.get("workspace").is_none());
+
+        for (bad, says) in [
+            ("    command: [\"make\"]\n    workspace: { size: 20GB }\n", "not a size"),
+            ("    command: [\"make\"]\n    workspace: { size: \"0\" }\n", "zero"),
+            ("    command: [\"make\"]\n    workspace: { caches: [] }\n", "unknown field `caches`"),
+            (
+                "    command: [\"make\"]\n    workspace: { cache: [{ prefix: \"a b\", paths: [/x] }] }\n",
+                "not a name",
+            ),
+            ("    type: approval\n    workspace: {}\n", "only command tasks"),
+            ("    type: wait\n    wait: { for: 10s }\n    workspace: {}\n", "only command tasks"),
+        ] {
+            let yaml = format!("name: ws\ntasks:\n  - name: t\n{bad}");
+            let err = DagGraph::from_yaml(&yaml).err().unwrap_or_else(|| panic!("must reject:\n{yaml}"));
+            assert!(format!("{err:#}").contains(says), "{yaml}\n{err:#}");
+        }
+    }
+
+    /// A checkout is the run's: `{{ ci_sha }}` and its like are filled from
+    /// the run's parameters when the run is made, and checked as they are
+    /// then, so a run that names no commit is refused there.
+    #[test]
+    fn a_checkout_is_filled_from_the_run_s_parameters_and_checked_then() {
+        let yaml = r#"
+name: ci
+parameters: { ci_sha: "", ci_repo: "" }
+tasks:
+  - name: build
+    command: ["make"]
+    workspace:
+      checkout:
+        repository: "https://github.com/{{ ci_repo }}.git"
+        commit: "{{ ci_sha }}"
+"#;
+        let sha = "4b4708e725f29891d22b4c96af9f0a403ff51c7c";
+        let params = BTreeMap::from([
+            ("ci_sha".to_string(), sha.to_string()),
+            ("ci_repo".to_string(), "acme/widgets".to_string()),
+        ]);
+        let g = DagGraph::from_yaml_with_params(yaml, &params).expect("a run with its commit");
+        let checkout = g
+            .task_spec("build")
+            .unwrap()
+            .workspace
+            .as_ref()
+            .unwrap()
+            .checkout
+            .clone()
+            .unwrap();
+        assert_eq!(checkout.repository, "https://github.com/acme/widgets.git");
+        assert_eq!(checkout.commit, sha);
+
+        // Without the run's parameters: no commit, refused.
+        let err = DagGraph::from_yaml(yaml).err().expect("refused");
+        assert!(
+            format!("{err:#}").contains("workspace.checkout.commit"),
+            "{err:#}"
+        );
+        // A parameter the spec does not have stays a template, and is refused.
+        let undeclared = yaml.replace("{{ ci_sha }}", "{{ sha }}");
+        let err = DagGraph::from_yaml_with_params(&undeclared, &params)
+            .err()
+            .expect("refused");
+        assert!(
+            format!("{err:#}").contains("names a parameter the run does not have"),
+            "{err:#}"
+        );
+        // A repository a caller could point at a file, refused whatever fills it.
+        let file = BTreeMap::from([
+            ("ci_sha".to_string(), sha.to_string()),
+            ("ci_repo".to_string(), "x/../../etc".to_string()),
+        ]);
+        assert!(DagGraph::from_yaml_with_params(yaml, &file).is_err());
+        // A checkout is a workspace's: a task that runs no command has none.
+        let approval = "name: ws\ntasks:\n  - name: t\n    type: approval\n    workspace: { checkout: { repository: \"https://h/r\", commit: \"4b4708e725f29891d22b4c96af9f0a403ff51c7c\" } }\n";
+        let err = DagGraph::from_yaml(approval).err().expect("refused");
+        assert!(format!("{err:#}").contains("only command tasks"), "{err:#}");
+    }
+
     #[test]
     fn runner_class_validation_rules() {
         // `resources.gpu` sugar folds into effective limits; explicit keys win.
@@ -2665,18 +3664,28 @@ tasks:
     #[test]
     fn dataset_subscriptions_extraction() {
         assert_eq!(
-            dataset_subscriptions("name: p\non_datasets: [\"a://b\"]\ntasks: []\n"),
+            dataset_subscriptions("name: p\non_datasets: [\"a://b\"]\ntasks: []\n").unwrap(),
             Some((vec!["a://b".to_string()], "any".to_string()))
         );
         assert_eq!(
             dataset_subscriptions(
                 "name: p\non_datasets: [\"a://b\", \"a://c\"]\ndatasets_mode: all\ntasks: []\n"
-            ),
-            Some((vec!["a://b".to_string(), "a://c".to_string()], "all".to_string()))
+            )
+            .unwrap(),
+            Some((
+                vec!["a://b".to_string(), "a://c".to_string()],
+                "all".to_string()
+            ))
         );
-        // No subscriptions, or an unparseable spec → None.
-        assert_eq!(dataset_subscriptions("name: p\ntasks: []\n"), None);
-        assert_eq!(dataset_subscriptions("{{ not yaml"), None);
+        // No subscriptions → None; a spec that does not parse here is an
+        // error, and not the same: one a newer engine reads may have a key
+        // this one refuses, and still subscribe.
+        assert_eq!(dataset_subscriptions("name: p\ntasks: []\n").unwrap(), None);
+        assert!(dataset_subscriptions("{{ not yaml").is_err());
+        let newer = "name: p\non_datasets: [\"a://b\"]\ntasks:\n  - name: t\n    \
+                     command: [\"true\"]\n    env_from: [{ name: X, task: a, read: last_line, \
+                     trim: true }]\n";
+        assert!(dataset_subscriptions(newer).is_err());
     }
 
     #[test]
@@ -2991,8 +4000,14 @@ tasks:
         .expect("attribution is not in this build")
         .to_string();
         assert!(err.contains("not in this build"), "names the gap: {err}");
-        assert!(err.contains("#what-this-build-does-not-do"), "links the anchor: {err}");
-        assert!(err.contains("external_cost"), "names the OPEN ceiling, so the refusal is not read as 'budgets are paid': {err}");
+        assert!(
+            err.contains("#what-this-build-does-not-do"),
+            "links the anchor: {err}"
+        );
+        assert!(
+            err.contains("external_cost"),
+            "names the OPEN ceiling, so the refusal is not read as 'budgets are paid': {err}"
+        );
         assert!(err.contains("`pool:`"), "names the other open bound: {err}");
         assert!(
             signpost_hits(SignpostGate::ExternalCostAttribution) > before,
@@ -3010,6 +4025,97 @@ tasks:
             "name: p\nbudget: { external_cost_attribution: true }\ntasks:\n  - { name: a, command: [x] }\n",
         )
         .expect("an enterprise build accepts attribution");
+    }
+
+    /// A token budget is the meter's, which this build does not keep: refused,
+    /// counted, and pointed at what bounds a run here.
+    #[cfg(not(feature = "enterprise"))]
+    #[test]
+    fn a_token_budget_is_gated_and_the_signpost_names_what_holds_a_run_here() {
+        use crate::metrics::{signpost_hits, SignpostGate};
+        let before = signpost_hits(SignpostGate::TokenBudget);
+        let err = DagGraph::from_yaml(
+            "name: p\nbudget: { tokens: 1000 }\ntasks:\n  - { name: a, command: [x], tokens: 100 }\n",
+        )
+        .err()
+        .expect("a token budget is not in this build")
+        .to_string();
+        assert!(err.contains("not in this build"), "names the gap: {err}");
+        assert!(
+            err.contains("#what-this-build-does-not-do"),
+            "links the anchor: {err}"
+        );
+        assert!(
+            err.contains("budget: { tasks: N }"),
+            "names the open bound: {err}"
+        );
+        assert!(
+            signpost_hits(SignpostGate::TokenBudget) > before,
+            "the refusal is counted"
+        );
+        // What a task may spend is a declaration, and open.
+        DagGraph::from_yaml("name: p\ntasks:\n  - { name: a, command: [x], tokens: 100 }\n")
+            .expect("tokens: alone is accepted");
+    }
+
+    /// Where the meter is kept: a budget, and a task reserving what it alone
+    /// could never be given, said at creation.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn a_token_budget_is_accepted_where_it_ships_and_a_task_must_fit_it() {
+        let dag = DagGraph::from_yaml(
+            "name: p\nbudget: { tokens: 1000 }\ntasks:\n  - { name: a, command: [x], tokens: 100 }\n",
+        )
+        .expect("an enterprise build accepts a token budget");
+        assert_eq!(dag.spec.budget.as_ref().and_then(|b| b.tokens), Some(1000));
+        let err = DagGraph::from_yaml(
+            "name: p\nbudget: { tokens: 50 }\ntasks:\n  - { name: a, command: [x], tokens: 100 }\n",
+        )
+        .err()
+        .expect("a task reserving more than the budget")
+        .to_string();
+        assert!(
+            err.contains("task 'a'") && err.contains("budget.tokens=50"),
+            "{err}"
+        );
+        assert!(DagGraph::from_yaml(
+            "name: p\nbudget: { tokens: 0 }\ntasks:\n  - { name: a, command: [x] }\n"
+        )
+        .is_err());
+        let err = DagGraph::from_yaml(&format!(
+            "name: p\nbudget: {{ tokens: {} }}\ntasks:\n  - {{ name: a, command: [x] }}\n",
+            crate::tokens::MOST + 1
+        ))
+        .err()
+        .expect("a budget past what the meter counts")
+        .to_string();
+        assert!(err.contains("expected at most"), "{err}");
+    }
+
+    /// `tokens:` is a command's, at least one, and no more than the meter counts.
+    #[test]
+    fn tokens_are_a_command_tasks_and_at_least_one() {
+        let err =
+            DagGraph::from_yaml("name: p\ntasks:\n  - { name: a, command: [x], tokens: 0 }\n")
+                .err()
+                .expect("zero")
+                .to_string();
+        assert!(err.contains("tokens=0"), "{err}");
+        let err = DagGraph::from_yaml(&format!(
+            "name: p\ntasks:\n  - {{ name: a, command: [x], tokens: {} }}\n",
+            crate::tokens::MOST + 1
+        ))
+        .err()
+        .expect("more than the meter counts")
+        .to_string();
+        assert!(err.contains("expected at most"), "{err}");
+        let err = DagGraph::from_yaml(
+            "name: p\ntasks:\n  - { name: a, type: approval, approvers: [ops], tokens: 10 }\n",
+        )
+        .err()
+        .expect("an approval spends none")
+        .to_string();
+        assert!(err.contains("cannot have `tokens:`"), "{err}");
     }
 
     /// `arguments` with nothing to pass them to is a mistake, and a silent one
@@ -3135,6 +4241,45 @@ tasks:
         assert_eq!(
             g.task_spec("a").unwrap().command,
             vec!["echo", "2026-07-07T00:00:00+00:00", "k"]
+        );
+    }
+
+    /// Expansion empties `spec.parameters`, so the graph keeps the values it
+    /// was expanded with for the run row: the overrides over the defaults,
+    /// exactly what the tasks saw. A key only the caller sent is kept too:
+    /// `notify.git` may name one the tasks never do.
+    #[test]
+    fn the_graph_keeps_the_parameters_it_was_expanded_with() {
+        let yaml = "name: w\nparameters: { commit_sha: \"\", keep: \"k\" }\ntasks:\n  - { name: a, command: [\"echo\", \"{{ keep }}\"] }\n";
+        let overrides = BTreeMap::from([
+            (
+                "commit_sha".to_string(),
+                "4b4708e725f29891d22b4c96af9f0a403ff51c7c".to_string(),
+            ),
+            ("only_the_caller_sent".to_string(), "x".to_string()),
+        ]);
+        let g = DagGraph::from_yaml_with_params(yaml, &overrides).unwrap();
+        assert!(g.spec.parameters.is_empty(), "expansion consumes them");
+        assert_eq!(
+            g.parameters,
+            BTreeMap::from([
+                (
+                    "commit_sha".to_string(),
+                    "4b4708e725f29891d22b4c96af9f0a403ff51c7c".to_string()
+                ),
+                ("keep".to_string(), "k".to_string()),
+                ("only_the_caller_sent".to_string(), "x".to_string()),
+            ])
+        );
+
+        let defaults = DagGraph::from_yaml(yaml).unwrap();
+        assert_eq!(
+            defaults.parameters.get("keep").map(String::as_str),
+            Some("k")
+        );
+        assert_eq!(
+            defaults.parameters.get("commit_sha").map(String::as_str),
+            Some("")
         );
     }
 
@@ -3561,6 +4706,32 @@ tasks:
         assert!(DagGraph::from_yaml(&y("")).err().unwrap().to_string().contains("needs max_active_runs"));
         let unresolved = "name: w\nmax_active_runs: 1\nconcurrency_key: \"{{ nope }}\"\ntasks:\n  - { name: a, command: [\"true\"] }\n";
         assert!(DagGraph::from_yaml(unresolved).err().unwrap().to_string().contains("no value"));
+    }
+
+    #[test]
+    fn when_full_says_what_a_cap_does_and_needs_one() {
+        let y = |head: &str| format!("name: w\n{head}tasks:\n  - {{ name: a, command: [\"true\"] }}\n");
+        let of = |head: &str| DagGraph::from_yaml(&y(head)).map(|g| g.spec.when_full);
+        let refused = |head: &str| of(head).err().unwrap().to_string();
+        // Stated or not, and each of the three.
+        assert_eq!(of("max_active_runs: 1\n").unwrap(), None);
+        assert_eq!(of("max_active_runs: 3\nwhen_full: refuse\n").unwrap(), Some(WhenFull::Refuse));
+        assert_eq!(of("max_active_runs: 3\nwhen_full: queue\n").unwrap(), Some(WhenFull::Queue));
+        assert_eq!(of("max_active_runs: 1\nwhen_full: supersede\n").unwrap(), Some(WhenFull::Supersede));
+        assert!(!WhenFull::default().waits() && WhenFull::Queue.waits() && WhenFull::Supersede.waits());
+        // It is the cap's, and says nothing without one.
+        assert!(refused("when_full: queue\n").contains("needs max_active_runs"));
+        assert!(refused("max_active_runs: 0\nwhen_full: queue\n").contains("needs max_active_runs"));
+        // One run takes another's place, and not one of several.
+        assert!(refused("max_active_runs: 2\nwhen_full: supersede\n").contains("needs max_active_runs: 1"));
+        // A word that is none of the three is no workflow.
+        assert!(of("max_active_runs: 1\nwhen_full: latest\n").is_err());
+        // What is written is what is kept, for a run that is read again.
+        let kept = serde_yaml::to_string(&DagGraph::from_yaml(&y("max_active_runs: 1\nwhen_full: supersede\n")).unwrap().spec).unwrap();
+        assert!(kept.contains("when_full: supersede"), "{kept}");
+        for word in [WhenFull::Refuse, WhenFull::Queue, WhenFull::Supersede] {
+            assert_eq!(serde_yaml::to_string(&word).unwrap().trim(), word.as_str());
+        }
     }
 
     #[test]

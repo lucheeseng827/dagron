@@ -1,0 +1,19 @@
+# Every filter a push and a pull request take, in their ignore forms too.
+name: filters
+on:
+  push:
+    branches-ignore: ["wip/**"]
+    tags-ignore: ["*-rc.*"]
+    paths-ignore: ["docs/**", "**.md"]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main, "release/**"]
+    paths:
+      - "src/**"
+      - "!src/**/*.md"
+  merge_group:
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: make test

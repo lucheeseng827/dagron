@@ -1,0 +1,16 @@
+shows: A step's if is decided as the job runs, and a failure it allows does not end the job
+front: github
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on: push
+  jobs:
+    build:
+      runs-on: ubuntu-latest
+      steps:
+        - id: build
+          run: make
+          continue-on-error: true
+        - if: steps.build.outcome == 'failure'
+          run: make clean all
+        - if: always()
+          run: make report

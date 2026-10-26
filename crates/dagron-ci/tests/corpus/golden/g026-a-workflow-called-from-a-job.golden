@@ -1,0 +1,3 @@
+not a pipeline:
+  jobs.call.uses: a job that calls a reusable workflow (`uses:`) is not taken by dagron-ci's GitHub front-end yet (see docs/CI_GITHUB.md)
+  jobs.call.with: a job that calls a reusable workflow (`with:`) is not taken by dagron-ci's GitHub front-end yet (see docs/CI_GITHUB.md)

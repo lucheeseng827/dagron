@@ -1,0 +1,32 @@
+// A label the importer is told the image of, and options.
+pipeline {
+    agent { label 'linux' }
+    options {
+        retry(2)
+        skipDefaultCheckout()
+        timestamps()
+        disableConcurrentBuilds(abortPrevious: true)
+    }
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+        stage('Build') {
+            options {
+                timeout(time: 1, unit: 'HOURS')
+            }
+            steps {
+                sh 'make -j4'
+            }
+        }
+        stage('Integration') {
+            agent { docker { image 'postgres:16'; alwaysPull true; args '-e POSTGRES_PASSWORD=ci' } }
+            options { retry(3) }
+            steps {
+                sh 'pg_ctl start && make it'
+            }
+        }
+    }
+}

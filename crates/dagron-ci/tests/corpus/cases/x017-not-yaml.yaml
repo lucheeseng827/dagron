@@ -1,0 +1,8 @@
+shows: A file that is not YAML is no pipeline, and is told where it stops being one
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: build
+      steps: [run: make

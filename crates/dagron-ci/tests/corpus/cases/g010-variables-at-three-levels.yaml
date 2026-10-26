@@ -1,0 +1,19 @@
+shows: A workflow's variables, a job's and a step's each reach the step, the nearest winning
+front: github
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on: push
+  env:
+    LEVEL: workflow
+    ONLY_WORKFLOW: "1"
+  jobs:
+    show:
+      runs-on: ubuntu-latest
+      env:
+        LEVEL: job
+        ONLY_JOB: "2"
+      steps:
+        - run: echo "$LEVEL $ONLY_WORKFLOW $ONLY_JOB"
+        - run: echo "$LEVEL"
+          env:
+            LEVEL: step

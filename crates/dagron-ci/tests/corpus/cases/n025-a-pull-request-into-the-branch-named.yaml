@@ -1,0 +1,10 @@
+shows: A pull request into the branch a pipeline names runs it, in the pull request's own group
+event: { kind: pull_request, base_ref: main, pr: 12, ref: refs/pull/12/head }
+source: |
+  name: ci
+  on:
+    pull_request: { branches: [main] }
+  tasks:
+    - name: test
+      steps:
+        - run: make test

@@ -4,14 +4,13 @@
 //! the same transaction so any open SSE stream (this replica or another) reflects
 //! the change immediately.
 //!
-//! NOTE: the cancel/retry/submit SQL is intentionally inlined here rather than
-//! reused from the dagron engine crate. The engine's `db.rs` carries a
-//! `compile_error!` that fires when both the `sqlite` and `postgres` features are
-//! enabled; depending on the engine crate from this Postgres-only service would
-//! trip that under Cargo's workspace feature unification. The inlined statements
-//! mirror engine `db::postgres::{cancel_run, retry_task_from_ui, create_run}` —
-//! keep them in sync if the engine schema changes. The submitted task `input`
-//! JSON must match the engine's `dag::TaskSpec` shape (see `TaskSpecInput`).
+//! Cancel and submit go through `dagron_core::db` (`cancel_run`, `create_run*`),
+//! so a run created or cancelled here is written exactly as the engine writes
+//! it: a cancel from either API ends the run the same way, outbox event and
+//! all. The retry SQL is still inlined, mirroring engine
+//! `db::postgres::retry_task_from_ui`; keep it in sync if the engine schema
+//! changes. The submitted task `input` JSON must match the engine's
+//! `dag::TaskSpec` shape (see `TaskSpecInput`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -26,6 +25,7 @@ use uuid::Uuid;
 use dagron_artifact::ArtifactKey;
 
 use crate::auth::AuthUser;
+#[cfg(feature = "postgres")]
 use crate::routes::artifacts;
 use crate::state::AppState;
 
@@ -33,10 +33,30 @@ use crate::state::AppState;
 
 #[derive(Serialize)]
 pub struct CancelResponse {
+    /// How many tasks the cancel called off.
     pub cancelled: u64,
+    /// How many of them a worker still holds: asked to stop, and `running`
+    /// until their work is gone. While this is not zero the run reads
+    /// `running` too, and ends `cancelled` once they have stopped.
+    pub stopping: u64,
 }
 
-/// `POST /api/runs/:id/cancel` — flip all non-terminal tasks to cancelled.
+/// `POST /api/runs/:id/cancel` — cancel a running run and every task of it
+/// still to finish. `cancelled` is how many tasks it called off: 0 for a run
+/// already terminal, which this leaves as it is.
+///
+/// **A cancel asks.** A task that had not started, or was waiting (on an
+/// approval, a sensor, a deferred job), is `cancelled` at once. One a worker
+/// holds is asked to stop: its engine tells the executor at its next sweep,
+/// and the task is `cancelled` when its container, pod or process is gone.
+/// `stopping` counts those. The run ends with the last of them, and until
+/// then reads `running`, with `stopping_as: "cancelled"` in its detail, and
+/// holds its concurrency key. A second cancel in that time changes nothing.
+///
+/// Through `dagron_core::db::cancel_run`, the engine's own cancel: the run's
+/// `run.completed` event (status `cancelled`) is written when the run ends,
+/// and the engine's next tick runs the rest of its end (commit status,
+/// webhooks, run sink).
 pub async fn cancel_run(
     _auth: AuthUser,
     State(state): State<AppState>,
@@ -53,38 +73,19 @@ pub async fn cancel_run(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let now = chrono::Utc::now().to_rfc3339();
-    let mut tx = state.write_pool.begin().await.map_err(internal)?;
-    let cancelled = sqlx::query(
-        "UPDATE task_runs
-         SET status = 'cancelled', finished_at = $1, claimed_by = NULL
-         WHERE run_id = $2 AND status IN ('pending', 'ready', 'running')",
-    )
-    .bind(&now)
-    .bind(&id)
-    .execute(&mut *tx)
-    .await
-    .map_err(internal)?
-    .rows_affected();
-
-    if cancelled > 0 {
-        // Reflect the cancellation on the run itself so GET /api/runs and
-        // GET /api/runs/:id don't read a stale 'running'/'pending' status.
-        sqlx::query(
-            "UPDATE workflow_runs
-             SET status = 'cancelled', finished_at = $1
-             WHERE id = $2 AND status IN ('pending', 'running')",
-        )
-        .bind(&now)
-        .bind(&id)
-        .execute(&mut *tx)
+    let did = dagron_core::db::cancel_run(&state.write_pool, &id)
         .await
-        .map_err(internal)?;
-
-        notify(&mut tx, &id).await?;
-    }
-    tx.commit().await.map_err(internal)?;
-    Ok(Json(CancelResponse { cancelled }))
+        .map_err(|e| {
+            tracing::error!(error = ?e, run_id = %id, "cancel failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .unwrap_or_default();
+    Ok(Json(CancelResponse {
+        // Called off, whether or not their work has stopped yet: what this
+        // field has always counted.
+        cancelled: did.cancelled + did.stopping,
+        stopping: did.stopping,
+    }))
 }
 
 // ── Retry ─────────────────────────────────────────────────────────────────────
@@ -94,13 +95,52 @@ pub struct RetryResponse {
     pub retried: bool,
 }
 
-/// `POST /api/runs/:id/tasks/:tid/retry` — resurrect a failed/cancelled task.
-/// 409 if the task isn't in a retryable state; 404 if it doesn't belong to the run.
+/// The answer for a rerun, a retry or a clear that the datastore refused.
+///
+/// A run that had ended asks its concurrency key before it runs again, as a
+/// new run does, and a full key is a `429` that says so, with nothing
+/// written. A run rerun whole while a task of it still owes the teardown of a
+/// remote job is a `409`, with nothing written: it can be rerun once the
+/// engine has torn the job down. Anything else is logged and is the `500` it
+/// always was.
+fn run_again_refusal(e: anyhow::Error) -> (StatusCode, String) {
+    if let Some(t) = e.downcast_ref::<dagron_core::models::TeardownOwed>() {
+        return (StatusCode::CONFLICT, t.to_string());
+    }
+    if let Some(m) = e.downcast_ref::<dagron_core::models::MaxActiveRunsReached>() {
+        let scope = m.key.as_deref().map(|k| format!(" and concurrency_key '{k}'")).unwrap_or_default();
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "max_active_runs reached for workflow '{}'{scope} ({} active, cap {}): \
+                 the run was not set running again",
+                m.name, m.active, m.max
+            ),
+        );
+    }
+    tracing::error!(error = ?e, "running a run again failed");
+    (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())
+}
+
+// A rerun, a retry and a clear are the engine's: `dagron_core::db` has the one
+// implementation of each, and its own API calls the same three functions.
+// This file carried a copy of each, "kept in sync" by a comment, and the
+// copies had drifted: the rerun here left rule-skipped tasks skipped, and none
+// of the three cleared a task's fault verdict, its log or its remote job's
+// handle. Each now keeps the attempts it replaces, asks the concurrency key
+// when it sets an ended run running again, and writes an outbox event.
+
+/// `POST /api/runs/:id/tasks/:tid/retry` — resurrect a failed/cancelled task,
+/// and set its run running again if it had ended. 409 if the task isn't in a
+/// retryable state; 404 if it doesn't belong to the run; 429 if the run had
+/// ended and its concurrency key is full. The caller is recorded on the task
+/// as who put it back (`reset_by`): a gate it puts back to ask again takes no
+/// approval from them where it is `not_triggerer`.
 pub async fn retry_task(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Path((id, tid)): Path<(String, String)>,
-) -> Result<Json<RetryResponse>, StatusCode> {
+) -> Result<Json<RetryResponse>, (StatusCode, String)> {
     // Scope-check: the task must belong to this run.
     let status: Option<String> = sqlx::query_scalar(
         "SELECT status FROM task_runs WHERE id = $1 AND run_id = $2",
@@ -109,45 +149,29 @@ pub async fn retry_task(
     .bind(&id)
     .fetch_optional(&state.write_pool)
     .await
-    .map_err(internal)?;
+    .map_err(internal_msg)?;
+    let not_retryable = || {
+        (
+            StatusCode::CONFLICT,
+            format!("task '{tid}' is not in a retryable (failed/cancelled) state"),
+        )
+    };
     let Some(status) = status else {
-        return Err(StatusCode::NOT_FOUND);
+        return Err((StatusCode::NOT_FOUND, format!("task '{tid}' not found in run '{id}'")));
     };
     if status != "failed" && status != "cancelled" {
-        return Err(StatusCode::CONFLICT);
+        return Err(not_retryable());
     }
 
-    let mut tx = state.write_pool.begin().await.map_err(internal)?;
-    let updated = sqlx::query(
-        "UPDATE task_runs
-         SET status = 'ready', claimed_by = NULL, lease_expires_at = NULL,
-             scheduled_at = NULL, finished_at = NULL, output = NULL, version = version + 1
-         WHERE id = $1 AND status IN ('failed', 'cancelled')",
-    )
-    .bind(&tid)
-    .execute(&mut *tx)
-    .await
-    .map_err(internal)?
-    .rows_affected();
-
-    if updated == 0 {
-        // Raced to terminal-but-not-retryable between the check and the update.
-        tx.rollback().await.map_err(internal)?;
-        return Err(StatusCode::CONFLICT);
+    // The check above is for the answer; the engine's statement is the gate.
+    let who = caller_identity(&auth.0);
+    let retried = dagron_core::db::retry_task_from_ui_by(&state.write_pool, &tid, Some(&who))
+        .await
+        .map_err(run_again_refusal)?;
+    if !retried {
+        return Err(not_retryable());
     }
-
-    // Re-arm a run already finalized failed so the reconcile loop re-engages.
-    sqlx::query(
-        "UPDATE workflow_runs SET status = 'running', finished_at = NULL
-         WHERE id = $1 AND status = 'failed'",
-    )
-    .bind(&id)
-    .execute(&mut *tx)
-    .await
-    .map_err(internal)?;
-
-    notify(&mut tx, &id).await?;
-    tx.commit().await.map_err(internal)?;
+    tracing::info!(run_id = %id, task_id = %tid, "task retried");
     Ok(Json(RetryResponse { retried: true }))
 }
 
@@ -163,91 +187,34 @@ pub struct ClearResponse {
 /// `pending`, recompute `remaining_deps`, and re-arm the run so the reconcile
 /// loop re-runs just that sub-DAG. Unlike `retry_task` (a single failed task),
 /// this re-runs a still-`succeeded` node on demand and cascades to its
-/// downstream. Mirrors engine `db::clear_task_with_downstream` (keep in sync).
-/// 404 unknown run/task, 409 task not in a completed state.
+/// downstream. 404 unknown run/task, 409 task not in a completed state, 429 if
+/// the run had ended and its concurrency key is full. The caller is recorded
+/// on each task put back (`reset_by`), as a retry records them.
 pub async fn clear_task(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Path((id, tid)): Path<(String, String)>,
 ) -> Result<Json<ClearResponse>, (StatusCode, String)> {
-    let mut tx = state.write_pool.begin().await.map_err(internal_msg)?;
-
-    // Lock the target row and re-check inside the tx so a concurrent clear/retry
-    // serializes rather than double-resetting.
-    let status: Option<String> = sqlx::query_scalar(
-        "SELECT status FROM task_runs WHERE id = $1 AND run_id = $2 FOR UPDATE",
-    )
-    .bind(&tid)
-    .bind(&id)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(internal_msg)?;
-    let Some(status) = status else {
-        return Err((StatusCode::NOT_FOUND, format!("task '{tid}' not found in run '{id}'")));
+    let who = caller_identity(&auth.0);
+    let cleared =
+        dagron_core::db::clear_task_with_downstream_by(&state.write_pool, &id, &tid, Some(&who))
+            .await
+            .map_err(run_again_refusal)?;
+    let Some(cleared) = cleared else {
+        // The engine guards both under one answer: a task that is not in the
+        // run, and one that is not completed. Tell them apart for the caller.
+        let known = dagron_core::db::task_exists(&state.write_pool, &id, &tid)
+            .await
+            .map_err(run_again_refusal)?;
+        return Err(if known {
+            (
+                StatusCode::CONFLICT,
+                format!("task '{tid}' is not in a clearable (completed) state"),
+            )
+        } else {
+            (StatusCode::NOT_FOUND, format!("task '{tid}' not found in run '{id}'"))
+        });
     };
-    if !matches!(status.as_str(), "succeeded" | "failed" | "skipped" | "cancelled") {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("task '{tid}' is not in a clearable (completed) state"),
-        ));
-    }
-
-    let now = chrono::Utc::now().to_rfc3339();
-
-    // Reset the target + its transitive downstream cone (terminal tasks only).
-    let cleared = sqlx::query(
-        "WITH RECURSIVE cone(id) AS (
-             SELECT id FROM task_runs WHERE id = $1 AND run_id = $2
-             UNION
-             SELECT td.dependent_id FROM task_dependencies td
-             JOIN cone c ON td.dependency_id = c.id
-         )
-         UPDATE task_runs
-         SET status='pending', attempt=0, claimed_by=NULL, lease_expires_at=NULL,
-             output=NULL, finished_at=NULL, scheduled_at=$3, version=version+1
-         WHERE id IN (SELECT id FROM cone)
-           AND status IN ('succeeded','failed','skipped','cancelled')",
-    )
-    .bind(&tid)
-    .bind(&id)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await
-    .map_err(internal_msg)?
-    .rows_affected();
-
-    // Recompute remaining_deps for the reset frontier in a second statement so it
-    // sees the post-reset statuses (a just-reset dependency must count as
-    // outstanding — a single self-referential UPDATE can't guarantee that). Only
-    // *non-terminal* deps count: a terminal failed/cancelled upstream outside the
-    // reset cone never decrements again, so counting it would strand the task.
-    sqlx::query(
-        "UPDATE task_runs
-         SET remaining_deps = (
-                 SELECT COUNT(*) FROM task_dependencies d
-                 JOIN task_runs dep ON dep.id = d.dependency_id
-                 WHERE d.dependent_id = task_runs.id
-                   AND dep.status NOT IN ('succeeded','skipped','failed','cancelled')
-             )
-         WHERE run_id = $1 AND status = 'pending'",
-    )
-    .bind(&id)
-    .execute(&mut *tx)
-    .await
-    .map_err(internal_msg)?;
-
-    // Re-arm a run that had finished so the reconcile loop resumes.
-    sqlx::query(
-        "UPDATE workflow_runs SET status='running', finished_at=NULL, output=NULL
-         WHERE id=$1 AND status IN ('succeeded','failed','cancelled')",
-    )
-    .bind(&id)
-    .execute(&mut *tx)
-    .await
-    .map_err(internal_msg)?;
-
-    notify(&mut tx, &id).await.map_err(|s| (s, "internal server error".to_string()))?;
-    tx.commit().await.map_err(internal_msg)?;
 
     tracing::info!(run_id = %id, task_id = %tid, cleared, "task cleared with downstream");
     Ok(Json(ClearResponse { run_id: id, task_id: tid, cleared }))
@@ -335,7 +302,22 @@ async fn check_bound_digests(
             ),
         ));
     }
+    // A one-node install (SQLite) keeps no artifact index, so an approval bound
+    // to artifacts cannot be checked there. The return
+    // is the function's end only in this build.
+    #[cfg(feature = "sqlite")]
+    #[allow(clippy::needless_return)]
+    {
+        let _ = (state, run_id, gate, sent);
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "this gate binds its approval to artifacts, which dagron-api's Postgres build checks; a one-node (SQLite) install cannot"
+                .to_string(),
+        ));
+    }
+    #[cfg(feature = "postgres")]
     let mut lines = String::new();
+    #[cfg(feature = "postgres")]
     for bind in binds {
         let Some((task, name)) = bind.split_once('/') else {
             tracing::error!(%bind, "stored bind is not <task>/<name>");
@@ -373,12 +355,37 @@ async fn check_bound_digests(
             dagron_artifact::sanitize_component(name)
         ));
     }
+    #[cfg(feature = "postgres")]
     Ok((ArtifactKey::new(run_id, gate, APPROVED_DIGESTS_FILE), lines))
 }
 
 /// The artifact a gate with `binds` publishes on approval, under the gate's own
 /// task name: `$DAGRON_ARTIFACTS/<gate>/approved.sha256`.
 pub(crate) const APPROVED_DIGESTS_FILE: &str = "approved.sha256";
+
+/// Who started a run, for a rule that reads it (`not_triggerer`), over
+/// `workflow_runs` under the alias given, left-joined to `run_triggers rt`.
+///
+/// The actor of the run's trigger record, where it has one: the person who
+/// asked, a pusher, a pull request's author, and for a run a parent's task
+/// started, the parent's. A record with no actor names nobody, and bars
+/// nobody. A run with no record predates it, and is its submitter's
+/// (`triggered_by`), as it was.
+///
+/// It was `triggered_by` alone, which for a run a CI service submitted is the
+/// service: the rule compared an approver with the service's own token and
+/// never with whoever pushed. And a sub-workflow's run had no submitter at
+/// all, so a gate in one barred nobody, whoever had started its parent.
+macro_rules! triggerer_sql {
+    ($run:literal) => {
+        concat!(
+            "CASE WHEN rt.run_id IS NOT NULL THEN rt.actor ELSE ",
+            $run,
+            ".triggered_by END"
+        )
+    };
+}
+pub(crate) use triggerer_sql;
 
 async fn resolve_approval(
     state: &AppState,
@@ -406,11 +413,17 @@ async fn resolve_approval(
 
     // Who may decide. Read from the primary (a replica can lag a fresh run) and
     // from the stored TaskSpec, which no request can edit.
-    let gate: Option<(Option<String>, Option<String>, String)> = sqlx::query_as(
-        "SELECT t.input, r.triggered_by, t.name FROM task_runs t
+    // `(input, triggered_by, name, reset_by)`: `reset_by` is who put the gate
+    // back to ask again, if anyone did.
+    type Gate = (Option<String>, Option<String>, String, Option<String>);
+    let gate: Option<Gate> = sqlx::query_as(concat!(
+        "SELECT t.input, ",
+        triggerer_sql!("r"),
+        ", t.name, t.reset_by FROM task_runs t
            JOIN workflow_runs r ON r.id = t.run_id
+           LEFT JOIN run_triggers rt ON rt.run_id = r.id
           WHERE t.id = $1 AND t.run_id = $2",
-    )
+    ))
     .bind(tid)
     .bind(id)
     .fetch_optional(&state.write_pool)
@@ -418,7 +431,7 @@ async fn resolve_approval(
     .map_err(internal_msg)?;
     // sha256 lines to publish for downstream tasks once the approval lands.
     let mut approved_digests: Option<(ArtifactKey, String)> = None;
-    if let Some((input, triggered_by, gate_name)) = gate {
+    if let Some((input, triggered_by, gate_name, reset_by)) = gate {
         let authz: GateAuthz = match input.as_deref() {
             Some(s) => serde_json::from_str(s).map_err(|e| {
                 tracing::error!(error = ?e, task_id = %tid, "unreadable stored task spec");
@@ -433,16 +446,29 @@ async fn resolve_approval(
             ));
         }
         if approve && authz.not_triggerer {
-            if let Some(t) = triggered_by.as_deref() {
-                if [claims.email.as_str(), claims.sub.as_str()]
-                    .iter()
-                    .any(|me| !me.is_empty() && me.eq_ignore_ascii_case(t))
-                {
-                    return Err((
-                        StatusCode::FORBIDDEN,
-                        "this gate is not_triggerer: the person who started the run may not approve it".to_string(),
-                    ));
-                }
+            let is_me = |who: Option<&str>| {
+                who.is_some_and(|t| {
+                    [claims.email.as_str(), claims.sub.as_str()]
+                        .iter()
+                        .any(|me| !me.is_empty() && me.eq_ignore_ascii_case(t))
+                })
+            };
+            if is_me(triggered_by.as_deref()) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "this gate is not_triggerer: the person who started the run may not approve it"
+                        .to_string(),
+                ));
+            }
+            // Nor may whoever put the gate back to ask again, by a rerun, a
+            // retry or a clear: else the person who re-armed a gate could
+            // approve it, the only person involved.
+            if is_me(reset_by.as_deref()) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "this gate is not_triggerer: the person who put it back to ask again may not approve it"
+                        .to_string(),
+                ));
             }
         }
         if approve && !authz.binds.is_empty() {
@@ -476,10 +502,10 @@ async fn resolve_approval(
     if rows == 0 {
         tx.rollback().await.map_err(internal_msg)?;
         // Disambiguate: unknown task → 404, existing-but-not-awaiting → 409.
-        // `1::bigint` — a bare literal is INT4 and will not decode into i64, so
+        // `CAST(1 AS BIGINT)` — a bare literal is INT4 and will not decode into i64, so
         // this disambiguation would 500 exactly when the task DOES exist.
         let known: Option<i64> =
-            sqlx::query_scalar("SELECT 1::bigint FROM task_runs WHERE id = $1 AND run_id = $2")
+            sqlx::query_scalar("SELECT CAST(1 AS BIGINT) FROM task_runs WHERE id = $1 AND run_id = $2")
                 .bind(tid)
                 .bind(id)
                 .fetch_optional(&state.read_pool)
@@ -510,11 +536,14 @@ async fn resolve_approval(
     // that downstream tasks cannot verify. The put precedes the commit, so a
     // failed commit can leave this file behind while the gate stays pending: its
     // presence alone does not prove an approval (the next approval overwrites it).
+    // Never set on SQLite, whose check above refuses an artifact-bound gate.
+    #[cfg(feature = "sqlite")]
+    let _ = &approved_digests;
+    #[cfg(feature = "postgres")]
     if let Some((key, lines)) = &approved_digests {
-        let put = match state.artifact_store.as_deref() {
-            Some(s) => s.put(key, lines.as_bytes()).await.map(|_| ()),
-            None => Err(anyhow::anyhow!("artifact store not configured")),
-        };
+        // Recorded as any artifact is, so that it is listed with the run's
+        // and expires when they do.
+        let put = crate::routes::artifact_index::put_recorded(state, key, lines.as_bytes()).await;
         if let Err(e) = put {
             tracing::error!(error = %e, "could not publish approved digests");
             return Err((StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string()));
@@ -539,7 +568,8 @@ async fn resolve_approval(
 
 #[derive(Debug, Default, Deserialize)]
 pub struct RerunBody {
-    /// Rerun mode. Only `failed` (the default) is supported; `task:<id>` is reserved.
+    /// Rerun mode: `failed` (the default), from the failed tasks; or `all`,
+    /// the run whole, what succeeded included. `task:<id>` is reserved.
     #[serde(default)]
     from: Option<String>,
     /// Deep-merged into each reset task's stored TaskSpec `input` (behind the
@@ -557,27 +587,35 @@ pub struct RerunResponse {
 }
 
 /// `POST /api/runs/:id/rerun` — cascade rerun a failed/cancelled run from its
-/// failure frontier: every failed/cancelled task resets to `pending` and the run
-/// re-arms, while succeeded tasks stay intact. `remaining_deps` is recomputed so
-/// the frontier becomes ready and tasks behind a reset dependency wait for it to
-/// re-succeed. Mirrors engine `db::postgres::rerun_from_failed` (keep in sync),
-/// plus the optional `params` input override (QW4). 404 unknown / 409 not
-/// rerunnable / 400 bad mode or non-object params.
+/// failure frontier: every failed, cancelled and rule-skipped task resets to
+/// `pending` and the run re-arms, while succeeded tasks stay intact.
+/// `remaining_deps` is recomputed so the frontier becomes ready and tasks
+/// behind a reset dependency wait for it to re-succeed. It is the engine's
+/// rerun (`db::rerun_from_failed_in`), with the optional `params` input
+/// override (QW4) written in the same transaction. With `{"from": "all"}`
+/// the run is rerun whole (`db::rerun_all_in`): an ended run, one that
+/// succeeded too, runs again from its first tasks. 404 unknown / 409 not
+/// rerunnable, or rerun whole while a task still owes the teardown of a
+/// remote job / 400 bad mode or non-object params / 429 the run's concurrency
+/// key is full. The caller is recorded on each task put back (`reset_by`), as
+/// a retry records them.
 pub async fn rerun_run(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Path(id): Path<String>,
     body: Option<Json<RerunBody>>,
 ) -> Result<Json<RerunResponse>, (StatusCode, String)> {
     let body = body.map(|Json(b)| b).unwrap_or_default();
-    if let Some(from) = &body.from {
-        if from != "failed" {
+    let whole = match body.from.as_deref() {
+        None | Some("failed") => false,
+        Some("all") => true,
+        Some(from) => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                format!("unsupported rerun mode '{from}'; only 'failed' is supported"),
+                format!("unsupported rerun mode '{from}'; 'failed' and 'all' are supported"),
             ));
         }
-    }
+    };
     // Non-enterprise builds accept the field (so serde doesn't silently discard
     // it) but must reject it explicitly so callers know params had no effect.
     #[cfg(not(feature = "enterprise"))]
@@ -594,42 +632,61 @@ pub async fn rerun_run(
         }
     }
 
-    let mut tx = state.write_pool.begin().await.map_err(internal_msg)?;
-
-    // Lock the run row and re-check its state inside the transaction so concurrent
-    // reruns serialize: the loser blocks here until the winner commits, then reads
-    // 'running' and gets a 409 instead of committing a false success.
+    // For the answer: which of "no such run" and "not one to rerun" it is.
+    // No lock is taken here. The engine's rerun takes the admission lock
+    // before any row of the run, and its guarded UPDATE of the run is the
+    // gate two reruns serialize on: the loser reads `running` and gets a 409.
     let status: Option<String> =
-        sqlx::query_scalar("SELECT status FROM workflow_runs WHERE id = $1 FOR UPDATE")
+        sqlx::query_scalar("SELECT status FROM workflow_runs WHERE id = $1")
             .bind(&id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&state.write_pool)
             .await
             .map_err(internal_msg)?;
+    let not_rerunnable = || {
+        let states = if whole {
+            "succeeded/failed/cancelled"
+        } else {
+            "failed/cancelled"
+        };
+        (
+            StatusCode::CONFLICT,
+            format!("run '{id}' is not in a rerunnable state ({states})"),
+        )
+    };
     let Some(status) = status else {
         return Err((StatusCode::NOT_FOUND, format!("run '{id}' not found")));
     };
-    if status != "failed" && status != "cancelled" {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("run '{id}' is not in a rerunnable state (failed/cancelled)"),
-        ));
+    if status != "failed" && status != "cancelled" && !(whole && status == "succeeded") {
+        return Err(not_rerunnable());
     }
 
-    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = state.write_pool.begin().await.map_err(internal_msg)?;
 
     // Behind the `enterprise` feature: capture the broken cone's specs before
-    // reset and deep-merge `params` into each task's `input`. The reset UPDATE
-    // below never touches `input`
-    // (it carries the command), so these per-row overrides are applied alongside it.
+    // reset and deep-merge `params` into each task's `input`. The reset never
+    // touches `input` (it carries the command), so these per-row overrides are
+    // written beside it, once the engine's rerun has set the run running: a
+    // run that has ended has no task a worker could move in between.
+    //
+    // The cone is the one the engine's rerun resets: the failed, the cancelled
+    // and the rule-skipped; and for a whole rerun, every task but a runtime
+    // fan-out's instances, which it drops. A task left out here runs again on
+    // the input it had, beside siblings that were given the new one.
     #[cfg(feature = "enterprise")]
     let overrides: Vec<(String, String)> = if let Some(params) = body.params.as_ref() {
-        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-            "SELECT id, input FROM task_runs WHERE run_id = $1 AND status IN ('failed','cancelled')",
-        )
-        .bind(&id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(internal_msg)?;
+        let cone = if whole {
+            "SELECT id, input FROM task_runs
+              WHERE run_id = $1 AND fanout_parent IS NULL
+                AND status IN ('succeeded', 'failed', 'cancelled', 'skipped')"
+        } else {
+            "SELECT id, input FROM task_runs
+              WHERE run_id = $1 AND status IN ('failed', 'cancelled', 'skipped')"
+        };
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(cone)
+            .bind(&id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(internal_msg)?;
         let mut out = Vec::new();
         for (task_id, input) in rows {
             let Some(input) = input else { continue };
@@ -650,23 +707,23 @@ pub async fn rerun_run(
     #[cfg(not(feature = "enterprise"))]
     let overrides: Vec<(String, String)> = Vec::new();
 
-    let reset = sqlx::query(
-        "UPDATE task_runs
-         SET status='pending', attempt=0, claimed_by=NULL, lease_expires_at=NULL,
-             output=NULL, finished_at=NULL, scheduled_at=$1, version=version+1,
-             remaining_deps=(
-                 SELECT COUNT(*) FROM task_dependencies d
-                 JOIN task_runs dep ON dep.id=d.dependency_id
-                 WHERE d.dependent_id=task_runs.id AND dep.status NOT IN ('succeeded','skipped')
-             )
-         WHERE run_id=$2 AND status IN ('failed','cancelled')",
-    )
-    .bind(&now)
-    .bind(&id)
-    .execute(&mut *tx)
-    .await
-    .map_err(internal_msg)?
-    .rows_affected();
+    let who = caller_identity(&auth.0);
+    let reset = if whole {
+        dagron_core::db::rerun_all_in(&mut tx, &id, Some(&who)).await
+    } else {
+        dagron_core::db::rerun_from_failed_in(
+            &mut tx,
+            &id,
+            dagron_core::models::RunAgain::Rerun,
+            Some(&who),
+        )
+        .await
+    }
+    .map_err(run_again_refusal)?;
+    let Some(reset) = reset else {
+        // Lost to another rerun between the read above and the gate.
+        return Err(not_rerunnable());
+    };
 
     for (task_id, new_input) in &overrides {
         sqlx::query("UPDATE task_runs SET input = $1 WHERE id = $2")
@@ -677,19 +734,13 @@ pub async fn rerun_run(
             .map_err(internal_msg)?;
     }
 
-    sqlx::query(
-        "UPDATE workflow_runs SET status='running', finished_at=NULL, output=NULL
-         WHERE id=$1 AND status IN ('failed','cancelled')",
-    )
-    .bind(&id)
-    .execute(&mut *tx)
-    .await
-    .map_err(internal_msg)?;
-
-    notify(&mut tx, &id).await.map_err(|s| (s, "internal server error".to_string()))?;
     tx.commit().await.map_err(internal_msg)?;
 
-    tracing::info!(run_id = %id, reset, overrides = overrides.len(), "run reran from failure");
+    if whole {
+        tracing::info!(run_id = %id, reset, overrides = overrides.len(), "run reran whole");
+    } else {
+        tracing::info!(run_id = %id, reset, overrides = overrides.len(), "run reran from failure");
+    }
     Ok(Json(RerunResponse { run_id: id, rerun: reset }))
 }
 
@@ -810,6 +861,10 @@ pub(crate) struct TaskSpecInput {
     /// store first, then process env / secrets dir).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) env: Vec<EnvVarInput>,
+    /// The environment this task's secrets are resolved from, in place of
+    /// the workflow's own (engine `environment` on a task).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) environment: Option<String>,
     /// Conditional gate (engine `when`). On this path two forms are accepted:
     /// a parameter condition (evaluated at submit — false drops the task, its
     /// dependents proceed) or a runtime condition referencing
@@ -1646,6 +1701,104 @@ pub struct SubmitBody {
     /// pre-existing `{"yaml": "..."}` body stays valid unchanged.
     #[serde(default)]
     parameters: BTreeMap<String, String>,
+    /// What started the run, from a caller that may say ([`run_trigger`]).
+    #[serde(default)]
+    trigger: Option<TriggerBody>,
+}
+
+/// What a caller says started the run it is submitting: the event a CI service
+/// is running a pipeline for. It becomes the run's `run_triggers` row.
+#[derive(Deserialize, Default, Debug, Clone)]
+pub struct TriggerBody {
+    /// `ci`, the one kind a caller may set.
+    pub kind: String,
+    /// Who caused it at the source: the pusher, a pull request's author.
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// `trusted`, `untrusted` or `agent`.
+    #[serde(default)]
+    pub trust: Option<String>,
+    #[serde(default)]
+    pub forge_host: Option<String>,
+    /// `owner/name` on that forge.
+    #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default, rename = "ref")]
+    pub git_ref: Option<String>,
+    #[serde(default)]
+    pub sha: Option<String>,
+    #[serde(default)]
+    pub base_sha: Option<String>,
+    #[serde(default)]
+    pub pr: Option<i64>,
+    /// The caller's own id for the event.
+    #[serde(default)]
+    pub event_id: Option<String>,
+}
+
+/// The longest a trigger's text field may be. They are names, refs and ids.
+const TRIGGER_FIELD_MAX: usize = 512;
+
+/// The trigger record a submit carries, checked, with its principal set from
+/// the caller the gateway authenticated. `None` when the submit names none.
+///
+/// A trigger is a claim about where a run came from, and what reads it (a
+/// list narrowed to CI's runs) believes it. So it is taken only from a caller
+/// in the trigger group, and anyone else's is refused outright: dropping it
+/// silently would run a submit its sender believes is marked.
+pub(crate) fn run_trigger(
+    claims: &crate::auth::SessionClaims,
+    body: Option<&TriggerBody>,
+) -> Result<Option<dagron_core::models::RunTrigger>, (StatusCode, String)> {
+    let Some(t) = body else { return Ok(None) };
+    if !crate::auth::may_set_trigger(claims) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "this caller may not say what started a run: `trigger` is taken from a member of the `{}` group",
+                crate::auth::TRIGGER_GROUP
+            ),
+        ));
+    }
+    let refuse = |why: String| Err((StatusCode::UNPROCESSABLE_ENTITY, why));
+    if t.kind != "ci" {
+        return refuse(format!("trigger.kind {:?} is not one a caller sets: `ci` is", t.kind));
+    }
+    if let Some(trust) = t.trust.as_deref() {
+        if !matches!(trust, "trusted" | "untrusted" | "agent") {
+            return refuse(format!("trigger.trust {trust:?} is not trusted, untrusted or agent"));
+        }
+    }
+    for (name, value) in [
+        ("actor", &t.actor),
+        ("forge_host", &t.forge_host),
+        ("repo", &t.repo),
+        ("ref", &t.git_ref),
+        ("sha", &t.sha),
+        ("base_sha", &t.base_sha),
+        ("event_id", &t.event_id),
+    ] {
+        if value.as_deref().is_some_and(|v| v.len() > TRIGGER_FIELD_MAX || v.chars().any(char::is_control)) {
+            return refuse(format!(
+                "trigger.{name} is over {TRIGGER_FIELD_MAX} bytes, or holds a control character"
+            ));
+        }
+    }
+    Ok(Some(dagron_core::models::RunTrigger {
+        kind: t.kind.clone(),
+        principal: format!("ci:{}", caller_identity(claims)),
+        actor: t.actor.clone(),
+        trust: t.trust.clone(),
+        // A CI service's run comes from a repository, which it names below.
+        source: None,
+        forge_host: t.forge_host.clone(),
+        repo: t.repo.clone(),
+        git_ref: t.git_ref.clone(),
+        sha: t.sha.clone(),
+        base_sha: t.base_sha.clone(),
+        pr: t.pr,
+        event_id: t.event_id.clone(),
+    }))
 }
 
 #[derive(Serialize)]
@@ -1686,6 +1839,107 @@ mod submit_body_tests {
 }
 
 #[cfg(test)]
+mod run_trigger_tests {
+    use super::{run_trigger, SubmitBody, TriggerBody};
+    use crate::auth::SessionClaims;
+    use axum::http::StatusCode;
+
+    fn claims(groups: &[&str]) -> SessionClaims {
+        SessionClaims {
+            sub: "u-1".into(),
+            email: "ci@example.com".into(),
+            name: "ci".into(),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            exp: 0,
+        }
+    }
+
+    fn ci() -> TriggerBody {
+        TriggerBody { kind: "ci".into(), ..TriggerBody::default() }
+    }
+
+    /// Every body sent before this field existed has none, and gets no record.
+    #[test]
+    fn a_submit_that_names_no_trigger_gets_none() {
+        let b: SubmitBody = serde_json::from_str(r#"{"yaml":"name: x"}"#).unwrap();
+        assert!(b.trigger.is_none());
+        assert_eq!(run_trigger(&claims(&[]), None).unwrap(), None);
+        // A member of the group that names none gets none either.
+        assert_eq!(run_trigger(&claims(&["ci:trigger"]), None).unwrap(), None);
+    }
+
+    /// The whole point: only the group's members are believed. An operator, an
+    /// admin and a viewer are each refused, not silently run unmarked.
+    #[test]
+    fn a_trigger_from_outside_the_group_is_refused() {
+        for groups in [&[][..], &["admin"], &["viewer"], &["ci"], &["CI:TRIGGER"]] {
+            let (status, why) = run_trigger(&claims(groups), Some(&ci())).unwrap_err();
+            assert_eq!(status, StatusCode::FORBIDDEN, "{groups:?}");
+            assert!(why.contains("ci:trigger"), "{why}");
+        }
+    }
+
+    /// The principal is who the gateway authenticated, never a field of the
+    /// body: there is none to set.
+    #[test]
+    fn the_principal_is_the_authenticated_caller() {
+        let body: SubmitBody = serde_json::from_str(
+            r#"{"yaml":"name: x","trigger":{"kind":"ci","principal":"ci:someone-else","actor":"octo",
+                "trust":"trusted","forge_host":"github.com","repo":"acme/widgets","ref":"refs/heads/main",
+                "sha":"abc","base_sha":"def","pr":7,"event_id":"e-1"}}"#,
+        )
+        .unwrap();
+        let t = run_trigger(&claims(&["ci:trigger"]), body.trigger.as_ref()).unwrap().unwrap();
+        assert_eq!(t.principal, "ci:ci@example.com");
+        assert_eq!(
+            (t.kind.as_str(), t.actor.as_deref(), t.trust.as_deref(), t.pr),
+            ("ci", Some("octo"), Some("trusted"), Some(7))
+        );
+        assert_eq!(
+            (t.forge_host.as_deref(), t.repo.as_deref(), t.git_ref.as_deref()),
+            (Some("github.com"), Some("acme/widgets"), Some("refs/heads/main"))
+        );
+        assert_eq!(
+            (t.sha.as_deref(), t.base_sha.as_deref(), t.event_id.as_deref()),
+            (Some("abc"), Some("def"), Some("e-1"))
+        );
+    }
+
+    /// A member cannot mark a run as a schedule's or a person's: those kinds
+    /// are derived, and `ci` is the one a caller sets.
+    #[test]
+    fn only_the_ci_kind_and_a_known_trust_are_taken() {
+        let member = claims(&["ci:trigger"]);
+        for kind in ["manual", "schedule", "backfill", "", "CI"] {
+            let t = TriggerBody { kind: kind.into(), ..TriggerBody::default() };
+            let (status, why) = run_trigger(&member, Some(&t)).unwrap_err();
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{kind:?}");
+            assert!(why.contains("trigger.kind"), "{why}");
+        }
+        let t = TriggerBody { trust: Some("owner".into()), ..ci() };
+        assert_eq!(run_trigger(&member, Some(&t)).unwrap_err().0, StatusCode::UNPROCESSABLE_ENTITY);
+        for trust in ["trusted", "untrusted", "agent"] {
+            let t = TriggerBody { trust: Some(trust.into()), ..ci() };
+            assert!(run_trigger(&member, Some(&t)).is_ok(), "{trust}");
+        }
+    }
+
+    /// The fields are stored and shown, so they are bounded and printable.
+    #[test]
+    fn an_oversized_or_unprintable_field_is_refused() {
+        let member = claims(&["ci:trigger"]);
+        let long = TriggerBody { repo: Some("r".repeat(513)), ..ci() };
+        let (status, why) = run_trigger(&member, Some(&long)).unwrap_err();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(why.contains("trigger.repo"), "{why}");
+        let at_the_limit = TriggerBody { repo: Some("r".repeat(512)), ..ci() };
+        assert!(run_trigger(&member, Some(&at_the_limit)).is_ok());
+        let odd = TriggerBody { actor: Some("octo\ncat".into()), ..ci() };
+        assert!(run_trigger(&member, Some(&odd)).unwrap_err().1.contains("trigger.actor"));
+    }
+}
+
+#[cfg(test)]
 mod idempotency_tests {
     use super::*;
     use axum::http::HeaderMap;
@@ -1700,6 +1954,7 @@ mod idempotency_tests {
         SubmitBody {
             yaml: yaml.to_string(),
             parameters: params.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            trigger: None,
         }
     }
 
@@ -1779,7 +2034,7 @@ mod idempotency_tests {
     }
 }
 
-// ── idempotent submit (G-AG2) ───────────────────────────────────────────────
+// ── idempotent submit ───────────────────────────────────────────────────────
 
 /// Cap on an `Idempotency-Key`. Comfortably past a UUID or a hex digest, and
 /// short enough that a hostile client cannot use a primary-key index as free
@@ -1791,13 +2046,21 @@ const MAX_IDEMPOTENCY_KEY: usize = 255;
 /// key and creating the run; a live submit resolves its claim in the time one
 /// `create_run` takes, so this is far longer than any healthy path needs and
 /// short enough that a crash does not strand a key until its run's retention.
+///
+/// Taking a stale claim over is safe whatever became of the submit that made
+/// it. The claim is resolved in the transaction that creates the run
+/// (`dagron_core::db::create_run_claimed`): a submit that died left no run,
+/// and one that is only slow finds its claim gone when it comes to commit,
+/// and creates none.
 const IN_FLIGHT_CLAIM_SECS: i64 = 300;
 
 /// What the key lookup decided.
-enum Claim {
-    /// This request owns the key and must create the run, then resolve the
-    /// claim to its id.
-    Held,
+pub(crate) enum Claim {
+    /// This request owns the key and must create the run, resolving the
+    /// claim to its id in the same transaction. Carries the claim's
+    /// `created_at` as this request wrote it: what tells its claim from one
+    /// that takes the key over later.
+    Held(String),
     /// The key already names a completed submission. Return *that* run rather
     /// than making a second one — the whole point of the header.
     Replay(String),
@@ -1809,7 +2072,7 @@ enum Claim {
 /// **empty** one is a 400 rather than the same thing: a client sending it
 /// believes it has retry safety, and quietly giving it none is the failure this
 /// endpoint exists to remove.
-fn idempotency_key(
+pub(crate) fn idempotency_key(
     headers: &axum::http::HeaderMap,
 ) -> Result<Option<String>, (StatusCode, String)> {
     let Some(raw) = headers.get("idempotency-key") else {
@@ -1865,6 +2128,30 @@ fn request_fingerprint(body: &SubmitBody) -> String {
     out
 }
 
+/// [`request_fingerprint`] for `POST /api/workflows/{id}/run`: the stored
+/// workflow and the arguments it is run with. The tag keeps it from ever
+/// matching a `POST /api/runs` body, so one key reused across the two routes
+/// is a 409, not a replay of the other route's run.
+pub(crate) fn workflow_run_fingerprint(
+    workflow_id: &str,
+    parameters: &BTreeMap<String, String>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    hash_field(&mut h, "workflow-run");
+    hash_field(&mut h, workflow_id);
+    for (k, v) in parameters {
+        hash_field(&mut h, k);
+        hash_field(&mut h, v);
+    }
+    let mut out = String::with_capacity(64);
+    for b in h.finalize() {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 /// Feed one length-prefixed field into the digest.
 fn hash_field(h: &mut sha2::Sha256, s: &str) {
     use sha2::Digest;
@@ -1882,7 +2169,7 @@ fn hash_field(h: &mut sha2::Sha256, s: &str) {
 /// The claim is scoped to `principal` (the authenticated caller): the key is
 /// that caller's private handle on its own retry, so two principals sharing one
 /// engine never collide on a key string one of them never issued.
-async fn claim_idempotency_key(
+pub(crate) async fn claim_idempotency_key(
     state: &AppState,
     principal: &str,
     key: &str,
@@ -1915,9 +2202,21 @@ async fn claim_idempotency_key(
     .map_err(internal_msg)?;
 
     if won.is_some() {
-        return Ok(Claim::Held);
+        return Ok(Claim::Held(now));
     }
+    key_holder(state, principal, key, fingerprint).await.map(Claim::Replay)
+}
 
+/// The run `key` already names for `principal`, for a request that does not
+/// hold the key: a repeat of the request the key was claimed for is answered
+/// with that request's run. Anything else is a 409: the key was used for a
+/// different request, or the submit that holds it has not finished.
+async fn key_holder(
+    state: &AppState,
+    principal: &str,
+    key: &str,
+    fingerprint: &str,
+) -> Result<String, (StatusCode, String)> {
     let existing: Option<(Option<String>, String)> = sqlx::query_as(
         "SELECT run_id, fingerprint FROM run_idempotency WHERE principal = $1 AND idempotency_key = $2",
     )
@@ -1939,7 +2238,7 @@ async fn claim_idempotency_key(
         Some((_, fp)) if fp != fingerprint => {
             Err(key_conflict(key, "already used for a different request body"))
         }
-        Some((Some(run_id), _)) => Ok(Claim::Replay(run_id)),
+        Some((Some(run_id), _)) => Ok(run_id),
         // Claimed, not yet resolved, and not yet stale: an identical submit is
         // in flight. 409 rather than a wait — the caller retries and gets the
         // run id, which is cheaper than holding a connection open here.
@@ -1952,37 +2251,24 @@ async fn claim_idempotency_key(
     }
 }
 
-/// Point a held claim at the run it produced. After this, replays return it.
-async fn resolve_idempotency_claim(state: &AppState, principal: &str, key: &str, run_id: &str) {
-    if let Err(e) = sqlx::query(
-        "UPDATE run_idempotency SET run_id = $1
-          WHERE principal = $2 AND idempotency_key = $3 AND run_id IS NULL",
-    )
-    .bind(run_id)
-    .bind(principal)
-    .bind(key)
-    .execute(&state.write_pool)
-    .await
-    {
-        // The run exists and the caller is about to be told so. Failing the
-        // request now would be the worse answer — it would report a failure for
-        // work that succeeded. The cost is that a retry within the in-flight
-        // window sees a 409 instead of the replay.
-        tracing::error!(error = ?e, %key, %run_id, "failed to resolve idempotency claim");
-    }
-}
-
 /// Drop a held claim whose submit failed, so the key is usable again.
 ///
-/// Guarded on `run_id IS NULL`: a resolved claim can never be deleted by this,
-/// whatever it is called with.
-async fn release_idempotency_claim(state: &AppState, principal: &str, key: &str) {
+/// Guarded on `run_id IS NULL` and on `claimed_at`, the `created_at` this
+/// request's claim wrote: a resolved claim can never be deleted by this, and
+/// neither can the claim of a later submit that took the key over.
+pub(crate) async fn release_idempotency_claim(
+    state: &AppState,
+    principal: &str,
+    key: &str,
+    claimed_at: &str,
+) {
     if let Err(e) = sqlx::query(
         "DELETE FROM run_idempotency
-          WHERE principal = $1 AND idempotency_key = $2 AND run_id IS NULL",
+          WHERE principal = $1 AND idempotency_key = $2 AND run_id IS NULL AND created_at = $3",
     )
     .bind(principal)
     .bind(key)
+    .bind(claimed_at)
     .execute(&state.write_pool)
     .await
     {
@@ -1992,13 +2278,106 @@ async fn release_idempotency_claim(state: &AppState, principal: &str, key: &str)
     }
 }
 
+/// What a submit made under an `Idempotency-Key` came to.
+pub(crate) enum Keyed {
+    /// This request created the run: 201.
+    Created(String),
+    /// The key already named a run, which is the answer: 200, and nothing
+    /// was created.
+    Replayed(String),
+}
+
+/// [`submit_yaml_triggered`] under an `Idempotency-Key`, for both routes that
+/// take one. The key is claimed for the caller, and the claim is resolved to
+/// the run by the write that creates it, in one transaction
+/// (`dagron_core::db::create_run_claimed`).
+///
+/// It was two steps: the run was created, and the claim was pointed at it by a
+/// statement of its own afterwards, whose failure was only logged. A
+/// submitter that died in between, or whose second statement failed, left a
+/// run with an unresolved claim; once that went stale the caller's retry took
+/// the key over and made a second run. A submit slower than the stale window
+/// did the same without any failure at all.
+///
+/// - A refused submit gives the key back, as before.
+/// - A submit whose claim was taken over while it was in flight creates
+///   nothing, and is answered from what holds the key now: the other submit's
+///   run, or a 409 while that one is still in flight.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn submit_yaml_keyed(
+    state: &AppState,
+    yaml: &str,
+    authored_yaml: &str,
+    caller_params: &BTreeMap<String, String>,
+    triggered_by: &str,
+    trigger: Option<&dagron_core::models::RunTrigger>,
+    principal: &str,
+    key: &str,
+    fingerprint: &str,
+) -> Result<Keyed, (StatusCode, String)> {
+    let claimed_at = match claim_idempotency_key(state, principal, key, fingerprint).await? {
+        // 200, not 201: nothing was created. The status is the whole signal
+        // here — anything counting created runs in front of this endpoint
+        // (a proxy, a quota, a meter) reads 201 and must not be told a
+        // replay is a new run.
+        Claim::Replay(run_id) => return Ok(Keyed::Replayed(run_id)),
+        Claim::Held(claimed_at) => claimed_at,
+    };
+    let claim = dagron_core::db::IdempotencyClaim { principal, key, claimed_at: &claimed_at };
+    // A submit that names no trigger is its caller's own.
+    let manual;
+    let trigger = match trigger {
+        Some(t) => t,
+        None => {
+            manual = manual_trigger(triggered_by);
+            &manual
+        }
+    };
+    let created = match build_dag(state, yaml, caller_params, Some(trigger)).await {
+        Ok(dag) => dagron_core::db::create_run_claimed(
+            &state.write_pool,
+            &dag,
+            authored_yaml,
+            Some(triggered_by),
+            Some(trigger),
+            &claim,
+        )
+        .await
+        .map_err(create_run_refusal),
+        Err(refusal) => Err(refusal),
+    };
+    match created {
+        Ok(Some(run_id)) => Ok(Keyed::Created(run_id)),
+        // The claim was not this request's any more by the time the run came
+        // to be written, so no run was. Whoever holds the key has the answer.
+        Ok(None) => key_holder(state, principal, key, fingerprint).await.map(Keyed::Replayed),
+        Err(e) => {
+            // A rejected submit must not burn the key. The caller fixed
+            // nothing by retrying if the key it chose is now spent.
+            release_idempotency_claim(state, principal, key, &claimed_at).await;
+            Err(e)
+        }
+    }
+}
+
+/// The record of a run `who` asked this gateway for with no trigger of
+/// their own to give: a person's, or a token of theirs.
+pub(crate) fn manual_trigger(who: &str) -> dagron_core::models::RunTrigger {
+    dagron_core::models::RunTrigger {
+        kind: dagron_core::models::trigger_kind::MANUAL.to_string(),
+        principal: format!("user:{who}"),
+        actor: Some(who.to_string()),
+        ..Default::default()
+    }
+}
+
 /// `POST /api/runs` — submit a DAG
 /// (`{ "yaml": "...", "parameters": { … } }`; `parameters` optional). Parses
 /// and cycle-checks server-side (the authoritative validation), resolves any
 /// `workflow_ref` chains into a flat DAG, then creates the run. The original
 /// (un-expanded) YAML is stored as the run's definition.
 ///
-/// Optionally idempotent (G-AG2). With an `Idempotency-Key` header, a repeat of
+/// Optionally idempotent. With an `Idempotency-Key` header, a repeat of
 /// the same submit returns the **same** `run_id` with `200 OK` instead of
 /// creating a second run; a first submit still answers `201 Created`. Without
 /// the header the endpoint behaves exactly as before, so no existing caller
@@ -2016,36 +2395,32 @@ pub async fn submit_run(
     // the same string.
     let principal = auth.0.sub.as_str();
     let triggerer = caller_identity(&auth.0);
+    // Refused before anything is written, as a malformed key is. The trigger is
+    // not part of the request's fingerprint: two events for one commit carry
+    // one key and two event ids, and the second is a replay of the first run,
+    // whose record is the first event's.
+    let trigger = run_trigger(&auth.0, body.trigger.as_ref())?;
 
     // Validated before anything is written, so a malformed key never leaves a
     // run behind that its caller cannot find again by retrying.
     let Some(key) = idempotency_key(&headers)? else {
-        let run_id =
-            submit_yaml_as(&state, &body.yaml, &body.yaml, &body.parameters, Some(&triggerer)).await?;
+        let run_id = submit_yaml_triggered(
+            &state, &body.yaml, &body.yaml, &body.parameters, &triggerer, trigger.as_ref(),
+        )
+        .await?;
         return Ok((StatusCode::CREATED, Json(SubmitResponse { run_id })));
     };
 
-    match claim_idempotency_key(&state, principal, &key, &request_fingerprint(&body)).await? {
-        // 200, not 201: nothing was created. The status is the whole signal
-        // here — anything counting created runs in front of this endpoint
-        // (a proxy, a quota, a meter) reads 201 and must not be told a
-        // replay is a new run.
-        Claim::Replay(run_id) => Ok((StatusCode::OK, Json(SubmitResponse { run_id }))),
-        Claim::Held => {
-            match submit_yaml_as(&state, &body.yaml, &body.yaml, &body.parameters, Some(&triggerer)).await {
-                Ok(run_id) => {
-                    resolve_idempotency_claim(&state, principal, &key, &run_id).await;
-                    Ok((StatusCode::CREATED, Json(SubmitResponse { run_id })))
-                }
-                Err(e) => {
-                    // A rejected submit must not burn the key. The caller fixed
-                    // nothing by retrying if the key it chose is now spent.
-                    release_idempotency_claim(&state, principal, &key).await;
-                    Err(e)
-                }
-            }
-        }
-    }
+    let fingerprint = request_fingerprint(&body);
+    let submitted = submit_yaml_keyed(
+        &state, &body.yaml, &body.yaml, &body.parameters, &triggerer, trigger.as_ref(),
+        principal, &key, &fingerprint,
+    )
+    .await?;
+    Ok(match submitted {
+        Keyed::Created(run_id) => (StatusCode::CREATED, Json(SubmitResponse { run_id })),
+        Keyed::Replayed(run_id) => (StatusCode::OK, Json(SubmitResponse { run_id })),
+    })
 }
 
 /// Create a run from spec YAML: inline `workflow_ref` chains, fold the declared
@@ -2064,6 +2439,7 @@ pub async fn submit_run(
 /// instead of parking. The row writer drifted separately (#657's `is_approval`).
 /// Routing both through `dagron_core` makes that class of bug impossible: one
 /// parser, one writer, shared with the engine.
+#[cfg(test)]
 pub(crate) async fn submit_yaml(
     state: &AppState,
     yaml: &str,
@@ -2090,6 +2466,7 @@ pub(crate) async fn submit_yaml(
 /// Overrides beat the spec's own `parameters:` defaults (that is
 /// `from_yaml_with_params`' documented behaviour), and keys the spec never
 /// references are harmless.
+#[cfg(test)]
 pub(crate) async fn submit_yaml_with_params(
     state: &AppState,
     yaml: &str,
@@ -2099,9 +2476,10 @@ pub(crate) async fn submit_yaml_with_params(
     submit_yaml_as(state, yaml, authored_yaml, caller_params, None).await
 }
 
-/// [`submit_yaml_with_params`], recording who submitted the run. `not_triggerer`
-/// approval gates compare the approver against this. `None` = nobody
-/// interactive (schedules, dataset fires, plan submissions).
+/// [`submit_yaml_with_params`] for a run `triggered_by` asked for, recorded as
+/// theirs ([`manual_trigger`]). `None` writes no record, which no route does:
+/// it is what a run from before the record looks like, for the tests of one.
+#[cfg(test)]
 pub(crate) async fn submit_yaml_as(
     state: &AppState,
     yaml: &str,
@@ -2109,10 +2487,71 @@ pub(crate) async fn submit_yaml_as(
     caller_params: &BTreeMap<String, String>,
     triggered_by: Option<&str>,
 ) -> Result<String, (StatusCode, String)> {
-    let dag = build_dag(state, yaml, caller_params).await?;
+    match triggered_by {
+        Some(who) => {
+            submit_yaml_triggered(state, yaml, authored_yaml, caller_params, who, None).await
+        }
+        None => {
+            let dag = build_dag(state, yaml, caller_params, None).await?;
+            dagron_core::db::create_run(&state.write_pool, &dag, authored_yaml)
+                .await
+                .map_err(create_run_refusal)
+        }
+    }
+}
+
+/// [`submit_yaml_recorded`] for a run `triggered_by` submitted, with the
+/// trigger record the submit carried ([`run_trigger`]), or as their own
+/// where it carried none ([`manual_trigger`]).
+pub(crate) async fn submit_yaml_triggered(
+    state: &AppState,
+    yaml: &str,
+    authored_yaml: &str,
+    caller_params: &BTreeMap<String, String>,
+    triggered_by: &str,
+    trigger: Option<&dagron_core::models::RunTrigger>,
+) -> Result<String, (StatusCode, String)> {
+    let manual;
+    let trigger = match trigger {
+        Some(t) => t,
+        None => {
+            manual = manual_trigger(triggered_by);
+            &manual
+        }
+    };
+    submit_yaml_recorded(
+        state,
+        yaml,
+        authored_yaml,
+        caller_params,
+        Some(triggered_by),
+        trigger,
+    )
+    .await
+}
+
+/// Create a run from spec YAML as [`submit_yaml`] describes, with what
+/// started it (`trigger`), written with the run or not at all. Every run this
+/// gateway makes is made here or under an `Idempotency-Key`
+/// ([`submit_yaml_keyed`]), and each has a record.
+///
+/// `triggered_by` is the caller, where the gateway knows one by name; it is
+/// kept on the run as well, as it was before a run had a record.
+pub(crate) async fn submit_yaml_recorded(
+    state: &AppState,
+    yaml: &str,
+    authored_yaml: &str,
+    caller_params: &BTreeMap<String, String>,
+    triggered_by: Option<&str>,
+    trigger: &dagron_core::models::RunTrigger,
+) -> Result<String, (StatusCode, String)> {
+    let dag = build_dag(state, yaml, caller_params, Some(trigger)).await?;
+    let pool = &state.write_pool;
     let created = match triggered_by {
-        Some(who) => dagron_core::db::create_run_by(&state.write_pool, &dag, authored_yaml, who).await,
-        None => dagron_core::db::create_run(&state.write_pool, &dag, authored_yaml).await,
+        Some(who) => {
+            dagron_core::db::create_run_triggered_by(pool, &dag, authored_yaml, who, trigger).await
+        }
+        None => dagron_core::db::create_run_triggered(pool, &dag, authored_yaml, trigger).await,
     };
     created.map_err(create_run_refusal)
 }
@@ -2128,10 +2567,17 @@ pub(crate) fn caller_identity(claims: &crate::auth::SessionClaims) -> String {
 /// chains, and run the engine's parser. Reads only, so a caller that writes the
 /// run some other way (dead-letter redrive) builds it with the same rules and
 /// before opening its own transaction.
+///
+/// `trigger` is what the run will be recorded as started by. Each
+/// environment the spec names is asked its policy with it
+/// (`dagron_core::envpolicy`): a run that may not use one is refused here
+/// (403), before its variables are put into anything that is stored. `None`
+/// is a run with no record, which is this installation's own.
 pub(crate) async fn build_dag(
     state: &AppState,
     yaml: &str,
     caller_params: &BTreeMap<String, String>,
+    trigger: Option<&dagron_core::models::RunTrigger>,
 ) -> Result<dagron_core::dag::DagGraph, (StatusCode, String)> {
     // One Value parse serves both the environment-key read and the
     // `workflow_ref` check (LOW_LATENCY R-3) — previously each step re-parsed
@@ -2140,15 +2586,22 @@ pub(crate) async fn build_dag(
     // children's top-level keys are never merged), so the key cannot change.
     let root: serde_yaml::Value = serde_yaml::from_str(yaml)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid YAML: {e}")))?;
+    // The run's facts: its record's class and ref, which are the gateway's
+    // and the CI service's word, and the workflow's own name.
+    let pipeline = root
+        .get("name")
+        .and_then(serde_yaml::Value::as_str)
+        .unwrap_or_default();
+    let facts = dagron_core::envpolicy::RunFacts::of(trigger, pipeline);
     let mut params = caller_params.clone();
-    params.extend(environment_params(state, &root).await?);
+    params.extend(environment_params(state, &root, trigger, &facts).await?);
     // Library imports first: a library's templates join this spec's own before
     // the engine parses it, and a chained workflow is inlined from the merged text.
     let (root, yaml) = crate::expand::resolve_template_uses(state, root, yaml).await?;
     let expanded = crate::expand::expand_workflow_refs(state, root, &yaml).await?;
     // The engine's own parse → expand (task_defaults, parameters, templates,
     // fan-out, submit-time `when:`) → validate pipeline.
-    dagron_core::dag::DagGraph::from_yaml_with_params(&expanded, &params).map_err(|e| {
+    let dag = dagron_core::dag::DagGraph::from_yaml_with_params(&expanded, &params).map_err(|e| {
         // A budget refusal is not a malformed spec, and must not read as one.
         // "invalid DAG: workflow 'x' would create 900 tasks…" tells an author to
         // go looking for a syntax error that isn't there.
@@ -2166,7 +2619,76 @@ pub(crate) async fn build_dag(
             return (StatusCode::BAD_REQUEST, p.to_string());
         }
         (StatusCode::BAD_REQUEST, format!("invalid DAG: {e}"))
-    })
+    })?;
+    // A run that is not trusted is confined (`dagron_core::confine`): one whose
+    // workflow names what such a run may not use is refused, in the words its
+    // making would refuse it with, and before anything is claimed for it.
+    if dagron_core::confine::confined(&facts.trust) {
+        if let Some((what, why)) = dagron_core::confine::refusal(&dag.spec, &facts.trust) {
+            let refused = dagron_core::confine::ConfinedRefused {
+                class: facts.trust.clone(),
+                what,
+                why,
+            };
+            return Err((StatusCode::FORBIDDEN, refused.to_string()));
+        }
+    }
+    // A task may name an environment of its own for its secrets. Each is
+    // asked here as well, and has to be there: the engine would refuse the
+    // task its secrets at dispatch, and a run that is going to fail so is
+    // better not made.
+    for name in dagron_core::envpolicy::named_by(&dag) {
+        if dag.spec.environment.as_deref() == Some(name.as_str()) {
+            continue;
+        }
+        admit_environment(state, &name, trigger, &facts).await?;
+        // A repository's need not be made: its secrets read as empty where
+        // there is none, as GitHub's undefined secret does.
+        if dagron_core::envpolicy::is_repository_environment(&name) {
+            continue;
+        }
+        let there: Option<i32> = sqlx::query_scalar("SELECT 1 FROM environments WHERE name = $1")
+            .bind(&name)
+            .fetch_optional(&state.read_pool)
+            .await
+            .map_err(internal_msg)?;
+        if there.is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("environment '{name}' not found"),
+            ));
+        }
+    }
+    Ok(dag)
+}
+
+/// Whether `environment` admits a run of these facts, by the policy stored
+/// for it: 403 with the reason where it does not. A policy that cannot be
+/// read is a 500, and never an admission. A repository's environment is
+/// that repository's runs' alone, as the engine holds it
+/// (`envpolicy::repository_admits`), whatever its policy.
+async fn admit_environment(
+    state: &AppState,
+    environment: &str,
+    trigger: Option<&dagron_core::models::RunTrigger>,
+    facts: &dagron_core::envpolicy::RunFacts,
+) -> Result<(), (StatusCode, String)> {
+    dagron_core::envpolicy::repository_admits(environment, trigger)
+        .map_err(|refused| (StatusCode::FORBIDDEN, refused.to_string()))?;
+    // Read from the database that is written to. A policy is a gate: a
+    // replica that had not caught up with one made stricter would admit the
+    // run on the old one.
+    let policy = dagron_core::db::environment_policy(&state.write_pool, environment)
+        .await
+        .map_err(|e| {
+            tracing::error!(environment, error = ?e, "an environment's policy could not be read");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error".to_string(),
+            )
+        })?;
+    dagron_core::envpolicy::admits(environment, policy.as_ref(), facts)
+        .map_err(|refused| (StatusCode::FORBIDDEN, refused.to_string()))
 }
 
 /// The answer for a failed `dagron_core::db::create_run*` write.
@@ -2178,13 +2700,23 @@ pub(crate) fn create_run_refusal(e: anyhow::Error) -> (StatusCode, String) {
     // handler free to return a header-bearing tuple directly.)
     if let Some(m) = e.downcast_ref::<dagron_core::models::MaxActiveRunsReached>() {
         let scope = m.key.as_deref().map(|k| format!(" and concurrency_key '{k}'")).unwrap_or_default();
+        // A workflow whose runs wait refuses one where as many wait as may.
+        let waiting = match m.waiting {
+            0 => String::new(),
+            waiting => format!(", {waiting} of them waiting: no more may wait"),
+        };
         return (
             StatusCode::TOO_MANY_REQUESTS,
             format!(
-                "max_active_runs reached for workflow '{}'{scope} ({} active, cap {})",
+                "max_active_runs reached for workflow '{}'{scope} ({} active{waiting}, cap {})",
                 m.name, m.active, m.max
             ),
         );
+    }
+    // A run that is not trusted named what such a run may not use: the
+    // caller's to know, and no fault of this service.
+    if let Some(refused) = e.downcast_ref::<dagron_core::confine::ConfinedRefused>() {
+        return (StatusCode::FORBIDDEN, refused.to_string());
     }
     tracing::error!(error = ?e, "create_run failed");
     (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())
@@ -2196,14 +2728,21 @@ pub(crate) fn create_run_refusal(e: anyhow::Error) -> (StatusCode, String) {
 /// variables are substituted at submit, which is this gateway's job. Feeding
 /// them in as parameter overrides means the engine's substitution does the work
 /// — no second implementation of `{{ }}`.
+///
+/// The environment's policy is asked first, with the run's `facts`: a run
+/// it does not admit is given none of its variables, and is not told
+/// whether there is such an environment.
 async fn environment_params(
     state: &AppState,
     doc: &serde_yaml::Value,
+    trigger: Option<&dagron_core::models::RunTrigger>,
+    facts: &dagron_core::envpolicy::RunFacts,
 ) -> Result<std::collections::BTreeMap<String, String>, (StatusCode, String)> {
     let mut out = std::collections::BTreeMap::new();
     let Some(env_name) = doc.get("environment").and_then(serde_yaml::Value::as_str) else {
         return Ok(out);
     };
+    admit_environment(state, env_name, trigger, facts).await?;
     let vars: Option<String> =
         sqlx::query_scalar("SELECT variables FROM environments WHERE name = $1")
             .bind(env_name)
@@ -2213,6 +2752,10 @@ async fn environment_params(
     // A declared but unknown environment is a 400 — a spec pinned to prod must
     // not silently run without prod's variables.
     let Some(vars) = vars else {
+        // A repository's that was never made has no variables.
+        if dagron_core::envpolicy::is_repository_environment(env_name) {
+            return Ok(out);
+        }
         return Err((StatusCode::BAD_REQUEST, format!("environment '{env_name}' not found")));
     };
     let vars: std::collections::BTreeMap<String, String> =
@@ -2232,13 +2775,21 @@ async fn environment_params(
 /// definition (re-trigger). Unlike `rerun` (which resumes a failed/cancelled run
 /// in place), this works for any run — including a succeeded one — and produces a
 /// brand-new run_id.
+///
+/// The new run is created with the parameters this one was created with
+/// ([`resubmit_parameters`]). The stored definition holds only the spec's
+/// defaults, so a resubmit used to run as if nobody had passed any: a run
+/// submitted with `commit_sha` resubmitted with it empty, and one whose
+/// parameters fill in a field the spec cannot run without was refused.
 pub async fn resubmit_run(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<SubmitResponse>), (StatusCode, String)> {
-    let yaml: Option<String> = sqlx::query_scalar(
-        "SELECT d.spec FROM workflow_runs r
+    // The definition and the parameters in one read, so that both are of the
+    // same run on a replica that is behind.
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT d.spec, r.parameters FROM workflow_runs r
          JOIN workflow_definitions d ON d.id = r.definition_id
          WHERE r.id = $1",
     )
@@ -2246,12 +2797,70 @@ pub async fn resubmit_run(
     .fetch_optional(&state.read_pool)
     .await
     .map_err(internal_msg)?;
-    let yaml = yaml.ok_or((StatusCode::NOT_FOUND, format!("run '{id}' not found")))?;
+    let (yaml, stored) = row.ok_or((StatusCode::NOT_FOUND, format!("run '{id}' not found")))?;
 
     parse_and_validate(&yaml)?;
+    let params = resubmit_parameters(&id, &yaml, stored.as_deref())?;
+    // A new run, and its caller's: what the run it copies was for is that
+    // run's to say, and this one says which run that is. But for its class,
+    // where that run was not trusted: what it ran was not this caller's to
+    // write, and running it again does not make it so. Read from the
+    // database that is written to, as a gate is.
     let triggerer = caller_identity(&auth.0);
-    let run_id = submit_yaml_as(&state, &yaml, &yaml, &BTreeMap::new(), Some(&triggerer)).await?;
+    let original = dagron_core::db::run_trigger(&state.write_pool, &id)
+        .await
+        .map_err(|e| {
+            tracing::error!(run = %id, error = ?e, "a run's record could not be read");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error".to_string(),
+            )
+        })?;
+    let trigger = manual_trigger(&triggerer)
+        .from_source(format!("resubmit:{id}"))
+        .copying(original.as_ref());
+    let run_id =
+        submit_yaml_recorded(&state, &yaml, &yaml, &params, Some(&triggerer), &trigger).await?;
     Ok((StatusCode::CREATED, Json(SubmitResponse { run_id })))
+}
+
+/// The parameters a resubmit of run `id` passes: the ones the run was created
+/// with (`workflow_runs.parameters`, its spec's defaults with its caller's
+/// values over them), from the spec `yaml` and what is `stored`.
+///
+/// - **None stored:** a run from before the column existed. It resubmits with
+///   its spec's defaults, which is all such a run ever had.
+/// - **A declared environment is read again.** Its variables were folded into
+///   what was stored, as `env.NAME`. They are not the caller's: a resubmit
+///   takes the environment as it is now, like any new run, so a variable since
+///   changed is the new value and one since removed is gone. Without a
+///   declared environment an `env.` key can only be the caller's own, and is
+///   carried like the rest.
+/// - **Unreadable:** refused. A run must not go out without the parameters it
+///   is said to be a resubmit with.
+fn resubmit_parameters(
+    id: &str,
+    yaml: &str,
+    stored: Option<&str>,
+) -> Result<BTreeMap<String, String>, (StatusCode, String)> {
+    let Some(stored) = stored else {
+        return Ok(BTreeMap::new());
+    };
+    let mut params: BTreeMap<String, String> = serde_json::from_str(stored).map_err(|e| {
+        tracing::error!(run_id = %id, error = %e, "a run's stored parameters cannot be read");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("run '{id}' cannot be resubmitted: its stored parameters cannot be read"),
+        )
+    })?;
+    let declares_environment = serde_yaml::from_str::<serde_yaml::Value>(yaml)
+        .ok()
+        .and_then(|doc| doc.get("environment").and_then(|e| e.as_str().map(str::to_owned)))
+        .is_some();
+    if declares_environment {
+        params.retain(|name, _| !name.starts_with("env."));
+    }
+    Ok(params)
 }
 
 /// Submit-time preparation, run after `workflow_ref` expansion and before
@@ -2456,7 +3065,7 @@ pub(crate) async fn create_run(
 
 /// NOTIFY inside a control handler's transaction; errors map to 500.
 async fn notify(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::Transaction<'_, crate::db::Db>,
     run_id: &str,
 ) -> Result<(), StatusCode> {
     notify_tx(tx, run_id).await.map_err(|e| {
@@ -2466,13 +3075,17 @@ async fn notify(
 }
 
 async fn notify_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::Transaction<'_, crate::db::Db>,
     run_id: &str,
 ) -> anyhow::Result<()> {
+    #[cfg(feature = "postgres")]
     sqlx::query("SELECT pg_notify('task_events', $1)")
         .bind(run_id)
         .execute(&mut **tx)
         .await?;
+    // SQLite has no NOTIFY: the SSE pump polls for what changed (`stream.rs`).
+    #[cfg(feature = "sqlite")]
+    let _ = (tx, run_id);
     Ok(())
 }
 

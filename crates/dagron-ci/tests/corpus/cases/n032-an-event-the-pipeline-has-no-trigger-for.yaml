@@ -1,0 +1,10 @@
+shows: A pipeline that takes only pushes is passed over for a pull request
+event: { kind: pull_request }
+source: |
+  name: ci
+  on:
+    push: { branches: [main] }
+  tasks:
+    - name: build
+      steps:
+        - run: make

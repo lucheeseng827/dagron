@@ -396,12 +396,15 @@ pub struct BackfillResponse {
 /// queue-backed backfill (survives a restart mid-call) is the remaining beta
 /// follow-up documented in the roadmap.
 pub async fn backfill(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<BackfillBody>,
 ) -> Result<Json<BackfillResponse>, (StatusCode, String)> {
     use chrono::{DateTime, Utc};
+
+    // Each run is this caller's backfill of the schedule, and says so.
+    let who = crate::routes::control::caller_identity(&auth.0);
 
     let from = DateTime::parse_from_rfc3339(&body.from)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid 'from' (RFC3339): {e}")))?
@@ -482,8 +485,22 @@ pub async fn backfill(
         // create_run is its own transaction, so the claim and the run can't share
         // one. If it fails, release the claim (DELETE) so the slot stays reclaimable
         // instead of being permanently counted as `skipped` on a later retry.
-        let run_id = match crate::routes::control::submit_yaml(&state, &spec_yaml, &spec_yaml).await
-        {
+        let trigger = dagron_core::models::RunTrigger {
+            kind: dagron_core::models::trigger_kind::BACKFILL.to_string(),
+            source: Some(format!("schedule:{id}")),
+            event_id: Some(logical_date.clone()),
+            ..crate::routes::control::manual_trigger(&who)
+        };
+        let submitted = crate::routes::control::submit_yaml_recorded(
+            &state,
+            &spec_yaml,
+            &spec_yaml,
+            &std::collections::BTreeMap::new(),
+            Some(&who),
+            &trigger,
+        )
+        .await;
+        let run_id = match submitted {
             Ok(run_id) => run_id,
             Err(e) => {
                 let _ = sqlx::query(

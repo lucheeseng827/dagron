@@ -15,9 +15,9 @@ path = "src/lib.rs"
 # the multi-cloud checkpoint substrate. One feature per backend; S3-compatible
 # MinIO/Ceph rides `s3` via AWS_ENDPOINT_URL. `cloud` is the shared adapter
 # (implied by any backend; usable alone for a custom/in-memory ObjectStore).
-s3 = ["cloud", "object_store/aws"]
-gcs = ["cloud", "object_store/gcp"]
-azure = ["cloud", "object_store/azure"]
+s3 = ["cloud", "object_store/aws", "dep:http"]
+gcs = ["cloud", "object_store/gcp", "dep:http"]
+azure = ["cloud", "object_store/azure", "dep:http"]
 cloud = ["dep:object_store", "dep:futures-util"]
 # Encrypted artifacts at rest + the rotation sweep. Feature-gated; forwards to the
 # KEK gate in dagron-crypto, which is where the line is actually enforced.
@@ -40,7 +40,10 @@ tokio-util = { version = "0.7", features = ["io"] }
 # the archive sinks, so one client stack serves both.
 object_store = { version = "0.11", optional = true }
 futures-util = { version = "0.3", optional = true }
-# Envelope encryption for at-rest artifacts (G-C2). Default (SDK-free) features —
+# The request a presigned URL is signed for, as object_store's signer names
+# it. Its own HTTP stack's type, already resolved: with a cloud backend only.
+http = { version = "1", optional = true }
+# Envelope encryption for at-rest artifacts. Default (SDK-free) features —
 # BYOK/KMS providers are selected at the call site via dagron_crypto::provider_from_env.
 dagron-crypto = { path = "../dagron-crypto" }
 # Tiered store (`tiered` module): content hashes, the NDJSON upload ledger.
@@ -48,6 +51,9 @@ sha2 = "0.10"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# A task log's closed segments are zstd. In the lock already.
+zstd = "0.13"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
+tempfile = "3"

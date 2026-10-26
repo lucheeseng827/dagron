@@ -1,0 +1,38 @@
+# Imported from a Jenkinsfile by dagron-import.
+#
+# To do by hand (1):
+#   stage('Package').steps[0]: the files stashed as "app" in the job build are not handed to this one: a job's files are not kept. Make the stages that share them steps of one job
+#
+# Changed on the way (2):
+#   on: a multibranch pipeline's builds are each branch and tag pushed, each pull request, and a run asked for (dispatch) here: say on: where it ran for fewer
+#   stage('Build').steps[0]: Jenkins's variables a step reads are set at its head from dagron-ci's own (CI_SHA, CI_REF, …): a program it runs that reads one the step does not is not given it
+#
+# Not carried over (2):
+#   stage('Build').steps[1]: a stash is not kept: what a later stage of the same job takes of it is in the job's workspace already
+#   stage('Package').agent.docker.args: the host's Docker socket is a Docker daemon of the job's own here (docker_daemon), where the engine's operator offers one; a run that is not trusted is refused it
+name: 03-agent-none-and-stash
+on:
+  push: {}
+  pull_request: {}
+  dispatch: {}
+tasks:
+- name: build
+  docker_image: golang:1.23
+  steps:
+  - name: Build
+    run: go build -o app ./cmd/app
+- name: package
+  docker_image: docker:27
+  depends_on:
+  - build
+  docker_daemon: true
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        stage('Package').steps[0]: the files stashed as "app" in the job build are not handed to this one: a job's files are not kept. Make the stages that share them steps of one job
+      DAGRON_IMPORT
+      exit 1
+  - name: Package
+    run: docker build -t app:latest .

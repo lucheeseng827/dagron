@@ -1,6 +1,6 @@
 "use client";
 
-import { forwardRef } from "react";
+import { forwardRef, useMemo, useState } from "react";
 import { levelColor } from "@/lib/log-filter";
 import type { LogLevel } from "@/types/dagron";
 
@@ -33,6 +33,10 @@ export interface LogLinesProps {
   showLineNumbers?: boolean;
   /// Show the time gutter. Off in panes too narrow to carry it.
   showTimes?: boolean;
+  /// Fold a GitHub workflow's `::group::` lines. Off while a filter is
+  /// set: a group whose end the filter left out would fold every match
+  /// after it.
+  fold?: boolean;
   style?: React.CSSProperties;
 }
 
@@ -51,10 +55,71 @@ function hhmmss(iso: string): string {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
 }
 
+const GROUP = "::group::";
+const ENDGROUP = "::endgroup::";
+
+/// One line as it is drawn: a GitHub workflow's `::group::` line is the
+/// header of the lines up to its `::endgroup::`, which fold under it.
+interface Row {
+  line: RenderedLine;
+  /// Set on a group's header: its title and how many lines it holds.
+  header?: { title: string; size: number };
+  /// The key of the group the line is in, where it is in one.
+  within?: string;
+  /// An `::endgroup::` line, which is not drawn.
+  end?: boolean;
+}
+
+/// A group's key: its task's and its line's number in that task's output,
+/// which stay its own as the pane's window moves.
+function groupKey(line: RenderedLine): string {
+  return `${line.task ?? ""}:${line.n}`;
+}
+
+/// The groups of `lines`, each task's its own (tasks' lines may come in
+/// turn). A group ends at its `::endgroup::`, or at its task's next
+/// `::group::`: GitHub's do not nest.
+function grouped(lines: RenderedLine[]): Row[] {
+  const rows: Row[] = [];
+  const open = new Map<string, { key: string; header: Row }>();
+  for (const line of lines) {
+    const text = line.text.trimStart();
+    const task = line.task ?? "";
+    const group = open.get(task);
+    if (text.startsWith(GROUP)) {
+      const header: Row = { line, header: { title: text.slice(GROUP.length), size: 0 } };
+      rows.push(header);
+      open.set(task, { key: groupKey(line), header });
+    } else if (text.startsWith(ENDGROUP)) {
+      rows.push({ line, end: true });
+      open.delete(task);
+    } else if (group) {
+      group.header.header!.size += 1;
+      rows.push({ line, within: group.key });
+    } else {
+      rows.push({ line });
+    }
+  }
+  return rows;
+}
+
 const LogLines = forwardRef<HTMLDivElement, LogLinesProps>(function LogLines(
-  { lines, empty, showLineNumbers = true, showTimes = true, style },
+  { lines, empty, showLineNumbers = true, showTimes = true, fold = true, style },
   ref,
 ) {
+  const rows = useMemo(
+    () => (fold ? grouped(lines) : lines.map((line) => ({ line }) as Row)),
+    [lines, fold],
+  );
+  // The groups opened: each is folded until it is, as GitHub folds them.
+  const [opened, setOpened] = useState<Set<string>>(() => new Set());
+  const toggle = (key: string) =>
+    setOpened((was) => {
+      const next = new Set(was);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
   return (
     <div
       ref={ref}
@@ -72,15 +137,35 @@ const LogLines = forwardRef<HTMLDivElement, LogLinesProps>(function LogLines(
       {lines.length === 0 ? (
         <div style={{ color: "var(--dim)", padding: "8px 12px", fontSize: 12 }}>{empty}</div>
       ) : (
-        lines.map((l) => (
+        rows
+          .filter((r) => !r.end && (r.within == null || opened.has(r.within)))
+          .map(({ line: l, header }) => (
           <div
             key={l.key}
+            onClick={header ? () => toggle(groupKey(l)) : undefined}
+            role={header ? "button" : undefined}
+            tabIndex={header ? 0 : undefined}
+            aria-expanded={header ? opened.has(groupKey(l)) : undefined}
+            onKeyDown={
+              header
+                ? (e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      toggle(groupKey(l));
+                    }
+                  }
+                : undefined
+            }
+            title={
+              header ? (opened.has(groupKey(l)) ? "Fold this group" : "Unfold this group") : undefined
+            }
             style={{
               display: "flex",
               gap: 8,
               padding: "0 12px",
               opacity: l.matched ? 1 : 0.55,
               borderLeft: `2px solid ${l.matched ? levelColor(l.level) : "transparent"}`,
+              cursor: header ? "pointer" : undefined,
             }}
           >
             {showLineNumbers && (
@@ -158,7 +243,18 @@ const LogLines = forwardRef<HTMLDivElement, LogLinesProps>(function LogLines(
                 flex: 1,
               }}
             >
-              {l.text || " "}
+              {header ? (
+                <>
+                  <span style={{ userSelect: "none" }}>{opened.has(groupKey(l)) ? "▾ " : "▸ "}</span>
+                  <strong>{header.title || "group"}</strong>
+                  <span style={{ color: "var(--dim)" }}>
+                    {" "}
+                    ({header.size} {header.size === 1 ? "line" : "lines"})
+                  </span>
+                </>
+              ) : (
+                l.text || " "
+              )}
             </span>
           </div>
         ))

@@ -1,0 +1,17 @@
+# The public proof's first and third figures: webhook to job, and what the cell's
+# own parts cost per 1,000 jobs. Run with REPLICAS=3 and WORKERS=700, in a
+# fresh cell.
+#
+# Webhook to job is taken run by run from the system's own timestamps
+# (report.mjs's `latency`): the event received, the engine's run made, its
+# job claimed, and the job's own first line. The first step is a cell with
+# little to do, 20 jobs at once, so that what one push waits is not what a
+# busy cell makes it; the rest are stage 0's loads. Each step's cost is its
+# measured window's compute and memory over the jobs that ended in it.
+#
+# NAME JOBS SECS HOLD [LPS] [KIB] [PARK]
+latency-20     20  30 180
+quiet-100     100 120 180
+quiet-1000   1000 120 180
+logs-100      100 120 180 10
+logs-1000    1000 120 180 10

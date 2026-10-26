@@ -1,0 +1,14 @@
+shows: An action of another repository, neither the checkout nor one the repository provides, is fetched before the job starts, and its step uses it
+front: github
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on: push
+  jobs:
+    build:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+        - uses: actions/setup-node@v4
+          with:
+            node-version: 22
+        - run: npm test

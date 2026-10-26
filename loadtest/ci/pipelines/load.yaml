@@ -1,0 +1,48 @@
+# The synthetic job of the CI load harness. A push to a branch under `load/`
+# runs it, and the branch says what the job does:
+#
+#   load/<seconds>/<log lines a second>/<artifact KiB>/<anything>
+#
+# It lasts that many seconds, writes that many lines of log a second (in a
+# burst every five seconds, so that a thousand of these are not a thousand
+# processes started a second), and then writes that much to the run's artifact
+# directory where the engine gives it one. With no log lines it is one sleep.
+#
+# Its first line is the time it began, in nanoseconds. How long a run waited
+# for its job to start is in none of the engine's own records, which keep when
+# a task became ready and when it finished: the harness measures from this.
+#
+# No checkout: the harness's forge holds no git objects to fetch.
+name: load
+on:
+  push: { branches: ["load/**"] }
+tasks:
+  - name: job
+    workspace: { checkout: false }
+    steps:
+      - name: work
+        run: |
+          now=$(date +%s%N)
+          case "$now" in *[!0-9]*|'') now="$(date +%s)000000000" ;; esac
+          echo "load-job-started $now"
+          shape=${CI_REF#*load/}
+          set -f; IFS=/; set -- $shape; unset IFS; set +f
+          secs=${1:-60} lps=${2:-0} kib=${3:-0}
+          if [ "$lps" -eq 0 ]; then
+            sleep "$secs"
+          else
+            pad=................................................................................
+            left=$secs
+            while [ "$left" -gt 0 ]; do
+              nap=5; [ "$left" -lt "$nap" ] && nap=$left
+              i=0; n=$((lps * nap))
+              while [ "$i" -lt "$n" ]; do echo "load $left $i $pad"; i=$((i + 1)); done
+              sleep "$nap"
+              left=$((left - nap))
+            done
+          fi
+          if [ "$kib" -gt 0 ] && [ -n "${DAGRON_ARTIFACTS:-}" ]; then
+            head -c "$((kib * 1024))" /dev/zero > "$DAGRON_ARTIFACTS/load-$$.bin"
+            echo "load-job-artifact $kib KiB"
+          fi
+          echo "load-job-done"

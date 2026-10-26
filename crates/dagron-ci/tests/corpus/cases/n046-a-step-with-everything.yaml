@@ -1,0 +1,16 @@
+shows: A step's name, variables, timeout and continue_on_error travel with it to the job
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: test
+      steps:
+        - name: unit
+          run: cargo test --workspace
+          env: { RUST_BACKTRACE: "1", CARGO_TERM_COLOR: never }
+          timeout_secs: 1200
+        - name: slow
+          run: scripts/slow.sh
+          continue_on_error: true
+        - run: echo done

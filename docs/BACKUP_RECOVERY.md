@@ -24,6 +24,7 @@ Back up everything in the first table. Everything in the second is re-creatable.
 | **Artifact KEK** (`dagron-crypto` provider config) — *not in this build* | env / KMS | encrypted artifacts at rest become unreadable. Open builds have no KEK: artifacts are stored as written, and only `DAGRON_ENV_SECRET_KEY` above applies |
 | **Artifact store** (`DAGRON_ARTIFACT_DIR` or object store) | filesystem / bucket | run outputs and checkpoints that tasks wrote |
 | **GC archive** (`GC_ARCHIVE_DIR` / `GC_ARCHIVE_URL`) | filesystem / bucket | runs the retention GC already moved out of the DB — `/api/archive/*` stops resolving them |
+| **Log store** (`DAGRON_LOG_STORE`) | directory / bucket | the logs of runs: every task log kept there reads `503` (`the log moved on each time it was read`) where the database names its segments |
 
 | Not state | Why |
 | --- | --- |
@@ -60,6 +61,53 @@ pg_dump -U dagron -d workflow -Fc -f "workflow-$(date -u +%Y%m%dT%H%M%SZ).dump"
 `-Fc` (custom format) is what `pg_restore` consumes, and it compresses. Keep the
 dumps somewhere that is not the database host.
 
+### Where the dumps go: `dagron backup` and the chart's CronJob
+
+The engine binary moves dumps to a backup target and back (`dagron backup`, in
+every published engine image). A target is a URL, and each works the same:
+
+| Target | Where | Credentials |
+|---|---|---|
+| `s3://bucket/prefix` | S3, or MinIO, Ceph, R2 (`AWS_ENDPOINT_URL`) | `AWS_*`, or the pod's role (IRSA) |
+| `gs://bucket/prefix` | Google Cloud Storage | `GOOGLE_*`, or GKE workload identity |
+| `az://container/prefix` | Azure Blob Storage | `AZURE_STORAGE_ACCOUNT_NAME` with `AZURE_*`, or Azure AD workload identity |
+| `file:///dir` | a directory: a volume, an NFS mount | the filesystem's |
+
+```bash
+dagron backup put workflow-20261019T021700Z.dump gs://acme-backups/dagron --keep 14
+dagron backup list gs://acme-backups/dagron            # newest first
+dagron backup get gs://acme-backups/dagron ./restore   # the newest; --name for another
+dagron backup prune gs://acme-backups/dagron --keep 14
+```
+
+`put` streams the file and checks the target holds every byte; `get` writes
+beside the name and renames once whole, so a half-fetched dump is never one;
+`--keep` deletes all but the newest N and never all of them.
+
+On Kubernetes, the chart does it nightly: `backup.enabled=true` with
+`backup.to` one of the URLs above makes a CronJob that runs `pg_dump` (as the
+`postgres` image's client, `backup.dumpImage`) into a scratch volume and
+`dagron backup put` from the engine's image, keeping `backup.keep` (14). A
+`file://` target names its PersistentVolumeClaim (`backup.claimName`); a cloud
+target's credentials are the CronJob's ServiceAccount's
+(`backup.serviceAccount.annotations` for workload identity) or `backup.extraEnv`.
+It dumps whichever database the engine uses, the bundled one included.
+
+```bash
+helm upgrade dagron oci://registry-1.docker.io/mancube/dagron --reuse-values \
+  --set backup.enabled=true --set backup.to=gs://acme-backups/dagron \
+  --set backup.serviceAccount.annotations."iam\.gke\.io/gcp-service-account"=dagron-backup@acme.iam.gserviceaccount.com
+```
+
+What was run of this: the CronJob's two steps as the chart renders them (the
+dump as uid 65532 on a read-only root; the send, to each kind of target, by
+`scripts/backup-e2e.sh`), not the CronJob itself on a cluster, and not against
+the real clouds.
+
+On-premises, without a cloud: [`BACKUP_ONPREM.md`](BACKUP_ONPREM.md). The
+enterprise state-store cells back up with CloudNativePG's WAL archiving to S3,
+GCS or Azure (the cell chart's `backup.provider`).
+
 For anything with a real RPO, dumps are a floor, not the plan: enable
 **continuous archiving / PITR** (`archive_mode`, WAL shipping) or use your
 provider's snapshot + point-in-time feature. A nightly dump means up to 24 h of
@@ -94,6 +142,9 @@ sidecars carry committed data that has not been checkpointed. Either use
   through the API (`GET /api/runs/{run}/artifacts/{task}/{name}`).
 - the artifact store directory/bucket, if tasks write outputs you cannot recompute
 - the GC archive directory/bucket, if you rely on `/api/archive/*`
+- the log store's directory or bucket (`DAGRON_LOG_STORE`), with its own versioning
+  where it is a bucket: the engines remove from it what the database no longer
+  names, so a dump and the store taken at different times do not match (§6.9)
 
 ---
 
@@ -158,7 +209,24 @@ roll: the schema is a superset and coordination is through DB rows, not RPC.
 
 ## 5. Rehearse the restore (do this before you need it)
 
-The whole drill, against a scratch database, without touching production:
+`scripts/restore-drill.sh` is the whole drill, against any target the dumps
+went to: it fetches the newest dump, restores it into a scratch database,
+holds it to the live one (the same newest migration; no table the drill
+counts empty where live's is not, or fuller than live's), starts an engine on
+it, waits for "worker pool ready", and drops the scratch database.
+
+```bash
+DAGRON=/usr/local/bin/dagron scripts/restore-drill.sh gs://acme-backups/dagron \
+  --into postgres://dagron:…@postgres:5432/postgres \
+  --live postgres://dagron:…@postgres:5432/workflow
+```
+
+It exits 0 only on a pass, so it can run on a schedule of its own.
+`scripts/backup-e2e.sh` runs it on each kind of target (a directory, an S3
+store, a GCS emulator and Azurite), after three nights' dumps were sent to each
+and the newest two kept.
+
+By hand, the same drill against a scratch database, without touching production:
 
 ```bash
 # 1. dump
@@ -281,11 +349,49 @@ Normal. Their leases are stale; the reconcile loop reclaims them (default 30 s)
 and re-dispatches. If a run must not re-execute, cancel it before starting the
 engine.
 
+### 6.9 The log store after restoring an older dump
+
+With `DAGRON_LOG_STORE`, the engines remove from the store what no task row
+names: a deleted task's logs, and a writing of a log a later one took the
+place of ([`LOG_PIPELINE.md`](LOG_PIPELINE.md) §7.4). A dump older than the
+store does not match it both ways:
+
+- **Rows that name what was removed since.** A task of the dump whose log was
+  begun again, or whose row was deleted and is back, names segments the store
+  no longer has: its log reads `503` (`the log moved on each time it was read`) for good. Nothing
+  brings them back but the store's own versioning.
+- **What was written since, with no row.** Logs of tasks the dump does not
+  have stay in the store. Clear them by recording each such task, by its id
+  as the store names it (the name of its directory, or what follows
+  `logs-` in the bucket): a task's id, in lower case as dagron writes it,
+  never a run's id (a `file://` store that shares its directory with
+  artifacts keeps a run's artifacts under the run's id) and never empty.
+  On Postgres:
+
+  ```sql
+  INSERT INTO log_sweeps (task_id, reason, marked_at, due_at)
+  SELECT '<task id>', 'orphan', t, t FROM (SELECT to_char(clock_timestamp()
+    AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"+00:00"') AS t) now WHERE true
+  ON CONFLICT (task_id) DO NOTHING;
+  ```
+
+  On SQLite, `t` is `strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')` (and the
+  `WHERE true` is needed: SQLite would read `ON` as a join's). An
+  engine with the store removes only what no row names, so an id that still
+  has a row costs nothing: its current writing stays.
+
+Never run an engine with `DAGRON_LOG_SWEEP_SECS` above `0` on a copy of the
+database that names the production store (a staging restore, a rehearsal,
+§5): every task the copy deletes or reruns has its production logs removed.
+Give such a copy `DAGRON_LOG_SWEEP_SECS=0`, or a store of its own.
+
 ---
 
 ## See also
 
 - [`OPERATIONS.md`](OPERATIONS.md) — deploy, monitoring, security, symptom-first troubleshooting
+- [`BACKUP_ONPREM.md`](BACKUP_ONPREM.md) — backups with no cloud: NFS, MinIO, the drill on a schedule
+- [`BACKUP_AWS.md`](BACKUP_AWS.md) — point-in-time recovery on AWS
 - **HA / multi-node** — leases and leader election decide how §6.8 behaves
 - [`CONFIG.md`](CONFIG.md) — every env knob named above
 - **GitOps** — keeping definitions in git is what makes §6.2 survivable

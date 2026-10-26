@@ -1,0 +1,51 @@
+// Conditions of when.
+pipeline {
+    agent { docker { image 'alpine:3.20' } }
+    stages {
+        stage('Release branch') {
+            when { branch 'release/*' }
+            steps { sh 'echo release' }
+        }
+        stage('Tag') {
+            when { buildingTag() }
+            steps { sh 'echo tag' }
+        }
+        stage('Version tag') {
+            when { tag 'v*' }
+            steps { sh 'echo version' }
+        }
+        stage('Pull request into main') {
+            when { changeRequest target: 'main' }
+            steps { sh 'echo pr' }
+        }
+        stage('Not main') {
+            when { not { branch 'main' } }
+            steps { sh 'echo not main' }
+        }
+        stage('Either') {
+            when {
+                anyOf {
+                    branch 'main'
+                    environment name: 'FORCE', value: 'yes'
+                }
+            }
+            steps { sh 'echo either' }
+        }
+        stage('Docs changed') {
+            when {
+                allOf {
+                    changeset 'docs/**'
+                    not { changeRequest() }
+                }
+            }
+            steps { sh 'echo docs' }
+        }
+        stage('Before agent') {
+            when {
+                beforeAgent true
+                triggeredBy 'TimerTrigger'
+            }
+            steps { sh 'echo nightly' }
+        }
+    }
+}

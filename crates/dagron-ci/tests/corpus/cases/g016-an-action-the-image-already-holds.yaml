@@ -1,0 +1,15 @@
+shows: An action the repository says its image provides is left out of the job's steps
+front: github
+github:
+  runs_on: { ubuntu-latest: "docker.io/library/rust:1-bookworm" }
+  provided: [dtolnay/rust-toolchain, Swatinem/rust-cache]
+source: |
+  on: push
+  jobs:
+    test:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+        - uses: dtolnay/rust-toolchain@stable
+        - uses: Swatinem/rust-cache@v2
+        - run: cargo test

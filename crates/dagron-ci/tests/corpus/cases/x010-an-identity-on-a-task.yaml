@@ -1,0 +1,10 @@
+shows: A task's identity names its audiences under oidc, so one written without it is refused
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: deploy
+      identity: { audience: sts.amazonaws.com }
+      steps:
+        - run: make deploy

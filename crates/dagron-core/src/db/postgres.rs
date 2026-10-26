@@ -14,13 +14,16 @@
 //!    `mark_task_failed`, `recover_expired_leases`) fires `pg_notify` on the
 //!    `task_events` channel. Each scheduler holds a [`Waker`] backed by a
 //!    `PgListener`, so it wakes the instant *any* worker (including itself)
-//!    changes readiness, rather than waiting out the full tick.
+//!    changes readiness, rather than waiting out the full tick. A wake takes
+//!    every notification that is waiting, so a burst of them is one tick.
 //!
 //! The state machine, lease semantics, dependency-counter decrement, and
 //! recursive downstream cancellation are identical to the SQLite path — only the
 //! claim mechanism and wake source differ.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::task::Poll;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
@@ -32,11 +35,13 @@ use crate::{
     attempt_log::{AttemptEnd, Policy as AttemptPolicy},
     dag::DagGraph,
     models::{RunStatus, TaskRun},
+    quota_wait::{self, QuotaRequeue, QuotaWaitStats},
 };
 /// Only `list_task_attempts` materializes this, and that is an `ops` read
 /// endpoint — a lean engine build never constructs one.
 #[cfg(feature = "ops")]
 use crate::models::TaskAttempt;
+use super::Woken;
 
 /// NOTIFY channel the reconcile loop listens on for early wakeups.
 const EVENT_CHANNEL: &str = "task_events";
@@ -86,7 +91,7 @@ pub async fn init_pool(conn: &str) -> Result<Pool> {
     // missing in the resolved migrations" — before the enterprise migrator runs.
     let mut base = sqlx::migrate!("./migrations_pg");
     base.set_ignore_missing(true);
-    base.run(&pool).await?;
+    migrate(&pool, &mut base).await?;
     #[cfg(feature = "enterprise")]
     {
         // enterprise migrations live in a separate dir but share sqlx's single
@@ -96,9 +101,231 @@ pub async fn init_pool(conn: &str) -> Result<Pool> {
         // sqlx errors "previously applied but missing in resolved migrations").
         let mut ee = sqlx::migrate!("./migrations_pg_ee");
         ee.set_ignore_missing(true);
-        ee.run(&pool).await?;
+        migrate(&pool, &mut ee).await?;
     }
     Ok(pool)
+}
+
+/// Run `migrator` under the migration lock, replaying it when a migration lost
+/// a race to dagron-api.
+///
+/// Engines that start together migrate one at a time, under the session
+/// advisory lock sqlx's migrator takes, by sqlx's key ([`migration_lock_key`]):
+/// an engine of an earlier release, which takes it sqlx's way, waits for this
+/// one, and this one for it. The key is the database's, whatever the schema,
+/// so dagron-ci takes the same lock where it shares the engine's database, as
+/// it does by default, and it waits for it as this does
+/// (`crates/dagron-ci/src/db.rs`). The lock is taken here, and `migrator` has
+/// sqlx's own locking turned off (which is why it is taken mutably), because
+/// sqlx waits inside one `SELECT pg_advisory_lock`, and a session waiting in a
+/// statement holds a snapshot. A `-- no-transaction` migration's `CREATE INDEX
+/// CONCURRENTLY` waits for every older snapshot in the database to go, so the
+/// holder's index build waited for the waiter while the waiter waited for the
+/// holder. Postgres broke that deadlock by failing the side whose own check, a
+/// `deadlock_timeout` (1 s) into its wait, found the cycle closed: the waiter,
+/// which exited, when the build came to wait for it within that second; else
+/// the build, as over a populated table, which left the index INVALID and the
+/// engine exited, and the next engine's `IF NOT EXISTS` then took the index for
+/// built and recorded the migration as applied. Here a waiter polls
+/// `pg_try_advisory_lock`, each try a statement of its own, so between tries
+/// it holds no snapshot. (An engine or a dagron-ci of an earlier release still
+/// waits sqlx's way, so one started beside this one's index builds still meets
+/// that deadlock: an old container restarted during an upgrade, one that a
+/// rollback starts, or a dagron-ci pinned to an earlier image.)
+///
+/// The lock is a session's, so through a pooler in transaction mode (a cell's
+/// PgBouncer) it keeps no two migrators apart, as sqlx's did not: a try that
+/// reaches the holder's server session takes the lock again. Two engines that
+/// come to the same `CREATE INDEX CONCURRENTLY` there deadlock as above, the
+/// second waiting for the table's lock inside its statement, with a snapshot
+/// the first's build waits out. Only a direct connection keeps them apart.
+///
+/// dagron-api's schema bootstrap creates some of these tables too (`users`,
+/// `git_repos`, `environments`: migrations 008, 009 and 026), and compose and a
+/// Helm install start both processes at once. `CREATE TABLE IF NOT EXISTS` is
+/// not atomic against a concurrent creator. When dagron-api's statement commits
+/// first, the migration fails on a catalog constraint instead of taking the
+/// no-op path, and the engine exited before it served:
+///
+/// ```text
+/// Error: while executing migration 8: error returned from database:
+///   duplicate key value violates unique constraint "pg_type_typname_nsp_index"
+/// ```
+///
+/// A migration that ran in a transaction rolled back whole and was not
+/// recorded, so it is replayed, and this time `IF NOT EXISTS` sees the
+/// committed table. One marked `-- no-transaction` (the concurrent index
+/// builds) is never replayed: a failure can leave it half done.
+///
+/// The lock is the session's, so after a failure the attempt's connection is
+/// closed rather than returned to the pool: closing ends the session, and
+/// that frees the lock. Returned, the connection would keep the lock, and the
+/// next attempt, on another connection after a lost race, would wait for it
+/// forever.
+async fn migrate(pool: &PgPool, migrator: &mut sqlx::migrate::Migrator) -> Result<()> {
+    const MAX_ATTEMPTS: u32 = 4;
+    migrator.set_locking(false);
+    let mut attempt = 1;
+    loop {
+        let mut conn = pool.acquire().await?;
+        let key = match lock_migrations(&mut conn).await {
+            Ok(key) => key,
+            Err(e) => {
+                let _ = conn.close().await;
+                return Err(e);
+            }
+        };
+        match migrator.run_direct(&mut *conn).await {
+            Ok(()) => {
+                release_migration_lock(conn, key).await;
+                return Ok(());
+            }
+            Err(e) if attempt < MAX_ATTEMPTS && lost_a_race(migrator, &e) => {
+                let _ = conn.close().await;
+                tracing::warn!(
+                    attempt,
+                    error = %e,
+                    "a migration raced another session creating the same object; retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(250 * u64::from(attempt))).await;
+                attempt += 1;
+            }
+            Err(e) => {
+                let _ = conn.close().await;
+                return Err(e.into());
+            }
+        }
+    }
+}
+
+/// How long a migrator waiting for another's lock sleeps between tries.
+const MIGRATION_LOCK_POLL: Duration = Duration::from_millis(200);
+
+/// How often a migrator still waiting for the lock says so again, louder.
+const MIGRATION_LOCK_WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// Take the migration lock on `conn`, waiting for another session that holds
+/// it, and return its key.
+///
+/// Each try is a `pg_try_advisory_lock` of its own, with a sleep between, so
+/// a waiter holds no snapshot while it waits: see [`migrate`] for the deadlock
+/// a waiter in `pg_advisory_lock` takes part in.
+async fn lock_migrations(conn: &mut sqlx::PgConnection) -> Result<i64> {
+    let database: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut *conn)
+        .await?;
+    let key = migration_lock_key(&database);
+    let started = std::time::Instant::now();
+    let mut warn_at = MIGRATION_LOCK_WARN_EVERY;
+    let mut waiting = false;
+    while !try_migration_lock(conn, key).await? {
+        if !waiting {
+            waiting = true;
+            tracing::info!(
+                database = %database,
+                "waiting for another engine's or dagron-ci's migrations to finish"
+            );
+        } else if started.elapsed() >= warn_at {
+            warn_at += MIGRATION_LOCK_WARN_EVERY;
+            // A long index build can hold it this long; so can a session that
+            // is not migrating at all, as a pooler in transaction mode can
+            // leave one holding it. pg_locks shows a bigint key in two halves.
+            tracing::warn!(
+                database = %database,
+                key,
+                classid = key >> 32,
+                objid = key & 0xffff_ffff,
+                waited_secs = started.elapsed().as_secs(),
+                "still waiting for the migration lock; its holder is the session \
+                 pg_locks shows with locktype advisory, this classid and objid, and \
+                 objsubid 1"
+            );
+        }
+        tokio::time::sleep(MIGRATION_LOCK_POLL).await;
+    }
+    Ok(key)
+}
+
+/// Let the migration lock go. A connection whose unlock fails is closed rather
+/// than returned to the pool, for closing the session frees the lock all the
+/// same; one whose unlock finds the lock not its own is closed too, so that it
+/// is not used again (the lock is on another server session, which closing
+/// this connection does not end).
+async fn release_migration_lock(mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>, key: i64) {
+    let released = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
+        .bind(key)
+        .fetch_one(&mut *conn)
+        .await;
+    match released {
+        Ok(true) => {}
+        Ok(false) => {
+            // The try and the unlock reached two server sessions, as through
+            // a pooler in transaction mode: the lock is left on the other.
+            tracing::warn!(
+                key,
+                "the migration lock was not this session's to release; through a \
+                 pooler in transaction mode the lock keeps no migrators apart"
+            );
+            let _ = conn.close().await;
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not release the migration lock; closing its connection"
+            );
+            let _ = conn.close().await;
+        }
+    }
+}
+
+async fn try_migration_lock(conn: &mut sqlx::PgConnection, key: i64) -> Result<bool> {
+    Ok(sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(key)
+        .fetch_one(conn)
+        .await?)
+}
+
+/// The advisory-lock key of a database's migrations, as sqlx-postgres 0.8
+/// makes it for its own migrator's lock (`generate_lock_id`): the CRC-32
+/// (ISO-HDLC) of the database's name times `0x3d32ad9e`. The product fits an
+/// `i64`. It must stay sqlx's key, for engines of earlier releases take that.
+fn migration_lock_key(database: &str) -> i64 {
+    0x3d32_ad9e * i64::from(crc32_iso_hdlc(database.as_bytes()))
+}
+
+/// CRC-32 ISO-HDLC (the zlib and Ethernet CRC), bit by bit: it runs over one
+/// database name per migrator, so a table would buy nothing.
+fn crc32_iso_hdlc(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+        }
+    }
+    !crc
+}
+
+/// Did a migration that ran in a transaction fail because another session
+/// created the same object first, so a replay takes the no-op path?
+///
+/// `23505` counts only on a `pg_*` catalog index: a unique violation in a data
+/// migration is that migration's own error. Then the codes Postgres raises when
+/// an object appears between the existence check and the create, and a
+/// deadlock, which also rolls the migration back whole.
+fn lost_a_race(migrator: &sqlx::migrate::Migrator, err: &sqlx::migrate::MigrateError) -> bool {
+    let sqlx::migrate::MigrateError::ExecuteMigration(e, version) = err else {
+        return false;
+    };
+    let in_transaction = migrator.iter().any(|m| m.version == *version && !m.no_tx);
+    in_transaction
+        && e.as_database_error()
+            .is_some_and(|db| match db.code().as_deref() {
+                Some("23505") => db.constraint().is_some_and(|c| c.starts_with("pg_")),
+                // duplicate_table / duplicate_object / duplicate_column / deadlock_detected
+                Some("42P07" | "42710" | "42701" | "40P01") => true,
+                _ => false,
+            })
 }
 
 /// Readiness probe: one round trip proving a pooled connection can be acquired
@@ -108,17 +335,92 @@ pub async fn ping(pool: &Pool) -> Result<()> {
     Ok(())
 }
 
+/// The indexes of this schema that an interrupted `CREATE INDEX CONCURRENTLY`
+/// left INVALID, by name. Postgres keeps such an index up to date and never
+/// reads it, so the statement it was for reads as if it had none. Nothing
+/// here rebuilds one: when its migration runs again, `IF NOT EXISTS` takes
+/// it for built, and the migration is then recorded as applied. `REINDEX
+/// INDEX CONCURRENTLY` does.
+pub async fn invalid_indexes(pool: &Pool) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT c.relname::text FROM pg_index i
+           JOIN pg_class c ON c.oid = i.indexrelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE NOT i.indisvalid AND n.nspname = current_schema()
+            AND NOT EXISTS (SELECT 1 FROM pg_stat_progress_create_index p
+                             WHERE p.relid = i.indrelid)
+          ORDER BY 1",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
 /// Inserts a workflow_definition + workflow_run + all task_runs + dependency edges
 /// in a single transaction, then NOTIFYs so any idle scheduler wakes to advance
 /// the root tasks. Returns the new run_id.
 pub async fn create_run(pool: &Pool, dag: &DagGraph, yaml_spec: &str) -> Result<String> {
-    create_run_inner(pool, dag, yaml_spec, None, None, None).await
+    create_run_inner(pool, dag, yaml_spec, None, None, None, None, None).await
 }
 
-/// [`create_run`] that records who submitted the run in the same insert, so the
-/// run is never visible without it: `not_triggerer` gates read `triggered_by`.
-pub async fn create_run_by(pool: &Pool, dag: &DagGraph, yaml_spec: &str, triggered_by: &str) -> Result<String> {
-    create_run_inner(pool, dag, yaml_spec, None, None, Some(triggered_by)).await
+/// [`create_run`] that records what started the run (`run_triggers`), in the
+/// same transaction: a run is never visible without what it was for, and a run
+/// that was refused leaves no record behind.
+pub async fn create_run_triggered(
+    pool: &Pool,
+    dag: &DagGraph,
+    yaml_spec: &str,
+    trigger: &crate::models::RunTrigger,
+) -> Result<String> {
+    create_run_inner(pool, dag, yaml_spec, None, None, None, Some(trigger), None).await
+}
+
+/// [`create_run_triggered`] for a run a gateway's caller submitted: who that
+/// was is kept on the run as well (`triggered_by`), in the same insert.
+pub async fn create_run_triggered_by(
+    pool: &Pool,
+    dag: &DagGraph,
+    yaml_spec: &str,
+    triggered_by: &str,
+    trigger: &crate::models::RunTrigger,
+) -> Result<String> {
+    create_run_inner(pool, dag, yaml_spec, None, None, Some(triggered_by), Some(trigger), None).await
+}
+
+/// [`create_run_triggered_by`] for a submit made under an
+/// `Idempotency-Key`: the caller's claim on the key is resolved to the run
+/// **in the same transaction**. The run and the key's answer commit together
+/// or not at all, so a key never names a run that is not there, and a run
+/// made under a key is never left without it.
+///
+/// It used to be two steps: the run was created, and the claim was pointed at
+/// it in a statement of its own afterwards, whose failure was logged and let
+/// go. A submitter that died in between, or whose second statement failed,
+/// left a run with an unresolved claim. Once that claim went stale the
+/// caller's retry took the key over and made a second run: the one thing the
+/// key is there to prevent. So did a submit slow enough for its claim to go
+/// stale while it was still writing.
+///
+/// `Ok(None)` when the claim is no longer this submit's
+/// ([`IdempotencyClaim::claimed_at`](super::IdempotencyClaim)): a later
+/// submit took the key over, or the claim was released. Then nothing is
+/// created, and the caller answers from what holds the key now.
+///
+/// The claim's row is locked as the transaction's first statement, so two
+/// submits of one key queue there and a stale claim cannot be taken over
+/// while the run that will resolve it is being written.
+pub async fn create_run_claimed(
+    pool: &Pool,
+    dag: &DagGraph,
+    yaml_spec: &str,
+    triggered_by: Option<&str>,
+    trigger: Option<&crate::models::RunTrigger>,
+    claim: &super::IdempotencyClaim<'_>,
+) -> Result<Option<String>> {
+    match create_run_inner(pool, dag, yaml_spec, None, None, triggered_by, trigger, Some(claim)).await {
+        Ok(run_id) => Ok(Some(run_id)),
+        Err(e) if e.is::<super::IdempotencyClaimLost>() => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// [`create_run`] that also commits a streaming source's cursor **in the same
@@ -126,14 +428,17 @@ pub async fn create_run_by(pool: &Pool, dag: &DagGraph, yaml_spec: &str, trigger
 /// source position `(source_name, position)` become durable atomically, so a
 /// crash can never leave a created run whose input position would be replayed
 /// (a duplicate run) or an advanced position whose run was lost.
+///
+/// `trigger` is what started the run, recorded with it.
 pub async fn create_run_with_offset(
     pool: &Pool,
     dag: &DagGraph,
     yaml_spec: &str,
     source_name: &str,
     position: &str,
+    trigger: Option<&crate::models::RunTrigger>,
 ) -> Result<String> {
-    create_run_inner(pool, dag, yaml_spec, Some((source_name, position)), None, None).await
+    create_run_inner(pool, dag, yaml_spec, Some((source_name, position)), None, None, trigger, None).await
 }
 
 /// [`create_run`] that deletes the dead letter `dead_letter_id` **in the same
@@ -146,24 +451,30 @@ pub async fn create_run_with_offset(
 /// The delete is the claim. Concurrent redrives of one id queue on its row
 /// lock, and each loser finds the row gone once the winner commits, so a dead
 /// letter becomes at most one run.
+///
+/// `trigger` is what started the run, recorded with it.
 #[cfg(feature = "ops")]
 pub async fn create_run_from_dead_letter(
     pool: &Pool,
     dag: &DagGraph,
     yaml_spec: &str,
     dead_letter_id: &str,
+    trigger: Option<&crate::models::RunTrigger>,
 ) -> Result<Option<String>> {
-    match create_run_inner(pool, dag, yaml_spec, None, Some(dead_letter_id), None).await {
+    match create_run_inner(pool, dag, yaml_spec, None, Some(dead_letter_id), None, trigger, None).await {
         Ok(run_id) => Ok(Some(run_id)),
         Err(e) if e.is::<super::DeadLetterGone>() => Ok(None),
         Err(e) => Err(e),
     }
 }
 
-/// The run writer behind [`create_run`], [`create_run_with_offset`] and
-/// `create_run_from_dead_letter`. Besides the run, `offset` commits a source
-/// cursor and `dead_letter` deletes that dead letter first, as the claim, all in
-/// the one transaction.
+/// The run writer behind [`create_run`], [`create_run_with_offset`],
+/// `create_run_from_dead_letter` and [`create_run_claimed`]. Besides the run,
+/// `offset` commits a source cursor, `dead_letter` deletes that dead letter
+/// first, as the claim, `trigger` records what started the run, and `claim`
+/// resolves the caller's `Idempotency-Key` to the run, all in the one
+/// transaction.
+#[allow(clippy::too_many_arguments)]
 async fn create_run_inner(
     pool: &Pool,
     dag: &DagGraph,
@@ -171,7 +482,32 @@ async fn create_run_inner(
     offset: Option<(&str, &str)>,
     dead_letter: Option<&str>,
     triggered_by: Option<&str>,
+    trigger: Option<&crate::models::RunTrigger>,
+    claim: Option<&super::IdempotencyClaim<'_>>,
 ) -> Result<String> {
+    // A run that is not trusted is confined (`crate::confine`). What such a
+    // run may not use is refused here, where every run is made, before
+    // anything of it is written; and its rows are written from a copy of the
+    // graph without what it is not given.
+    let held;
+    let dag = match crate::confine::held(dag, crate::envpolicy::class_of(trigger))? {
+        Some(graph) => {
+            held = graph;
+            &held
+        }
+        None => dag,
+    };
+    // And a task of such a run that names a protected environment waits on
+    // a gate of the policy's approvers (`crate::protected`), put in here,
+    // after the run was held to what it may write.
+    let gated;
+    let dag = match crate::protected::gated(pool, dag, trigger).await? {
+        Some(graph) => {
+            gated = graph;
+            &gated
+        }
+        None => dag,
+    };
     let def_id = Uuid::new_v4().to_string();
     let run_id = Uuid::new_v4().to_string();
     let created = chrono::Utc::now();
@@ -190,6 +526,30 @@ async fn create_run_inner(
     });
 
     let mut tx = pool.begin().await?;
+
+    // The caller's `Idempotency-Key` claim (`create_run_claimed`), locked as
+    // the transaction's first statement and resolved below, once the run's row
+    // is there for it to name. Locked first for the reason the dead letter is
+    // claimed first: nothing then waits on a claim while it holds a workflow's
+    // admission lock. A claim that is not this submit's any more (taken over
+    // once it went stale, or released) ends the transaction here, before
+    // anything of the run is written.
+    if let Some(claim) = claim {
+        let ours: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM run_idempotency
+              WHERE principal = $1 AND idempotency_key = $2
+                AND run_id IS NULL AND created_at = $3
+                FOR UPDATE",
+        )
+        .bind(claim.principal)
+        .bind(claim.key)
+        .bind(claim.claimed_at)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if ours.is_none() {
+            return Err(anyhow::Error::new(super::IdempotencyClaimLost));
+        }
+    }
 
     // Redrive claim (`create_run_from_dead_letter`), the transaction's first
     // statement. A concurrent redrive of the same id blocks on this row lock
@@ -220,6 +580,14 @@ async fn create_run_inner(
     // transaction inserts is visible to the next admitter. Workflows without a
     // cap never take the lock, so the uncapped path is unchanged. (SQLite needs
     // no equivalent: its single-writer transaction already serializes creators.)
+    //
+    // A run that arrives at a full cap is refused, unless its workflow says a
+    // run waits (`when_full`): then it is made, with `queued_at`, and each of
+    // its tasks is written with one dependency more than it has. Nothing
+    // advances such a task, and [`admit_waiting_runs`] takes the one away
+    // when the run's turn comes. A run that waits is in the way of the next
+    // one as a run that runs is, so runs are let in in the order they came.
+    let mut waits = false;
     if let Some(max) = dag.spec.max_active_runs {
         if max > 0 {
             // With a `concurrency_key` the cap is per (workflow, key): the lock
@@ -235,26 +603,46 @@ async fn create_run_inner(
                 .bind(&lock_scope)
                 .execute(&mut *tx)
                 .await?;
-            let active: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM workflow_runs wr
-                 JOIN workflow_definitions d ON d.id = wr.definition_id
-                 WHERE wr.status = 'running' AND d.name = $1
-                   AND wr.concurrency_key IS NOT DISTINCT FROM $2",
-            )
-            .bind(&dag.spec.name)
-            .bind(&dag.spec.concurrency_key)
-            .fetch_one(&mut *tx)
-            .await?;
-            if active >= max as i64 {
-                return Err(anyhow::Error::new(crate::models::MaxActiveRunsReached {
-                    name: dag.spec.name.clone(),
-                    max,
-                    active,
-                    key: dag.spec.concurrency_key.clone(),
-                }));
+            let when_full = dag.spec.when_full.unwrap_or_default();
+            if when_full == crate::dag::WhenFull::Supersede {
+                // A run that is not trusted takes the place of its own
+                // source's runs alone (`crate::confine::SPEC_ALLOWED`).
+                let own = trigger.filter(|t| crate::confine::confined(crate::envpolicy::class_of(Some(t))));
+                supersede_runs(
+                    &mut tx,
+                    &dag.spec.name,
+                    dag.spec.concurrency_key.as_deref(),
+                    &run_id,
+                    own,
+                    &now,
+                )
+                .await?;
+            }
+            let (active, waiting) =
+                runs_in_flight(&mut tx, &dag.spec.name, dag.spec.concurrency_key.as_deref(), None).await?;
+            if active >= i64::from(max) {
+                if !when_full.waits() || waiting >= crate::dag::max_waiting_runs() {
+                    return Err(anyhow::Error::new(crate::models::MaxActiveRunsReached {
+                        name: dag.spec.name.clone(),
+                        max,
+                        active,
+                        waiting: if when_full.waits() { waiting } else { 0 },
+                        key: dag.spec.concurrency_key.clone(),
+                    }));
+                }
+                waits = true;
             }
         }
     }
+    // And the installation's own cap on the runs running at once, where it
+    // has one: over it, the run waits as it would for its workflow's. It
+    // waits behind the runs that wait already, so a place a run's end frees
+    // is the sweep's to give the oldest, not the newest's to take.
+    if !waits && installation_room(&mut tx, Behind::Waiting).await?.is_some_and(|room| room <= 0) {
+        waits = true;
+    }
+    // The dependency a waiting run's tasks are held by, which none of them has.
+    let held_by = i64::from(waits);
 
     sqlx::query(
         "INSERT INTO workflow_definitions (id, name, spec, created_at) VALUES ($1, $2, $3, $4)",
@@ -271,11 +659,24 @@ async fn create_run_inner(
     // NULL, so "never assessed" stays distinguishable from "written before
     // the column existed". See `crate::clock`.
     let clock = crate::clock::current();
+    // The parameters the run was created with (migration 067), for templates
+    // resolved after submit. Stored even when empty: `{}` says "none", NULL
+    // says "written before the column existed".
+    let parameters = serde_json::to_string(&dag.parameters)?;
+    // A `notify.git` run's `pending` status is owed from the moment it exists
+    // (migration 070); an engine with a forge token posts it.
+    let start_pending_at = dag
+        .spec
+        .notify
+        .as_ref()
+        .and_then(|n| n.git.as_ref())
+        .map(|_| &now);
     sqlx::query(
         "INSERT INTO workflow_runs
            (id, definition_id, status, created_at, deadline_at, alert_deadline_at, result_from, environment,
-            clock_confidence, clock_offset_ms, clock_source, concurrency_key, triggered_by)
-         VALUES ($1, $2, 'running', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            clock_confidence, clock_offset_ms, clock_source, concurrency_key, triggered_by, parameters,
+            start_pending_at, queued_at)
+         VALUES ($1, $2, 'running', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
     )
     .bind(&run_id)
     .bind(&def_id)
@@ -289,8 +690,43 @@ async fn create_run_inner(
     .bind(&clock.source)
     .bind(&dag.spec.concurrency_key)
     .bind(triggered_by)
+    .bind(&parameters)
+    .bind(start_pending_at)
+    .bind(waits.then_some(&now))
     .execute(&mut *tx)
     .await?;
+
+    // What started the run (migrations 072, 077), with it or not at all.
+    if let Some(t) = trigger {
+        sqlx::query(
+            "INSERT INTO run_triggers
+               (run_id, kind, principal, actor, trust, source, forge_host, repo, ref, sha, base_sha, pr,
+                event_id, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+        )
+        .bind(&run_id)
+        .bind(&t.kind)
+        .bind(&t.principal)
+        .bind(&t.actor)
+        .bind(&t.trust)
+        .bind(&t.source)
+        .bind(&t.forge_host)
+        .bind(&t.repo)
+        .bind(&t.git_ref)
+        .bind(&t.sha)
+        .bind(&t.base_sha)
+        .bind(t.pr)
+        .bind(&t.event_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // Its token budget, with it or not at all.
+    #[cfg(feature = "enterprise")]
+    if let Some(budget) = dag.spec.budget.as_ref().and_then(|b| b.tokens) {
+        crate::tokens::open_budget(&mut *tx, &run_id, budget).await?;
+    }
 
     // Create task_run rows; store the full TaskSpec as JSON in `input` so the
     // row is self-contained — dispatch only needs task.id + task.input.
@@ -451,7 +887,7 @@ async fn create_run_inner(
             task_rows.push(TaskRow {
                 id: task_id.clone(),
                 name,
-                dep_count,
+                dep_count: dep_count + held_by,
                 input_json,
                 trigger_rule: trigger_rule.to_string(),
                 allow_failure,
@@ -518,6 +954,27 @@ async fn create_run_inner(
     // Exactly-once: the source cursor rides the run's transaction.
     if let Some((source_name, position)) = offset {
         upsert_source_offset(&mut *tx, source_name, position, &now).await?;
+    }
+
+    // The key's answer rides it too: the claim locked above now names the run.
+    // The row cannot have moved under that lock; the count is checked all the
+    // same, since a claim that resolved nothing must not leave a run behind.
+    if let Some(claim) = claim {
+        let resolved = sqlx::query(
+            "UPDATE run_idempotency SET run_id = $1
+              WHERE principal = $2 AND idempotency_key = $3
+                AND run_id IS NULL AND created_at = $4",
+        )
+        .bind(&run_id)
+        .bind(claim.principal)
+        .bind(claim.key)
+        .bind(claim.claimed_at)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if resolved != 1 {
+            return Err(anyhow::Error::new(super::IdempotencyClaimLost));
+        }
     }
 
     notify(&mut *tx, &run_id).await?;
@@ -680,6 +1137,9 @@ pub async fn release_source_partitions(
 
 /// Reclaim tasks whose worker lease expired — the core crash-recovery primitive.
 /// NOTIFYs when anything was recovered so peers re-evaluate the now-ready rows.
+///
+/// A task that was asked to stop is not one of them: it must not run again.
+/// Its lapsed lease is [`claim_teardowns`]'s to take.
 pub async fn recover_expired_leases(pool: &Pool) -> Result<u64> {
     let now = chrono::Utc::now().to_rfc3339();
     // RETURNING run_id so we can fire one NOTIFY per distinct affected run —
@@ -691,6 +1151,8 @@ pub async fn recover_expired_leases(pool: &Pool) -> Result<u64> {
          WHERE status = 'running'
            AND lease_expires_at IS NOT NULL
            AND lease_expires_at < $1
+           AND stop_requested_at IS NULL
+           AND session_id IS NULL
          RETURNING run_id",
     )
     .bind(&now)
@@ -1101,8 +1563,9 @@ async fn claim_ready_filtered(
                  claimed_by = $1,
                  lease_expires_at = $2,
                  attempt = attempt + 1,
-                 log = NULL,
-                 version = version + 1
+                 log = NULL, log_fence = NULL, log_gen = NULL,
+                 version = version + 1,
+                 session_id = NULL
              WHERE id IN (
                  SELECT id FROM task_runs
                  WHERE status = 'ready'
@@ -1209,7 +1672,8 @@ async fn claim_ready_filtered(
         let updated = sqlx::query(
             "UPDATE task_runs
              SET status = 'running', claimed_by = $1, lease_expires_at = $2,
-                 attempt = attempt + 1, version = version + 1, log = NULL
+                 attempt = attempt + 1, version = version + 1, log = NULL, log_fence = NULL, log_gen = NULL,
+                 session_id = NULL
              WHERE id = $3 AND status = 'ready' AND version = $4",
         )
         .bind(worker_id)
@@ -1319,8 +1783,9 @@ pub async fn claim_ready_gang(
              claimed_by = $1,
              lease_expires_at = $2,
              attempt = attempt + 1,
-             log = NULL,
-             version = version + 1
+             log = NULL, log_fence = NULL, log_gen = NULL,
+             version = version + 1,
+             session_id = NULL
          WHERE gang_id = $3 AND status = 'ready'
          RETURNING id, run_id, name, status,
                    attempt - 1 AS attempt, remaining_deps,
@@ -1366,12 +1831,35 @@ pub async fn oversized_ready_gangs(pool: &Pool, max_size: i64) -> Result<Vec<(St
 }
 
 /// Die-together: a gang member failed — cancel every non-terminal sibling.
-/// The version bump fences running siblings: their next heartbeat renewal
-/// fails the claim-triple check and aborts their local execution, and any
-/// late result write is rejected. Returns siblings cancelled.
+///
+/// A sibling no worker holds is `cancelled` here, and its version bumped so
+/// that nothing late can be written under an earlier claim. One a worker
+/// holds is **asked to stop** (`stop_requested_at`) and stays `running`, with
+/// its claim, until that worker says its work is gone
+/// ([`settle_stopped_task`]): its engine sees the request at its next sweep.
+/// Returns the siblings cancelled or asked.
 pub async fn cancel_gang_siblings(pool: &Pool, member_id: &str) -> Result<u64> {
     let now = chrono::Utc::now().to_rfc3339();
-    let rows = sqlx::query(
+    let mut tx = pool.begin().await?;
+    // With a whole lease to answer in, as in `stop_run_tasks`.
+    let asked = sqlx::query(
+        "UPDATE task_runs
+         SET lease_expires_at = CASE WHEN stop_requested_at IS NULL THEN $3
+                                     ELSE lease_expires_at END,
+             stop_requested_at = COALESCE(stop_requested_at, $1),
+             output = COALESCE(output, 'cancelled: gang member failed')
+         WHERE gang_id IS NOT NULL
+           AND gang_id = (SELECT gang_id FROM task_runs WHERE id = $2)
+           AND id != $2
+           AND status = 'running' AND claimed_by IS NOT NULL
+         RETURNING run_id",
+    )
+    .bind(&now)
+    .bind(member_id)
+    .bind(stop_lease())
+    .fetch_all(&mut *tx)
+    .await?;
+    let cancelled = sqlx::query(
         "UPDATE task_runs
          SET status = 'cancelled', claimed_by = NULL, lease_expires_at = NULL,
              version = version + 1, finished_at = $1,
@@ -1379,21 +1867,22 @@ pub async fn cancel_gang_siblings(pool: &Pool, member_id: &str) -> Result<u64> {
          WHERE gang_id IS NOT NULL
            AND gang_id = (SELECT gang_id FROM task_runs WHERE id = $2)
            AND id != $2
-           AND status IN ('pending', 'ready', 'running')
+           AND (status IN ('pending', 'ready') OR (status = 'running' AND claimed_by IS NULL))
          RETURNING run_id",
     )
     .bind(&now)
     .bind(member_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
     let mut seen = std::collections::HashSet::new();
-    for row in &rows {
+    for row in asked.iter().chain(&cancelled) {
         let run_id: String = row.try_get("run_id")?;
         if seen.insert(run_id.clone()) {
-            notify(pool, &run_id).await?;
+            notify(&mut *tx, &run_id).await?;
         }
     }
-    Ok(rows.len() as u64)
+    tx.commit().await?;
+    Ok((asked.len() + cancelled.len()) as u64)
 }
 
 /// Mark a task succeeded and decrement remaining_deps for all direct dependents.
@@ -1443,7 +1932,7 @@ async fn mark_task_succeeded_inner(
         "UPDATE task_runs
          SET status = 'succeeded', finished_at = $1, output = $2, claimed_by = NULL,
              cache_hit = $6
-         WHERE id = $3 AND claimed_by = $4 AND version = $5
+         WHERE id = $3 AND claimed_by = $4 AND version = $5 AND stop_requested_at IS NULL
          RETURNING run_id",
     )
     .bind(&now)
@@ -1456,6 +1945,12 @@ async fn mark_task_succeeded_inner(
     .await?;
 
     let Some(updated) = updated else {
+        // Asked to stop, and over by itself first: cancelled, not succeeded.
+        if settle_stopping(&mut tx, task_id, worker_id, fence, &now).await? {
+            tx.commit().await?;
+            tracing::info!(task_id, "the task ended after it was asked to stop: cancelled");
+            return Ok(false);
+        }
         tx.commit().await?;
         tracing::warn!(task_id, "stale completion ignored — task already reclaimed");
         return Ok(false);
@@ -1516,6 +2011,27 @@ async fn mark_task_succeeded_inner(
     Ok(true)
 }
 
+/// What the task `name` of the run `run_id` came to: its status, and the
+/// end of what it printed (its last `tail` characters, which is all a reader
+/// of its last line needs of an output that may be megabytes). `None` when
+/// the run has no such task.
+pub async fn task_outcome(
+    pool: &Pool,
+    run_id: &str,
+    name: &str,
+    tail: usize,
+) -> Result<Option<(String, String)>> {
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT status, right(output, $1) FROM task_runs WHERE run_id = $2 AND name = $3",
+    )
+    .bind(tail as i32)
+    .bind(run_id)
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(status, output)| (status, output.unwrap_or_default())))
+}
+
 /// Mark a task failed and decrement its direct dependents' dependency counters
 /// (a failure is terminal, exactly like success). Whether each dependent then
 /// runs or is skipped is decided by its `trigger_rule` in
@@ -1537,7 +2053,7 @@ pub async fn mark_task_failed(
     let updated = sqlx::query(
         "UPDATE task_runs
          SET status = 'failed', finished_at = $1, output = $2, claimed_by = NULL
-         WHERE id = $3 AND claimed_by = $4 AND version = $5
+         WHERE id = $3 AND claimed_by = $4 AND version = $5 AND stop_requested_at IS NULL
          RETURNING run_id",
     )
     .bind(&now)
@@ -1549,6 +2065,12 @@ pub async fn mark_task_failed(
     .await?;
 
     let Some(updated) = updated else {
+        // Asked to stop, and over by itself first: cancelled, not failed.
+        if settle_stopping(&mut tx, task_id, worker_id, fence, &now).await? {
+            tx.commit().await?;
+            tracing::info!(task_id, "the task ended after it was asked to stop: cancelled");
+            return Ok(false);
+        }
         tx.commit().await?;
         tracing::warn!(task_id, "stale failure ignored — task already reclaimed");
         return Ok(false);
@@ -1599,41 +2121,733 @@ pub async fn note_task_log(pool: &Pool, task_id: &str, fence: i64, note: &str) -
 /// chunk of an attempt — it replaces any prior-attempt output so a retried task's
 /// tail starts clean; subsequent chunks append. The task's final output is
 /// overwritten whole by `mark_task_*` at completion, so this is a live view only.
-/// A `pg_notify` wakes SSE subscribers so a browser tail updates promptly.
+///
+/// Returns the run of the row it changed, and `None` where the guard matched
+/// nothing (a stale or late chunk). **It does not notify:** the caller tells
+/// of the runs it appended to, with [`notify_runs`], once it has made its
+/// appends. [`append_task_outputs`] is that caller, and what the engine
+/// uses.
+///
+/// It used to notify in its own transaction, and that was what held a cell
+/// with many tasks writing. Postgres keeps its notification queue in commit
+/// order by one lock for the whole database, which a transaction that has
+/// notified takes as it commits and holds until its commit is flushed. So
+/// every append of every engine was committed one at a time, a flush each,
+/// and whatever else notifies (a task's end, a run's making) waited in the
+/// same queue: with enough tasks writing, for seconds. An append that does
+/// not notify takes no such lock, and those made together are flushed
+/// together.
 pub async fn append_task_output(
     pool: &Pool,
     task_id: &str,
     fence: i64,
     chunk: &str,
     reset: bool,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let sql = if reset {
-        "UPDATE task_runs SET log = $1
+        "UPDATE task_runs SET log = $1, log_fence = $3, log_gen = COALESCE(log_gen, 0) + 1
          WHERE id = $2 AND version = $3 AND status = 'running' RETURNING run_id"
     } else {
-        "UPDATE task_runs SET log = COALESCE(log, '') || $1
+        "UPDATE task_runs SET log = COALESCE(log, '') || $1, log_fence = $3
          WHERE id = $2 AND version = $3 AND status = 'running' RETURNING run_id"
     };
-    let mut tx = pool.begin().await?;
-    let run_id: Option<String> = sqlx::query_scalar(sql)
+    let run_id = sqlx::query_scalar(sql)
         .bind(chunk)
         .bind(task_id)
         .bind(fence)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(pool)
         .await?;
-    // Only notify if a row actually changed (the guard matched) — a stale/late
-    // chunk that hit nothing shouldn't wake subscribers.
-    if let Some(run_id) = run_id {
-        notify(&mut *tx, &run_id).await?;
+    Ok(run_id)
+}
+
+/// What beginning an attempt's log again left behind ([`reset_task_log`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogReset {
+    /// The run of the task, to tell of the change.
+    pub run_id: String,
+    /// Which writing of the attempt's log this is (`log_gen`): what its
+    /// segments and open part are named by.
+    pub gen: i64,
+    /// A writing before this one was begun in the log store, and is recorded
+    /// for the store's GC to remove (`log_sweeps`): the caller wakes it.
+    pub swept: bool,
+}
+
+/// The database's clock as a record of `log_sweeps` keeps it: the text the
+/// outbox's trigger writes (090), so that no engine's clock matters.
+const SWEEP_NOW: &str =
+    "to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"+00:00\"')";
+
+/// [`SWEEP_NOW`], `secs` on: a parameter's or a column's number of seconds.
+fn sweep_clock_in(secs: &str) -> String {
+    format!(
+        "to_char((clock_timestamp() + make_interval(secs => CAST({secs} AS DOUBLE PRECISION))) \
+         AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"+00:00\"')"
+    )
+}
+
+/// Begin a running attempt's log again from its start: its first chunk, or
+/// its whole text once more (a seal). One transaction: the row's `log`
+/// becomes `text` (the open part, where the store keeps it in the row, or
+/// `''` for a `file://` store's notes), its `log_fence` the attempt's and
+/// its `log_gen` one more, and the closed segments' rows of this attempt and
+/// of every one before it go. So a reader sees the old log or the new one,
+/// never the old segments before the new text. `None` where the attempt is
+/// not running (it is over, or another took the row): nothing is changed.
+///
+/// The row counts the writings begun in the log store (`log_writings`), and
+/// where one was begun before this, the task is recorded for the store's GC
+/// (`log_sweeps`, due at once), in the same transaction: what the store keeps
+/// of the writing before is no reader's now, and goes from there, not here.
+pub async fn reset_task_log(
+    pool: &Pool,
+    task_id: &str,
+    fence: i64,
+    text: &str,
+) -> Result<Option<LogReset>> {
+    let mut tx = pool.begin().await?;
+    let begun: Option<(String, i64, i64)> = sqlx::query_as(
+        "UPDATE task_runs SET log = $1, log_fence = $3, log_gen = COALESCE(log_gen, 0) + 1,
+             log_writings = COALESCE(log_writings, 0) + 1
+         WHERE id = $2 AND version = $3 AND status = 'running'
+         RETURNING run_id, log_gen, log_writings",
+    )
+    .bind(text)
+    .bind(task_id)
+    .bind(fence)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((run_id, gen, writings)) = begun else {
+        return Ok(None);
+    };
+    // The row says `version = fence`, and a log's fence is never past its
+    // row's version: every attempt's segments are this one's or before it.
+    sqlx::query("DELETE FROM log_segments WHERE task_id = $1 AND fence <= $2")
+        .bind(task_id)
+        .bind(fence)
+        .execute(&mut *tx)
+        .await?;
+    let swept = writings > 1;
+    if swept {
+        sqlx::query(&format!(
+            "INSERT INTO log_sweeps (task_id, run_id, reason, marked_at, due_at)
+             VALUES ($1, $2, 'superseded', {SWEEP_NOW}, {SWEEP_NOW})
+             ON CONFLICT (task_id) DO UPDATE SET reason = 'superseded', run_id = EXCLUDED.run_id,
+                 marked_at = EXCLUDED.marked_at, due_at = EXCLUDED.due_at,
+                 stamp = log_sweeps.stamp + 1, tries = 0, last_error = NULL"
+        ))
+        .bind(task_id)
+        .bind(&run_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(Some(LogReset { run_id, gen, swept }))
+}
+
+/// Mark a task's row as one whose log the store holds a writing of, before
+/// the engine writes there what it learnt of an attempt from the database
+/// rather than began (`log_writings`, where a reset has not set it): a task
+/// is recorded for the store's GC when its row goes only so. Nothing where it
+/// is set, or where the row is gone.
+pub async fn mark_log_kept(pool: &Pool, task_id: &str) -> Result<()> {
+    sqlx::query("UPDATE task_runs SET log_writings = 1 WHERE id = $1 AND log_writings IS NULL")
+        .bind(task_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Take up to `limit` records of `log_sweeps` that are due, the earliest
+/// first, for `lease_secs`: each is due again then, unless it is finished
+/// before, and its stamp moves on, so that whoever held it before cannot
+/// finish it. Records another sweeper holds are passed over.
+pub async fn claim_log_sweeps(
+    pool: &Pool,
+    limit: i64,
+    lease_secs: i64,
+    first: super::ClaimFirst,
+) -> Result<Vec<super::LogSweep>> {
+    let which = match first {
+        super::ClaimFirst::Superseded => "reason = 'superseded' AND ",
+        super::ClaimFirst::Any => "",
+    };
+    // Taken once, as a materialized CTE: a subquery joined to the table it
+    // locks can be run again for each row of a nested loop, and then one
+    // claim takes more than `limit` and another none. The time is taken once
+    // too, so that the index on `due_at` bounds what is read.
+    let rows: Vec<(String, Option<String>, String, i64, i64)> = sqlx::query_as(&format!(
+        "WITH due AS MATERIALIZED (
+             SELECT task_id FROM log_sweeps WHERE {which}due_at <= (SELECT {SWEEP_NOW})
+             ORDER BY due_at LIMIT $1 FOR UPDATE SKIP LOCKED
+         )
+         UPDATE log_sweeps s SET due_at = {}, stamp = s.stamp + 1
+         FROM due WHERE s.task_id = due.task_id
+         RETURNING s.task_id, s.run_id, s.reason, s.stamp, s.tries",
+        sweep_clock_in("$2")
+    ))
+    .bind(limit)
+    .bind(lease_secs)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(task_id, run_id, reason, stamp, tries)| super::LogSweep {
+            task_id,
+            run_id,
+            reason,
+            stamp,
+            tries,
+        })
+        .collect())
+}
+
+/// The writing each of `tasks` that has a row is on ([`LOG_FENCE`],
+/// [`LOG_GEN`]): what its readers name, and what the store's GC keeps.
+pub async fn log_writings_of(pool: &Pool, tasks: &[String]) -> Result<Vec<(String, i64, i64)>> {
+    if tasks.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(sqlx::query_as(&format!(
+        "SELECT id, {LOG_FENCE}, {LOG_GEN} FROM task_runs WHERE id = ANY($1)"
+    ))
+    .bind(tasks)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Finish claimed records of `log_sweeps`, each by `(task, stamp)` as its
+/// claim left it: `retire`'s go (a removal found nothing left), and
+/// `relook`'s are due again in `relook_secs` (a removal took something, and
+/// a writer that has not stopped may make more). A record whose stamp moved
+/// on since (the task was recorded again, or another sweeper claimed it) is
+/// left as it is.
+///
+/// One record a statement: a statement that held one record and waited for
+/// another could close a cycle with a purge, whose trigger records the
+/// tasks it deletes in an order of its own, in one transaction.
+pub async fn finish_log_sweeps(
+    pool: &Pool,
+    retire: &[(String, i64)],
+    relook: &[(String, i64)],
+    relook_secs: i64,
+) -> Result<()> {
+    for (task_id, stamp) in retire {
+        sqlx::query("DELETE FROM log_sweeps WHERE task_id = $1 AND stamp = $2")
+            .bind(task_id)
+            .bind(stamp)
+            .execute(pool)
+            .await?;
+    }
+    let relooked = format!(
+        "UPDATE log_sweeps SET due_at = {}, stamp = stamp + 1, tries = 0, last_error = NULL
+         WHERE task_id = $1 AND stamp = $2",
+        sweep_clock_in("$3")
+    );
+    for (task_id, stamp) in relook {
+        sqlx::query(&relooked)
+            .bind(task_id)
+            .bind(stamp)
+            .bind(relook_secs)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+/// A claimed record whose removal failed: due again in `after_secs`, with
+/// one more try and the error, where its stamp is still `stamp`. Whether it
+/// was.
+pub async fn defer_log_sweep(
+    pool: &Pool,
+    task_id: &str,
+    stamp: i64,
+    after_secs: i64,
+    error: &str,
+) -> Result<bool> {
+    let done = sqlx::query(&format!(
+        "UPDATE log_sweeps SET due_at = {}, stamp = stamp + 1, tries = tries + 1, last_error = $4
+         WHERE task_id = $1 AND stamp = $2",
+        sweep_clock_in("$3")
+    ))
+    .bind(task_id)
+    .bind(stamp)
+    .bind(after_secs)
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() == 1)
+}
+
+/// What waits in `log_sweeps` ([`super::LogSweepsWaiting`]).
+pub async fn log_sweeps_waiting(pool: &Pool) -> Result<super::LogSweepsWaiting> {
+    let (waiting, failing, oldest_marked_at): (i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE tries > 0), MIN(marked_at) FROM log_sweeps",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(super::LogSweepsWaiting {
+        waiting,
+        failing,
+        oldest_marked_at,
+    })
+}
+
+/// A closed segment of a task attempt's log: its object's name in the log
+/// store, in the attempt's order.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct LogSegmentRow {
+    pub task_id: String,
+    pub fence: i64,
+    pub seq: i64,
+    pub object_key: String,
+}
+
+/// The closed log segments of `tasks`, each of the attempt its log is of
+/// alone ([`LOG_FENCE`]), in order: what a reader puts before the open part.
+pub async fn log_segments_of(pool: &Pool, tasks: &[String]) -> Result<Vec<LogSegmentRow>> {
+    let mut out = Vec::new();
+    for chunk in tasks.chunks(500) {
+        let marks = (1..=chunk.len())
+            .map(|n| format!("${n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT s.task_id, s.fence, s.seq, s.object_key FROM log_segments s \
+             JOIN task_runs t ON t.id = s.task_id \
+             AND s.fence = (CASE WHEN t.log IS NULL THEN t.version ELSE COALESCE(t.log_fence, t.version) END) \
+             WHERE s.task_id IN ({marks}) ORDER BY s.task_id, s.seq"
+        );
+        let mut q = sqlx::query_as::<_, LogSegmentRow>(&sql);
+        for task in chunk {
+            q = q.bind(task);
+        }
+        out.extend(q.fetch_all(pool).await?);
+    }
+    Ok(out)
+}
+
+/// Where a task attempt's log stands in the store: the next segment's number,
+/// how many bytes its task row's `log` holds (the open part, where the store
+/// keeps it there), and which writing of the log the row's is (`log_gen`).
+/// What the engine reads of an attempt it was not writing when it started.
+/// `None` where the task has no row: nothing of it is to be written.
+pub async fn log_open_state(
+    pool: &Pool,
+    task_id: &str,
+    fence: i64,
+) -> Result<Option<(i64, i64, i64)>> {
+    Ok(sqlx::query_as(
+        "SELECT COALESCE((SELECT MAX(seq) + 1 FROM log_segments WHERE task_id = $1 AND fence = $2), 0), \
+                CAST(COALESCE(octet_length(log), 0) AS BIGINT), \
+                CAST(COALESCE(log_gen, 0) AS BIGINT) \
+         FROM task_runs WHERE id = $1",
+    )
+    .bind(task_id)
+    .bind(fence)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// A task attempt's row `log`: the open part of a store that keeps it there.
+pub async fn read_row_log(pool: &Pool, task_id: &str, fence: i64) -> Result<Option<String>> {
+    let log: Option<Option<String>> =
+        sqlx::query_scalar("SELECT log FROM task_runs WHERE id = $1 AND version = $2")
+            .bind(task_id)
+            .bind(fence)
+            .fetch_optional(pool)
+            .await?;
+    Ok(log.flatten())
+}
+
+/// Record a task attempt's closed segments `pieces` (each its number, its
+/// object's name, its bytes and its lines), all in one transaction, or none.
+/// Where their text was the row's open part (`from_row`: how many characters
+/// of the row's `log` they took), the characters leave the row in the same
+/// transaction, so that a reader sees each line once: as segment, or as open
+/// part. What was appended after the text was read stays. A segment recorded
+/// already is not recorded again.
+pub async fn close_log_segments(
+    pool: &Pool,
+    task_id: &str,
+    fence: i64,
+    pieces: &[(i64, String, i64, i64)],
+    from_row: Option<i64>,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    for (seq, object_key, bytes, lines) in pieces {
+        sqlx::query(
+            "INSERT INTO log_segments (task_id, fence, seq, object_key, bytes, lines, closed_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')) ON CONFLICT DO NOTHING",
+        )
+        .bind(task_id)
+        .bind(fence)
+        .bind(seq)
+        .bind(object_key)
+        .bind(bytes)
+        .bind(lines)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if let Some(chars) = from_row {
+        sqlx::query(
+            "UPDATE task_runs SET log = SUBSTR(log, CAST($3 AS INTEGER) + 1) WHERE id = $1 AND version = $2",
+        )
+        .bind(task_id)
+        .bind(fence)
+        .bind(chars)
+        .execute(&mut *tx)
+        .await?;
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// The number of closed log segments of the attempt a task row's log is of
+/// ([`LOG_FENCE`]), as a column of a query of `task_runs`: read with the
+/// row, in one statement, so that a reader's segments and the row's open
+/// part are of one moment.
+const SEGMENTS_COLUMN: &str = "(SELECT COUNT(*) FROM log_segments s \
+     WHERE s.task_id = task_runs.id AND s.fence = (CASE WHEN task_runs.log IS NULL THEN task_runs.version \
+     ELSE COALESCE(task_runs.log_fence, task_runs.version) END))";
+
+/// A task row as a reader of logs wants it: its id, the attempt its log is of
+/// ([`LOG_FENCE`]) and which writing of it ([`LOG_GEN`]), its `log`, its
+/// `output`, and how many closed segments that writing has.
+pub type TaskLogRow = (String, i64, i64, Option<String>, Option<String>, i64);
+
+/// Each task row of a run as a reader of logs wants it ([`TaskLogRow`]).
+pub async fn task_log_rows(pool: &Pool, run_id: &str) -> Result<Vec<TaskLogRow>> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT id, {LOG_FENCE}, {LOG_GEN}, log, output, {SEGMENTS_COLUMN} FROM task_runs WHERE run_id = $1"
+    ))
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// One task row of a run as a reader of logs wants it ([`TaskLogRow`]).
+pub async fn task_log_row(pool: &Pool, run_id: &str, task_id: &str) -> Result<Option<TaskLogRow>> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT id, {LOG_FENCE}, {LOG_GEN}, log, output, {SEGMENTS_COLUMN} FROM task_runs \
+         WHERE run_id = $1 AND id = $2"
+    ))
+    .bind(run_id)
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// The attempt a task row's log is of, as a column of a query of
+/// `task_runs`: the fence it was begun under, which a reset keeps in
+/// `log_fence`, or, with no log yet, the attempt the row is on. Not
+/// `version` alone: a teardown's claim or a gang sibling's cancel moves
+/// `version` on and leaves the log the one it was.
+pub const LOG_FENCE: &str =
+    "(CASE WHEN log IS NULL THEN version ELSE COALESCE(log_fence, version) END)";
+
+/// Which writing of its attempt's log a task row's `log` is, as a column:
+/// one more at every reset (a first chunk, a seal). A reader that follows a
+/// log by its bytes knows by it that the bytes before its position are no
+/// longer the ones it read.
+pub const LOG_GEN: &str = "COALESCE(log_gen, 0)";
+
+/// A task of a run the live relay follows, as it reads them each pass:
+/// where its log stands, without its text.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct LogTail {
+    pub run_id: String,
+    pub task_id: String,
+    pub name: String,
+    pub status: String,
+    /// The task's attempts so far, counted through its life, as the log views
+    /// count them.
+    pub attempt: i64,
+    /// The attempt its log is of ([`LOG_FENCE`]), and which writing of it
+    /// ([`LOG_GEN`]).
+    pub fence: i64,
+    pub gen: i64,
+    /// How many closed segments the attempt has, and their bytes.
+    pub segments: i64,
+    pub closed: i64,
+    /// The bytes of the row's `log`; `None` where it has none.
+    pub row_bytes: Option<i64>,
+    /// The bytes of the row's `output`: what a view shows of a task that kept
+    /// no log.
+    pub output_bytes: i64,
+}
+
+const LOG_TAILS_SELECT: &str = "SELECT t.run_id, t.id AS task_id, t.name, t.status, t.attempt, t.fence, t.gen,
+        (SELECT COUNT(*) FROM log_segments s WHERE s.task_id = t.id AND s.fence = t.fence) AS segments,
+        CAST((SELECT COALESCE(SUM(s.bytes), 0) FROM log_segments s
+              WHERE s.task_id = t.id AND s.fence = t.fence) AS BIGINT) AS closed,
+        CAST(octet_length(t.log) AS BIGINT) AS row_bytes,
+        CAST(COALESCE(octet_length(t.output), 0) AS BIGINT) AS output_bytes
+     FROM (SELECT run_id, id, name, status, attempt_base + attempt AS attempt, scheduled_at, log, output,
+                  (CASE WHEN log IS NULL THEN version ELSE COALESCE(log_fence, version) END) AS fence,
+                  COALESCE(log_gen, 0) AS gen
+           FROM task_runs";
+
+const LOG_TAILS_ORDER: &str = "ORDER BY t.run_id, t.scheduled_at IS NULL, t.scheduled_at, t.name";
+
+/// Every task of `runs` as the live relay reads it ([`LogTail`]), in each
+/// run's order of execution, in one statement: its segments and its row of
+/// one moment.
+pub async fn log_tails(pool: &Pool, runs: &[String]) -> Result<Vec<LogTail>> {
+    Ok(sqlx::query_as::<_, LogTail>(&format!(
+        "{LOG_TAILS_SELECT} WHERE run_id = ANY($1)) t {LOG_TAILS_ORDER}"
+    ))
+    .bind(runs)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// One task as the live relay reads it ([`LogTail`]): what a stream reads
+/// before it reads that task's log itself.
+pub async fn log_tail_of(pool: &Pool, task_id: &str) -> Result<Option<LogTail>> {
+    Ok(
+        sqlx::query_as::<_, LogTail>(&format!("{LOG_TAILS_SELECT} WHERE id = $1) t"))
+            .bind(task_id)
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
+/// A read of a task row's `log` from a byte position of its attempt's whole
+/// log ([`log_row_bytes`]): the attempt and writing it is of, the position,
+/// how many bytes of the log are before the row's beside the closed segments
+/// (a `file://` store's open part, 0 elsewhere), and at most how many to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowRead {
+    pub task_id: String,
+    pub fence: i64,
+    pub gen: i64,
+    pub pos: i64,
+    pub base: i64,
+    pub max: i64,
+}
+
+/// What [`log_row_bytes`] read of a row: the closed segments' bytes as the
+/// read found them, the row's `log` in bytes, and the bytes read, which begin
+/// at `pos`, or at the row's start where `pos` is before it (a segment closed
+/// since the position was read: the bytes before the row are the segments').
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct RowBytes {
+    pub task_id: String,
+    pub closed: i64,
+    pub row_bytes: i64,
+    pub bytes: Vec<u8>,
+}
+
+/// Read task rows' `log` from byte positions of their attempts' logs (the
+/// live relay). A row is read only while its log is still the
+/// attempt and writing `reads` name; one that is not is left out, its text
+/// gone or begun again. The closed segments are summed in the statement that
+/// reads the row, so that a segment closed since the caller looked is seen.
+pub async fn log_row_bytes(pool: &Pool, reads: &[RowRead]) -> Result<Vec<RowBytes>> {
+    if reads.is_empty() {
+        return Ok(Vec::new());
+    }
+    let col = |f: fn(&RowRead) -> i64| reads.iter().map(f).collect::<Vec<i64>>();
+    let ids: Vec<&str> = reads.iter().map(|r| r.task_id.as_str()).collect();
+    Ok(sqlx::query_as::<_, RowBytes>(
+        "SELECT w.task_id, c.closed, CAST(octet_length(t.log) AS BIGINT) AS row_bytes,
+                substring(convert_to(t.log, 'UTF8')
+                          FROM CAST(GREATEST(w.pos - c.closed - w.base, 0) + 1 AS INTEGER)
+                          FOR CAST(w.max AS INTEGER)) AS bytes
+         FROM unnest($1::text[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[], $6::bigint[])
+              AS w(task_id, fence, gen, pos, base, max)
+         JOIN task_runs t ON t.id = w.task_id
+         CROSS JOIN LATERAL (SELECT CAST(COALESCE(SUM(s.bytes), 0) AS BIGINT) AS closed
+                             FROM log_segments s WHERE s.task_id = w.task_id AND s.fence = w.fence) c
+         WHERE t.log IS NOT NULL AND COALESCE(t.log_fence, t.version) = w.fence
+           AND COALESCE(t.log_gen, 0) = w.gen",
+    )
+    .bind(ids)
+    .bind(col(|r| r.fence))
+    .bind(col(|r| r.gen))
+    .bind(col(|r| r.pos))
+    .bind(col(|r| r.base))
+    .bind(col(|r| r.max))
+    .fetch_all(pool)
+    .await?)
+}
+
+/// At most `max` bytes of a task row's `output` from byte `from`: what stands
+/// in for the log of a task that kept none. `None` where it has none.
+pub async fn log_output_bytes(
+    pool: &Pool,
+    task_id: &str,
+    from: i64,
+    max: i64,
+) -> Result<Option<Vec<u8>>> {
+    let bytes: Option<Option<Vec<u8>>> = sqlx::query_scalar("SELECT substring(convert_to(output, 'UTF8') FROM CAST($2 + 1 AS INTEGER) FOR CAST($3 AS INTEGER))
+         FROM task_runs WHERE id = $1 AND output IS NOT NULL")
+        .bind(task_id)
+        .bind(from)
+        .bind(max)
+        .fetch_optional(pool)
+        .await?;
+    Ok(bytes.flatten())
+}
+
+/// The closed segments of a task attempt's log, in order: each its number and
+/// its bytes, which put together say where each begins.
+pub async fn log_segment_spans(pool: &Pool, task_id: &str, fence: i64) -> Result<Vec<(i64, i64)>> {
+    Ok(sqlx::query_as(
+        "SELECT seq, bytes FROM log_segments WHERE task_id = $1 AND fence = $2 ORDER BY seq",
+    )
+    .bind(task_id)
+    .bind(fence)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Tell the subscribers of `runs` that something of theirs changed: one
+/// notification a run, in one statement, so one commit and one turn at the
+/// notification queue's lock however many runs there are. What a batch of
+/// log appends calls once it is made, so that a browser's tail of any of
+/// them updates promptly. Nothing is sent for no runs.
+///
+/// Not in the transaction of what changed, and after it: a subscriber that
+/// reads on being told finds the change there. Told and then lost with the
+/// engine is a tail that updates at the next append instead.
+pub async fn notify_runs(pool: &Pool, runs: &[String]) -> Result<()> {
+    if runs.is_empty() {
+        return Ok(());
+    }
+    sqlx::query("SELECT pg_notify($1, run) FROM unnest($2::text[]) AS run")
+        .bind(EVENT_CHANNEL)
+        .bind(runs)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// One append of a batch: a task's attempt, and what it wrote since the last.
+pub struct LogAppend {
+    pub task_id: String,
+    /// The attempt's fence: an append of an attempt that is over reaches
+    /// nothing.
+    pub fence: i64,
+    pub text: String,
+    /// The row's log is replaced, not added to (see [`append_task_output`]).
+    pub reset: bool,
+}
+
+/// The most log appends in flight at once, whatever the pool would take.
+const LOG_APPEND_LANES: usize = 4;
+
+/// How many log appends may be in flight at once on `pool`: up to four, and
+/// never more than half of its connections, so that what else the process
+/// does with the pool (its workers renew their leases through it) is not left
+/// waiting on a log. A pool of the smallest size has them one at a time.
+///
+/// Each append is a row of its own and a transaction of its own, and none
+/// notifies (see [`append_task_output`]), so several at once hold no lock
+/// together, and the database commits those that end together with one
+/// flush.
+pub fn log_append_lanes(pool: &Pool) -> usize {
+    (pool.options().get_max_connections() as usize / 2).clamp(1, LOG_APPEND_LANES)
+}
+
+/// Make a batch of log appends, as many at once as the pool takes
+/// ([`log_append_lanes`]), and then tell of the runs they were made to, each
+/// once, in one statement ([`notify_runs`]). What the reconcile loop calls
+/// with the chunks that have waited their second.
+///
+/// Best-effort, as a log's tail is: an append that fails is logged and its
+/// text is gone, and so is a telling that fails, which a tail makes up for at
+/// the next append. Returns how many appends were made, those that reached
+/// no row among them.
+///
+/// No two of `appends` may be to one task: they would be made in no order.
+pub async fn append_task_outputs(pool: &Pool, appends: Vec<LogAppend>) -> usize {
+    append_task_outputs_in(pool, appends, log_append_lanes(pool)).await
+}
+
+/// [`append_task_outputs`], with `lanes` appends in flight at once, four at
+/// most. Which lane an append falls in decides nothing.
+pub async fn append_task_outputs_in(pool: &Pool, appends: Vec<LogAppend>, lanes: usize) -> usize {
+    let lanes = lanes.clamp(1, LOG_APPEND_LANES);
+    let mut lane: [Vec<LogAppend>; LOG_APPEND_LANES] = Default::default();
+    for (n, append) in appends.into_iter().enumerate() {
+        lane[n % lanes].push(append);
+    }
+    let [a, b, c, d] = lane;
+    let made = tokio::join!(
+        append_each(pool, a),
+        append_each(pool, b),
+        append_each(pool, c),
+        append_each(pool, d),
+    );
+    let mut written = 0;
+    let mut runs = Vec::new();
+    for (lane_written, lane_runs) in [made.0, made.1, made.2, made.3] {
+        written += lane_written;
+        runs.extend(lane_runs);
+    }
+    // The runs that were appended to are told of once, each once.
+    runs.sort_unstable();
+    runs.dedup();
+    if let Err(e) = notify_runs(pool, &runs).await {
+        tracing::warn!(error = %e, runs = runs.len(), "telling of live-log appends failed");
+    }
+    written
+}
+
+/// One lane's appends, one after another: how many were made, and the runs
+/// of the rows they changed.
+async fn append_each(pool: &Pool, lane: Vec<LogAppend>) -> (usize, Vec<String>) {
+    let mut written = 0;
+    let mut runs = Vec::new();
+    for append in lane {
+        match append_task_output(
+            pool,
+            &append.task_id,
+            append.fence,
+            &append.text,
+            append.reset,
+        )
+        .await
+        {
+            Ok(run) => {
+                written += 1;
+                runs.extend(run);
+            }
+            Err(e) => {
+                tracing::warn!(task_id = %append.task_id, error = %e, "live-log append failed")
+            }
+        }
+    }
+    (written, runs)
 }
 
 // ── Runtime fan-out (`with_output_of:`) ──────────────────────────────────────
 
 /// Statuses meaning an instance will not change again.
 const FANOUT_TERMINAL: [&str; 4] = ["succeeded", "failed", "skipped", "cancelled"];
+
+/// The fan-out sweep's read of the parked barriers ([`reconcile_fanouts`]),
+/// for its index (migrations_pg/101): those with no instance of their
+/// generation still to end, a batch at a time. A barrier whose instances
+/// still run is the common case, and the sweep has nothing to do for it.
+///
+/// Exact: the expansion stamps each instance with the version its CAS wrote
+/// (`RETURNING version`), and an instance of an older generation is one the
+/// sweep drops (`fanout_epoch < version`), so a barrier left out here is one
+/// the sweep would read and pass over. The statuses are [`FANOUT_TERMINAL`].
+pub(crate) const PARKED_FANOUTS: &str =
+    "SELECT b.id, b.run_id, b.input, b.allow_failure, b.version,
+                    b.runner_class, b.priority, b.pool
+             FROM task_runs b
+             WHERE b.status = 'running' AND b.fanout_of IS NOT NULL AND b.claimed_by IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM task_runs i
+                   WHERE i.fanout_parent = b.id AND i.fanout_epoch >= b.version
+                     AND i.status NOT IN ('succeeded', 'failed', 'skipped', 'cancelled')
+               )
+             LIMIT $1";
 
 /// Resolve parked runtime fan-out barriers — the sweep that makes
 /// `with_output_of:` work.
@@ -1666,15 +2880,17 @@ const FANOUT_TERMINAL: [&str; 4] = ["succeeded", "failed", "skipped", "cancelled
 /// expand it; phase 2's resolve is guarded on the parked shape, so a
 /// double-resolve is a no-op. A crash mid-expansion commits nothing and the
 /// barrier is simply expanded again next tick.
-pub async fn reconcile_fanouts(pool: &Pool) -> Result<Vec<(String, crate::models::FanoutOutcome)>> {
-    let parked: Vec<ParkedFanout> = sqlx::query_as(
-            "SELECT id, run_id, input, allow_failure, version,
-                    runner_class, priority, pool
-             FROM task_runs
-             WHERE status = 'running' AND fanout_of IS NOT NULL AND claimed_by IS NULL",
-        )
+///
+/// Reads up to [`super::SWEEP_BATCH`] barriers a pass, and says when it read
+/// that many.
+pub async fn reconcile_fanouts(
+    pool: &Pool,
+) -> Result<super::Pass<(String, crate::models::FanoutOutcome)>> {
+    let parked: Vec<ParkedFanout> = sqlx::query_as(PARKED_FANOUTS)
+        .bind(super::SWEEP_BATCH)
         .fetch_all(pool)
         .await?;
+    let full = parked.len() as i64 >= super::SWEEP_BATCH;
 
     let mut out = Vec::new();
     for (task_id, run_id, input, allow_failure, version, runner_class, priority, pool_name) in
@@ -1917,7 +3133,7 @@ pub async fn reconcile_fanouts(pool: &Pool) -> Result<Vec<(String, crate::models
             crate::models::FanoutOutcome::Expanded { instances: instances.len() },
         ));
     }
-    Ok(out)
+    Ok(super::Pass { done: out, full })
 }
 
 /// A one-line account of how the instances went, stored as the barrier's
@@ -2040,10 +3256,11 @@ pub async fn resolve_approval(
 
 /// Auto-resolve approval gates whose `approval_timeout_secs` elapsed since they
 /// began waiting (`scheduled_at`), applying `approval_on_timeout` (default
-/// `reject`). Returns the `(task_id, approved)` decisions. Idempotent via
+/// `reject`). Returns the `(task_id, approved, deadline)` decisions, the
+/// deadline being when the gate timed out (RFC 3339). Idempotent via
 /// `resolve_approval`'s guard. Not `ops`-gated — the reconcile loop calls this
 /// every tick in every build.
-pub async fn resolve_expired_approvals(pool: &Pool) -> Result<Vec<(String, bool)>> {
+pub async fn resolve_expired_approvals(pool: &Pool) -> Result<Vec<(String, bool, String)>> {
     let now = chrono::Utc::now();
     let candidates: Vec<(String, String, Option<String>, i64, Option<String>)> = sqlx::query_as(
         "SELECT id, run_id, scheduled_at, approval_timeout_secs, approval_on_timeout
@@ -2072,7 +3289,7 @@ pub async fn resolve_expired_approvals(pool: &Pool) -> Result<Vec<(String, bool)
             if approve { "approve" } else { "reject" }
         );
         if resolve_approval(pool, &run_id, &id, approve, Some("timeout"), Some(&note)).await? {
-            resolved.push((id, approve));
+            resolved.push((id, approve, deadline.to_rfc3339()));
         }
     }
     Ok(resolved)
@@ -2125,7 +3342,7 @@ pub async fn park_subworkflow(
     let rows = sqlx::query(
         "UPDATE task_runs
          SET sub_run_id = $1, claimed_by = NULL, lease_expires_at = NULL
-         WHERE id = $2 AND status = 'running' AND version = $3",
+         WHERE id = $2 AND status = 'running' AND version = $3 AND stop_requested_at IS NULL",
     )
     .bind(child_run_id)
     .bind(task_id)
@@ -2143,7 +3360,7 @@ pub async fn release_subworkflow_task(pool: &Pool, task_id: &str, fence: i64) ->
     let rows = sqlx::query(
         "UPDATE task_runs
          SET status = 'ready', claimed_by = NULL, lease_expires_at = NULL
-         WHERE id = $1 AND status = 'running' AND version = $2",
+         WHERE id = $1 AND status = 'running' AND version = $2 AND stop_requested_at IS NULL",
     )
     .bind(task_id)
     .bind(fence)
@@ -2159,7 +3376,7 @@ pub async fn release_subworkflow_task(pool: &Pool, task_id: &str, fence: i64) ->
 /// so a re-sweep is a no-op.
 ///
 /// **The child run's own output becomes this task's output** when it has one,
-/// falling back to the constant below when it does not (G-AG5). Without that a
+/// falling back to the constant below when it does not. Without that a
 /// sub-workflow is a procedure and not a function: `result_from` gives a run a
 /// single return value, and the parent used to throw it away and write
 /// "sub-workflow succeeded" instead, so `{{ tasks.<child>.output }}` in the
@@ -2332,6 +3549,17 @@ pub async fn fail_parked_subworkflow(
     Ok(true)
 }
 
+/// The sub-workflow sweep's read of the parked triggers whose child run has
+/// ended ([`reconcile_subworkflows`]), for its index (migrations_pg/105), a
+/// batch at a time. A trigger whose child is gone is left parked, as a
+/// trigger whose child still runs is: the join reads neither.
+pub(crate) const PARKED_SUBWORKFLOWS: &str =
+    "SELECT t.id, t.run_id, t.sub_run_id, c.status, c.output
+         FROM task_runs t JOIN workflow_runs c ON c.id = t.sub_run_id
+         WHERE t.status = 'running' AND t.sub_run_id IS NOT NULL
+           AND c.status IN ('succeeded', 'failed', 'cancelled')
+         LIMIT $1";
+
 /// Sweep parked sub-workflow tasks (#23): for each `running` task holding a
 /// `sub_run_id`, if its child run is terminal, decide what happens to the
 /// trigger.
@@ -2350,27 +3578,24 @@ pub async fn fail_parked_subworkflow(
 /// Returns the `(task_id, succeeded)` resolutions — iterations that continued are
 /// not resolutions and are not reported. Run each reconcile tick; idempotent via
 /// the parked-shape guards, so every scheduler in an HA set may sweep.
-pub async fn reconcile_subworkflows(pool: &Pool) -> Result<Vec<(String, bool)>> {
+///
+/// Reads up to [`super::SWEEP_BATCH`] triggers a pass, each with its child's
+/// status and output, and says when it read that many.
+pub async fn reconcile_subworkflows(pool: &Pool) -> Result<super::Pass<(String, bool)>> {
     // `run_id` rides along so a re-arm can wake idle peers (see the `Again`
     // arm): moving the trigger to `ready` is a readiness change, and every other
     // one in this module fires `pg_notify` rather than making a scheduler wait
     // out the poll interval — which, per conversation turn, this loop would
     // otherwise pay N times.
-    let parked: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT id, run_id, sub_run_id FROM task_runs
-         WHERE status = 'running' AND sub_run_id IS NOT NULL",
-    )
-    .fetch_all(pool)
-    .await?;
+    let parked: Vec<(String, String, String, String, Option<String>)> =
+        sqlx::query_as(PARKED_SUBWORKFLOWS)
+            .bind(super::SWEEP_BATCH)
+            .fetch_all(pool)
+            .await?;
+    let full = parked.len() as i64 >= super::SWEEP_BATCH;
 
     let mut resolved = Vec::new();
-    for (task_id, run_id, child_run_id) in parked {
-        let child: Option<(String, Option<String>)> =
-            sqlx::query_as("SELECT status, output FROM workflow_runs WHERE id = $1")
-                .bind(&child_run_id)
-                .fetch_optional(pool)
-                .await?;
-        let Some((child_status, child_output)) = child else { continue }; // child gone → leave parked
+    for (task_id, run_id, child_run_id, child_status, child_output) in parked {
         let succeeded = match child_status.as_str() {
             "succeeded" => true,
             "failed" | "cancelled" => false,
@@ -2452,7 +3677,10 @@ pub async fn reconcile_subworkflows(pool: &Pool) -> Result<Vec<(String, bool)>> 
             resolved.push((task_id, succeeded));
         }
     }
-    Ok(resolved)
+    Ok(super::Pass {
+        done: resolved,
+        full,
+    })
 }
 
 /// The `repeat:` spec of a task, from its stored `TaskSpec` JSON.
@@ -2484,7 +3712,7 @@ pub async fn park_wait(pool: &Pool, task_id: &str, fence: i64, wake_at: &str) ->
     let rows = sqlx::query(
         "UPDATE task_runs
          SET wake_at = $1, claimed_by = NULL, lease_expires_at = NULL
-         WHERE id = $2 AND status = 'running' AND version = $3",
+         WHERE id = $2 AND status = 'running' AND version = $3 AND stop_requested_at IS NULL",
     )
     .bind(wake_at)
     .bind(task_id)
@@ -2495,22 +3723,31 @@ pub async fn park_wait(pool: &Pool, task_id: &str, fence: i64, wake_at: &str) ->
     Ok(rows > 0)
 }
 
+/// The time sensors' read of the due waits ([`reconcile_waits`]), for its
+/// index (migrations_pg/102): the longest due first, a batch at a time.
+pub(crate) const DUE_WAITS: &str = "SELECT id, wake_at FROM task_runs
+         WHERE status = 'running' AND wake_at IS NOT NULL AND wake_at <= $1
+         ORDER BY wake_at
+         LIMIT $2";
+
 /// Sweep parked wait sensors (#27): resolve (succeed) every `running` task whose
 /// `wake_at` deadline has passed, advancing its dependents. Returns the resolved
-/// task ids. Run each reconcile tick; the guarded UPDATE is idempotent and
-/// HA-safe (only one scheduler resolves a given task).
-pub async fn reconcile_waits(pool: &Pool) -> Result<Vec<String>> {
+/// tasks, each `(task_id, wake_at)`. Run each reconcile tick; the guarded UPDATE
+/// is idempotent and HA-safe (only one scheduler resolves a given task).
+///
+/// Reads up to [`super::SWEEP_BATCH`] a pass, the longest due first, and says
+/// when it read that many.
+pub async fn reconcile_waits(pool: &Pool) -> Result<super::Pass<(String, String)>> {
     let now = chrono::Utc::now().to_rfc3339();
-    let due: Vec<(String,)> = sqlx::query_as(
-        "SELECT id FROM task_runs
-         WHERE status = 'running' AND wake_at IS NOT NULL AND wake_at <= $1",
-    )
-    .bind(&now)
-    .fetch_all(pool)
-    .await?;
+    let due: Vec<(String, String)> = sqlx::query_as(DUE_WAITS)
+        .bind(&now)
+        .bind(super::SWEEP_BATCH)
+        .fetch_all(pool)
+        .await?;
+    let full = due.len() as i64 >= super::SWEEP_BATCH;
 
     let mut resolved = Vec::new();
-    for (task_id,) in due {
+    for (task_id, wake_at) in due {
         let mut tx = pool.begin().await?;
         let rows = sqlx::query(
             "UPDATE task_runs SET status = 'succeeded', finished_at = $1, output = 'wait elapsed'
@@ -2536,9 +3773,12 @@ pub async fn reconcile_waits(pool: &Pool) -> Result<Vec<String>> {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        resolved.push(task_id);
+        resolved.push((task_id, wake_at));
     }
-    Ok(resolved)
+    Ok(super::Pass {
+        done: resolved,
+        full,
+    })
 }
 
 /// Park a claimed `type: wait` HTTP sensor (#27 follow-on): keep it `running` but
@@ -2556,7 +3796,7 @@ pub async fn park_wait_url(
     let rows = sqlx::query(
         "UPDATE task_runs
          SET wait_url = $1, next_poll_at = $2, claimed_by = NULL, lease_expires_at = NULL
-         WHERE id = $3 AND status = 'running' AND version = $4",
+         WHERE id = $3 AND status = 'running' AND version = $4 AND stop_requested_at IS NULL",
     )
     .bind(url)
     .bind(next_poll_at)
@@ -2568,24 +3808,59 @@ pub async fn park_wait_url(
     Ok(rows > 0)
 }
 
-/// List up to `limit` parked HTTP wait sensors (#27 follow-on) due for a poll
-/// (oldest deadline first — the cap bounds how much probing one tick can do): `running` tasks
-/// holding a `wait_url` whose `next_poll_at` has elapsed (or is NULL). Returns
-/// `(task_id, wait_url)` pairs for the engine to GET.
-pub async fn due_url_waits(pool: &Pool, limit: i64) -> Result<Vec<(String, String)>> {
-    let now = chrono::Utc::now().to_rfc3339();
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, wait_url FROM task_runs
-         WHERE status = 'running' AND wait_url IS NOT NULL
-           AND (next_poll_at IS NULL OR next_poll_at <= $1)
+/// The HTTP sensors' read of the ones due a poll ([`claim_due_url_waits`]),
+/// for its index (migrations_pg/103). No `next_poll_at IS NULL` branch:
+/// [`park_wait_url`] always sets it, and migrations_pg/106 set it on any
+/// sensor parked without one, so the branch only made the read take every
+/// parked sensor.
+pub(crate) const DUE_URL_WAITS: &str = "SELECT id, wait_url, next_poll_at FROM task_runs
+         WHERE status = 'running' AND wait_url IS NOT NULL AND next_poll_at <= $1
          ORDER BY next_poll_at
-         LIMIT $2",
-    )
-    .bind(&now)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
+         LIMIT $2";
+
+/// **Claim** up to `limit` parked HTTP wait sensors (#27 follow-on) due for a
+/// poll, the longest due first (the cap bounds how much probing one tick can
+/// do), and return the ones this engine won: `(task_id, wait_url, due at)`.
+///
+/// Claimed as the external polls are ([`claim_due_external_polls`]): every
+/// engine sweeps them, and a sensor read and not claimed was polled once by
+/// each, which a vendor's endpoint sees as N times the rate. The claim moves
+/// `next_poll_at` on to `claim_secs` from now, guarded on the value read, and
+/// is the crash bound too: a sensor whose engine dies mid-GET is due again
+/// then. The GET's answer moves it again ([`repark_url_wait`]) or resolves
+/// the sensor ([`resolve_url_wait`]). The caller makes `claim_secs` longer
+/// than its GET's timeout, so a sensor is never claimed while a GET of it is
+/// in flight.
+pub async fn claim_due_url_waits(
+    pool: &Pool,
+    limit: i64,
+    claim_secs: u64,
+) -> Result<Vec<(String, String, String)>> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let until = crate::dag::delayed_retry_at(claim_secs);
+    let rows: Vec<(String, String, String)> = sqlx::query_as(DUE_URL_WAITS)
+        .bind(&now)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    let mut won = Vec::with_capacity(rows.len());
+    for (id, url, due) in rows {
+        let claimed = sqlx::query(
+            "UPDATE task_runs SET next_poll_at = $1
+             WHERE id = $2 AND status = 'running' AND wait_url IS NOT NULL
+               AND next_poll_at = $3",
+        )
+        .bind(&until)
+        .bind(&id)
+        .bind(&due)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        if claimed > 0 {
+            won.push((id, url, due));
+        }
+    }
+    Ok(won)
 }
 
 /// Push a parked HTTP wait sensor's next poll out to `next_poll_at` (#27
@@ -2666,7 +3941,7 @@ pub async fn park_external(
          SET external_kind = $1, external_handle = $2, external_endpoint = $3,
              next_poll_at = $4, external_deadline_at = $5,
              claimed_by = NULL, lease_expires_at = NULL
-         WHERE id = $6 AND status = 'running' AND version = $7",
+         WHERE id = $6 AND status = 'running' AND version = $7 AND stop_requested_at IS NULL",
     )
     .bind(kind)
     .bind(handle)
@@ -3191,6 +4466,23 @@ pub async fn prune_dataset_triggers(pool: &Pool) -> Result<u64> {
     .rows_affected())
 }
 
+/// Drop every subscription of the registered workflows in `names`, which
+/// declare no `on_datasets:` (any more): one statement for all of them, by
+/// the table's key, whichever engine synced their rows, and whether or not
+/// it has restarted since. Returns the rows dropped.
+pub async fn clear_dataset_triggers(pool: &Pool, names: &[String]) -> Result<u64> {
+    if names.is_empty() {
+        return Ok(0);
+    }
+    Ok(
+        sqlx::query("DELETE FROM dataset_triggers WHERE workflow_name = ANY($1::text[])")
+            .bind(names)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+    )
+}
+
 /// Claim dataset triggers that are due to fire. For each subscribed workflow:
 /// `any` mode fires when **any** subscribed dataset has an event newer than its
 /// cursor; `all` mode fires only when **every** subscribed dataset does — the
@@ -3320,7 +4612,7 @@ pub async fn park_wait_dataset(pool: &Pool, task_id: &str, fence: i64, uri: &str
          SET wait_dataset = $1,
              wait_dataset_cursor = (SELECT COALESCE(MAX(id), 0) FROM dataset_events WHERE uri = $1),
              claimed_by = NULL, lease_expires_at = NULL
-         WHERE id = $2 AND status = 'running' AND version = $3",
+         WHERE id = $2 AND status = 'running' AND version = $3 AND stop_requested_at IS NULL",
     )
     .bind(uri)
     .bind(task_id)
@@ -3331,20 +4623,28 @@ pub async fn park_wait_dataset(pool: &Pool, task_id: &str, fence: i64, uri: &str
     Ok(rows > 0)
 }
 
-/// Sweep parked dataset sensors: resolve (succeed) every one whose dataset has
-/// an event newer than its park-time cursor, advancing dependents. Returns
-/// `(task_id, uri)` resolutions. Idempotent, HA-safe (guarded UPDATE).
-pub async fn reconcile_dataset_waits(pool: &Pool) -> Result<Vec<(String, String)>> {
-    let due: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, wait_dataset FROM task_runs t
+/// The dataset sensors' read of the ones whose dataset has moved
+/// ([`reconcile_dataset_waits`]), for its index (migrations_pg/104), a batch
+/// at a time.
+pub(crate) const PARKED_DATASET_WAITS: &str = "SELECT id, wait_dataset FROM task_runs t
          WHERE status = 'running' AND wait_dataset IS NOT NULL
            AND EXISTS (
                SELECT 1 FROM dataset_events e
                WHERE e.uri = t.wait_dataset AND e.id > COALESCE(t.wait_dataset_cursor, 0)
-           )",
-    )
-    .fetch_all(pool)
-    .await?;
+           )
+         LIMIT $1";
+
+/// Sweep parked dataset sensors: resolve (succeed) every one whose dataset has
+/// an event newer than its park-time cursor, advancing dependents. Returns
+/// `(task_id, uri)` resolutions. Idempotent, HA-safe (guarded UPDATE).
+///
+/// Reads up to [`super::SWEEP_BATCH`] a pass, and says when it read that many.
+pub async fn reconcile_dataset_waits(pool: &Pool) -> Result<super::Pass<(String, String)>> {
+    let due: Vec<(String, String)> = sqlx::query_as(PARKED_DATASET_WAITS)
+        .bind(super::SWEEP_BATCH)
+        .fetch_all(pool)
+        .await?;
+    let full = due.len() as i64 >= super::SWEEP_BATCH;
 
     let now = chrono::Utc::now().to_rfc3339();
     let mut resolved = Vec::new();
@@ -3375,7 +4675,10 @@ pub async fn reconcile_dataset_waits(pool: &Pool) -> Result<Vec<(String, String)
         tx.commit().await?;
         resolved.push((task_id, uri));
     }
-    Ok(resolved)
+    Ok(super::Pass {
+        done: resolved,
+        full,
+    })
 }
 
 /// The dataset registry, most recently updated first (management API read).
@@ -3436,7 +4739,8 @@ pub async fn run_dataset_io(pool: &Pool, run_id: &str) -> Result<(Vec<String>, V
 /// Reset a failed task to `ready` for a later retry attempt.
 ///
 /// `scheduled_at = retry_at` keeps `claim_ready` from picking it up until the
-/// backoff window elapses; `attempt` is left for `claim_ready` to increment.
+/// backoff window elapses; `attempt` is left for `claim_ready` to increment,
+/// and only [`requeue_quota_wait`] ever gives one back.
 /// No NOTIFY is issued — the row is deliberately not yet claimable, so the
 /// fixed-interval safety-net poll is what eventually picks it up at `retry_at`.
 pub async fn retry_task(
@@ -3451,10 +4755,12 @@ pub async fn retry_task(
     let policy = AttemptPolicy::from_env();
     let mut tx = pool.begin().await?;
 
-    // `RETURNING attempt` rather than a second read: this statement is the one
-    // place that knows the CAS held, and the number it returns is the attempt
-    // whose output the same statement is about to overwrite. Reading it
-    // separately would race the next claim, which increments it.
+    // `RETURNING` rather than a second read: this statement is the one place
+    // that knows the CAS held, and the number it returns is the attempt whose
+    // output the same statement is about to overwrite. Reading it separately
+    // would race the next claim, which increments it. The number is the
+    // task's count for its life (`attempt_base + attempt`), which a rerun or
+    // a clear does not set back: it is what `task_attempts` is keyed by.
     let claimed: Option<(i64,)> = sqlx::query_as(
         // Mirrors the SQLite backend: the fault columns describe why this row
         // is *currently* failed, and a row about to run again is not failed.
@@ -3468,8 +4774,8 @@ pub async fn retry_task(
              fault_class = NULL,
              fault_detail = NULL,
              fault_confidence = NULL
-         WHERE id = $3 AND claimed_by = $4 AND version = $5
-         RETURNING attempt",
+         WHERE id = $3 AND claimed_by = $4 AND version = $5 AND stop_requested_at IS NULL
+         RETURNING attempt_base + attempt",
     )
     .bind(&retry_at)
     .bind(&error)
@@ -3480,6 +4786,14 @@ pub async fn retry_task(
     .await?;
 
     let Some((attempt,)) = claimed else {
+        // Asked to stop: it does not run again. Cancelled, where it would
+        // have been queued for its next attempt.
+        let now = chrono::Utc::now().to_rfc3339();
+        if settle_stopping(&mut tx, task_id, worker_id, fence, &now).await? {
+            tx.commit().await?;
+            tracing::info!(task_id, "the task ended after it was asked to stop: cancelled, not retried");
+            return Ok(false);
+        }
         tx.commit().await?;
         tracing::warn!(task_id, "stale retry ignored — task already reclaimed");
         return Ok(false);
@@ -3554,7 +4868,7 @@ pub async fn list_task_attempts(pool: &Pool, task_id: &str) -> Result<Vec<TaskAt
     // ones. Capped because `DAGRON_ATTEMPT_LOG_KEEP=0` disables eviction, and
     // an unbounded retention policy must not imply an unbounded response.
     let mut rows = sqlx::query_as::<_, TaskAttempt>(
-        "SELECT task_id, attempt, reason, output, truncated, finished_at
+        "SELECT task_id, attempt, reason, status, scheduled_at, output, truncated, finished_at
          FROM task_attempts WHERE task_id = $1 ORDER BY attempt DESC LIMIT $2",
     )
     .bind(task_id)
@@ -3563,6 +4877,145 @@ pub async fn list_task_attempts(pool: &Pool, task_id: &str) -> Result<Vec<TaskAt
     .await?;
     rows.reverse();
     Ok(rows)
+}
+
+/// How many attempts `task_id` made in the rounds a rerun or a clear ended
+/// (`attempt_base`). The attempt on its row plus this is the task's count for
+/// its life, which is what its kept attempts are numbered by. 0 for a task
+/// that is not there.
+#[cfg(feature = "ops")]
+pub async fn task_attempt_base(pool: &Pool, task_id: &str) -> Result<i64> {
+    let base: Option<i64> =
+        sqlx::query_scalar("SELECT attempt_base FROM task_runs WHERE id = $1")
+            .bind(task_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(base.unwrap_or(0))
+}
+
+// ── Quota back-pressure ──────────────────────────────────────────────────────
+
+/// Hand a claimed task back to the queue because its pod was refused by a full
+/// Kubernetes namespace `ResourceQuota` (migration 051/066): the row returns to
+/// `ready` with a future `scheduled_at` and the attempt the claim consumed is
+/// given back. Mirrors the SQLite backend — see there for why the give-back is
+/// sound, how the wait marker (`quota_wait_version = version`) expires without
+/// being cleared, and what continues an episode.
+///
+/// Fenced like [`retry_task`], plus `status = 'running'`, so it lands at most
+/// once per claim; a lost fence is [`QuotaRequeue::Stale`]. At the bound
+/// ([`QuotaRequeue::Expired`]) **nothing is written** and the caller still
+/// holds the claim.
+///
+/// The read takes the row lock (`FOR UPDATE`), so the decision and the write
+/// are about the same row state: a sweep on another scheduler (lease recovery,
+/// a cancel) either lands before the read, and this call is `Stale`, or waits
+/// for the commit. No NOTIFY, for the reason `retry_task` gives — the row is
+/// deliberately not claimable yet.
+pub async fn requeue_quota_wait(
+    pool: &Pool,
+    task_id: &str,
+    worker_id: &str,
+    fence: i64,
+    detail: &str,
+    max_wait_secs: i64,
+) -> Result<QuotaRequeue> {
+    // One wall-clock read: the bound check, the probe time and the durations
+    // reported back all derive from it.
+    let now = chrono::Utc::now();
+    let mut tx = pool.begin().await?;
+
+    let held: Option<(Option<String>, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT quota_wait_since, quota_waits, quota_wait_version FROM task_runs
+         WHERE id = $1 AND claimed_by = $2 AND version = $3 AND status = 'running'
+           AND stop_requested_at IS NULL
+         FOR UPDATE",
+    )
+    .bind(task_id)
+    .bind(worker_id)
+    .bind(fence)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some((since, waits, wait_version)) = held else {
+        // Asked to stop, and nothing was started for this dispatch: cancelled,
+        // where it would have been handed back to its queue.
+        if settle_stopping(&mut tx, task_id, worker_id, fence, &now.to_rfc3339()).await? {
+            tx.commit().await?;
+            tracing::info!(task_id, "the task was asked to stop before it started: cancelled, not requeued");
+            return Ok(QuotaRequeue::Stale);
+        }
+        tx.commit().await?;
+        tracing::warn!(task_id, "stale quota requeue ignored — task already reclaimed");
+        return Ok(QuotaRequeue::Stale);
+    };
+
+    // A `since` that does not parse is treated as no episode rather than as an
+    // error: the cost is a bound that restarts, not a task that cannot be
+    // handed back.
+    let prior = (wait_version == Some(fence - 1))
+        .then_some(since)
+        .flatten()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|s| (s.with_timezone(&chrono::Utc), waits));
+
+    let jitter = quota_wait::jitter_permille(task_id, fence);
+    let (since, waits, retry_at) = match quota_wait::step(now, prior, max_wait_secs, jitter) {
+        quota_wait::Step::Wait { since, waits, retry_at } => (since, waits, retry_at),
+        quota_wait::Step::GiveUp { waits, waited_secs } => {
+            tx.commit().await?;
+            return Ok(QuotaRequeue::Expired { waits, waited_secs });
+        }
+    };
+
+    let rows = sqlx::query(
+        "UPDATE task_runs
+         SET status = 'ready',
+             scheduled_at = $1,
+             claimed_by = NULL,
+             lease_expires_at = NULL,
+             attempt = GREATEST(attempt - 1, 0),
+             quota_wait_since = $2,
+             quota_waits = $3,
+             quota_wait_version = version,
+             quota_wait_detail = $4
+         WHERE id = $5 AND claimed_by = $6 AND version = $7 AND status = 'running'
+           AND stop_requested_at IS NULL",
+    )
+    .bind(retry_at.to_rfc3339())
+    .bind(since.to_rfc3339())
+    .bind(waits)
+    .bind(quota_wait::clip_detail(detail))
+    .bind(task_id)
+    .bind(worker_id)
+    .bind(fence)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+
+    if rows == 0 {
+        tracing::warn!(task_id, "stale quota requeue ignored — task already reclaimed");
+        return Ok(QuotaRequeue::Stale);
+    }
+    Ok(QuotaRequeue::Requeued {
+        waits,
+        waited_secs: (now - since).num_seconds().max(0),
+        retry_in_secs: (retry_at - now).num_seconds().max(0),
+    })
+}
+
+/// Tasks waiting on quota right now, and when the longest-waiting one was first
+/// refused. See the SQLite twin: the predicate is the waiting rule itself,
+/// because the columns outlive the wait. Not `ops`-gated.
+pub async fn quota_wait_stats(pool: &Pool) -> Result<QuotaWaitStats> {
+    let (waiting, oldest_since): (i64, Option<String>) = sqlx::query_as(
+        "SELECT COUNT(*), MIN(quota_wait_since) FROM task_runs
+         WHERE status = 'ready' AND quota_wait_version = version",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(QuotaWaitStats { waiting, oldest_since })
 }
 
 // ── Fault attribution ────────────────────────────────────────────────────────
@@ -3819,49 +5272,534 @@ pub async fn reclass_ready_tasks_near_deadline(
     Ok(rows.len() as u64)
 }
 
-/// Resurrect a failed/cancelled task from the management API (UI retry).
+// ── Running again: one implementation ───────────────────────────────────────
+//
+// A rerun, a retry and a clear each put tasks of a run back to run again, and
+// each is asked for through two doors: the engine's own API and dagron-api's.
+// dagron-api carried its own SQL for all three, "kept in sync" by a comment,
+// and the copies had drifted: its rerun left rule-skipped tasks skipped, and
+// none of its three cleared a task's fault verdict, its log or its remote
+// job's handle. Both doors call the functions below now, and a rerun of a run
+// whole ([`rerun_all`]) is one more of them. Each, in one transaction:
+// - **keeps what it replaces** ([`keep_replaced`]): a task that ran has that
+//   attempt's status, times and output tail put in `task_attempts` before its
+//   row is reset;
+// - **asks the concurrency key** ([`lock_run_cap`], [`refuse_if_full`]) when
+//   it sets a run that had ended running again, as `create_run` asks it for a
+//   new run;
+// - **writes one outbox event** ([`insert_run_again`]), so that what listens
+//   for a run's end also hears that it is running again.
+
+/// The tasks one of them resets: the `WHERE` its statements share.
+#[cfg(feature = "ops")]
+#[derive(Clone, Copy)]
+enum Reset<'a> {
+    /// A run's broken cone: its failed, cancelled and rule-skipped tasks.
+    BrokenCone { run_id: &'a str },
+    /// One failed or cancelled task.
+    Task { task_id: &'a str },
+    /// A completed task, and every completed task that depends on it.
+    Cone { run_id: &'a str, task_id: &'a str },
+    /// A run whole: every task of it that ended, what succeeded included,
+    /// but a runtime fan-out's instances, which [`rerun_all_in`] drops.
+    Whole { run_id: &'a str },
+}
+
+#[cfg(feature = "ops")]
+impl<'a> Reset<'a> {
+    /// The condition over `task_runs t`, its placeholders numbered from
+    /// `first`, and what they are bound to, in order.
+    fn condition(self, first: usize) -> (String, Vec<&'a str>) {
+        match self {
+            Reset::BrokenCone { run_id } => (
+                format!("t.run_id = ${first} AND t.status IN ('failed', 'cancelled', 'skipped')"),
+                vec![run_id],
+            ),
+            Reset::Whole { run_id } => (
+                format!(
+                    "t.run_id = ${first} AND t.fanout_parent IS NULL
+                     AND t.status IN ('succeeded', 'failed', 'skipped', 'cancelled')"
+                ),
+                vec![run_id],
+            ),
+            Reset::Task { task_id } => (
+                format!("t.id = ${first} AND t.status IN ('failed', 'cancelled')"),
+                vec![task_id],
+            ),
+            Reset::Cone { run_id, task_id } => (
+                format!(
+                    "t.id IN (
+                         WITH RECURSIVE cone(id) AS (
+                             SELECT id FROM task_runs WHERE id = ${first} AND run_id = ${}
+                             UNION
+                             SELECT td.dependent_id FROM task_dependencies td
+                             JOIN cone c ON td.dependency_id = c.id
+                         )
+                         SELECT id FROM cone)
+                     AND t.status IN ('succeeded', 'failed', 'skipped', 'cancelled')",
+                    first + 1
+                ),
+                vec![task_id, run_id],
+            ),
+        }
+    }
+}
+
+/// A decided approval gate, over `task_runs t`. A gate is never claimed, so
+/// its `attempt` stays 0, and yet its decision is what it did: a reset keeps
+/// it as an attempt ([`keep_replaced`]), numbered `attempt_base + 1`, and
+/// moves `attempt_base` on by one for it, as it moves it on by a task's
+/// attempts. Else putting a gate back would leave no record of who approved
+/// what it guarded.
+#[cfg(feature = "ops")]
+const DECIDED_GATE: &str = "(t.is_approval = 1 AND t.status IN ('succeeded', 'failed'))";
+
+/// Keep the attempts `reset` is about to replace, in its transaction and
+/// before it: for each task that ran, how the attempt ended, when it was
+/// queued and when it ended, and the tail of what it printed, under `reason`
+/// (what is replacing it). A task that never ran, cancelled or skipped before
+/// a worker took it, has no attempt to keep. What it printed is what a reader
+/// of its log saw: the log an executor streamed, or its output where none did.
+/// A decided approval gate is kept as one attempt ([`DECIDED_GATE`]).
+///
+/// The row is written under `attempt_base + attempt`, the task's count for
+/// its life ([`TaskAttempt::attempt`]), and the rows that pushes out of the
+/// window go, as [`record_attempt`] does for a worker's retry. The tail is cut
+/// here in characters, where that one cuts in bytes: it is taken in the
+/// statement that reads the rows, so that a rerun of ten thousand failed tasks
+/// moves no output through this process.
+///
+/// A no-op when retention is off (`DAGRON_ATTEMPT_LOG_BYTES=0`).
+#[cfg(feature = "ops")]
+async fn keep_replaced(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    reset: Reset<'_>,
+    reason: &str,
+    now: &str,
+) -> Result<()> {
+    let policy = AttemptPolicy::from_env();
+    if !policy.enabled() {
+        return Ok(());
+    }
+    let (condition, bound) = reset.condition(4);
+    let sql = format!(
+        "INSERT INTO task_attempts
+             (task_id, attempt, reason, status, output, truncated, scheduled_at, finished_at)
+         SELECT t.id, t.attempt_base + GREATEST(t.attempt, 1), $1, t.status,
+                right(COALESCE(NULLIF(t.log, ''), t.output), $2),
+                COALESCE(char_length(COALESCE(NULLIF(t.log, ''), t.output)) > $2, false),
+                t.scheduled_at, COALESCE(t.finished_at, $3)
+         FROM task_runs t
+         WHERE (t.attempt > 0 OR {DECIDED_GATE}) AND {condition}
+         ON CONFLICT (task_id, attempt) DO UPDATE SET
+             reason = excluded.reason,
+             status = excluded.status,
+             output = excluded.output,
+             truncated = excluded.truncated,
+             scheduled_at = excluded.scheduled_at,
+             finished_at = excluded.finished_at"
+    );
+    let mut kept = sqlx::query(&sql)
+        .bind(reason)
+        .bind(i32::try_from(policy.bytes).unwrap_or(i32::MAX))
+        .bind(now);
+    for value in &bound {
+        kept = kept.bind(*value);
+    }
+    kept.execute(&mut **tx).await?;
+
+    if policy.keep > 0 {
+        let (condition, bound) = reset.condition(2);
+        let sql = format!(
+            "DELETE FROM task_attempts a USING task_runs t
+             WHERE a.task_id = t.id AND (t.attempt > 0 OR {DECIDED_GATE}) AND {condition}
+               AND a.attempt <= t.attempt_base + GREATEST(t.attempt, 1) - $1"
+        );
+        let mut evicted = sqlx::query(&sql).bind(i64::try_from(policy.keep).unwrap_or(i64::MAX));
+        for value in &bound {
+            evicted = evicted.bind(*value);
+        }
+        evicted.execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
+/// The cap a run's workflow puts on its runs in flight, and what it counts
+/// them under.
+#[cfg(feature = "ops")]
+struct RunCap {
+    name: String,
+    key: Option<String>,
+    max: u32,
+}
+
+/// `run_id`'s cap, with its admission lock taken, or `None` for a workflow
+/// with no cap (or no such run). The lock is the one `create_run` takes, for
+/// the same reason: the count in [`refuse_if_full`] and the write that sets
+/// the run running must be one step against other admitters.
+///
+/// Taken first, before any row of the run is written, by each of the three:
+/// two of them on one run then queue here and not on each other's rows.
+#[cfg(feature = "ops")]
+async fn lock_run_cap(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: &str,
+) -> Result<Option<RunCap>> {
+    let run: Option<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT d.name, d.spec, wr.concurrency_key
+         FROM workflow_runs wr
+         JOIN workflow_definitions d ON d.id = wr.definition_id
+         WHERE wr.id = $1",
+    )
+    .bind(run_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((name, spec, key)) = run else {
+        return Ok(None);
+    };
+    let Some(max) = crate::dag::DagGraph::stored_max_active_runs(&spec) else {
+        return Ok(None);
+    };
+    let lock_scope = match &key {
+        Some(key) => format!("{name}\u{1f}{key}"),
+        None => name.clone(),
+    };
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
+        .bind(RUN_ADMISSION_LOCK)
+        .bind(&lock_scope)
+        .execute(&mut **tx)
+        .await?;
+    Ok(Some(RunCap { name, key, max }))
+}
+
+/// Count `run_id`'s deadlines again from now ([`super::deadlines_again`]), in
+/// the transaction that sets it running again after it ended, and let its SLA
+/// alert fire again: the run is held to its `run_timeout_secs` and its
+/// `deadline` from when it runs again, as a run let in after a wait is
+/// ([`admit_waiting_runs`]). Each of the four that set an ended run running
+/// again calls it once it has.
+#[cfg(feature = "ops")]
+async fn rearm_deadlines(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: &str,
+) -> Result<()> {
+    let spec: Option<String> = sqlx::query_scalar(
+        "SELECT d.spec FROM workflow_runs wr
+         JOIN workflow_definitions d ON d.id = wr.definition_id
+         WHERE wr.id = $1",
+    )
+    .bind(run_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(spec) = spec else {
+        return Ok(());
+    };
+    let (deadline_at, alert_deadline_at) = super::deadlines_again(&spec, chrono::Utc::now());
+    sqlx::query(
+        "UPDATE workflow_runs
+         SET deadline_at = COALESCE($1, deadline_at),
+             alert_deadline_at = COALESCE($2, alert_deadline_at),
+             alert_fired_at = NULL
+         WHERE id = $3",
+    )
+    .bind(deadline_at)
+    .bind(alert_deadline_at)
+    .bind(run_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Refuse to set `run_id` running again while its key is full without it:
+/// [`MaxActiveRunsReached`](crate::models::MaxActiveRunsReached), as a new run
+/// of the key would be refused. Called once the run reads `running` in this
+/// transaction, which the error then rolls back.
+///
+/// Refused whatever the workflow says of a full cap (`when_full`): a run that
+/// is set running again does not wait, and does not take another's place. A
+/// run that waits for the key is in its way as one that runs is, so it does
+/// not go ahead of one either.
+#[cfg(feature = "ops")]
+async fn refuse_if_full(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: &str,
+    cap: &RunCap,
+) -> Result<()> {
+    let (active, _) = runs_in_flight(tx, &cap.name, cap.key.as_deref(), Some(run_id)).await?;
+    if active >= i64::from(cap.max) {
+        return Err(anyhow::Error::new(crate::models::MaxActiveRunsReached {
+            name: cap.name.clone(),
+            max: cap.max,
+            active,
+            waiting: 0,
+            key: cap.key.clone(),
+        }));
+    }
+    Ok(())
+}
+
+/// Refuse to rerun `run_id` whole while tasks of it still owe the teardown
+/// of a remote job: [`TeardownOwed`](crate::models::TeardownOwed), with
+/// nothing written. The rerun resets each task's handle with the rest of its
+/// result, and a handle it dropped would never be swept, so the job would run
+/// on uncounted. The rule is `gc_old_runs`' own, for the same reason.
+///
+/// Called once the run reads `running` in this transaction: the cancel that
+/// ended the run has committed, and its debt is seen.
+#[cfg(feature = "ops")]
+async fn refuse_if_teardown_owed(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: &str,
+) -> Result<()> {
+    let owing: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_runs
+         WHERE run_id = $1 AND external_handle IS NOT NULL AND status <> 'running'",
+    )
+    .bind(run_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if owing > 0 {
+        return Err(anyhow::Error::new(crate::models::TeardownOwed {
+            run_id: run_id.to_string(),
+            tasks: owing,
+        }));
+    }
+    Ok(())
+}
+
+/// How many runs of workflow `name` are in flight under `key`, and how many
+/// of those wait for their turn: `(in flight, waiting)`. `except` leaves one
+/// run out, for a run that asks about the others.
+///
+/// A run being stopped is in flight until its work is gone, and a run that
+/// waits is in flight from the moment it is made. The caller holds the key's
+/// admission lock.
+async fn runs_in_flight(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    name: &str,
+    key: Option<&str>,
+    except: Option<&str>,
+) -> Result<(i64, i64)> {
+    Ok(sqlx::query_as(
+        "SELECT COUNT(*),
+                COUNT(*) FILTER (WHERE wr.queued_at IS NOT NULL AND wr.admitted_at IS NULL)
+         FROM workflow_runs wr
+         JOIN workflow_definitions d ON d.id = wr.definition_id
+         WHERE wr.status = 'running' AND d.name = $1
+           AND wr.concurrency_key IS NOT DISTINCT FROM $2
+           AND wr.id IS DISTINCT FROM $3",
+    )
+    .bind(name)
+    .bind(key)
+    .bind(except)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
+/// Cancel the runs a new run of workflow `name` and `key` takes the place of
+/// (`when_full: supersede`): every run of the key that has not ended and is
+/// not being stopped already, the ones that wait as the ones that run.
+/// Returns how many were asked.
+///
+/// Each is cancelled as [`cancel_run`] cancels one, in the new run's own
+/// transaction: a task nothing runs for is `cancelled` here, and one a worker
+/// holds is asked to stop. A run with nothing stopping ends at once, with its
+/// `run.completed` event, which the rest of its end-of-run work is owed to.
+/// One with work still running stays `running`
+/// until that is gone, and holds its key until then: the new run waits for
+/// it, and is let in by [`admit_waiting_runs`]. Its `output` says which run
+/// took its place (`by`).
+///
+/// `own` is the new run's record where that run is not trusted. Such a run
+/// takes the place of runs of its own source alone: the same forge and
+/// repository, and the same pull request and ref. Its key is its author's to
+/// write, and one that named another pull request's key would otherwise
+/// cancel that one's runs. What it may not cancel stays in its way, and it
+/// waits behind it.
+///
+/// The caller holds the key's admission lock, taken before any run's row as
+/// the three that set a run running again take it.
+async fn supersede_runs(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    name: &str,
+    key: Option<&str>,
+    by: &str,
+    own: Option<&crate::models::RunTrigger>,
+    now: &str,
+) -> Result<u64> {
+    let before: Vec<String> = sqlx::query_scalar(
+        "SELECT wr.id FROM workflow_runs wr
+         JOIN workflow_definitions d ON d.id = wr.definition_id
+         WHERE wr.status = 'running' AND wr.stopping_as IS NULL AND d.name = $1
+           AND wr.concurrency_key IS NOT DISTINCT FROM $2
+           AND (NOT $3 OR EXISTS (
+               SELECT 1 FROM run_triggers t
+               WHERE t.run_id = wr.id
+                 AND t.forge_host IS NOT DISTINCT FROM $4
+                 AND t.repo IS NOT DISTINCT FROM $5
+                 AND t.pr IS NOT DISTINCT FROM $6
+                 AND t.ref IS NOT DISTINCT FROM $7
+           ))
+         ORDER BY wr.created_at, wr.id",
+    )
+    .bind(name)
+    .bind(key)
+    .bind(own.is_some())
+    .bind(own.and_then(|t| t.forge_host.as_deref()))
+    .bind(own.and_then(|t| t.repo.as_deref()))
+    .bind(own.and_then(|t| t.pr))
+    .bind(own.and_then(|t| t.git_ref.as_deref()))
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut asked = 0;
+    for run_id in &before {
+        // The run row first, as a cancel takes it.
+        let ours = sqlx::query(
+            "UPDATE workflow_runs
+             SET stopping_as = 'cancelled', stop_requested_at = $1, start_pending_at = NULL,
+                 output = $3
+             WHERE id = $2 AND status = 'running' AND stopping_as IS NULL",
+        )
+        .bind(now)
+        .bind(run_id)
+        .bind(format!("superseded by run {by}"))
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+        if ours == 0 {
+            continue;
+        }
+        stop_run_tasks(tx, run_id, now).await?;
+        finish_stopped_run(tx, run_id, now).await?;
+        notify(&mut **tx, run_id).await?;
+        asked += 1;
+    }
+    Ok(asked)
+}
+
+/// Write the event that says tasks of `run_id` were put back to run again
+/// ([`RunAgain::event`]), in the transaction that puts them back.
+#[cfg(feature = "ops")]
+async fn insert_run_again(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: &str,
+    by: crate::models::RunAgain,
+    tasks: u64,
+    task_id: Option<&str>,
+    now: &str,
+) -> Result<()> {
+    let (event_type, payload) = by.event(run_id, tasks, task_id);
+    sqlx::query(
+        "INSERT INTO event_outbox
+           (id, run_id, event_type, payload, status, attempts, next_attempt_at, created_at)
+         VALUES ($1, $2, $3, $4, 'pending', 0, $5, $6)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(run_id)
+    .bind(event_type)
+    .bind(&payload)
+    .bind(now)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Resurrect a failed/cancelled task from the management API (a retry).
 ///
 /// Unlike [`retry_task`], this carries NO worker fence — a human retrying a dead
-/// task has no claim to match. Resets the task to `ready` (version bumped so any
-/// late stale worker is fenced off) and re-arms the run if it had already been
-/// finalized to `failed`. Phase 1 retries only this task; cascade-retry of
-/// downstream tasks the failure cancelled is deferred. Returns false if the task
-/// was not in a retryable (`failed`/`cancelled`) state.
-#[allow(dead_code)] // consumed by dagron-api (management API), not the engine binary
+/// task has no claim to match. Resets the task to `ready`, queued now (version
+/// bumped so any late stale worker is fenced off), and sets its run running
+/// again if it had ended, failed or cancelled: a run whose task is about to
+/// run is a running run. Only this task is retried; what its failure
+/// cancelled downstream is a rerun's or a clear's to bring back. The attempt
+/// it replaces is kept, the concurrency key is asked if the run had ended,
+/// and an event is written (see "Running again", above).
+///
+/// `false` if the task is not in a retryable (`failed`/`cancelled`) state.
+/// [`MaxActiveRunsReached`](crate::models::MaxActiveRunsReached) if its run had
+/// ended and its key is full: then nothing is written.
+#[cfg(feature = "ops")]
 pub async fn retry_task_from_ui(pool: &Pool, task_id: &str) -> Result<bool> {
+    retry_task_from_ui_by(pool, task_id, None).await
+}
+
+/// [`retry_task_from_ui`], saying who asked for it (`reset_by`): the person
+/// dagron-api was asked by, from whom a gate put back to ask again takes no
+/// approval where it is `not_triggerer`.
+#[cfg(feature = "ops")]
+pub async fn retry_task_from_ui_by(pool: &Pool, task_id: &str, who: Option<&str>) -> Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
     let mut tx = pool.begin().await?;
+
+    let run_id: Option<String> = sqlx::query_scalar("SELECT run_id FROM task_runs WHERE id = $1")
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(run_id) = run_id else {
+        tx.commit().await?;
+        return Ok(false);
+    };
+    let cap = lock_run_cap(&mut tx, &run_id).await?;
+    keep_replaced(&mut tx, Reset::Task { task_id }, crate::models::RunAgain::Retry.reason(), &now).await?;
 
     let updated = sqlx::query(
         "UPDATE task_runs
          SET status = 'ready',
              claimed_by = NULL,
              lease_expires_at = NULL,
-             scheduled_at = NULL,
+             scheduled_at = $3,
+             finished_at = NULL,
              output = NULL,
-             log = NULL,
+             log = NULL, log_fence = NULL, log_gen = NULL,
+             -- As a worker's own retry clears them: the verdict says why the
+             -- row is failed, and a row about to run again is not.
+             fault_class = NULL,
+             fault_detail = NULL,
+             fault_confidence = NULL,
+             -- A rejected gate's decision is kept as an attempt of its
+             -- (`DECIDED_GATE`), and the gate asks again from nothing; what
+             -- parked a row last time goes as a rerun's reset has it go.
+             attempt_base = attempt_base
+                 + CASE WHEN attempt = 0 AND is_approval = 1 AND status IN ('succeeded', 'failed')
+                        THEN 1 ELSE 0 END,
+             sub_run_id = NULL, wake_at = NULL, wait_url = NULL,
+             wait_dataset = NULL, wait_dataset_cursor = NULL,
+             decided_by = NULL, decision_comment = NULL, cache_hit = FALSE,
+             reset_by = $2,
              version = version + 1
-         WHERE id = $1 AND status IN ('failed', 'cancelled')
-         RETURNING run_id",
+         WHERE id = $1 AND status IN ('failed', 'cancelled')",
     )
     .bind(task_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    let Some(updated) = updated else {
-        tx.commit().await?;
+    .bind(who)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if updated == 0 {
+        // Not retryable, or no longer: what was kept above goes with it.
+        tx.rollback().await?;
         return Ok(false);
-    };
-    let run_id: String = updated.try_get("run_id")?;
+    }
 
-    // Re-arm a run that was already finalized failed so the reconcile loop re-engages.
-    sqlx::query(
-        "UPDATE workflow_runs SET status = 'running', finished_at = NULL
-         WHERE id = $1 AND status = 'failed'",
+    let rearmed = sqlx::query(
+        "UPDATE workflow_runs SET status = 'running', finished_at = NULL,
+             queued_at = CASE WHEN admitted_at IS NULL THEN NULL ELSE queued_at END
+         WHERE id = $1 AND status IN ('failed', 'cancelled')",
     )
     .bind(&run_id)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if rearmed == 1 {
+        if let Some(cap) = &cap {
+            refuse_if_full(&mut tx, &run_id, cap).await?;
+        }
+        rearm_deadlines(&mut tx, &run_id).await?;
+    }
 
+    insert_run_again(&mut tx, &run_id, crate::models::RunAgain::Retry, 1, Some(task_id), &now).await?;
     notify(&mut *tx, &run_id).await?;
     tx.commit().await?;
     Ok(true)
@@ -3877,28 +5815,72 @@ pub async fn retry_task_from_ui(pool: &Pool, task_id: &str) -> Result<bool> {
 /// (`failed`/`cancelled`) state, or loses a concurrent-rerun race; otherwise
 /// `Some(n)` with the number of tasks reset. `version` is bumped to fence stale
 /// workers, and a `pg_notify` wakes idle peers the instant the run is re-armed.
+/// [`MaxActiveRunsReached`](crate::models::MaxActiveRunsReached) if the run's
+/// concurrency key is full: then nothing is written. The attempts it replaces
+/// are kept and an event is written (see "Running again", above).
 #[cfg(feature = "ops")]
 pub async fn rerun_from_failed(pool: &Pool, run_id: &str) -> Result<Option<u64>> {
-    let now = chrono::Utc::now().to_rfc3339();
+    rerun_from_failed_as(pool, run_id, crate::models::RunAgain::Rerun).await
+}
+
+/// [`rerun_from_failed`], saying what asked for it: a person's rerun, or the
+/// engine's own ([`RunAgain::AutoRerun`](crate::models::RunAgain::AutoRerun)),
+/// whose event keeps its own type.
+#[cfg(feature = "ops")]
+pub async fn rerun_from_failed_as(
+    pool: &Pool,
+    run_id: &str,
+    by: crate::models::RunAgain,
+) -> Result<Option<u64>> {
     let mut tx = pool.begin().await?;
+    let reset = rerun_from_failed_in(&mut tx, run_id, by, None).await?;
+    tx.commit().await?;
+    Ok(reset)
+}
+
+/// [`rerun_from_failed_as`] inside the caller's transaction, for a caller
+/// with a write of its own to land with the rerun or not at all (dagron-api's
+/// `params` override of the reset tasks' input). The caller commits. It must
+/// hold no row lock of this run when it calls: the admission lock is taken
+/// first here, as by the other two. `who` is the person dagron-api was asked
+/// by, recorded on each task put back (`reset_by`).
+#[cfg(feature = "ops")]
+pub async fn rerun_from_failed_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: &str,
+    by: crate::models::RunAgain,
+    who: Option<&str>,
+) -> Result<Option<u64>> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let cap = lock_run_cap(tx, run_id).await?;
 
     // Re-arm the run as the atomic gate. This guarded UPDATE serializes concurrent
     // reruns: the row lock blocks a second tx until the first commits, after which
     // the status is already 'running' and it matches zero rows. A miss (run absent,
     // not rerunnable, or a lost race) → `None`, so no caller reports a false success.
+    // A run that was cancelled as it waited for its key was never let in, and
+    // its tasks are put back below with the dependencies they have: it does
+    // not wait now, and `admit_waiting_runs` must not take it for one that
+    // does. The same holds for the two other statements that set a run
+    // running again.
     let armed = sqlx::query(
         "UPDATE workflow_runs
-         SET status = 'running', finished_at = NULL, output = NULL
+         SET status = 'running', finished_at = NULL, output = NULL,
+             queued_at = CASE WHEN admitted_at IS NULL THEN NULL ELSE queued_at END
          WHERE id = $1 AND status IN ('failed', 'cancelled')",
     )
     .bind(run_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?
     .rows_affected();
     if armed == 0 {
-        tx.commit().await?;
         return Ok(None);
     }
+    if let Some(cap) = &cap {
+        refuse_if_full(tx, run_id, cap).await?;
+    }
+    rearm_deadlines(tx, run_id).await?;
+    keep_replaced(tx, Reset::BrokenCone { run_id }, by.reason(), &now).await?;
 
     // Reset the broken cone (failed, cancelled, and rule-skipped tasks) in two
     // statements so the remaining_deps recompute sees the post-reset statuses —
@@ -3907,11 +5889,18 @@ pub async fn rerun_from_failed(pool: &Pool, run_id: &str) -> Result<Option<u64>>
     let reset = sqlx::query(
         "UPDATE task_runs
          SET status = 'pending',
+             -- The round's attempts join the task's count for its life, which
+             -- is what its kept attempts are numbered by, and the round starts
+             -- again from none: the task has its `max_attempts` once more. A
+             -- rejected gate's decision counts as one (`DECIDED_GATE`).
+             attempt_base = attempt_base
+                 + CASE WHEN attempt = 0 AND is_approval = 1 AND status IN ('succeeded', 'failed')
+                        THEN 1 ELSE attempt END,
              attempt = 0,
              claimed_by = NULL,
              lease_expires_at = NULL,
              output = NULL,
-             log = NULL,
+             log = NULL, log_fence = NULL, log_gen = NULL,
              finished_at = NULL,
              -- The fault verdict describes why this row is *currently* failed.
              -- A row being reset to run again is not failed, so the previous
@@ -3932,13 +5921,20 @@ pub async fn rerun_from_failed(pool: &Pool, run_id: &str) -> Result<Option<u64>>
              external_deadline_at = NULL,
              next_poll_at = NULL,
              external_epoch = external_epoch + 1,
+             -- What parked the row last time, and who decided it, as a whole
+             -- rerun's reset has them go (see the clear's).
+             sub_run_id = NULL, wake_at = NULL, wait_url = NULL,
+             wait_dataset = NULL, wait_dataset_cursor = NULL,
+             decided_by = NULL, decision_comment = NULL, cache_hit = FALSE,
+             reset_by = $3,
              scheduled_at = $1,
              version = version + 1
          WHERE run_id = $2 AND status IN ('failed', 'cancelled', 'skipped')",
     )
     .bind(&now)
     .bind(run_id)
-    .execute(&mut *tx)
+    .bind(who)
+    .execute(&mut **tx)
     .await?
     .rows_affected();
 
@@ -3953,11 +5949,144 @@ pub async fn rerun_from_failed(pool: &Pool, run_id: &str) -> Result<Option<u64>>
          WHERE run_id = $1 AND status = 'pending'",
     )
     .bind(run_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
-    notify(&mut *tx, run_id).await?;
+    insert_run_again(tx, run_id, by, reset, None, &now).await?;
+    notify(&mut **tx, run_id).await?;
+    Ok(Some(reset))
+}
+
+/// Rerun a run whole (`from: all`): every task of a run that has ended,
+/// succeeded, failed or cancelled, is put back, what succeeded included, and
+/// the run runs again from its first tasks, as GitHub's "Re-run all jobs"
+/// does. The same run, so the same id and trigger record.
+///
+/// As [`rerun_from_failed`] in all else: `None` when the run does not exist,
+/// has not ended, or loses a race with another rerun; `Some(n)` with the
+/// number of tasks reset; [`MaxActiveRunsReached`](crate::models::MaxActiveRunsReached)
+/// if its concurrency key is full, and then nothing is written;
+/// [`TeardownOwed`](crate::models::TeardownOwed), and nothing written, while a
+/// task of the run still owes the teardown of a remote job (a deferred task
+/// cancelled while its job ran). The attempts it replaces are kept, under
+/// `rerun`, and its `run.rerun` event says `"from": "all"` (see "Running
+/// again", above). Each task is reset as a clear resets one, its checkpoint
+/// dropped with the rest of its result: the run starts over, and resumes
+/// nothing. An approval gate asks again.
+#[cfg(feature = "ops")]
+pub async fn rerun_all(pool: &Pool, run_id: &str) -> Result<Option<u64>> {
+    let mut tx = pool.begin().await?;
+    let reset = rerun_all_in(&mut tx, run_id, None).await?;
     tx.commit().await?;
+    Ok(reset)
+}
+
+/// [`rerun_all`] inside the caller's transaction, as
+/// [`rerun_from_failed_in`] is for [`rerun_from_failed`]: for dagron-api's
+/// `params` override, written with it. The caller commits, and holds no row
+/// lock of this run when it calls. `who` is the person dagron-api was asked
+/// by (`reset_by`).
+#[cfg(feature = "ops")]
+pub async fn rerun_all_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: &str,
+    who: Option<&str>,
+) -> Result<Option<u64>> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let by = crate::models::RunAgain::RerunAll;
+    let cap = lock_run_cap(tx, run_id).await?;
+
+    // The gate, as a rerun from the failed tasks has it, and open to a run
+    // that succeeded too. It counts the rerun of every job (`whole_reruns`),
+    // by which a reader that counts runs tells it from a rerun of the failed
+    // ones.
+    let armed = sqlx::query(
+        "UPDATE workflow_runs
+         SET status = 'running', finished_at = NULL, output = NULL,
+             queued_at = CASE WHEN admitted_at IS NULL THEN NULL ELSE queued_at END,
+             whole_reruns = whole_reruns + 1
+         WHERE id = $1 AND status IN ('succeeded', 'failed', 'cancelled')",
+    )
+    .bind(run_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if armed == 0 {
+        return Ok(None);
+    }
+    if let Some(cap) = &cap {
+        refuse_if_full(tx, run_id, cap).await?;
+    }
+    refuse_if_teardown_owed(tx, run_id).await?;
+    rearm_deadlines(tx, run_id).await?;
+    keep_replaced(tx, Reset::Whole { run_id }, by.reason(), &now).await?;
+
+    // A runtime fan-out's instances are made from its producer's output, which
+    // runs again first: they go, edges first, as the barrier's next expansion
+    // would drop them (`reconcile_fanouts`). Kept, a barrier would be judged
+    // by the last run's instances before it is expanded again, and wait for a
+    // failed one forever.
+    sqlx::query(
+        "DELETE FROM task_dependencies
+         WHERE dependency_id IN (
+                   SELECT id FROM task_runs WHERE run_id = $1 AND fanout_parent IS NOT NULL)
+            OR dependent_id IN (
+                   SELECT id FROM task_runs WHERE run_id = $1 AND fanout_parent IS NOT NULL)",
+    )
+    .bind(run_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM task_runs WHERE run_id = $1 AND fanout_parent IS NOT NULL")
+        .bind(run_id)
+        .execute(&mut **tx)
+        .await?;
+
+    // Every other task, as a clear resets one (see there for each column).
+    let reset = sqlx::query(
+        "UPDATE task_runs
+         SET status = 'pending',
+             attempt_base = attempt_base
+                 + CASE WHEN attempt = 0 AND is_approval = 1 AND status IN ('succeeded', 'failed')
+                        THEN 1 ELSE attempt END,
+             attempt = 0,
+             claimed_by = NULL, lease_expires_at = NULL,
+             output = NULL, log = NULL, log_fence = NULL, log_gen = NULL, finished_at = NULL, scheduled_at = $1, version = version + 1,
+             checkpoint_uri = NULL, checkpoint_marker = NULL,
+             external_kind = NULL, external_handle = NULL, external_endpoint = NULL,
+             external_deadline_at = NULL, next_poll_at = NULL,
+             external_epoch = external_epoch + 1,
+             fault_class = NULL, fault_detail = NULL, fault_confidence = NULL,
+             sub_run_id = NULL, wake_at = NULL, wait_url = NULL,
+             wait_dataset = NULL, wait_dataset_cursor = NULL,
+             decided_by = NULL, decision_comment = NULL, cache_hit = FALSE,
+             reset_by = $3
+         WHERE run_id = $2 AND fanout_parent IS NULL
+           AND status IN ('succeeded', 'failed', 'skipped', 'cancelled')",
+    )
+    .bind(&now)
+    .bind(run_id)
+    .bind(who)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+
+    // Each task waits for each of its dependencies again, all of them pending.
+    sqlx::query(
+        "UPDATE task_runs
+         SET remaining_deps = (
+                 SELECT COUNT(*) FROM task_dependencies d
+                 JOIN task_runs dep ON dep.id = d.dependency_id
+                 WHERE d.dependent_id = task_runs.id
+                   AND dep.status NOT IN ('succeeded', 'skipped')
+             )
+         WHERE run_id = $1 AND status = 'pending'",
+    )
+    .bind(run_id)
+    .execute(&mut **tx)
+    .await?;
+
+    insert_run_again(tx, run_id, by, reset, None, &now).await?;
+    notify(&mut **tx, run_id).await?;
     Ok(Some(reset))
 }
 
@@ -3984,14 +6113,30 @@ pub async fn task_exists(pool: &Pool, run_id: &str, task_id: &str) -> Result<boo
 /// of tasks reset, or `None` if the target doesn't exist in the run or isn't in
 /// a terminal state (a running/pending task can't be cleared — `409`). See the
 /// SQLite copy for the full rationale; a `pg_notify` wakes idle peers on commit.
+/// [`MaxActiveRunsReached`](crate::models::MaxActiveRunsReached) if the run had
+/// ended and its concurrency key is full: then nothing is written. The attempts
+/// it replaces are kept and an event is written (see "Running again", above).
 #[cfg(feature = "ops")]
 pub async fn clear_task_with_downstream(
     pool: &Pool,
     run_id: &str,
     task_id: &str,
 ) -> Result<Option<u64>> {
+    clear_task_with_downstream_by(pool, run_id, task_id, None).await
+}
+
+/// [`clear_task_with_downstream`], saying who asked for it (`reset_by`), as
+/// [`retry_task_from_ui_by`] does.
+#[cfg(feature = "ops")]
+pub async fn clear_task_with_downstream_by(
+    pool: &Pool,
+    run_id: &str,
+    task_id: &str,
+    who: Option<&str>,
+) -> Result<Option<u64>> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = pool.begin().await?;
+    let cap = lock_run_cap(&mut tx, run_id).await?;
 
     let status: Option<String> =
         sqlx::query_scalar("SELECT status FROM task_runs WHERE id = $1 AND run_id = $2")
@@ -4007,6 +6152,13 @@ pub async fn clear_task_with_downstream(
         tx.commit().await?;
         return Ok(None); // only a completed task can be cleared
     }
+    keep_replaced(
+        &mut tx,
+        Reset::Cone { run_id, task_id },
+        crate::models::RunAgain::Clear.reason(),
+        &now,
+    )
+    .await?;
 
     // Reset the target + its transitive downstream cone (terminal tasks only).
     let reset = sqlx::query(
@@ -4017,8 +6169,14 @@ pub async fn clear_task_with_downstream(
              JOIN cone c ON td.dependency_id = c.id
          )
          UPDATE task_runs
-         SET status = 'pending', attempt = 0, claimed_by = NULL, lease_expires_at = NULL,
-             output = NULL, log = NULL, finished_at = NULL, scheduled_at = $3, version = version + 1,
+         SET status = 'pending',
+             -- A decided gate's decision counts as an attempt (`DECIDED_GATE`).
+             attempt_base = attempt_base
+                 + CASE WHEN attempt = 0 AND is_approval = 1 AND status IN ('succeeded', 'failed')
+                        THEN 1 ELSE attempt END,
+             attempt = 0,
+             claimed_by = NULL, lease_expires_at = NULL,
+             output = NULL, log = NULL, log_fence = NULL, log_gen = NULL, finished_at = NULL, scheduled_at = $3, version = version + 1,
              checkpoint_uri = NULL, checkpoint_marker = NULL,
              -- …and for the same reason a cleared deferred row drops its remote
              -- handle and takes a fresh epoch: the next submit must start a new
@@ -4029,13 +6187,22 @@ pub async fn clear_task_with_downstream(
              -- Same reason as `retry_task` and `rerun_from_failed`: a cleared
              -- row is not a failed row, so it must not carry a failed row's
              -- verdict into whatever happens next.
-             fault_class = NULL, fault_detail = NULL, fault_confidence = NULL
+             fault_class = NULL, fault_detail = NULL, fault_confidence = NULL,
+             -- What parked the row last time, and who decided it: a cleared
+             -- row is parked again, and a gate asks again, from nothing. Left,
+             -- a sweep could resolve the row from its last child run or its
+             -- last deadline between its claim and its park.
+             sub_run_id = NULL, wake_at = NULL, wait_url = NULL,
+             wait_dataset = NULL, wait_dataset_cursor = NULL,
+             decided_by = NULL, decision_comment = NULL, cache_hit = FALSE,
+             reset_by = $4
          WHERE id IN (SELECT id FROM cone)
            AND status IN ('succeeded', 'failed', 'skipped', 'cancelled')",
     )
     .bind(task_id)
     .bind(run_id)
     .bind(&now)
+    .bind(who)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -4060,14 +6227,23 @@ pub async fn clear_task_with_downstream(
     .await?;
 
     // Re-arm a run that had finished so the reconcile loop resumes.
-    sqlx::query(
-        "UPDATE workflow_runs SET status = 'running', finished_at = NULL, output = NULL
+    let rearmed = sqlx::query(
+        "UPDATE workflow_runs SET status = 'running', finished_at = NULL, output = NULL,
+             queued_at = CASE WHEN admitted_at IS NULL THEN NULL ELSE queued_at END
          WHERE id = $1 AND status IN ('succeeded', 'failed', 'cancelled')",
     )
     .bind(run_id)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if rearmed == 1 {
+        if let Some(cap) = &cap {
+            refuse_if_full(&mut tx, run_id, cap).await?;
+        }
+        rearm_deadlines(&mut tx, run_id).await?;
+    }
 
+    insert_run_again(&mut tx, run_id, crate::models::RunAgain::Clear, reset, Some(task_id), &now).await?;
     notify(&mut *tx, run_id).await?;
     tx.commit().await?;
     Ok(Some(reset))
@@ -4499,18 +6675,91 @@ pub async fn count_active_tasks(pool: &Pool) -> Result<i64> {
 /// one to `succeeded`/`failed`. The terminal `UPDATE` is guarded with
 /// `status = 'running'`, so when several schedulers race only one finalizes a
 /// given run. Returns the runs newly transitioned to terminal (for logging).
+///
+/// It joins every running run to all its tasks, so its cost grows with what
+/// is running. A reconcile loop that knows which runs changed asks for those
+/// alone ([`reap_woken`]), and covers the rest a slice at a time
+/// ([`reap_slice`]).
 pub async fn reap_completed_runs(pool: &Pool) -> Result<Vec<(String, RunStatus)>> {
-    // Group by (status, allow_failure) so a `failed` task with allow_failure=1
-    // counts as terminal but does not fail the run (fast-win #11).
-    let rows = sqlx::query(
-        "SELECT wr.id AS run_id, tr.status AS status, tr.allow_failure AS allow_failure, COUNT(*) AS cnt
-         FROM workflow_runs wr
-         JOIN task_runs tr ON tr.run_id = wr.id
-         WHERE wr.status = 'running'
-         GROUP BY wr.id, tr.status, tr.allow_failure",
+    reap(pool, None).await
+}
+
+/// Finalize the runs a reconcile loop was told of, where their tasks are all
+/// terminal: every running run for [`Woken::All`], and for [`Woken::Runs`]
+/// those alone, by their keys, whatever else is running.
+pub async fn reap_woken(pool: &Pool, woken: &Woken) -> Result<Vec<(String, RunStatus)>> {
+    match woken {
+        Woken::All => reap(pool, None).await,
+        Woken::Runs(runs) if runs.is_empty() => Ok(Vec::new()),
+        Woken::Runs(runs) => reap(pool, Some(runs)).await,
+    }
+}
+
+/// Finalize what is complete among the next `limit` running runs after
+/// `after`, in the order of their ids, and say where the next slice starts:
+/// `None` when this one reached the end, so the next begins again.
+///
+/// The safety net under [`reap_woken`]: a run whose last task ended with a
+/// notification nobody took is finalized when its slice comes round. A slice
+/// is bounded, so a pass costs the same whatever is running, and passes cover
+/// every running run in turn.
+pub async fn reap_slice(
+    pool: &Pool,
+    after: Option<&str>,
+    limit: i64,
+) -> Result<(Vec<(String, RunStatus)>, Option<String>)> {
+    let runs: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM workflow_runs
+          WHERE status = 'running' AND stopping_as IS NULL AND id > $1
+          ORDER BY id
+          LIMIT $2",
     )
+    .bind(after.unwrap_or(""))
+    .bind(limit)
     .fetch_all(pool)
     .await?;
+    let next = if (runs.len() as i64) < limit {
+        None
+    } else {
+        runs.last().cloned()
+    };
+    if runs.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+    Ok((reap(pool, Some(&runs)).await?, next))
+}
+
+/// The reap itself: of every running run, or of `only` these.
+async fn reap(pool: &Pool, only: Option<&[String]>) -> Result<Vec<(String, RunStatus)>> {
+    // Group by (status, allow_failure) so a `failed` task with allow_failure=1
+    // counts as terminal but does not fail the run (fast-win #11).
+    let rows = match only {
+        None => {
+            sqlx::query(
+                "SELECT wr.id AS run_id, tr.status AS status, tr.allow_failure AS allow_failure, COUNT(*) AS cnt
+                 FROM workflow_runs wr
+                 JOIN task_runs tr ON tr.run_id = wr.id
+                 WHERE wr.status = 'running' AND wr.stopping_as IS NULL
+                 GROUP BY wr.id, tr.status, tr.allow_failure",
+            )
+            .fetch_all(pool)
+            .await?
+        }
+        // The same question of the named runs alone: each is found by its
+        // key, and its tasks by their run's index.
+        Some(runs) => {
+            sqlx::query(
+                "SELECT wr.id AS run_id, tr.status AS status, tr.allow_failure AS allow_failure, COUNT(*) AS cnt
+                 FROM workflow_runs wr
+                 JOIN task_runs tr ON tr.run_id = wr.id
+                 WHERE wr.id = ANY($1) AND wr.status = 'running' AND wr.stopping_as IS NULL
+                 GROUP BY wr.id, tr.status, tr.allow_failure",
+            )
+            .bind(runs)
+            .fetch_all(pool)
+            .await?
+        }
+    };
 
     struct Agg {
         total: i64,
@@ -4536,11 +6785,42 @@ pub async fn reap_completed_runs(pool: &Pool) -> Result<Vec<(String, RunStatus)>
             _ => {}
         }
     }
+    // A run with no task at all (each one a `when:` of its parameters left
+    // out) has nothing to wait for: it is complete, and succeeded. A run's
+    // tasks are made in the transaction that makes it, so none is a run
+    // whose tasks are yet to come. One that waits for its turn at a full cap
+    // (`when_full: queue`) ends once it is let in, in the order it came.
+    let empty: Vec<String> = match only {
+        None => {
+            sqlx::query_scalar(
+                "SELECT wr.id FROM workflow_runs wr
+                 WHERE wr.status = 'running' AND wr.stopping_as IS NULL
+                   AND (wr.queued_at IS NULL OR wr.admitted_at IS NOT NULL)
+                   AND NOT EXISTS (SELECT 1 FROM task_runs tr WHERE tr.run_id = wr.id)",
+            )
+            .fetch_all(pool)
+            .await?
+        }
+        Some(only) => {
+            sqlx::query_scalar(
+                "SELECT wr.id FROM workflow_runs wr
+                 WHERE wr.id = ANY($1) AND wr.status = 'running' AND wr.stopping_as IS NULL
+                   AND (wr.queued_at IS NULL OR wr.admitted_at IS NOT NULL)
+                   AND NOT EXISTS (SELECT 1 FROM task_runs tr WHERE tr.run_id = wr.id)",
+            )
+            .bind(only)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+    for run_id in empty {
+        runs.entry(run_id).or_insert(Agg { total: 0, terminal: 0, failed: 0 });
+    }
 
     let now = chrono::Utc::now().to_rfc3339();
     let mut finalized = Vec::new();
     for (run_id, agg) in runs {
-        if agg.total == 0 || agg.terminal < agg.total {
+        if agg.terminal < agg.total {
             continue;
         }
         let (status, status_str) = if agg.failed > 0 {
@@ -4550,9 +6830,17 @@ pub async fn reap_completed_runs(pool: &Pool) -> Result<Vec<(String, RunStatus)>
         };
         // Finalize the run and append its outbox event in ONE transaction, so the
         // event exists iff the finalization commits (transactional outbox).
+        //
+        // `completion_pending_at` is cleared because the end-of-run work is
+        // this end's event's. A stamp can only be here if a run a release
+        // before 10.7 ended outside the reaper was rerun before any tick
+        // claimed it; that end is superseded by this one. `start_pending_at` is cleared because
+        // a start never announced is moot once the run has ended.
         let mut tx = pool.begin().await?;
         let affected = sqlx::query(
-            "UPDATE workflow_runs SET status = $1, finished_at = $2 WHERE id = $3 AND status = 'running'",
+            "UPDATE workflow_runs
+             SET status = $1, finished_at = $2, completion_pending_at = NULL, start_pending_at = NULL
+             WHERE id = $3 AND status = 'running'",
         )
         .bind(status_str)
         .bind(&now)
@@ -4577,19 +6865,7 @@ pub async fn reap_completed_runs(pool: &Pool) -> Result<Vec<(String, RunStatus)>
                 .execute(&mut *tx)
                 .await?;
             }
-            let payload = serde_json::json!({ "run_id": run_id, "status": status_str }).to_string();
-            sqlx::query(
-                "INSERT INTO event_outbox
-                   (id, run_id, event_type, payload, status, attempts, next_attempt_at, created_at)
-                 VALUES ($1, $2, 'run.completed', $3, 'pending', 0, $4, $5)",
-            )
-            .bind(uuid::Uuid::new_v4().to_string())
-            .bind(&run_id)
-            .bind(&payload)
-            .bind(&now)
-            .bind(&now)
-            .execute(&mut *tx)
-            .await?;
+            insert_run_completed(&mut tx, &run_id, status_str, &now).await?;
             tx.commit().await?;
             finalized.push((run_id, status));
         } else {
@@ -4598,6 +6874,100 @@ pub async fn reap_completed_runs(pool: &Pool) -> Result<Vec<(String, RunStatus)>
         }
     }
     Ok(finalized)
+}
+
+/// Append `run_id`'s `run.completed` event to the outbox inside `tx`, the
+/// transaction that ends the run, so the event exists iff the end commits.
+/// Every path that ends a run writes it: the reaper, [`cancel_run`] and
+/// [`cancel_overdue_runs`]. The payload is `{"run_id", "status"}` on all three.
+async fn insert_run_completed(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: &str,
+    status: &str,
+    now: &str,
+) -> Result<()> {
+    let payload = serde_json::json!({ "run_id": run_id, "status": status }).to_string();
+    sqlx::query(
+        "INSERT INTO event_outbox
+           (id, run_id, event_type, payload, status, attempts, next_attempt_at, created_at)
+         VALUES ($1, $2, 'run.completed', $3, 'pending', 0, $4, $5)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(run_id)
+    .bind(&payload)
+    .bind(now)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Claim up to `limit` runs that a release before 10.7 ended outside the
+/// reaper and that still owe their end-of-run work: cancelled through either
+/// API, or failed by the `run_timeout_secs` sweep, which stamped
+/// `completion_pending_at`. Nothing stamps a run now: its `run.completed`
+/// event is owed to the engine's end-of-run sinks. The claim clears the stamp, and `SKIP LOCKED` lets replicas claim side by side, so
+/// each run is returned to exactly one caller, which then runs the work the
+/// reaper's own process runs for a run that finished.
+///
+/// A stamped run that is `running` again (rerun before any tick claimed it) is
+/// left alone: its end was superseded, and its next end is owed instead.
+pub async fn claim_pending_completions(
+    pool: &Pool,
+    limit: i64,
+) -> Result<Vec<(String, RunStatus)>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "UPDATE workflow_runs SET completion_pending_at = NULL
+         WHERE id IN (
+             SELECT id FROM workflow_runs
+             WHERE completion_pending_at IS NOT NULL
+               AND status IN ('succeeded', 'failed', 'cancelled')
+             ORDER BY completion_pending_at
+             LIMIT $1
+             FOR UPDATE SKIP LOCKED
+         )
+         RETURNING id, status",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|(id, status)| Ok((id, status.parse()?)))
+        .collect()
+}
+
+/// Claim up to `limit` running runs whose start is still to be announced:
+/// created with a `notify.git` block (`start_pending_at`), and no `pending`
+/// commit status posted for them yet. The claim clears the stamp, and `SKIP
+/// LOCKED` lets replicas claim side by side, so each run is announced by
+/// exactly one caller. A run that has already ended is never returned: its end
+/// cleared the stamp.
+pub async fn claim_pending_starts(pool: &Pool, limit: i64) -> Result<Vec<String>> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "UPDATE workflow_runs SET start_pending_at = NULL
+         WHERE id IN (
+             SELECT id FROM workflow_runs
+             WHERE start_pending_at IS NOT NULL AND status = 'running'
+             ORDER BY start_pending_at
+             LIMIT $1
+             FOR UPDATE SKIP LOCKED
+         )
+         RETURNING id",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(ids)
+}
+
+/// A run's status, or `None` when there is no such run.
+pub async fn run_status(pool: &Pool, run_id: &str) -> Result<Option<RunStatus>> {
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM workflow_runs WHERE id = $1")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await?;
+    status.map(|s| s.parse()).transpose()
 }
 
 /// The workflow definition's name for a run (for lineage / display), if found.
@@ -4626,6 +6996,27 @@ pub async fn workflow_name_for_task(pool: &Pool, task_id: &str) -> Result<Option
     .fetch_optional(pool)
     .await?;
     Ok(name)
+}
+
+/// A task's name and attempt, with its workflow's name where its run has
+/// one: what a build output's provenance says made it. The attempt is
+/// numbered by the task's count for its life (`attempt_base + attempt`), as
+/// its kept attempts are: a task that runs again after a rerun or a clear
+/// does not give a second build the number of the first.
+pub async fn task_in_workflow(
+    pool: &Pool,
+    task_id: &str,
+) -> Result<Option<(String, i64, Option<String>)>> {
+    let row: Option<(String, i64, Option<String>)> = sqlx::query_as(
+        "SELECT tr.name, tr.attempt_base + tr.attempt, d.name FROM task_runs tr
+         LEFT JOIN workflow_runs wr ON wr.id = tr.run_id
+         LEFT JOIN workflow_definitions d ON d.id = wr.definition_id
+         WHERE tr.id = $1",
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
 }
 
 /// Look up a memoized task result (#22): the cached output when a memo exists for
@@ -4704,6 +7095,80 @@ pub async fn spec_for_run(pool: &Pool, run_id: &str) -> Result<Option<String>> {
     Ok(row.map(|r| r.0))
 }
 
+/// How many tasks `run_id` has: every row of it, as it is now. A run grows
+/// where a task fans out over what another printed.
+pub async fn run_task_count(pool: &Pool, run_id: &str) -> Result<i64> {
+    let tasks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_runs WHERE run_id = $1")
+        .bind(run_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(tasks)
+}
+
+/// What started `run_id`, as it was recorded when the run was made
+/// (`run_triggers`). `None` for a run with no record: one made before every
+/// run had one, or a run that does not exist.
+pub async fn run_trigger(pool: &Pool, run_id: &str) -> Result<Option<crate::models::RunTrigger>> {
+    #[allow(clippy::type_complexity)]
+    let row: Option<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT kind, principal, actor, trust, source, forge_host, repo, ref, sha, base_sha, pr, event_id
+         FROM run_triggers WHERE run_id = $1",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(
+        |(kind, principal, actor, trust, source, forge_host, repo, git_ref, sha, base_sha, pr, event_id)| {
+            crate::models::RunTrigger {
+                kind,
+                principal,
+                actor,
+                trust,
+                source,
+                forge_host,
+                repo,
+                git_ref,
+                sha,
+                base_sha,
+                pr,
+                event_id,
+            }
+        },
+    ))
+}
+
+/// The parameters `run_id` was created with: the spec's defaults with the
+/// caller's overrides merged over them (`DagGraph::parameters`). `None` when
+/// the run does not exist, or predates the column, so a caller falls back to
+/// the spec's own defaults, which is all such a run ever had.
+pub async fn run_parameters(
+    pool: &Pool,
+    run_id: &str,
+) -> Result<Option<std::collections::BTreeMap<String, String>>> {
+    let raw: Option<Option<String>> =
+        sqlx::query_scalar("SELECT parameters FROM workflow_runs WHERE id = $1")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await?;
+    match raw.flatten() {
+        Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+        None => Ok(None),
+    }
+}
+
 /// Read a dagron-api-owned `ui_settings` value (e.g. the instance-wide
 /// notification defaults). The table may not exist on engine-only deployments;
 /// callers should treat an `Err` as "no setting".
@@ -4778,86 +7243,377 @@ pub async fn environment_secret(
     Ok(row.map(|r| r.0))
 }
 
-// ── Transactional outbox: drain API (for the delivery worker) ──────────────────
+/// The policy of the environment `name` ([`crate::envpolicy`]): which runs
+/// may use it. `None` where it has none, and where there is no such
+/// environment: both have the default policy, which admits `trusted` runs
+/// alone. A stored policy that cannot be read is an error, never "none": a
+/// row someone wrote to close an environment must not read as an open one.
+pub async fn environment_policy(
+    pool: &Pool,
+    name: &str,
+) -> Result<Option<crate::envpolicy::EnvironmentPolicy>> {
+    type Row = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT p.allowed_trust, p.allowed_refs, p.allowed_pipelines,
+                p.allowed_identity, p.approvers
+           FROM environment_policies p
+           JOIN environments e ON e.id = p.environment_id
+          WHERE e.name = $1",
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+    let Some((trust, refs, pipelines, identity, approvers)) = row else {
+        return Ok(None);
+    };
+    let list = |field: &str, json: &str| -> Result<Vec<String>> {
+        serde_json::from_str(json).map_err(|e| {
+            anyhow::anyhow!("environment '{name}': its policy's {field} is not a list: {e}")
+        })
+    };
+    Ok(Some(crate::envpolicy::EnvironmentPolicy {
+        allowed_trust: list("allowed_trust", &trust)?,
+        allowed_refs: refs
+            .as_deref()
+            .map(|j| list("allowed_refs", j))
+            .transpose()?,
+        allowed_pipelines: pipelines
+            .as_deref()
+            .map(|j| list("allowed_pipelines", j))
+            .transpose()?,
+        allowed_identity: identity
+            .as_deref()
+            .map(|j| list("allowed_identity", j))
+            .transpose()?
+            .unwrap_or_default(),
+        approvers: approvers
+            .as_deref()
+            .map(|j| list("approvers", j))
+            .transpose()?
+            .unwrap_or_default(),
+    }))
+}
 
-/// Claim up to `limit` due, pending outbox events for delivery with
-/// `FOR UPDATE SKIP LOCKED` (coordination-free, like task claiming), deferring
-/// each by `lease_secs` so a concurrent worker won't grab the same event
-/// mid-delivery. At-least-once: a crashed worker's lease lapses and the event is
-/// re-claimed.
+// ── Transactional outbox: drain API, a sink at a time ─────────────────────────
+//
+// Each consumer of the outbox is a sink ([`super::OutboxSink`])
+// with its own delivery state of each event, in `outbox_deliveries`: a sink
+// is first handed an event by [`outbox_enroll`], then claims, leases and
+// marks its own row of it exactly as the single-consumer outbox did its row
+// of `event_outbox`. What one sink does with an event is no other's concern.
+
+/// Name `sink` a consumer of the outbox, if it is not one yet: from now on it
+/// is handed every event written, of its types, and where it
+/// [`adopts_legacy`](super::OutboxSink::adopts_legacy) also those the
+/// single-consumer outbox held pending when this release's migration ran. A sink is also registered by
+/// its first enrolment; registering one first is how a process says that the
+/// events written from here on are its, before it drains any of them.
+pub async fn register_outbox_sink(pool: &Pool, sink: &super::OutboxSink<'_>) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    if sink.adopts_legacy {
+        // What the single-consumer outbox held pending when this release's
+        // migration ran (`outbox_epoch`), handed before the sink is named,
+        // and only while it is not: a replica that registers it again finds
+        // it named and adopts nothing.
+        sqlx::query(
+            "INSERT INTO outbox_deliveries (outbox_id, sink, status, attempts, next_attempt_at)
+             SELECT e.id, $1, 'pending', 0, e.created_at
+             FROM event_outbox e, outbox_epoch w
+             WHERE e.status = 'pending' AND e.created_at < w.per_sink_since
+               AND ($2::jsonb = '[]'::jsonb OR e.event_type IN (SELECT jsonb_array_elements_text($2::jsonb)))
+               AND NOT EXISTS (SELECT 1 FROM outbox_sinks s WHERE s.sink = $1)
+             ON CONFLICT (outbox_id, sink) DO NOTHING",
+        )
+        .bind(sink.name)
+        .bind(super::outbox_types_json(sink))
+        .execute(pool)
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO outbox_sinks (sink, since, cursor, registered_at) VALUES ($1, $2, $2, $2)
+         ON CONFLICT (sink) DO NOTHING",
+    )
+    .bind(sink.name)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    if sink.wants_tasks() {
+        renew_task_events(pool, sink, None).await?;
+    }
+    Ok(())
+}
+
+/// Have task events written for `sink` a day more (`wants_tasks_until`),
+/// where it would otherwise run out within the day; `until` what it is now,
+/// where read.
+async fn renew_task_events(
+    pool: &Pool,
+    sink: &super::OutboxSink<'_>,
+    until: Option<&str>,
+) -> Result<()> {
+    if let Some(next) = super::outbox_task_events_renew(until, chrono::Utc::now()) {
+        sqlx::query(
+            "UPDATE outbox_sinks SET wants_tasks_until = $1
+             WHERE sink = $2 AND (wants_tasks_until IS NULL OR wants_tasks_until < $1)",
+        )
+        .bind(&next)
+        .bind(sink.name)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Hand `sink` the events written since it last looked, up to
+/// [`super::OUTBOX_ENROLL_ROWS`]: a `pending` row of `outbox_deliveries` for
+/// each, due at once. Returns how many. Replicas enrol side by side: an event
+/// is handed to a sink once, whichever enrols it.
+///
+/// It looks from its cursor less [`super::OUTBOX_LATE_COMMIT_SECS`], for an
+/// event written with an earlier time than one already handed but committed
+/// after it, so that a sink never reads the outbox back to its beginning.
+pub async fn outbox_enroll(pool: &Pool, sink: &super::OutboxSink<'_>) -> Result<u64> {
+    let now = chrono::Utc::now();
+    let (since, cursor) = outbox_sink_position(pool, sink).await?;
+    let from = super::outbox_enrol_from(&since, &cursor);
+    // The cursor goes by what was found, not by what this call inserted: a
+    // replica enrolling the same sink may have inserted some or all of them
+    // first, and a batch it filled is still a full one.
+    let (found, latest, enrolled): (i64, Option<String>, i64) = sqlx::query_as(
+        "WITH found AS (
+             SELECT e.id, e.created_at FROM event_outbox e
+             WHERE e.status = 'pending' AND e.created_at >= $2
+               AND (($3::jsonb = '[]'::jsonb AND e.event_type NOT LIKE 'task.%')
+                    OR e.event_type IN (SELECT jsonb_array_elements_text($3::jsonb)))
+               AND NOT EXISTS (SELECT 1 FROM outbox_deliveries d WHERE d.outbox_id = e.id AND d.sink = $1)
+             ORDER BY e.created_at, e.id
+             LIMIT $4
+         ), added AS (
+             INSERT INTO outbox_deliveries (outbox_id, sink, status, attempts, next_attempt_at)
+             SELECT id, $1, 'pending', 0, created_at FROM found
+             ON CONFLICT (outbox_id, sink) DO NOTHING
+             RETURNING 1
+         )
+         SELECT (SELECT COUNT(*) FROM found), (SELECT MAX(created_at) FROM found),
+                (SELECT COUNT(*) FROM added)",
+    )
+    .bind(sink.name)
+    .bind(&from)
+    .bind(super::outbox_types_json(sink))
+    .bind(super::OUTBOX_ENROLL_ROWS)
+    .fetch_one(pool)
+    .await?;
+    let n = enrolled;
+    let next = super::outbox_next_cursor(latest, found, now);
+    if let Some(next) = next.filter(|next| super::outbox_cursor_moves(&cursor, next, found)) {
+        sqlx::query("UPDATE outbox_sinks SET cursor = $1 WHERE sink = $2 AND cursor < $1")
+            .bind(&next)
+            .bind(sink.name)
+            .execute(pool)
+            .await?;
+    }
+    Ok(n as u64)
+}
+
+/// Where `sink` enrols from, `(since, cursor)`, registering it first where
+/// it is new.
+async fn outbox_sink_position(
+    pool: &Pool,
+    sink: &super::OutboxSink<'_>,
+) -> Result<(String, String)> {
+    let read = || {
+        sqlx::query_as::<_, (String, String, Option<String>)>(
+            "SELECT since, cursor, wants_tasks_until FROM outbox_sinks WHERE sink = $1",
+        )
+        .bind(sink.name)
+        .fetch_optional(pool)
+    };
+    if let Some((since, cursor, until)) = read().await? {
+        // A sink that asks for task events is written them while it claims.
+        if sink.wants_tasks() {
+            renew_task_events(pool, sink, until.as_deref()).await?;
+        }
+        return Ok((since, cursor));
+    }
+    register_outbox_sink(pool, sink).await?;
+    let (since, cursor, _) = read().await?.expect("a sink just registered is there");
+    Ok((since, cursor))
+}
+
+/// Enrol `sink` ([`outbox_enroll`]), then claim up to `limit` of its due,
+/// pending events with `FOR UPDATE SKIP LOCKED` (coordination-free, like task
+/// claiming), deferring each by `lease_secs` so a concurrent worker of the
+/// same sink won't take the same event mid-delivery. At-least-once: a crashed
+/// worker's lease lapses and the event is claimed again.
 pub async fn claim_outbox_batch(
     pool: &Pool,
+    sink: &super::OutboxSink<'_>,
     limit: i64,
     lease_secs: i64,
 ) -> Result<Vec<crate::models::OutboxEvent>> {
+    Ok(claim_deliveries(pool, sink, limit, lease_secs)
+        .await?
+        .into_iter()
+        .map(|row| row.event)
+        .collect())
+}
+
+async fn claim_deliveries(
+    pool: &Pool,
+    sink: &super::OutboxSink<'_>,
+    limit: i64,
+    lease_secs: i64,
+) -> Result<Vec<OutboxUplinkRow>> {
+    outbox_enroll(pool, sink).await?;
     let now = chrono::Utc::now();
     let now_s = now.to_rfc3339();
-    let lease_until = (now + chrono::TimeDelta::seconds(lease_secs)).to_rfc3339();
+    let lease_until =
+        (now + chrono::TimeDelta::seconds(lease_secs.clamp(0, MAX_SPOOL_SECS))).to_rfc3339();
 
     let mut tx = pool.begin().await?;
     let rows = sqlx::query(
-        "SELECT id, run_id, event_type, payload, attempts FROM event_outbox
-         WHERE status = 'pending' AND next_attempt_at <= $1
-         ORDER BY next_attempt_at LIMIT $2
-         FOR UPDATE SKIP LOCKED",
+        "SELECT e.id, e.run_id, e.event_type, e.payload, d.attempts, e.created_at
+         FROM outbox_deliveries d JOIN event_outbox e ON e.id = d.outbox_id
+         WHERE d.sink = $1 AND d.status = 'pending' AND d.next_attempt_at <= $2
+         ORDER BY d.next_attempt_at LIMIT $3
+         FOR UPDATE OF d SKIP LOCKED",
     )
+    .bind(sink.name)
     .bind(&now_s)
     .bind(limit)
     .fetch_all(&mut *tx)
     .await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
-        let id: String = row.try_get("id")?;
-        sqlx::query("UPDATE event_outbox SET next_attempt_at = $1 WHERE id = $2")
-            .bind(&lease_until)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await?;
-        out.push(crate::models::OutboxEvent {
-            id,
-            run_id: row.try_get("run_id")?,
-            event_type: row.try_get("event_type")?,
-            payload: row.try_get("payload")?,
-            attempts: row.try_get("attempts")?,
+        out.push(OutboxUplinkRow {
+            event: crate::models::OutboxEvent {
+                id: row.try_get("id")?,
+                run_id: row.try_get("run_id")?,
+                event_type: row.try_get("event_type")?,
+                payload: row.try_get("payload")?,
+                attempts: row.try_get("attempts")?,
+                created_at: row.try_get("created_at")?,
+            },
+            created_at: row.try_get("created_at")?,
         });
     }
+    let ids: Vec<&str> = out.iter().map(|r| r.event.id.as_str()).collect();
+    sqlx::query(
+        "UPDATE outbox_deliveries SET next_attempt_at = $1 WHERE sink = $2 AND outbox_id = ANY($3)",
+    )
+    .bind(&lease_until)
+    .bind(sink.name)
+    .bind(&ids)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(out)
 }
 
-/// Mark an outbox event delivered.
-pub async fn mark_outbox_delivered(pool: &Pool, id: &str) -> Result<()> {
-    let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query("UPDATE event_outbox SET status = 'delivered', delivered_at = $1 WHERE id = $2 AND status = 'pending'")
-        .bind(&now)
-        .bind(id)
-        .execute(pool)
+/// Delete up to `limit` task events (`task.*`) written before `before`
+/// (RFC 3339), with every sink's delivery of them, oldest first. Returns how
+/// many. A task's events are notices for a look to follow, written for each
+/// attempt of each task; past [`super::OUTBOX_TASK_EVENTS_KEPT_SECS`] none is
+/// worth keeping, and nothing else ever deletes from the outbox.
+pub async fn prune_task_events(pool: &Pool, before: &str, limit: i64) -> Result<u64> {
+    let mut tx = pool.begin().await?;
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM event_outbox
+         WHERE created_at < $1 AND event_type LIKE 'task.%'
+         ORDER BY created_at LIMIT $2",
+    )
+    .bind(before)
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    sqlx::query("DELETE FROM outbox_deliveries WHERE outbox_id = ANY($1)")
+        .bind(&ids)
+        .execute(&mut *tx)
         .await?;
-    Ok(())
+    let n = sqlx::query("DELETE FROM event_outbox WHERE id = ANY($1)")
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+    Ok(n)
 }
 
-/// Delivery failed but is retryable: bump attempts, record the error, and set the
-/// next eligible time (`retry_at`, caller computes the backoff).
-pub async fn mark_outbox_failed(pool: &Pool, id: &str, error: &str, retry_at: &str) -> Result<()> {
+/// Mark the event `id` delivered to `sink`.
+pub async fn mark_outbox_delivered(pool: &Pool, sink: &str, id: &str) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
-        "UPDATE event_outbox SET attempts = attempts + 1, last_error = $1, next_attempt_at = $2 WHERE id = $3 AND status = 'pending'",
+        "UPDATE outbox_deliveries SET status = 'delivered', delivered_at = $1
+         WHERE sink = $2 AND outbox_id = $3 AND status = 'pending'",
     )
-    .bind(error)
-    .bind(retry_at)
+    .bind(&now)
+    .bind(sink)
     .bind(id)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-/// Delivery exhausted its retries: park the event as `dead` (the broker-DLQ analog).
-pub async fn mark_outbox_dead(pool: &Pool, id: &str, error: &str) -> Result<()> {
-    sqlx::query("UPDATE event_outbox SET status = 'dead', attempts = attempts + 1, last_error = $1 WHERE id = $2 AND status = 'pending'")
-        .bind(error)
-        .bind(id)
-        .execute(pool)
-        .await?;
+/// Delivery to `sink` failed but is retryable: bump attempts, record the
+/// error, and set the next eligible time (`retry_at`, caller computes the
+/// backoff).
+pub async fn mark_outbox_failed(
+    pool: &Pool,
+    sink: &str,
+    id: &str,
+    error: &str,
+    retry_at: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE outbox_deliveries SET attempts = attempts + 1, last_error = $1, next_attempt_at = $2
+         WHERE sink = $3 AND outbox_id = $4 AND status = 'pending'",
+    )
+    .bind(error)
+    .bind(retry_at)
+    .bind(sink)
+    .bind(id)
+    .execute(pool)
+    .await?;
     Ok(())
+}
+
+/// Delivery to `sink` exhausted its retries: park its row of the event as
+/// `dead` (the broker-DLQ analog). Other sinks' rows of it are untouched.
+pub async fn mark_outbox_dead(pool: &Pool, sink: &str, id: &str, error: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE outbox_deliveries SET status = 'dead', attempts = attempts + 1, last_error = $1
+         WHERE sink = $2 AND outbox_id = $3 AND status = 'pending'",
+    )
+    .bind(error)
+    .bind(sink)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// What each sink has of the outbox: `(sink, pending, dead, last delivered)`,
+/// by sink name.
+pub async fn outbox_sink_counts(pool: &Pool) -> Result<Vec<(String, i64, i64, Option<String>)>> {
+    Ok(sqlx::query_as(
+        "SELECT s.sink,
+                COUNT(d.outbox_id) FILTER (WHERE d.status = 'pending'),
+                COUNT(d.outbox_id) FILTER (WHERE d.status = 'dead'),
+                MAX(d.delivered_at) FILTER (WHERE d.status = 'delivered')
+         FROM outbox_sinks s LEFT JOIN outbox_deliveries d ON d.sink = s.sink
+         GROUP BY s.sink ORDER BY s.sink",
+    )
+    .fetch_all(pool)
+    .await?)
 }
 
 // ── Transactional outbox: spool bounds for the fleet uplink ───────────────────
@@ -4873,9 +7629,10 @@ pub async fn mark_outbox_dead(pool: &Pool, id: &str, error: &str) -> Result<()> 
 // so both backends stay identical and the SQL lives beside the outbox it
 // touches.
 //
-// Signature-for-signature identical to the SQLite backend's region; the tests
-// live there, because a unit runs on SQLite and that is where the behaviour is
-// exercised.
+// Each is of one sink's spool: what was handed to it ([`outbox_enroll`]) and
+// it has not yet delivered. Signature-for-signature identical to the SQLite
+// backend's region; the tests live there, because a unit runs on SQLite and
+// that is where the behaviour is exercised.
 
 /// The largest number of seconds this region will hand to
 /// [`chrono::TimeDelta::seconds`]. That constructor panics outside its
@@ -4885,10 +7642,9 @@ pub async fn mark_outbox_dead(pool: &Pool, id: &str, error: &str) -> Result<()> 
 /// configuring and far short of the panic.
 const MAX_SPOOL_SECS: i64 = 100 * 366 * 24 * 3600;
 
-/// The status a row shed by [`shed_outbox`] carries. `event_outbox.status` has
-/// no `CHECK` constraint (see the `011_event_outbox.sql` DDL), so this needs no
-/// migration; nothing re-claims such a row, because every claim filters
-/// `pending`.
+/// The status a sink's row shed by [`shed_outbox`] carries.
+/// `outbox_deliveries.status` has no `CHECK` constraint; nothing re-claims
+/// such a row, because every claim filters `pending`.
 pub const OUTBOX_STATUS_SHED: &str = "shed";
 
 /// One claimed outbox row, plus the wall-clock time the engine wrote it.
@@ -4915,77 +7671,49 @@ pub struct OutboxUplinkRow {
 /// on.
 pub async fn claim_outbox_batch_for_uplink(
     pool: &Pool,
+    sink: &super::OutboxSink<'_>,
     limit: i64,
     lease_secs: i64,
 ) -> Result<Vec<OutboxUplinkRow>> {
-    let now = chrono::Utc::now();
-    let now_s = now.to_rfc3339();
-    let lease_until =
-        (now + chrono::TimeDelta::seconds(lease_secs.clamp(0, MAX_SPOOL_SECS))).to_rfc3339();
-
-    let mut tx = pool.begin().await?;
-    let rows = sqlx::query(
-        "SELECT id, run_id, event_type, payload, attempts, created_at FROM event_outbox
-         WHERE status = 'pending' AND next_attempt_at <= $1
-         ORDER BY next_attempt_at LIMIT $2
-         FOR UPDATE SKIP LOCKED",
-    )
-    .bind(&now_s)
-    .bind(limit)
-    .fetch_all(&mut *tx)
-    .await?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let id: String = row.try_get("id")?;
-        sqlx::query("UPDATE event_outbox SET next_attempt_at = $1 WHERE id = $2")
-            .bind(&lease_until)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await?;
-        out.push(OutboxUplinkRow {
-            event: crate::models::OutboxEvent {
-                id,
-                run_id: row.try_get("run_id")?,
-                event_type: row.try_get("event_type")?,
-                payload: row.try_get("payload")?,
-                attempts: row.try_get("attempts")?,
-            },
-            created_at: row.try_get("created_at")?,
-        });
-    }
-    tx.commit().await?;
-    Ok(out)
+    claim_deliveries(pool, sink, limit, lease_secs).await
 }
 
-/// Bytes of event payload still waiting to be delivered (`status = 'pending'`).
+/// Bytes of event payload `sink` still has to deliver (`pending`).
 ///
 /// The payload is the row's whole variable cost — ids, types and timestamps are
 /// bounded and small — so it is what a byte budget is measured against.
 /// `octet_length`, not `length`: the latter counts characters, which
 /// under-counts anything non-ASCII, and the budget is protecting a disk.
-pub async fn outbox_pending_bytes(pool: &Pool) -> Result<i64> {
+pub async fn outbox_pending_bytes(pool: &Pool, sink: &str) -> Result<i64> {
     // SUM over no rows is NULL, not 0.
     let total: Option<i64> = sqlx::query_scalar(
-        "SELECT SUM(octet_length(payload))::bigint FROM event_outbox WHERE status = 'pending'",
+        "SELECT SUM(octet_length(e.payload))::bigint
+         FROM outbox_deliveries d JOIN event_outbox e ON e.id = d.outbox_id
+         WHERE d.sink = $1 AND d.status = 'pending'",
     )
+    .bind(sink)
     .fetch_one(pool)
     .await?;
     Ok(total.unwrap_or(0))
 }
 
-/// How long the oldest still-undelivered event has been waiting, in seconds
-/// (`0` when the spool is empty).
+/// How long the oldest event `sink` has still to deliver has been waiting, in
+/// seconds (`0` when its spool is empty).
 ///
 /// `created_at` is written as `chrono::Utc::now().to_rfc3339()` everywhere the
 /// engine emits an event, and that spelling is fixed-width and always UTC, so
 /// the lexicographic `MIN` the datastore computes is also the chronological
 /// one. A row whose timestamp does not parse reads as age `0` rather than as an
 /// error: an unparseable clock is not a reason to refuse to measure the spool.
-pub async fn outbox_oldest_pending_age_secs(pool: &Pool) -> Result<i64> {
-    let oldest: Option<String> =
-        sqlx::query_scalar("SELECT MIN(created_at) FROM event_outbox WHERE status = 'pending'")
-            .fetch_one(pool)
-            .await?;
+pub async fn outbox_oldest_pending_age_secs(pool: &Pool, sink: &str) -> Result<i64> {
+    let oldest: Option<String> = sqlx::query_scalar(
+        "SELECT MIN(e.created_at)
+         FROM outbox_deliveries d JOIN event_outbox e ON e.id = d.outbox_id
+         WHERE d.sink = $1 AND d.status = 'pending'",
+    )
+    .bind(sink)
+    .fetch_one(pool)
+    .await?;
     let Some(oldest) = oldest else {
         return Ok(0);
     };
@@ -4996,8 +7724,8 @@ pub async fn outbox_oldest_pending_age_secs(pool: &Pool) -> Result<i64> {
     Ok((chrono::Utc::now() - ts.with_timezone(&chrono::Utc)).num_seconds().max(0))
 }
 
-/// Bring the pending spool back inside its budget, parking what no longer fits
-/// as [`OUTBOX_STATUS_SHED`]. Returns how many rows were shed.
+/// Bring `sink`'s pending spool back inside its budget, parking what no
+/// longer fits as [`OUTBOX_STATUS_SHED`]. Returns how many rows were shed.
 ///
 /// Two budgets, applied in that order; `0` disables either one:
 ///
@@ -5013,13 +7741,15 @@ pub async fn outbox_oldest_pending_age_secs(pool: &Pool) -> Result<i64> {
 ///   machine for are the newest ones.
 ///
 /// Shed rows are never re-claimed (every claim filters `status = 'pending'`),
-/// keep their payload, and carry the budget that dropped them in `last_error`,
-/// so `SELECT COUNT(*), last_error FROM event_outbox WHERE status = 'shed'` is a
-/// readable answer to "what did this disk cost me". They are data loss by
+/// and carry the budget that dropped them in `last_error`, so
+/// `SELECT COUNT(*), last_error FROM outbox_deliveries WHERE status = 'shed'` is
+/// a readable answer to "what did this disk cost me". They are data loss by
 /// design: the alternative is a spool that grows until the datastore itself
-/// stops accepting writes, which loses the *run state* too.
+/// stops accepting writes, which loses the *run state* too. Only this sink's
+/// rows are shed: the event is still every other sink's to deliver.
 pub async fn shed_outbox(
     pool: &Pool,
+    sink: &str,
     max_bytes: i64,
     max_age_secs: i64,
     policy: &str,
@@ -5046,10 +7776,13 @@ pub async fn shed_outbox(
         .to_rfc3339();
         let reason = format!("shed: older than the {max_age_secs}s outbox age budget");
         shed += sqlx::query(
-            "UPDATE event_outbox SET status = 'shed', last_error = $1
-             WHERE status = 'pending' AND created_at < $2 AND next_attempt_at <= $3",
+            "UPDATE outbox_deliveries d SET status = 'shed', last_error = $1
+             FROM event_outbox e
+             WHERE e.id = d.outbox_id AND d.sink = $2 AND d.status = 'pending'
+               AND e.created_at < $3 AND d.next_attempt_at <= $4",
         )
         .bind(&reason)
+        .bind(sink)
         .bind(&cutoff)
         .bind(&due_now)
         .execute(pool)
@@ -5063,24 +7796,31 @@ pub async fn shed_outbox(
         // cannot be a bind parameter, so the only safe spelling is one where no
         // caller-supplied string ever reaches the SQL text.
         let sql = if largest_first {
-            "SELECT id, octet_length(payload)::bigint AS bytes FROM event_outbox
-             WHERE status = 'pending' AND next_attempt_at <= $1
-             ORDER BY bytes DESC, created_at ASC LIMIT $2"
+            "SELECT e.id, octet_length(e.payload)::bigint AS bytes
+             FROM outbox_deliveries d JOIN event_outbox e ON e.id = d.outbox_id
+             WHERE d.sink = $1 AND d.status = 'pending' AND d.next_attempt_at <= $2
+             ORDER BY bytes DESC, e.created_at ASC LIMIT $3"
         } else {
-            "SELECT id, octet_length(payload)::bigint AS bytes FROM event_outbox
-             WHERE status = 'pending' AND next_attempt_at <= $1
-             ORDER BY created_at ASC LIMIT $2"
+            "SELECT e.id, octet_length(e.payload)::bigint AS bytes
+             FROM outbox_deliveries d JOIN event_outbox e ON e.id = d.outbox_id
+             WHERE d.sink = $1 AND d.status = 'pending' AND d.next_attempt_at <= $2
+             ORDER BY e.created_at ASC LIMIT $3"
         };
         let reason = format!(
             "shed: over the {max_bytes}-byte outbox budget ({} first)",
             if largest_first { "largest" } else { "oldest" }
         );
-        let mut pending = outbox_pending_bytes(pool).await?;
+        let mut pending = outbox_pending_bytes(pool, sink).await?;
         loop {
             if pending <= max_bytes {
                 break;
             }
-            let victims: Vec<(String, i64)> = sqlx::query_as(sql).bind(&due_now).bind(PAGE).fetch_all(pool).await?;
+            let victims: Vec<(String, i64)> = sqlx::query_as(sql)
+                .bind(sink)
+                .bind(&due_now)
+                .bind(PAGE)
+                .fetch_all(pool)
+                .await?;
             if victims.is_empty() {
                 break;
             }
@@ -5090,10 +7830,11 @@ pub async fn shed_outbox(
                     break;
                 }
                 let n = sqlx::query(
-                    "UPDATE event_outbox SET status = 'shed', last_error = $1
-                     WHERE id = $2 AND status = 'pending'",
+                    "UPDATE outbox_deliveries SET status = 'shed', last_error = $1
+                     WHERE sink = $2 AND outbox_id = $3 AND status = 'pending'",
                 )
                 .bind(&reason)
+                .bind(sink)
                 .bind(&id)
                 .execute(pool)
                 .await?
@@ -5115,6 +7856,7 @@ pub async fn shed_outbox(
     if shed > 0 {
         tracing::warn!(
             shed,
+            sink,
             max_bytes,
             max_age_secs,
             policy,
@@ -5347,6 +8089,14 @@ fn row_to_task(row: &sqlx::postgres::PgRow) -> Result<TaskRun> {
         fault_confidence: row.try_get("fault_confidence").ok().flatten(),
         decided_by: row.try_get("decided_by").ok().flatten(),
         decision_comment: row.try_get("decision_comment").ok().flatten(),
+        // Quota wait (051/066), same tolerance: only the run-detail read
+        // selects these, already guarded by the waiting rule.
+        quota_wait_since: row.try_get("quota_wait_since").ok().flatten(),
+        quota_wait_detail: row.try_get("quota_wait_detail").ok().flatten(),
+        quota_waits: row.try_get("quota_waits").unwrap_or(0),
+        // The stop request (073), same tolerance: the run-detail read and the
+        // teardown claim select it.
+        stop_requested_at: row.try_get("stop_requested_at").ok().flatten(),
     })
 }
 
@@ -5360,7 +8110,9 @@ pub async fn list_runs(
 ) -> Result<Vec<crate::models::RunSummary>> {
     use crate::models::RunSummary;
     let base = "SELECT wr.id AS id, wd.name AS name, wr.status AS status,
-                       wr.created_at AS created_at, wr.finished_at AS finished_at
+                       wr.created_at AS created_at, wr.finished_at AS finished_at,
+                       wr.stopping_as AS stopping_as,
+                       wr.queued_at AS queued_at, wr.admitted_at AS admitted_at
                 FROM workflow_runs wr
                 JOIN workflow_definitions wd ON wd.id = wr.definition_id";
     let rows = match status {
@@ -5395,6 +8147,9 @@ pub async fn list_runs(
             status: status.parse()?,
             created_at: row.try_get("created_at")?,
             finished_at: row.try_get("finished_at")?,
+            stopping_as: row.try_get("stopping_as")?,
+            queued_at: row.try_get("queued_at")?,
+            admitted_at: row.try_get("admitted_at")?,
         });
     }
     Ok(out)
@@ -5406,7 +8161,8 @@ pub async fn get_run(pool: &Pool, run_id: &str) -> Result<Option<crate::models::
     use crate::models::WorkflowRun;
     let row = sqlx::query(
         "SELECT id, definition_id, status, input, output, created_at, finished_at,
-                clock_confidence, clock_offset_ms, clock_source
+                clock_confidence, clock_offset_ms, clock_source,
+                stopping_as, stop_requested_at, queued_at, admitted_at
          FROM workflow_runs WHERE id = $1",
     )
     .bind(run_id)
@@ -5430,6 +8186,10 @@ pub async fn get_run(pool: &Pool, run_id: &str) -> Result<Option<crate::models::
                 clock_confidence: row.try_get("clock_confidence").ok().flatten(),
                 clock_offset_ms: row.try_get("clock_offset_ms").ok().flatten(),
                 clock_source: row.try_get("clock_source").ok().flatten(),
+                stopping_as: row.try_get("stopping_as").ok().flatten(),
+                stop_requested_at: row.try_get("stop_requested_at").ok().flatten(),
+                queued_at: row.try_get("queued_at").ok().flatten(),
+                admitted_at: row.try_get("admitted_at").ok().flatten(),
             }))
         }
     }
@@ -5473,7 +8233,7 @@ pub async fn latest_run_created_at(pool: &Pool) -> Result<Option<String>> {
 #[cfg(feature = "ops")]
 pub async fn task_log(pool: &Pool, run_id: &str, task_id: &str) -> Result<Option<String>> {
     let row: Option<(Option<String>,)> =
-        sqlx::query_as("SELECT COALESCE(log, output) FROM task_runs WHERE run_id = $1 AND id = $2")
+        sqlx::query_as("SELECT COALESCE(NULLIF(log, ''), output) FROM task_runs WHERE run_id = $1 AND id = $2")
             .bind(run_id)
             .bind(task_id)
             .fetch_optional(pool)
@@ -5486,22 +8246,30 @@ pub async fn task_log(pool: &Pool, run_id: &str, task_id: &str) -> Result<Option
 #[cfg(feature = "ops")]
 pub async fn task_logs(pool: &Pool, run_id: &str) -> Result<std::collections::HashMap<String, String>> {
     let rows: Vec<(String, Option<String>)> =
-        sqlx::query_as("SELECT id, COALESCE(log, output) FROM task_runs WHERE run_id = $1")
+        sqlx::query_as("SELECT id, COALESCE(NULLIF(log, ''), output) FROM task_runs WHERE run_id = $1")
             .bind(run_id)
             .fetch_all(pool)
             .await?;
     Ok(rows.into_iter().map(|(id, log)| (id, log.unwrap_or_default())).collect())
 }
 
-/// All task rows of a run, ordered by name. Backs `GET /runs/:id`.
-#[cfg(feature = "ops")]
+/// All task rows of a run, ordered by name. Backs `GET /runs/:id`, and the
+/// engine's fetch ahead of a run's images, in every build.
 pub async fn list_tasks(pool: &Pool, run_id: &str) -> Result<Vec<TaskRun>> {
     let rows = sqlx::query(
+        // The quota columns are never cleared, so they are projected through
+        // the waiting rule: set while the row waits, NULL / 0 on any other.
         "SELECT id, run_id, name, status, attempt, remaining_deps,
                 input, output, claimed_by, lease_expires_at, version,
                 scheduled_at, finished_at, pool, priority, cache_hit,
                 wake_at, wait_url, wait_dataset, sub_run_id,
-                decided_by, decision_comment
+                decided_by, decision_comment, stop_requested_at,
+                CASE WHEN status = 'ready' AND quota_wait_version = version
+                     THEN quota_wait_since END AS quota_wait_since,
+                CASE WHEN status = 'ready' AND quota_wait_version = version
+                     THEN quota_wait_detail END AS quota_wait_detail,
+                CASE WHEN status = 'ready' AND quota_wait_version = version
+                     THEN quota_waits ELSE 0 END AS quota_waits
          FROM task_runs WHERE run_id = $1 ORDER BY name",
     )
     .bind(run_id)
@@ -5510,18 +8278,40 @@ pub async fn list_tasks(pool: &Pool, run_id: &str) -> Result<Vec<TaskRun>> {
     rows.iter().map(row_to_task).collect()
 }
 
-/// Cancel a still-running run: every non-terminal task → `cancelled`, the run row
-/// → `cancelled`. Idempotent — a second call (or a run already terminal) returns
-/// `false`. NOTIFYs so any scheduler re-checks completion promptly. A `running`
-/// task's lease is cleared; if its executor finishes anyway the fence guard in
-/// `mark_task_*` rejects the stale write, so cancellation cannot be clobbered.
+/// Cancel a still-running run. Returns what it did to the run's tasks, or
+/// `None` when there was nothing to cancel (no such run, or one already over).
+///
+/// **A cancel asks.** A task nothing is running for (`pending`, `ready`,
+/// `awaiting_approval`, or parked) is `cancelled` here. A task a worker holds
+/// is asked to stop (`stop_requested_at`) and stays `running`, with its claim:
+/// its engine sees the request at its next sweep and tells the executor, and
+/// the row becomes `cancelled` when that worker says the work is gone
+/// ([`settle_stopped_task`]). Any other result it reports is not applied.
+///
+/// **The run ends when its work has.** With no task still stopping, that is
+/// now: the run is `cancelled`, its `run.completed` event is written in this
+/// transaction, and the rest of the end-of-run work is owed to that event
+/// (the engine's end-of-run sinks). Otherwise
+/// the run stays `running` with `stopping_as = 'cancelled'`, and all of that
+/// happens in the transaction that settles its last stopping task. Until then
+/// it holds its concurrency key, and no record says it is over.
+///
+/// A `pending` status never posted (`start_pending_at`) is dropped: the end is
+/// what the commit should show. A second cancel of a run still stopping
+/// changes nothing and answers with what is still stopping. dagron-api cancels
+/// through this function too, so a cancel from either API is the same one.
 #[cfg(feature = "ops")]
-pub async fn cancel_run(pool: &Pool, run_id: &str) -> Result<bool> {
+pub async fn cancel_run(pool: &Pool, run_id: &str) -> Result<Option<crate::models::Cancelled>> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = pool.begin().await?;
 
-    let run_rows = sqlx::query(
-        "UPDATE workflow_runs SET status = 'cancelled', finished_at = $1
+    // The run row first, here and in every statement that ends a stopping
+    // task: two of those must not each see the other's task as still stopping.
+    let asked = sqlx::query(
+        "UPDATE workflow_runs
+         SET stopping_as = COALESCE(stopping_as, 'cancelled'),
+             stop_requested_at = COALESCE(stop_requested_at, $1),
+             start_pending_at = NULL
          WHERE id = $2 AND status = 'running'",
     )
     .bind(&now)
@@ -5530,59 +8320,54 @@ pub async fn cancel_run(pool: &Pool, run_id: &str) -> Result<bool> {
     .await?
     .rows_affected();
 
-    if run_rows == 0 {
+    if asked == 0 {
         tx.commit().await?;
-        return Ok(false);
+        return Ok(None);
     }
 
-    sqlx::query(
-        "UPDATE task_runs
-         SET status = 'cancelled', finished_at = $1, claimed_by = NULL, lease_expires_at = NULL
-         WHERE run_id = $2 AND status IN ('pending', 'ready', 'running', 'awaiting_approval')",
-    )
-    .bind(&now)
-    .bind(run_id)
-    .execute(&mut *tx)
-    .await?;
-
+    let did = stop_run_tasks(&mut tx, run_id, &now).await?;
+    finish_stopped_run(&mut tx, run_id, &now).await?;
     notify(&mut *tx, run_id).await?;
     tx.commit().await?;
-    Ok(true)
+    Ok(Some(did))
 }
 
 /// Enforce run-level deadlines (spec `run_timeout_secs`): every `running` run
-/// whose `deadline_at` has passed is marked **failed** (deadline exceeded is an
-/// error, unlike an operator cancel) and its non-terminal tasks are cancelled,
-/// mirroring [`cancel_run`]'s task semantics — leases cleared, and any executor
-/// that finishes anyway is rejected by the fence guard in `mark_task_*`.
-/// Idempotent by construction (the run leaves `running` in the same statement);
-/// safe to call from every scheduler's reconcile tick without leadership.
-/// Returns the ids of runs failed by this sweep.
-pub async fn cancel_overdue_runs(pool: &Pool) -> Result<Vec<String>> {
+/// whose `deadline_at` has passed ends **failed** (deadline exceeded is an
+/// error, unlike an operator cancel), and its tasks are stopped as
+/// [`cancel_run`] stops them: one nothing runs for is `cancelled` here, one a
+/// worker holds is asked to stop. The run is `failed` at once when none is
+/// stopping, and otherwise when the last of them has
+/// (`stopping_as = 'failed'`).
+///
+/// Idempotent by construction (a run it has asked is not asked again), and
+/// safe to call from every scheduler's reconcile tick without leadership. A
+/// run already being cancelled is left to end as cancelled. Returns the runs
+/// whose deadline this sweep acted on, each `(run_id, deadline_at)`.
+///
+/// A run that waits for its workflow's cap is not one of them: its budget is
+/// for what it runs, and is counted from when it is let in
+/// ([`admit_waiting_runs`]).
+pub async fn cancel_overdue_runs(pool: &Pool) -> Result<Vec<(String, String)>> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = pool.begin().await?;
 
-    let overdue: Vec<String> = sqlx::query_scalar(
+    let overdue: Vec<(String, String)> = sqlx::query_as(
         "UPDATE workflow_runs
-         SET status = 'failed', finished_at = $1,
+         SET stopping_as = 'failed', stop_requested_at = $1, start_pending_at = NULL,
              output = 'run deadline exceeded (run_timeout_secs)'
-         WHERE status = 'running' AND deadline_at IS NOT NULL AND deadline_at < $1
-         RETURNING id",
+         WHERE status = 'running' AND stopping_as IS NULL
+           AND deadline_at IS NOT NULL AND deadline_at < $1
+           AND (queued_at IS NULL OR admitted_at IS NOT NULL)
+         RETURNING id, deadline_at",
     )
     .bind(&now)
     .fetch_all(&mut *tx)
     .await?;
 
-    for run_id in &overdue {
-        sqlx::query(
-            "UPDATE task_runs
-             SET status = 'cancelled', finished_at = $1, claimed_by = NULL, lease_expires_at = NULL
-             WHERE run_id = $2 AND status IN ('pending', 'ready', 'running', 'awaiting_approval')",
-        )
-        .bind(&now)
-        .bind(run_id)
-        .execute(&mut *tx)
-        .await?;
+    for (run_id, _) in &overdue {
+        stop_run_tasks(&mut tx, run_id, &now).await?;
+        finish_stopped_run(&mut tx, run_id, &now).await?;
         notify(&mut *tx, run_id).await?;
     }
 
@@ -5590,27 +8375,518 @@ pub async fn cancel_overdue_runs(pool: &Pool) -> Result<Vec<String>> {
     Ok(overdue)
 }
 
+/// Let in the runs that wait for their workflow's cap (`when_full`), where a
+/// run before them has ended: oldest first, as many as the cap has room for.
+/// Returns the ids of the runs let in.
+///
+/// A run is let in by taking away the dependency its tasks were held by
+/// (`create_run`), in the transaction that writes `admitted_at`: its roots
+/// are then `pending` with nothing left to wait for, and the next advance
+/// makes them ready. Their `scheduled_at` is now, so what they then wait for a
+/// worker is counted from here. So is the run's `run_timeout_secs`: its
+/// deadline is moved on by as long as it waited.
+///
+/// The cap is each waiting run's own, read from the definition it was made
+/// with, and a run that cannot be let in stops the ones behind it: runs go in
+/// the order they came. A run being stopped holds its place until its work is
+/// gone, so a run that took another's place waits for that.
+///
+/// Safe from every scheduler's tick without leadership: each key is taken
+/// under its admission lock, as a new run of it is, and a run is let in by a
+/// statement that finds it waiting. Reads a partial index of the runs that
+/// wait, which is empty when none does.
+pub async fn admit_waiting_runs(pool: &Pool) -> Result<Vec<String>> {
+    // The keys whose runs have waited longest first: under an installation's
+    // cap, the runs that came first across the installation are let in first.
+    let keys: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT d.name, wr.concurrency_key
+         FROM workflow_runs wr
+         JOIN workflow_definitions d ON d.id = wr.definition_id
+         WHERE wr.queued_at IS NOT NULL AND wr.admitted_at IS NULL
+           AND wr.status = 'running' AND wr.stopping_as IS NULL
+         GROUP BY d.name, wr.concurrency_key
+         ORDER BY MIN(wr.queued_at)",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut admitted = Vec::new();
+    for (name, key) in &keys {
+        let mut tx = pool.begin().await?;
+        let lock_scope = match key {
+            Some(key) => format!("{name}\u{1f}{key}"),
+            None => name.clone(),
+        };
+        sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
+            .bind(RUN_ADMISSION_LOCK)
+            .bind(&lock_scope)
+            .execute(&mut *tx)
+            .await?;
+        let (in_flight, waiting) = runs_in_flight(&mut tx, name, key.as_deref(), None).await?;
+        let mut running = in_flight - waiting;
+        // What the installation's cap leaves, taken after the key's lock as a
+        // submit takes them, so the two never wait on each other.
+        let mut room = installation_room(&mut tx, Behind::Running).await?;
+        let next: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT wr.id, d.spec, wr.queued_at, wr.deadline_at
+             FROM workflow_runs wr
+             JOIN workflow_definitions d ON d.id = wr.definition_id
+             WHERE wr.queued_at IS NOT NULL AND wr.admitted_at IS NULL
+               AND wr.status = 'running' AND wr.stopping_as IS NULL
+               AND d.name = $1 AND wr.concurrency_key IS NOT DISTINCT FROM $2
+             ORDER BY wr.queued_at, wr.id
+             LIMIT $3",
+        )
+        .bind(name)
+        .bind(key)
+        .bind(ADMIT_AT_ONCE)
+        .fetch_all(&mut *tx)
+        .await?;
+        let now_dt = chrono::Utc::now();
+        let now = now_dt.to_rfc3339();
+        for (run_id, spec, queued_at, deadline_at) in &next {
+            // A definition with no cap now reads as one that holds nothing
+            // back, which only a row written by hand could be.
+            let cap = crate::dag::DagGraph::stored_max_active_runs(spec).map_or(i64::MAX, i64::from);
+            if running >= cap || room.is_some_and(|room| room <= 0) {
+                break;
+            }
+            let let_in = sqlx::query(
+                "UPDATE workflow_runs SET admitted_at = $1, deadline_at = $2
+                 WHERE id = $3 AND status = 'running' AND stopping_as IS NULL
+                   AND queued_at IS NOT NULL AND admitted_at IS NULL",
+            )
+            .bind(&now)
+            .bind(super::deadline_after_wait(deadline_at.as_deref(), queued_at, now_dt))
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if let_in == 0 {
+                continue;
+            }
+            sqlx::query(
+                "UPDATE task_runs SET remaining_deps = remaining_deps - 1, scheduled_at = $1
+                 WHERE run_id = $2 AND status = 'pending' AND remaining_deps > 0",
+            )
+            .bind(&now)
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+            notify(&mut *tx, run_id).await?;
+            running += 1;
+            room = room.map(|room| room - 1);
+            admitted.push(run_id.clone());
+        }
+        tx.commit().await?;
+    }
+    Ok(admitted)
+}
+
+/// What [`installation_room`] counts as taking the installation's room.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
+enum Behind {
+    /// The runs running and not waiting: the sweep's, letting the waiting in.
+    Running,
+    /// Those, and the runs that wait (for any cap): a submit's, which comes
+    /// after every one of them. One that waits for its workflow's cap alone
+    /// makes a new run wait a sweep at most.
+    Waiting,
+}
+
+/// The room the installation's cap on runs running at once leaves (the
+/// `run_admission_cap` row), taken under a lock every admission against it
+/// waits on: its number less the runs `behind` counts. `None` where the
+/// installation has no cap, as it has none but in a build that sets one.
+#[cfg(feature = "enterprise")]
+async fn installation_room(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    behind: Behind,
+) -> Result<Option<i64>> {
+    let cap: Option<i64> =
+        sqlx::query_scalar("SELECT max_active_runs FROM run_admission_cap WHERE id = 1")
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some(cap) = cap else {
+        return Ok(None);
+    };
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
+        .bind(RUN_ADMISSION_LOCK)
+        .bind(INSTALLATION_ADMISSION_SCOPE)
+        .execute(&mut **tx)
+        .await?;
+    let taken: i64 = sqlx::query_scalar(match behind {
+        Behind::Running => {
+            "SELECT COUNT(*) FROM workflow_runs
+              WHERE status = 'running' AND (queued_at IS NULL OR admitted_at IS NOT NULL)"
+        }
+        // A run that waits and is asked to stop is no longer in line.
+        Behind::Waiting => {
+            "SELECT COUNT(*) FROM workflow_runs
+              WHERE status = 'running'
+                AND (queued_at IS NULL OR admitted_at IS NOT NULL OR stopping_as IS NULL)"
+        }
+    })
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(Some(cap - taken))
+}
+
+#[cfg(not(feature = "enterprise"))]
+async fn installation_room(
+    _tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    _behind: Behind,
+) -> Result<Option<i64>> {
+    Ok(None)
+}
+
+/// The admission lock's scope for the installation's cap: `\u{1f}` begins no
+/// workflow's name, so it is no workflow's scope.
+#[cfg(feature = "enterprise")]
+const INSTALLATION_ADMISSION_SCOPE: &str = "\u{1f}installation";
+
+/// How many waiting runs of one key a pass of [`admit_waiting_runs`] reads.
+/// More than any cap lets in at once; what is left is the next pass's.
+const ADMIT_AT_ONCE: i64 = 64;
+
+/// End the runs that were asked to stop and have been left with no task
+/// stopping: a sweep, for what the statements that settle a task cannot reach.
+///
+/// A cancel and a settle each end the run in their own transaction, so an
+/// engine of this version never leaves one. An engine from before the stop
+/// request does: it knows nothing of the request, finishes the task under its
+/// claim as it always did (succeeded, failed, or queued for a retry), and ends
+/// no run. With engines of both versions on one datastore, such a run would
+/// read `running` for good.
+///
+/// For each, the stop is applied again (a task that came back to the queue is
+/// cancelled; one a worker has since claimed is asked), a request left on a
+/// task that is over is cleared, and the run ends if nothing is stopping now.
+/// Returns how many runs it ended. Reads a partial index of the runs being
+/// stopped, which is empty when none is.
+pub async fn end_stopped_runs(pool: &Pool) -> Result<u64> {
+    let stranded: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM workflow_runs
+         WHERE stopping_as IS NOT NULL AND status = 'running'
+           AND NOT EXISTS (
+               SELECT 1 FROM task_runs t
+               WHERE t.run_id = workflow_runs.id
+                 AND t.status = 'running' AND t.stop_requested_at IS NOT NULL
+           )",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut ended = 0;
+    for run_id in &stranded {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut tx = pool.begin().await?;
+        // The run's row first, as everywhere a stopping run is ended.
+        sqlx::query("SELECT id FROM workflow_runs WHERE id = $1 FOR UPDATE")
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+        stop_run_tasks(&mut tx, run_id, &now).await?;
+        sqlx::query(
+            "UPDATE task_runs SET stop_requested_at = NULL
+             WHERE run_id = $1 AND status <> 'running' AND stop_requested_at IS NOT NULL",
+        )
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+        if finish_stopped_run(&mut tx, run_id, &now).await?.is_some() {
+            ended += 1;
+        }
+        notify(&mut *tx, run_id).await?;
+        tx.commit().await?;
+    }
+    Ok(ended)
+}
+
+/// Stop a run's tasks, for [`cancel_run`] and [`cancel_overdue_runs`]: cancel
+/// those nothing is running for, and ask the ones a worker holds.
+///
+/// A row that is `running` with no claim is parked (a sensor, a sub-workflow,
+/// a deferred job): no worker runs anything for it. One with a claim was
+/// dispatched, and only its worker can say when what it started is gone.
+///
+/// A task that is asked for the first time is given a whole lease from now to
+/// answer in, whatever was left of its own. Its worker is watching it, and may
+/// renew nothing (`TASK_LEASE_HEARTBEAT=false`): without this a task that had
+/// outlived its lease would be claimed for a teardown in the tick that asked
+/// it, ahead of the worker stopping it. A task asked before keeps the lease it
+/// has, which [`release_stopping_task`] may have cut short on purpose.
+async fn stop_run_tasks(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: &str,
+    now: &str,
+) -> Result<crate::models::Cancelled> {
+    let lease = stop_lease();
+    let cancelled = sqlx::query(
+        "UPDATE task_runs
+         SET status = 'cancelled', finished_at = $1, claimed_by = NULL, lease_expires_at = NULL
+         WHERE run_id = $2
+           AND (status IN ('pending', 'ready', 'awaiting_approval')
+                OR (status = 'running' AND claimed_by IS NULL))",
+    )
+    .bind(now)
+    .bind(run_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    let stopping = sqlx::query(
+        "UPDATE task_runs
+         SET lease_expires_at = CASE WHEN stop_requested_at IS NULL THEN $3
+                                     ELSE lease_expires_at END,
+             stop_requested_at = COALESCE(stop_requested_at, $1)
+         WHERE run_id = $2 AND status = 'running' AND claimed_by IS NOT NULL",
+    )
+    .bind(now)
+    .bind(run_id)
+    .bind(&lease)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(crate::models::Cancelled { cancelled, stopping })
+}
+
+/// When the lease given to a task that is asked to stop runs out: a whole
+/// lease from now (see [`stop_run_tasks`]).
+fn stop_lease() -> String {
+    (chrono::Utc::now() + chrono::TimeDelta::seconds(super::lease_secs())).to_rfc3339()
+}
+
+/// End a run that was asked to stop, once none of its tasks is still stopping:
+/// the status it was to take (`stopping_as`), and its `run.completed` event,
+/// which the rest of the end-of-run work is owed to. Nothing while
+/// a task still is, and nothing for a run that was not asked.
+///
+/// The caller holds the run's row (see [`settle_stopping`]).
+async fn finish_stopped_run(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: &str,
+    now: &str,
+) -> Result<Option<String>> {
+    let ended: Option<String> = sqlx::query_scalar(
+        "UPDATE workflow_runs
+         SET status = stopping_as, finished_at = $1, completion_pending_at = NULL,
+             start_pending_at = NULL, stopping_as = NULL, stop_requested_at = NULL
+         WHERE id = $2 AND status = 'running' AND stopping_as IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM task_runs
+               WHERE run_id = $2 AND status = 'running' AND stop_requested_at IS NOT NULL
+           )
+         RETURNING status",
+    )
+    .bind(now)
+    .bind(run_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(status) = &ended {
+        insert_run_completed(tx, run_id, status, now).await?;
+    }
+    Ok(ended)
+}
+
+/// `cancelled`, for a task that was asked to stop and is held under this
+/// claim: its work is gone, or was never started. Ends its run too when it was
+/// the last one stopping ([`finish_stopped_run`]). `false`, and nothing
+/// written, for any other row.
+///
+/// Locks the run's row before the task's, as a cancel does. Two tasks of one
+/// run settling at once would otherwise each see the other still stopping and
+/// leave the run running for good; and a cancel and a settle taking the two
+/// rows in opposite orders would deadlock.
+async fn settle_stopping(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    task_id: &str,
+    worker_id: &str,
+    fence: i64,
+    now: &str,
+) -> Result<bool> {
+    let run_id: Option<String> = sqlx::query_scalar(
+        "SELECT run_id FROM task_runs
+         WHERE id = $1 AND claimed_by = $2 AND version = $3
+           AND status = 'running' AND stop_requested_at IS NOT NULL",
+    )
+    .bind(task_id)
+    .bind(worker_id)
+    .bind(fence)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(run_id) = run_id else {
+        return Ok(false);
+    };
+    sqlx::query("SELECT id FROM workflow_runs WHERE id = $1 FOR UPDATE")
+        .bind(&run_id)
+        .execute(&mut **tx)
+        .await?;
+    let settled = sqlx::query(
+        "UPDATE task_runs
+         SET status = 'cancelled', finished_at = $1, claimed_by = NULL, lease_expires_at = NULL,
+             stop_requested_at = NULL
+         WHERE id = $2 AND claimed_by = $3 AND version = $4
+           AND status = 'running' AND stop_requested_at IS NOT NULL",
+    )
+    .bind(now)
+    .bind(task_id)
+    .bind(worker_id)
+    .bind(fence)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if settled == 0 {
+        return Ok(false);
+    }
+    finish_stopped_run(tx, &run_id, now).await?;
+    notify(&mut **tx, &run_id).await?;
+    Ok(true)
+}
+
+/// A task that was asked to stop, and whose worker says its work is gone:
+/// `cancelled`, and its run ended if it was the last one stopping. `false`
+/// when the row is not such a task under this claim (it was never asked, or
+/// the claim is another's now): nothing is written.
+pub async fn settle_stopped_task(
+    pool: &Pool,
+    task_id: &str,
+    worker_id: &str,
+    fence: i64,
+) -> Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    let settled = settle_stopping(&mut tx, task_id, worker_id, fence, &now).await?;
+    tx.commit().await?;
+    Ok(settled)
+}
+
+/// A task that was asked to stop, and whose worker could not say its work is
+/// gone: left `running` and asked, with a lease that lapses in `retry_secs`,
+/// so that [`claim_teardowns`] takes it and its work is looked for again.
+/// `false` when the row is not such a task under this claim.
+pub async fn release_stopping_task(
+    pool: &Pool,
+    task_id: &str,
+    worker_id: &str,
+    fence: i64,
+    retry_secs: i64,
+) -> Result<bool> {
+    let retry_at = (chrono::Utc::now() + chrono::TimeDelta::seconds(retry_secs)).to_rfc3339();
+    let rows = sqlx::query(
+        "UPDATE task_runs SET lease_expires_at = $1
+         WHERE id = $2 AND claimed_by = $3 AND version = $4
+           AND status = 'running' AND stop_requested_at IS NOT NULL",
+    )
+    .bind(&retry_at)
+    .bind(task_id)
+    .bind(worker_id)
+    .bind(fence)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(rows == 1)
+}
+
+/// Claim tasks that were asked to stop and whose lease has lapsed: the worker
+/// that held them died, or could not see its teardown through. Nobody is
+/// watching their work, so it is looked for again, by a dispatch that only
+/// tears down.
+///
+/// The claim is a new one (`version + 1`), which is what makes everything the
+/// task left a predecessor of this dispatch, and voids a late word from the
+/// worker that held it. No attempt is spent: nothing runs. Returns the rows as
+/// a claim does, with the version from before it. `classes` is the claim's
+/// own filter: a teardown goes to an engine that serves the task's backend.
+///
+/// `held` are the tasks the asking engine still has an execution out for.
+/// They are not claimed: their worker is watching the work, lease or none,
+/// and its word is the one to wait for. Another engine cannot know that, and
+/// has the lease alone to go by.
+pub async fn claim_teardowns(
+    pool: &Pool,
+    worker_id: &str,
+    limit: i64,
+    classes: &[String],
+    held: &[String],
+) -> Result<Vec<TaskRun>> {
+    let now_dt = chrono::Utc::now();
+    let now = now_dt.to_rfc3339();
+    let lease_exp = (now_dt + chrono::TimeDelta::seconds(super::lease_secs())).to_rfc3339();
+    let rows = sqlx::query(
+        "UPDATE task_runs
+         SET claimed_by = $1, lease_expires_at = $2, version = version + 1
+         WHERE id IN (
+             SELECT id FROM task_runs
+             WHERE status = 'running' AND stop_requested_at IS NOT NULL
+               AND lease_expires_at IS NOT NULL AND lease_expires_at < $3
+               AND session_id IS NULL
+               AND (cardinality($5::text[]) = 0 OR runner_class = ANY($5::text[]))
+               AND NOT (id = ANY($6::text[]))
+             ORDER BY lease_expires_at
+             LIMIT $4
+             FOR UPDATE SKIP LOCKED
+         )
+         RETURNING id, run_id, name, status, attempt, remaining_deps,
+                   input, output, claimed_by, lease_expires_at,
+                   version - 1 AS version, scheduled_at, finished_at, pool,
+                   stop_requested_at",
+    )
+    .bind(worker_id)
+    .bind(&lease_exp)
+    .bind(&now)
+    .bind(limit)
+    .bind(classes)
+    .bind(held)
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(row_to_task).collect()
+}
+
+/// Of the tasks an engine has dispatched (`held`: each id with its fence),
+/// those whose work should stop now: asked to stop, or no longer this
+/// engine's under that claim. The engine asks at every sweep, so a cancel
+/// reaches the work within one, whether or not its worker renews a lease.
+pub async fn tasks_to_stop(
+    pool: &Pool,
+    worker_id: &str,
+    held: &[(String, i64)],
+) -> Result<Vec<String>> {
+    if held.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<&str> = held.iter().map(|(id, _)| id.as_str()).collect();
+    let rows: Vec<(String, i64, Option<String>, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, version, claimed_by, status, stop_requested_at
+         FROM task_runs WHERE id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(super::not_held(worker_id, held, rows))
+}
+
 /// Emit a soft SLA deadline alert (spec `deadline`) for each still-running run
 /// past its `alert_deadline_at` that hasn't alerted yet (#20). Fire-once and
 /// idempotent via a guarded `RETURNING` update (winner-take-all across
 /// schedulers). Does NOT cancel — appends a `run.deadline_exceeded` event to the
 /// transactional outbox in the same transaction and NOTIFYs the drainer.
-/// Returns the alerted run ids.
-pub async fn fire_deadline_alerts(pool: &Pool) -> Result<Vec<String>> {
+/// Returns the alerted runs, each `(run_id, alert_deadline_at)`.
+pub async fn fire_deadline_alerts(pool: &Pool) -> Result<Vec<(String, String)>> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = pool.begin().await?;
 
-    let fired: Vec<String> = sqlx::query_scalar(
+    let fired: Vec<(String, String)> = sqlx::query_as(
         "UPDATE workflow_runs SET alert_fired_at = $1
          WHERE status = 'running' AND alert_deadline_at IS NOT NULL
            AND alert_deadline_at < $1 AND alert_fired_at IS NULL
-         RETURNING id",
+         RETURNING id, alert_deadline_at",
     )
     .bind(&now)
     .fetch_all(&mut *tx)
     .await?;
 
-    for run_id in &fired {
+    for (run_id, _) in &fired {
         let payload = serde_json::json!({ "run_id": run_id, "reason": "deadline_exceeded" }).to_string();
         sqlx::query(
             "INSERT INTO event_outbox
@@ -5632,35 +8908,125 @@ pub async fn fire_deadline_alerts(pool: &Pool) -> Result<Vec<String>> {
 }
 
 /// Run- and task-count gauges grouped by status, read straight from the
-/// datastore for the `/metrics` endpoint.
+/// datastore: [`status_counts_live`] and [`status_counts_history`] in one.
 #[cfg(feature = "ops")]
 pub async fn status_counts(pool: &Pool) -> Result<crate::models::MetricsSnapshot> {
-    let runs: Vec<(String, i64)> =
-        sqlx::query_as("SELECT status, COUNT(*) FROM workflow_runs GROUP BY status")
-            .fetch_all(pool)
-            .await?;
-    let tasks: Vec<(String, i64)> =
-        sqlx::query_as("SELECT status, COUNT(*) FROM task_runs GROUP BY status")
-            .fetch_all(pool)
-            .await?;
-    let dead_letters: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM dead_letters").fetch_one(pool).await?;
-    // Per-workflow views. Each is bounded by something other than the size of
-    // the run history: a time window, the non-terminal task set, the parked
-    // dead letters.
+    let live = status_counts_live(pool).await?;
+    Ok(live.with_history(&status_counts_history(pool).await?, 0.0))
+}
+
+/// The `/metrics` gauges of the runs and tasks that have finished, by status,
+/// and of the runs of the last 24 hours that have: what grows
+/// with every run, read apart from the rest and cached longer. `NOT IN` the
+/// statuses [`status_counts_live`] reads, so a status added later is still
+/// counted.
+#[cfg(feature = "ops")]
+pub async fn status_counts_history(pool: &Pool) -> Result<crate::models::MetricsHistory> {
+    let finished = status_counts_finished(pool).await?;
+    Ok(crate::models::MetricsHistory {
+        recent_runs: recent_runs(pool, false).await?,
+        ..finished
+    })
+}
+
+/// The runs of the last [`crate::models::RECENT_RUNS_WINDOW_SECS`] by
+/// workflow, environment and status: those that have not finished where
+/// `unfinished`, and the rest where not. Bounded by a time window, not by the
+/// size of the run history, but a join of two tables that grow with it: the
+/// finished are read with the history. Those that have not are read for a
+/// scrape, by the index of the runs by status and when they were made
+/// (migrations_pg/048), which reads only theirs.
+#[cfg(feature = "ops")]
+async fn recent_runs(pool: &Pool, unfinished: bool) -> Result<Vec<crate::models::RecentRuns>> {
     let since = (chrono::Utc::now()
         - chrono::TimeDelta::seconds(crate::models::RECENT_RUNS_WINDOW_SECS))
     .to_rfc3339();
-    let recent: Vec<(String, Option<String>, String, i64)> = sqlx::query_as(
+    let recent: Vec<(String, Option<String>, String, i64)> = sqlx::query_as(&format!(
         "SELECT wd.name, wr.environment, wr.status, COUNT(*)
          FROM workflow_runs wr
          JOIN workflow_definitions wd ON wd.id = wr.definition_id
-         WHERE wr.created_at >= $1
+         WHERE wr.status {} ({}) AND wr.created_at >= $1
          GROUP BY wd.name, wr.environment, wr.status",
-    )
+        if unfinished { "IN" } else { "NOT IN" },
+        super::sql_list(&crate::models::LIVE_RUN_STATUSES)
+    ))
     .bind(&since)
     .fetch_all(pool)
     .await?;
+    Ok(recent
+        .into_iter()
+        .map(
+            |(workflow, environment, status, count)| crate::models::RecentRuns {
+                workflow,
+                environment,
+                status,
+                count,
+            },
+        )
+        .collect())
+}
+
+/// Of [`status_counts_history`], the runs and tasks that have finished, by
+/// status, alone: all dagron-api's `GET /api/metrics` serves of the history.
+#[cfg(feature = "ops")]
+pub async fn status_counts_finished(pool: &Pool) -> Result<crate::models::MetricsHistory> {
+    let runs: Vec<(String, i64)> = sqlx::query_as(&format!(
+        "SELECT status, COUNT(*) FROM workflow_runs WHERE status NOT IN ({}) GROUP BY status",
+        super::sql_list(&crate::models::LIVE_RUN_STATUSES)
+    ))
+    .fetch_all(pool)
+    .await?;
+    let tasks: Vec<(String, i64)> = sqlx::query_as(&format!(
+        "SELECT status, COUNT(*) FROM task_runs WHERE status NOT IN ({}) GROUP BY status",
+        super::sql_list(&crate::models::LIVE_TASK_STATUSES)
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(crate::models::MetricsHistory {
+        runs_by_status: runs,
+        tasks_by_status: tasks,
+        recent_runs: Vec::new(),
+    })
+}
+
+/// Of [`status_counts_live`], the runs and tasks that have not finished, by
+/// status, and the dead letters, alone: all dagron-api's `GET /api/metrics`
+/// serves of what has not finished. Three reads, where the whole is nine.
+#[cfg(feature = "ops")]
+pub async fn status_counts_unfinished(pool: &Pool) -> Result<crate::models::MetricsSnapshot> {
+    let runs: Vec<(String, i64)> = sqlx::query_as(&format!(
+        "SELECT status, COUNT(*) FROM workflow_runs WHERE status IN ({}) GROUP BY status",
+        super::sql_list(&crate::models::LIVE_RUN_STATUSES)
+    ))
+    .fetch_all(pool)
+    .await?;
+    let tasks: Vec<(String, i64)> = sqlx::query_as(&format!(
+        "SELECT status, COUNT(*) FROM task_runs WHERE status IN ({}) GROUP BY status",
+        super::sql_list(&crate::models::LIVE_TASK_STATUSES)
+    ))
+    .fetch_all(pool)
+    .await?;
+    let dead_letters: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dead_letters")
+        .fetch_one(pool)
+        .await?;
+    Ok(crate::models::MetricsSnapshot {
+        runs_by_status: runs,
+        tasks_by_status: tasks,
+        dead_letters,
+        ..Default::default()
+    })
+}
+
+/// The `/metrics` gauges of what has not finished: runs and
+/// tasks in the statuses of work still to do, by status, each read by its
+/// status index; the dead letters; the recent runs still to end; and the
+/// rest of the snapshot, each bounded by what is waiting, not by what has
+/// run. Read for a scrape.
+#[cfg(feature = "ops")]
+pub async fn status_counts_live(pool: &Pool) -> Result<crate::models::MetricsSnapshot> {
+    let unfinished = status_counts_unfinished(pool).await?;
+    // Per-workflow views. Each is bounded by something other than the size of
+    // the run history: the non-terminal task set, the parked dead letters.
     let active_tasks: Vec<(String, String, i64)> = sqlx::query_as(
         "SELECT wd.name, tr.status, COUNT(*)
          FROM task_runs tr
@@ -5676,20 +9042,18 @@ pub async fn status_counts(pool: &Pool) -> Result<crate::models::MetricsSnapshot
     )
     .fetch_all(pool)
     .await?;
+    let quota = quota_wait_stats(pool).await?;
+    let sweeps = log_sweeps_waiting(pool).await?;
+    // The partial index of the runs that wait, which is empty when none does.
+    let (runs_waiting, runs_waiting_oldest_since): (i64, Option<String>) = sqlx::query_as(
+        "SELECT COUNT(*), MIN(queued_at) FROM workflow_runs
+         WHERE queued_at IS NOT NULL AND admitted_at IS NULL AND status = 'running'",
+    )
+    .fetch_one(pool)
+    .await?;
     Ok(crate::models::MetricsSnapshot {
-        runs_by_status: runs,
-        tasks_by_status: tasks,
-        dead_letters,
         ready_by_class: ready_backlog_by_class(pool).await?,
-        recent_runs: recent
-            .into_iter()
-            .map(|(workflow, environment, status, count)| crate::models::RecentRuns {
-                workflow,
-                environment,
-                status,
-                count,
-            })
-            .collect(),
+        recent_runs: recent_runs(pool, true).await?,
         active_tasks,
         dead_letters_by_source: by_source
             .into_iter()
@@ -5699,6 +9063,15 @@ pub async fn status_counts(pool: &Pool) -> Result<crate::models::MetricsSnapshot
                 oldest_first_seen_at,
             })
             .collect(),
+        quota_waiting: quota.waiting,
+        quota_wait_oldest_since: quota.oldest_since,
+        runs_waiting,
+        runs_waiting_oldest_since,
+        log_sweeps_waiting: sweeps.waiting,
+        log_sweeps_failing: sweeps.failing,
+        log_sweeps_oldest_marked_at: sweeps.oldest_marked_at,
+        history_age_secs: 0.0,
+        ..unfinished
     })
 }
 
@@ -6032,6 +9405,124 @@ pub async fn gc_old_runs(pool: &Pool, cutoff: &str) -> Result<u64> {
     Ok(deleted)
 }
 
+// ── Sweep slots ────────────────────────────────────────────────────────────────
+
+/// The database's clock as a `sweep_slots` row keeps it, [`SWEEP_NOW`]'s
+/// text, `secs` on where given: read once for the whole statement. A claim
+/// that waited on a row's lock stamps every row it takes with one time; a
+/// clock read for each row split one claim across two times, and a third
+/// engine took a row of it.
+fn slot_clock(secs: Option<&str>) -> String {
+    let at = match secs {
+        Some(secs) => format!("statement_timestamp() + make_interval(secs => {secs})"),
+        None => "statement_timestamp()".to_string(),
+    };
+    slot_text(&at)
+}
+
+/// The time `at` gives as a `sweep_slots` row keeps it.
+fn slot_text(at: &str) -> String {
+    format!("to_char(({at}) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"+00:00\"')")
+}
+
+/// Take, for `holder`, the slots of `sweeps` (each `(name, seconds)`) that
+/// are due, and return those this engine took: each is its own for its
+/// `seconds` from now, and no other engine's until then.
+///
+/// One statement for every sweep, on the database's clock, so that no
+/// engine's clock decides. A slot whose row is missing is made: one deleted
+/// by hand comes back at the next claim, where an update alone would leave
+/// its sweep unrun on every engine. The rows are taken in the order of their
+/// names, so two engines lock them in one order and never wait on each
+/// other in a ring.
+///
+/// A slot is not a lock: an engine whose tick stalls after it took one may
+/// still be sweeping when the next window goes to another. So only a sweep
+/// two engines may run at once is put on a slot ([`crate::sweep::Scope`]).
+///
+/// A slot due later than this claim would set it is taken too. Once the
+/// database's clock has stepped back, every slot is due that much later,
+/// and no engine would take one (the leases, the deadlines, the sensors)
+/// until the clock caught up. Else it is another engine's of a longer
+/// interval for that sweep, and this one runs it early, as a shared sweep
+/// may. That is timed by the clock when the row is had, not when the
+/// statement began: a claim that waited on another's take of the row would
+/// find that take's window later than its own, and take the slot again.
+pub async fn claim_sweep_slots(
+    pool: &Pool,
+    holder: &str,
+    sweeps: &[(&str, f64)],
+) -> Result<Vec<super::SweepSlot>> {
+    if sweeps.is_empty() {
+        return Ok(Vec::new());
+    }
+    let names: Vec<String> = sweeps.iter().map(|(name, _)| name.to_string()).collect();
+    let secs: Vec<f64> = sweeps.iter().map(|(_, secs)| *secs).collect();
+    let rows: Vec<(String, i64, Option<String>)> = sqlx::query_as(&format!(
+        "INSERT INTO sweep_slots AS s (name, due_at, holder, turn, taken_at)
+         SELECT c.name, {due}, $1, 1, {now}
+           FROM unnest($2::text[], $3::float8[]) AS c(name, secs)
+          ORDER BY c.name
+         ON CONFLICT (name) DO UPDATE
+            SET due_at = excluded.due_at, holder = excluded.holder,
+                turn = s.turn + 1, taken_at = excluded.taken_at
+          WHERE s.due_at <= excluded.taken_at OR s.due_at > {ahead}
+         RETURNING s.name, s.turn, s.cursor",
+        due = slot_clock(Some("c.secs")),
+        now = slot_clock(None),
+        ahead = slot_text(
+            "clock_timestamp()
+               + (excluded.due_at::timestamptz - excluded.taken_at::timestamptz)"
+        ),
+    ))
+    .bind(holder)
+    .bind(&names)
+    .bind(&secs)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(name, turn, cursor)| super::SweepSlot { name, turn, cursor })
+        .collect())
+}
+
+/// Write where a sweep got to (the reap's last run), for whichever engine
+/// takes its slot next. Only at the `turn` the slot was taken at: an engine
+/// that stalled after it took the slot writes nothing once another has
+/// taken it since. Returns whether it was written.
+pub async fn set_sweep_cursor(
+    pool: &Pool,
+    name: &str,
+    turn: i64,
+    cursor: Option<&str>,
+) -> Result<bool> {
+    let rows = sqlx::query("UPDATE sweep_slots SET cursor = $3 WHERE name = $1 AND turn = $2")
+        .bind(name)
+        .bind(turn)
+        .bind(cursor)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(rows > 0)
+}
+
+/// Hand a sweep's slot back before its window is out: its pass read a full
+/// batch, and the next is due now, for the next engine to ask. That is the
+/// engine that handed it back, whose sweep is due again at once, unless
+/// another asks before its next tick: the engines told the slot was taken
+/// in this window wait a whole interval before they ask again. Only at the
+/// `turn` it was taken at. Returns whether it was handed back.
+pub async fn hand_back_sweep_slot(pool: &Pool, name: &str, turn: i64) -> Result<bool> {
+    let rows =
+        sqlx::query("UPDATE sweep_slots SET due_at = taken_at WHERE name = $1 AND turn = $2")
+            .bind(name)
+            .bind(turn)
+            .execute(pool)
+            .await?
+            .rows_affected();
+    Ok(rows > 0)
+}
+
 // ── v5 leadership singleton ─────────────────────────────────────────────────
 
 /// Try to acquire (or renew) the lease for `role`, valid for `lease_secs`.
@@ -6078,10 +9569,11 @@ pub async fn try_acquire_leadership(
 /// delivered only on commit, so a rolled-back mutation never wakes a peer for
 /// work that did not actually happen.
 ///
-/// The reconcile-loop [`Waker`] ignores the payload (it only needs the wakeup
-/// edge), so carrying the run_id is backward compatible — but it lets the
-/// management API's SSE bridge route each event to only the clients watching
-/// that run, instead of waking every browser on every transition.
+/// The payload is the run. The reconcile-loop [`Waker`] keeps the runs it
+/// was told of, so that a tick looks for ended runs among those and not among
+/// every run there is ([`Woken`]); and the management API's SSE bridge routes
+/// each event to only the clients watching that run, instead of waking every
+/// browser on every transition.
 async fn notify<'e, E>(executor: E, run_id: &str) -> Result<()>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
@@ -6100,9 +9592,39 @@ where
 /// returns the moment a notification arrives *or* the poll interval elapses,
 /// whichever comes first — so steady-state latency tracks real events while the
 /// timer remains a safety net for missed wakeups and time-based retries.
+///
+/// A notification says only that something changed, and a tick looks at
+/// everything. So the notifications that are waiting when `wait` is called,
+/// and those that arrive together, are one reason to tick: `wait` takes them
+/// all and returns once. Taken one a wait, a channel that fills faster than
+/// the loop ticks leaves a backlog the loop goes on ticking through after the
+/// work that sent it is over.
+///
+/// What a notification does say is which run changed, and that is kept: see
+/// [`Waker::take_woken`].
 pub struct Waker {
     listener: PgListener,
+    /// The runs named by the notifications taken since the last
+    /// [`Waker::take_woken`].
+    runs: std::collections::HashSet<String>,
+    /// That `runs` cannot be all that changed: nothing has been heard yet,
+    /// or the connection was lost, or more runs were named than are kept.
+    all: bool,
+    /// Notifications [`Waker::take_woken`] took that no [`Waker::wait`] has
+    /// answered for yet. A notification is a reason to tick again, whoever
+    /// took it off the connection: the next wait returns at once for these.
+    owed: usize,
 }
+
+/// The most runs a waker keeps the names of between two ticks. Past it the
+/// tick is told to look at everything, which is what it did before a wake
+/// named its run.
+const MAX_NAMED_RUNS: usize = 4096;
+
+/// The most notifications one [`Waker::wait`] takes. It bounds the time one
+/// wait spends taking them from a channel that fills as fast as it is
+/// emptied. What is left is the next wait's.
+const NOTIFICATIONS_PER_WAIT: usize = 65_536;
 
 impl Waker {
     /// Connect the LISTEN session. `DATABASE_LISTEN_URL`, when set, is used
@@ -6117,22 +9639,1959 @@ impl Waker {
             _ => PgListener::connect_with(pool).await?,
         };
         listener.listen(EVENT_CHANNEL).await?;
-        Ok(Self { listener })
+        // What was sent before this listened was not heard: the first tick
+        // looks at everything.
+        Ok(Self {
+            listener,
+            runs: std::collections::HashSet::new(),
+            all: true,
+            owed: 0,
+        })
     }
 
-    pub async fn wait(&mut self, interval: Duration) -> Result<()> {
+    /// What has changed since this was last asked: the runs named by every
+    /// notification taken, those that are waiting now among them.
+    ///
+    /// It is asked for at the point of a tick that looks for ended runs, and
+    /// not where the tick began. A notification the tick's own work sent (a
+    /// task it marked) has then most often arrived, so the run that task
+    /// ended is looked at in the tick that ended it.
+    ///
+    /// What it takes off the connection here is still owed a tick. A run
+    /// made while a tick was going is named by a notification this takes,
+    /// and that run's first task is the next tick's to start: were the
+    /// notification simply spent here, the wait that follows would find
+    /// nothing waiting and sleep out the poll interval over it.
+    pub async fn take_woken(&mut self) -> Woken {
+        self.owed += self.take_waiting().await;
+        if std::mem::take(&mut self.all) {
+            self.runs.clear();
+            return Woken::All;
+        }
+        Woken::Runs(self.runs.drain().collect())
+    }
+
+    /// Keep the run a notification names: its payload, up to a `:` should
+    /// one ever say more than the run (a run's id holds none).
+    fn heard(&mut self, payload: &str) {
+        if self.all {
+            return;
+        }
+        let run = payload.split(':').next().unwrap_or(payload);
+        self.runs.insert(run.to_string());
+        if self.runs.len() > MAX_NAMED_RUNS {
+            self.runs.clear();
+            self.all = true;
+        }
+    }
+
+    /// Wait for a reason to tick, and return how many notifications were
+    /// taken: 0 when it was the interval that passed.
+    pub async fn wait(&mut self, interval: Duration) -> Result<usize> {
+        // What arrived while the caller was busy: still on the connection,
+        // or taken off it already when the caller asked which runs changed.
+        let waiting = self.take_waiting().await + std::mem::take(&mut self.owed);
+        if waiting > 0 {
+            return Ok(waiting);
+        }
+        // `try_recv` and not `recv`: it says when the connection was lost,
+        // where `recv` connects again and says nothing. What was sent while
+        // there was no connection is gone, and a tick must not take the runs
+        // it has heard of for all that changed.
         tokio::select! {
-            recv = self.listener.recv() => {
+            recv = self.listener.try_recv() => match recv {
+                // The first of a burst wakes the wait, and the rest of what
+                // has arrived with it is taken before the caller ticks.
+                Ok(Some(first)) => {
+                    self.heard(first.payload());
+                    Ok(1 + self.take_waiting().await)
+                }
+                // The connection was lost, and is made again by the next
+                // asking. Tick now, and look at everything.
+                Ok(None) => {
+                    self.all = true;
+                    Ok(0)
+                }
                 // A transient listener/connection blip must not stop scheduling:
                 // log and fall back to a timer tick. PgListener auto-reconnects,
                 // and the next tick's queries run against the live pool regardless.
-                if let Err(err) = recv {
+                Err(err) => {
+                    self.all = true;
                     tracing::warn!(error = ?err, "listener recv failed; timer fallback for this tick");
                     tokio::time::sleep(interval).await;
+                    Ok(0)
                 }
-            }
-            _ = tokio::time::sleep(interval) => {}
+            },
+            _ = tokio::time::sleep(interval) => Ok(0),
         }
-        Ok(())
+    }
+
+    /// Take every notification that can be had without waiting for it, and
+    /// count them.
+    ///
+    /// Each is asked for and the asking dropped the moment it would wait. sqlx
+    /// takes a message off the connection whole or leaves it there, so a
+    /// dropped asking loses nothing. And nothing here yields, so a caller that
+    /// stops waiting cannot drop a count that was already taken.
+    ///
+    /// An error ends the taking and is not reported here: the wait that finds
+    /// nothing waiting meets it again, says so, and falls back to the timer.
+    /// Either way what was heard is no longer known to be everything.
+    async fn take_waiting(&mut self) -> usize {
+        let mut taken = 0;
+        while taken < NOTIFICATIONS_PER_WAIT {
+            let next = {
+                let mut recv = std::pin::pin!(self.listener.try_recv());
+                std::future::poll_fn(|cx| Poll::Ready(recv.as_mut().poll(cx))).await
+            };
+            match next {
+                Poll::Ready(Ok(Some(one))) => {
+                    self.heard(one.payload());
+                    taken += 1;
+                }
+                Poll::Ready(Ok(None)) | Poll::Ready(Err(_)) => {
+                    self.all = true;
+                    break;
+                }
+                Poll::Pending => break,
+            }
+        }
+        taken
+    }
+}
+
+// ── Path caches ──────────────────────────────────────────────────────────────
+// The index of what `workspace.cache` keeps in the engine's cache store. The
+// bytes are in the store; these rows say where, how big, and when last read.
+
+/// The ready entries of one cache in one scope, newest first: what a task of
+/// that repository and ref may restore.
+pub async fn path_cache_entries(
+    pool: &Pool,
+    scope: &str,
+    prefix: &str,
+    version: &str,
+    limit: i64,
+) -> Result<Vec<crate::models::PathCacheEntry>> {
+    let rows: Vec<(String, String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT id, cache_key, object_key, size_bytes FROM path_caches
+         WHERE scope = $1 AND prefix = $2 AND version = $3 AND state = 'ready'
+         ORDER BY created_at DESC, id DESC LIMIT $4",
+    )
+    .bind(scope)
+    .bind(prefix)
+    .bind(version)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, cache_key, object_key, size_bytes)| crate::models::PathCacheEntry {
+                id,
+                cache_key,
+                object_key,
+                size_bytes,
+            },
+        )
+        .collect())
+}
+
+/// An entry was offered to a task to restore: it was used now, for the
+/// quota's least-recently-used order.
+pub async fn path_cache_used(pool: &Pool, id: &str) -> Result<()> {
+    sqlx::query("UPDATE path_caches SET last_used_at = $1 WHERE id = $2 AND state = 'ready'")
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// A task was given a URL to save an entry to: its row, pending until the
+/// task has succeeded.
+pub async fn path_cache_offered(pool: &Pool, entry: &crate::models::NewPathCache) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO path_caches
+           (id, repo, scope, prefix, version, object_key, state, task_id, created_at, last_used_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $8)",
+    )
+    .bind(&entry.id)
+    .bind(&entry.repo)
+    .bind(&entry.scope)
+    .bind(&entry.prefix)
+    .bind(&entry.version)
+    .bind(&entry.object_key)
+    .bind(&entry.task_id)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The pending entries the sweep has something to do with: their task has
+/// ended (or its row is gone), or they were offered before `stale_before` and
+/// the URL they were offered with is spent. Oldest first.
+pub async fn path_caches_settled(
+    pool: &Pool,
+    stale_before: &str,
+    limit: i64,
+) -> Result<Vec<crate::models::PendingPathCache>> {
+    let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT p.id, p.object_key, p.created_at, t.status
+         FROM path_caches p LEFT JOIN task_runs t ON t.id = p.task_id
+         WHERE p.state = 'pending'
+           AND (t.id IS NULL OR t.status IN ('succeeded', 'failed', 'skipped', 'cancelled')
+                OR p.created_at < $1)
+         ORDER BY p.created_at LIMIT $2",
+    )
+    .bind(stale_before)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, object_key, created_at, task_status)| crate::models::PendingPathCache {
+                id,
+                object_key,
+                created_at,
+                task_status,
+            },
+        )
+        .collect())
+}
+
+/// Make a pending entry ready under the key its task saved it with, in the
+/// place of any ready entry of the same key in its scope. Returns the object
+/// keys of the entries it took the place of, for the store to forget, or
+/// `None` when the entry was no longer pending (another sweep took it).
+pub async fn path_cache_ready(
+    pool: &Pool,
+    id: &str,
+    cache_key: &str,
+    size_bytes: i64,
+) -> Result<Option<Vec<String>>> {
+    let mut tx = pool.begin().await?;
+    let row: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT scope, prefix, version FROM path_caches WHERE id = $1 AND state = 'pending' FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((scope, prefix, version)) = row else {
+        return Ok(None);
+    };
+    let replaced: Vec<(String,)> = sqlx::query_as(
+        "DELETE FROM path_caches
+         WHERE scope = $1 AND prefix = $2 AND version = $3 AND cache_key = $4 AND state = 'ready'
+         RETURNING object_key",
+    )
+    .bind(&scope)
+    .bind(&prefix)
+    .bind(&version)
+    .bind(cache_key)
+    .fetch_all(&mut *tx)
+    .await?;
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE path_caches SET state = 'ready', cache_key = $1, size_bytes = $2, task_id = NULL,
+           created_at = $3, last_used_at = $3
+         WHERE id = $4",
+    )
+    .bind(cache_key)
+    .bind(size_bytes)
+    .bind(&now)
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some(replaced.into_iter().map(|(k,)| k).collect()))
+}
+
+/// Forget an entry. Returns its object key, for the store to forget too, or
+/// `None` when another sweep already did.
+pub async fn path_cache_drop(pool: &Pool, id: &str) -> Result<Option<String>> {
+    let row: Option<(String,)> =
+        sqlx::query_as("DELETE FROM path_caches WHERE id = $1 RETURNING object_key")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(k,)| k))
+}
+
+/// The ready entries to evict, least recently used first: those of a
+/// repository past what is newer of it within `quota_bytes`, and those not
+/// read since `unused_since`.
+pub async fn path_cache_victims(
+    pool: &Pool,
+    quota_bytes: i64,
+    unused_since: &str,
+    limit: i64,
+) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT id FROM (
+           SELECT id, last_used_at,
+                  SUM(COALESCE(size_bytes, 0)) OVER (
+                    PARTITION BY repo ORDER BY last_used_at DESC, id DESC ROWS UNBOUNDED PRECEDING
+                  ) AS kept
+           FROM path_caches WHERE state = 'ready'
+         ) r
+         WHERE r.kept > $1 OR r.last_used_at < $2
+         ORDER BY r.last_used_at LIMIT $3",
+    )
+    .bind(quota_bytes)
+    .bind(unused_since)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+// ── Workflow artifacts ───────────────────────────────────────────────────────
+
+type ArtifactRow = (
+    String,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    Option<i64>,
+    Option<String>,
+    String,
+    String,
+);
+
+fn workflow_artifact(row: ArtifactRow) -> crate::models::WorkflowArtifact {
+    let (
+        id,
+        artifact_id,
+        run_id,
+        task_id,
+        name,
+        object_key,
+        size_bytes,
+        sha256,
+        created_at,
+        expires_at,
+    ) = row;
+    crate::models::WorkflowArtifact {
+        id,
+        artifact_id,
+        run_id,
+        task_id,
+        name,
+        object_key,
+        size_bytes,
+        sha256,
+        created_at,
+        expires_at,
+    }
+}
+
+/// A job asked to upload an artifact: its row, pending until the upload is
+/// said to be complete, and expiring as `artifact.expires_at` says.
+pub async fn workflow_artifact_begin(
+    pool: &Pool,
+    artifact: &crate::models::WorkflowArtifact,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO workflow_artifacts
+           (id, artifact_id, run_id, task_id, name, object_key, state, created_at, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8)",
+    )
+    .bind(&artifact.id)
+    .bind(artifact.artifact_id)
+    .bind(&artifact.run_id)
+    .bind(&artifact.task_id)
+    .bind(&artifact.name)
+    .bind(&artifact.object_key)
+    .bind(&artifact.created_at)
+    .bind(&artifact.expires_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// An upload is complete: the artifact is its run's, under its name, unless
+/// another of that name became so first. `false` then, or where the row is
+/// no longer pending. Two at once: the unique index refuses the second,
+/// which is `false` too.
+pub async fn workflow_artifact_ready(
+    pool: &Pool,
+    id: &str,
+    size_bytes: i64,
+    sha256: &str,
+    expires_at: &str,
+    provenance: Option<&str>,
+) -> Result<bool> {
+    let done = sqlx::query(
+        "UPDATE workflow_artifacts
+            SET state = 'ready', size_bytes = $1, sha256 = $2, expires_at = $3, created_at = $4,
+                provenance = $6
+          WHERE id = $5 AND state = 'pending'
+            AND NOT EXISTS (
+                SELECT 1 FROM workflow_artifacts AS w
+                 WHERE w.run_id = workflow_artifacts.run_id
+                   AND w.name = workflow_artifacts.name
+                   AND w.state = 'ready')",
+    )
+    .bind(size_bytes)
+    .bind(sha256)
+    .bind(expires_at)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(id)
+    .bind(provenance)
+    .execute(pool)
+    .await;
+    match done {
+        Ok(done) => Ok(done.rows_affected() == 1),
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// A run's artifacts whose uploads are complete, oldest first.
+pub async fn workflow_artifacts_of_run(
+    pool: &Pool,
+    run_id: &str,
+) -> Result<Vec<crate::models::WorkflowArtifact>> {
+    let rows: Vec<ArtifactRow> = sqlx::query_as(
+        "SELECT id, artifact_id, run_id, task_id, name, object_key, size_bytes, sha256,
+                created_at, expires_at
+           FROM workflow_artifacts WHERE run_id = $1 AND state = 'ready'
+          ORDER BY created_at, artifact_id",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(workflow_artifact).collect())
+}
+
+/// When `task_id`'s attempt that runs now was queued (`scheduled_at`): what
+/// it uploaded is later than this, and what an earlier attempt of it uploaded,
+/// before a rerun, a clear or a retry queued this one, is not. `None` for a
+/// task that is not there.
+pub async fn task_queued_at(pool: &Pool, task_id: &str) -> Result<Option<String>> {
+    let at: Option<Option<String>> =
+        sqlx::query_scalar("SELECT scheduled_at FROM task_runs WHERE id = $1")
+            .bind(task_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(at.flatten())
+}
+
+/// Drop an artifact's row: its object key, to delete its bytes by; `None`
+/// when another had dropped it.
+pub async fn workflow_artifact_drop(pool: &Pool, id: &str) -> Result<Option<String>> {
+    let row: Option<(String,)> =
+        sqlx::query_as("DELETE FROM workflow_artifacts WHERE id = $1 RETURNING object_key")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(k,)| k))
+}
+
+/// The artifacts that expired before `now`, pending ones too, soonest first:
+/// their ids and object keys. The rows stay until they are dropped, once
+/// their bytes are gone.
+pub async fn workflow_artifacts_expired(
+    pool: &Pool,
+    now: &str,
+    limit: i64,
+) -> Result<Vec<(String, String)>> {
+    Ok(sqlx::query_as(
+        "SELECT id, object_key FROM workflow_artifacts WHERE expires_at < $1
+          ORDER BY expires_at LIMIT $2",
+    )
+    .bind(now)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+// ── Task identity ────────────────────────────────────────────────────────────
+
+/// A task that asks for an identity is given a request credential: its row,
+/// in place of any an earlier attempt of the task had. Rows past their time
+/// go with it.
+pub async fn oidc_request_offered(pool: &Pool, request: &crate::models::OidcRequest) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM oidc_requests WHERE task_id = $1 OR expires_at < $2")
+        .bind(&request.task_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO oidc_requests
+           (token_sha256, run_id, task_id, task_name, attempt, audiences, environment, expires_at, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+    )
+    .bind(&request.token_sha256)
+    .bind(&request.run_id)
+    .bind(&request.task_id)
+    .bind(&request.task_name)
+    .bind(request.attempt)
+    .bind(serde_json::to_string(&request.audiences)?)
+    .bind(&request.environment)
+    .bind(&request.expires_at)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The request credential of this SHA-256, with its task's status now
+/// (`None` when the task's row is gone).
+pub async fn oidc_request(
+    pool: &Pool,
+    token_sha256: &str,
+) -> Result<Option<(crate::models::OidcRequest, Option<String>)>> {
+    #[allow(clippy::type_complexity)]
+    let row: Option<(
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT r.token_sha256, r.run_id, r.task_id, r.task_name, r.attempt, r.audiences,
+                    r.environment, r.expires_at, t.status
+             FROM oidc_requests r LEFT JOIN task_runs t ON t.id = r.task_id
+             WHERE r.token_sha256 = $1",
+    )
+    .bind(token_sha256)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(
+        |(
+            token_sha256,
+            run_id,
+            task_id,
+            task_name,
+            attempt,
+            audiences,
+            environment,
+            expires_at,
+            status,
+        )| {
+            (
+                crate::models::OidcRequest {
+                    token_sha256,
+                    run_id,
+                    task_id,
+                    task_name,
+                    attempt,
+                    audiences: serde_json::from_str(&audiences).unwrap_or_default(),
+                    environment,
+                    expires_at,
+                },
+                status,
+            )
+        },
+    ))
+}
+
+// ── Remote runner sessions ────────────────────────────────────────────────────
+//
+// A remote runner's session holds the tasks it has taken. The session's lease
+// is renewed by its heartbeat, one statement for every task it holds; a task
+// row is not rewritten. A session-held row keeps the lease it was claimed with
+// (non-NULL, so the predicates that read a NULL lease as parked keep their
+// meaning) and points at its session, and the engine's expired-lease sweeps
+// pass it by: it is [`recover_expired_sessions`]'s to take back.
+//
+// What a runner says of a task is kept in `runner_results`, and an engine
+// takes it ([`take_runner_results`]) and applies it as it does its own
+// workers' results. The claim and the runner's words are dagron-api's, which
+// is Postgres's alone: the functions it calls are here, and not in SQLite.
+
+/// How long an engine that took a runner's result has to apply it before
+/// another may take it: one that died with it in hand.
+const RUNNER_RESULT_RETAKE_SECS: i64 = 60;
+
+/// How long a session may hold a task its heartbeats do not name before it
+/// is taken for a claim the runner never heard of ([`renew_session`]): a
+/// heartbeat already on its way when the claim was answered does not name it.
+pub const ORPHAN_CLAIM_SECS: i64 = 60;
+
+/// Claim, for a runner's session, up to `limit` ready tasks of the classes it
+/// serves: the engine's own claim ([`claim_ready_classes`]), under the
+/// session's holder, and then each claimed row pointed at the session. A
+/// session that serves no class claims nothing: an empty list would claim
+/// every class.
+///
+/// The row's lease is a session lease from the claim, and is never renewed
+/// on the row: it says when the claim was made, which is what
+/// [`renew_session`] reads to find a claim the runner never heard of.
+///
+/// A row the session no longer exists to hold (it expired, and was swept,
+/// between the two statements) is given back as it was before the claim, its
+/// attempt with it: nothing ran.
+pub async fn claim_for_session(
+    pool: &Pool,
+    session_id: &str,
+    holder: &str,
+    limit: i64,
+    classes: &[String],
+    pool_caps: &std::collections::BTreeMap<String, i64>,
+) -> Result<Vec<TaskRun>> {
+    if classes.is_empty() || limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let claimed = claim_ready_classes(pool, holder, limit, classes, pool_caps).await?;
+    if claimed.is_empty() {
+        return Ok(claimed);
+    }
+    let ids: Vec<&str> = claimed.iter().map(|t| t.id.as_str()).collect();
+    let lease = (chrono::Utc::now()
+        + chrono::TimeDelta::seconds(crate::runner::session_lease_secs()))
+    .to_rfc3339();
+    let stamped: Vec<String> = sqlx::query_scalar(
+        "UPDATE task_runs t
+         SET session_id = s.id, lease_expires_at = $4
+         FROM runner_sessions s
+         WHERE s.id = $1 AND s.holder = $2
+           AND t.id = ANY($3) AND t.claimed_by = $2 AND t.status = 'running'
+         RETURNING t.id",
+    )
+    .bind(session_id)
+    .bind(holder)
+    .bind(&ids)
+    .bind(&lease)
+    .fetch_all(pool)
+    .await?;
+    if stamped.len() == claimed.len() {
+        return Ok(claimed);
+    }
+    let lost: Vec<&str> = ids.iter().copied().filter(|id| !stamped.iter().any(|s| s == id)).collect();
+    sqlx::query(
+        "UPDATE task_runs
+         SET status = 'ready', claimed_by = NULL, lease_expires_at = NULL,
+             attempt = GREATEST(attempt - 1, 0)
+         WHERE id = ANY($1) AND claimed_by = $2 AND status = 'running' AND session_id IS NULL",
+    )
+    .bind(&lost)
+    .bind(holder)
+    .execute(pool)
+    .await?;
+    tracing::warn!(session_id, given_back = lost.len(), "the session was gone as its tasks were claimed: given back");
+    Ok(claimed.into_iter().filter(|t| stamped.contains(&t.id)).collect())
+}
+
+/// Whether ready work of any of `classes` is due: asked before a session's
+/// claim, which is a write, so that a session long-polling an empty queue
+/// costs reads alone.
+pub async fn ready_for_classes(pool: &Pool, classes: &[String]) -> Result<bool> {
+    if classes.is_empty() {
+        return Ok(false);
+    }
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM task_runs
+             WHERE status = 'ready' AND runner_class = ANY($1)
+               AND (scheduled_at IS NULL OR scheduled_at <= $2)
+         )",
+    )
+    .bind(classes)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .fetch_one(pool)
+    .await?)
+}
+
+/// What a session's heartbeat comes to ([`renew_session`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRenewed {
+    pub lease_expires_at: String,
+    /// Of the tasks the heartbeat named, those whose work should stop.
+    pub cancel: Vec<String>,
+    /// The session is to drain: by its runner's word, or an admin's.
+    pub drain: bool,
+}
+
+/// A session's heartbeat: its lease renewed, and with it every task it holds,
+/// in one statement, which also reads what the heartbeat named of its tasks
+/// (a task row is not written). `None` where the session is not the
+/// runner's, or its lease has already lapsed: its tasks are, or are about to
+/// be, taken back, and the runner is to stop them and open another.
+///
+/// `held` is what the runner is running, each with its fence. Those to stop
+/// are as an engine's are ([`super::not_held`]): asked to stop, or no longer
+/// held under this session's claim and that fence.
+///
+/// A task the session holds and the heartbeat does not name, claimed longer
+/// ago than [`ORPHAN_CLAIM_SECS`], is a claim the runner never heard of: the
+/// answer to its claim was lost, or the task could not be made ready for it.
+/// It is given back as it was before the claim, its attempt with it, since
+/// nothing ran; or `cancelled`, where it was asked to stop. That second
+/// statement is made only when there is such a task.
+pub async fn renew_session(
+    pool: &Pool,
+    session_id: &str,
+    runner_id: &str,
+    held: &[(String, i64)],
+) -> Result<Option<SessionRenewed>> {
+    let now_dt = chrono::Utc::now();
+    let now = now_dt.to_rfc3339();
+    let lease = crate::runner::session_lease_secs();
+    let until = (now_dt + chrono::TimeDelta::seconds(lease)).to_rfc3339();
+    // A row's lease is its claim's time and a lease on: claimed before the
+    // cutoff, its lease is before this.
+    let orphaned_before =
+        (now_dt + chrono::TimeDelta::seconds(lease - ORPHAN_CLAIM_SECS)).to_rfc3339();
+    let ids: Vec<&str> = held.iter().map(|(id, _)| id.as_str()).collect();
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        String,
+        Option<String>,
+        bool,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "WITH s AS (
+             UPDATE runner_sessions SET lease_expires_at = $3
+             WHERE id = $1 AND runner_id = $2 AND lease_expires_at >= $4
+             RETURNING holder, draining_at
+         )
+         SELECT s.holder, s.draining_at, true,
+                t.id, t.version, t.claimed_by, t.status, t.stop_requested_at
+         FROM s LEFT JOIN task_runs t ON t.id = ANY($5)
+         UNION ALL
+         SELECT s.holder, s.draining_at, false,
+                t.id, t.version, t.claimed_by, t.status, t.stop_requested_at
+         FROM s JOIN task_runs t
+           ON t.session_id = $1 AND t.status = 'running' AND t.claimed_by = s.holder
+         WHERE NOT (t.id = ANY($5)) AND t.lease_expires_at < $6
+           AND NOT EXISTS (SELECT 1 FROM runner_results r WHERE r.task_id = t.id)",
+    )
+    .bind(session_id)
+    .bind(runner_id)
+    .bind(&until)
+    .bind(&now)
+    .bind(&ids)
+    .bind(&orphaned_before)
+    .fetch_all(pool)
+    .await?;
+    let Some(first) = rows.first() else {
+        return Ok(None);
+    };
+    let holder = first.0.clone();
+    let drain = first.1.is_some();
+    let mut named = Vec::new();
+    let mut orphans: Vec<(String, i64, bool)> = Vec::new();
+    for (_, _, was_named, id, version, by, status, asked) in rows {
+        let (Some(id), Some(version), Some(status)) = (id, version, status) else {
+            continue;
+        };
+        if was_named {
+            named.push((id, version, by, status, asked));
+        } else {
+            orphans.push((id, version, asked.is_some()));
+        }
+    }
+    if !orphans.is_empty() {
+        let given_back: Vec<&str> =
+            orphans.iter().filter(|(_, _, asked)| !asked).map(|(id, _, _)| id.as_str()).collect();
+        if !given_back.is_empty() {
+            let runs: Vec<String> = sqlx::query_scalar(
+                "UPDATE task_runs
+                 SET status = 'ready', claimed_by = NULL, lease_expires_at = NULL,
+                     session_id = NULL, attempt = GREATEST(attempt - 1, 0)
+                 WHERE id = ANY($1) AND claimed_by = $2 AND session_id = $3
+                   AND status = 'running' AND stop_requested_at IS NULL
+                 RETURNING run_id",
+            )
+            .bind(&given_back)
+            .bind(&holder)
+            .bind(session_id)
+            .fetch_all(pool)
+            .await?;
+            tracing::warn!(
+                session_id, given_back = runs.len(),
+                "a session held tasks its runner never named: given back"
+            );
+            notify_runs(pool, &runs).await?;
+        }
+        for (id, fence, _) in orphans.iter().filter(|(_, _, asked)| *asked) {
+            settle_stopped_task(pool, id, &holder, *fence).await?;
+        }
+    }
+    Ok(Some(SessionRenewed {
+        lease_expires_at: until,
+        cancel: super::not_held(&holder, held, named),
+        drain,
+    }))
+}
+
+/// What became of a runner's word on how a task came out
+/// ([`record_runner_result`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunnerResultRecorded {
+    /// Kept for an engine to apply; the task's run, which was told.
+    Recorded(String),
+    /// The same word, under the same fence, was kept already.
+    Duplicate,
+    /// The claim is not the session's any more, under that fence: the word
+    /// is too late, and changes nothing.
+    Stale,
+}
+
+/// Keep what a runner said of a task, for an engine to apply
+/// ([`take_runner_results`]). Kept only while the task is still held under
+/// the session's claim (`holder`) and `fence`; a word on an older claim of
+/// the same task, never applied, is replaced. The run is told, so that an
+/// engine wakes for it.
+pub async fn record_runner_result(
+    pool: &Pool,
+    task_id: &str,
+    holder: &str,
+    fence: i64,
+    outcome: crate::runner::Outcome,
+    exit_code: Option<i32>,
+    output: &str,
+) -> Result<RunnerResultRecorded> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let row: Option<(String, i64)> = sqlx::query_as(
+        "WITH t AS (
+             SELECT id, run_id, version, claimed_by FROM task_runs
+             WHERE id = $1 AND claimed_by = $2 AND version = $3
+               AND status = 'running' AND session_id IS NOT NULL
+         ), kept AS (
+             INSERT INTO runner_results
+                 (task_id, fence, claimed_by, status, exit_code, output, created_at)
+             SELECT id, version, claimed_by, $4, $5, $6, $7 FROM t
+             ON CONFLICT (task_id) DO UPDATE
+                 SET fence = EXCLUDED.fence, claimed_by = EXCLUDED.claimed_by,
+                     status = EXCLUDED.status, exit_code = EXCLUDED.exit_code,
+                     output = EXCLUDED.output, created_at = EXCLUDED.created_at,
+                     taken_by = NULL, taken_at = NULL
+                 WHERE runner_results.fence < EXCLUDED.fence
+             RETURNING task_id
+         )
+         SELECT t.run_id, (SELECT COUNT(*) FROM kept) FROM t",
+    )
+    .bind(task_id)
+    .bind(holder)
+    .bind(fence)
+    .bind(outcome.as_str())
+    .bind(exit_code)
+    .bind(output)
+    .bind(&now)
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        Some((run_id, kept)) if kept > 0 => {
+            notify(pool, &run_id).await?;
+            Ok(RunnerResultRecorded::Recorded(run_id))
+        }
+        // Held, and a word under this fence is kept already.
+        Some(_) => Ok(RunnerResultRecorded::Duplicate),
+        None => Ok(RunnerResultRecorded::Stale),
+    }
+}
+
+/// What became of a segment of a session's task's log
+/// ([`append_session_log`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionLogKept {
+    /// Written; the task's run, which the caller tells of.
+    Appended(String),
+    /// This segment, under this fence, was written already: sent again by a
+    /// runner that did not hear the answer. Nothing is written.
+    Duplicate,
+    /// The task is not held under the session's claim and that fence, or the
+    /// segment would take its log past the most that is kept of one.
+    NotKept,
+}
+
+/// Add segment `seq` of what a session's task wrote to its live log. A
+/// `reset` segment, and segment 0, replace the log: the attempt's first, or a
+/// seal (the whole log over again, redacted as one piece). Only while the
+/// task is held under the session's claim and `fence`, and only up to `most`
+/// bytes of log: the runner keeps to its cap and the end it keeps past it
+/// itself, and this is the floor under them
+/// ([`crate::runner::session_log_most`]).
+///
+/// A runner numbers an attempt's segments 0, 1, 2, …, a seal's among them,
+/// and the numbers only rise; one it did not hear the answer to it sends
+/// again, the same text under the same number. The last segment written, and
+/// its fence, are kept with the task, so a segment numbered at or below it
+/// under the same fence is one written already
+/// ([`SessionLogKept::Duplicate`]): the same one sent again, or one held up
+/// on its way until a later one, a seal, say, was written. One numbered past
+/// the next is written: its text is new, and a runner moves on only once it
+/// has been answered or has given a segment up for a seal.
+#[allow(clippy::too_many_arguments)]
+pub async fn append_session_log(
+    pool: &Pool,
+    task_id: &str,
+    holder: &str,
+    fence: i64,
+    seq: u64,
+    reset: bool,
+    text: &str,
+    most: usize,
+) -> Result<SessionLogKept> {
+    let seq = i64::try_from(seq).unwrap_or(i64::MAX);
+    let reset = reset || seq == 0;
+    let mut tx = pool.begin().await?;
+    // Locked, so that a segment sent again while the first is still being
+    // written waits for it and then reads it as written.
+    let held: Option<(String, bool, i64)> = sqlx::query_as(
+        "SELECT run_id,
+                COALESCE(log_fence = $3 AND $4 <= log_seq, FALSE),
+                COALESCE(octet_length(log), 0)::BIGINT
+         FROM task_runs
+         WHERE id = $1 AND claimed_by = $2 AND version = $3 AND status = 'running'
+         FOR UPDATE",
+    )
+    .bind(task_id)
+    .bind(holder)
+    .bind(fence)
+    .bind(seq)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((run_id, written, len)) = held else {
+        return Ok(SessionLogKept::NotKept);
+    };
+    if written {
+        return Ok(SessionLogKept::Duplicate);
+    }
+    let len = if reset { 0 } else { len };
+    if len.saturating_add(text.len() as i64) > i64::try_from(most).unwrap_or(i64::MAX) {
+        return Ok(SessionLogKept::NotKept);
+    }
+    sqlx::query(
+        "UPDATE task_runs
+         SET log = CASE WHEN $5 THEN $4 ELSE COALESCE(log, '') || $4 END,
+             log_seq = $3, log_fence = $2,
+             log_gen = CASE WHEN $5 THEN COALESCE(log_gen, 0) + 1 ELSE log_gen END
+         WHERE id = $1",
+    )
+    .bind(task_id)
+    .bind(fence)
+    .bind(seq)
+    .bind(text)
+    .bind(reset)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(SessionLogKept::Appended(run_id))
+}
+
+/// How many tasks a session holds now, its results not yet applied among
+/// them: what its claims are counted against.
+pub async fn session_running(pool: &Pool, session_id: &str, holder: &str) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_runs
+         WHERE session_id = $1 AND status = 'running' AND claimed_by = $2",
+    )
+    .bind(session_id)
+    .bind(holder)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// The work there is for each of `labels`: ready tasks of the class,
+/// those sessions hold, and the live sessions that serve it and what they run
+/// at once together. One row a label, in the order asked.
+pub async fn runner_queue(
+    pool: &Pool,
+    labels: &[String],
+) -> Result<Vec<crate::runner::LabelQueue>> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let rows: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT l.label,
+                (SELECT COUNT(*) FROM task_runs t
+                 WHERE t.status = 'ready' AND t.runner_class = l.label
+                   AND (t.scheduled_at IS NULL OR t.scheduled_at <= $2)),
+                (SELECT COUNT(*) FROM task_runs t
+                 WHERE t.status = 'running' AND t.session_id IS NOT NULL
+                   AND t.claimed_by IS NOT NULL AND t.runner_class = l.label),
+                (SELECT COUNT(*) FROM runner_sessions s
+                 WHERE l.label = ANY(s.labels) AND s.lease_expires_at >= $2
+                   AND s.draining_at IS NULL),
+                (SELECT COALESCE(SUM(s.capacity), 0)::BIGINT FROM runner_sessions s
+                 WHERE l.label = ANY(s.labels) AND s.lease_expires_at >= $2
+                   AND s.draining_at IS NULL)
+         FROM unnest($1::text[]) WITH ORDINALITY AS l(label, n)
+         ORDER BY l.n",
+    )
+    .bind(labels)
+    .bind(&now)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(label, ready, running, sessions, capacity)| crate::runner::LabelQueue {
+            label,
+            ready,
+            running,
+            sessions,
+            capacity,
+        })
+        .collect())
+}
+
+/// Take back the tasks of sessions whose lease has lapsed: their runner died,
+/// or was cut off. A task still held under its session's claim goes back to
+/// `ready`, as one whose lease lapsed does ([`recover_expired_leases`]). One
+/// that was asked to stop is `cancelled`, its run ended where it was the last
+/// such task: nobody can watch its work now. A task whose result the runner
+/// said, and no engine has applied yet, is left for that result. Then the
+/// sessions that hold nothing more are dropped.
+///
+/// Returns how many tasks were taken back or cancelled.
+pub async fn recover_expired_sessions(pool: &Pool) -> Result<u64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    // Most sweeps find no lapsed session (and a SQLite engine never has one):
+    // a read, and nothing written.
+    let any: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM runner_sessions WHERE lease_expires_at < $1)",
+    )
+    .bind(&now)
+    .fetch_one(pool)
+    .await?;
+    if !any {
+        return Ok(0);
+    }
+    const HELD_BY_EXPIRED: &str = "status = 'running' AND session_id IS NOT NULL
+           AND EXISTS (
+               SELECT 1 FROM runner_sessions s
+               WHERE s.id = task_runs.session_id AND s.holder = task_runs.claimed_by
+                 AND s.lease_expires_at < $1
+           )
+           AND NOT EXISTS (SELECT 1 FROM runner_results r WHERE r.task_id = task_runs.id)";
+    let requeued = sqlx::query(&format!(
+        "UPDATE task_runs
+         SET status = 'ready', claimed_by = NULL, lease_expires_at = NULL, session_id = NULL
+         WHERE {HELD_BY_EXPIRED} AND stop_requested_at IS NULL
+         RETURNING run_id"
+    ))
+    .bind(&now)
+    .fetch_all(pool)
+    .await?;
+    let mut seen = std::collections::HashSet::new();
+    for row in &requeued {
+        let run_id: String = row.try_get("run_id")?;
+        if seen.insert(run_id.clone()) {
+            notify(pool, &run_id).await?;
+        }
+    }
+    let stopping: Vec<(String, String, i64)> = sqlx::query_as(&format!(
+        "SELECT id, claimed_by, version FROM task_runs
+         WHERE {HELD_BY_EXPIRED} AND stop_requested_at IS NOT NULL"
+    ))
+    .bind(&now)
+    .fetch_all(pool)
+    .await?;
+    let mut cancelled = 0u64;
+    for (task_id, holder, fence) in &stopping {
+        if settle_stopped_task(pool, task_id, holder, *fence).await? {
+            cancelled += 1;
+        }
+    }
+    sqlx::query(
+        "DELETE FROM runner_sessions s
+         WHERE s.lease_expires_at < $1
+           AND NOT EXISTS (
+               SELECT 1 FROM task_runs t
+               WHERE t.session_id = s.id AND t.status = 'running' AND t.claimed_by = s.holder
+           )",
+    )
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(requeued.len() as u64 + cancelled)
+}
+
+/// Take up to `limit` of what remote runners said of their tasks, for this
+/// engine (`taker`) to apply. Each is the engine's until it drops it
+/// ([`drop_runner_results`]), or for a minute: one that an engine took and did
+/// not apply, because it died, is taken again. Applying one twice changes
+/// nothing the second time: every mark it makes is fenced.
+pub async fn take_runner_results(
+    pool: &Pool,
+    taker: &str,
+    limit: i64,
+) -> Result<Vec<crate::models::RunnerResult>> {
+    let now_dt = chrono::Utc::now();
+    let stale = (now_dt - chrono::TimeDelta::seconds(RUNNER_RESULT_RETAKE_SECS)).to_rfc3339();
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        String,
+        i64,
+        String,
+        String,
+        Option<i32>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "WITH taken AS (
+             UPDATE runner_results SET taken_by = $1, taken_at = $2
+             WHERE task_id IN (
+                 SELECT task_id FROM runner_results
+                 WHERE taken_at IS NULL OR taken_at < $3
+                 ORDER BY created_at
+                 LIMIT $4
+                 FOR UPDATE SKIP LOCKED
+             )
+             RETURNING task_id, fence, claimed_by, status, exit_code, output
+         )
+         SELECT taken.task_id, taken.fence, taken.claimed_by, taken.status,
+                taken.exit_code, taken.output, t.run_id, t.attempt, t.input
+         FROM taken LEFT JOIN task_runs t ON t.id = taken.task_id",
+    )
+    .bind(taker)
+    .bind(now_dt.to_rfc3339())
+    .bind(&stale)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(task_id, fence, claimed_by, outcome, exit_code, output, run_id, attempt, input)| {
+                crate::models::RunnerResult {
+                    task_id,
+                    claimed_by,
+                    fence,
+                    outcome,
+                    exit_code,
+                    output,
+                    run_id,
+                    attempt: attempt.unwrap_or(1).saturating_sub(1).max(0),
+                    input,
+                }
+            },
+        )
+        .collect())
+}
+
+/// Drop runners' results an engine has applied: each by its task and fence,
+/// so that a newer word on the same task, kept since, is not dropped with it.
+pub async fn drop_runner_results(pool: &Pool, applied: &[(String, i64)]) -> Result<()> {
+    if applied.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<&str> = applied.iter().map(|(id, _)| id.as_str()).collect();
+    let fences: Vec<i64> = applied.iter().map(|(_, fence)| *fence).collect();
+    sqlx::query(
+        "DELETE FROM runner_results r
+         USING unnest($1::text[], $2::bigint[]) AS a(task_id, fence)
+         WHERE r.task_id = a.task_id AND r.fence = a.fence",
+    )
+    .bind(&ids)
+    .bind(&fences)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod migration_lock_tests {
+    //! The migration lock, live, each test on a database of its own: the
+    //! lock's key is the database's, and a concurrent index build waits only
+    //! on the sessions of its own database, so neither reaches the other live
+    //! tests, which share TEST_DATABASE_URL's database.
+
+    use super::*;
+    use sqlx::migrate::{Migrate, Migrator};
+    use sqlx::{Connection, PgConnection};
+
+    /// A database made for one test, and dropped, with whatever is still
+    /// connected to it, when the test ends, by a panic too.
+    pub(super) struct OwnDatabase {
+        admin_url: String,
+        pub(super) name: String,
+        pub(super) url: String,
+    }
+
+    impl OwnDatabase {
+        pub(super) async fn new() -> Option<Self> {
+            let admin_url = match std::env::var("TEST_DATABASE_URL") {
+                Ok(u) if !u.trim().is_empty() => u,
+                _ => {
+                    eprintln!("TEST_DATABASE_URL unset - skipping a live-datastore test");
+                    return None;
+                }
+            };
+            let name = format!("mig_lock_{}", Uuid::new_v4().simple());
+            let mut admin = PgConnection::connect(&admin_url).await.unwrap();
+            let created = sqlx::query(&format!("CREATE DATABASE {name}"))
+                .execute(&mut admin)
+                .await;
+            let _ = admin.close().await;
+            if let Err(e) = created {
+                // insufficient_privilege: a role without CREATEDB.
+                if e.as_database_error().and_then(|db| db.code()).as_deref() == Some("42501") {
+                    eprintln!("TEST_DATABASE_URL's role may not create a database - skipping");
+                    return None;
+                }
+                panic!("CREATE DATABASE {name}: {e}");
+            }
+            let (head, query) = admin_url
+                .split_once('?')
+                .unwrap_or((admin_url.as_str(), ""));
+            let (server, _) = head.rsplit_once('/').unwrap();
+            let url = if query.is_empty() {
+                format!("{server}/{name}")
+            } else {
+                format!("{server}/{name}?{query}")
+            };
+            Some(Self {
+                admin_url,
+                name,
+                url,
+            })
+        }
+
+        async fn connect(&self) -> PgConnection {
+            PgConnection::connect(&self.url).await.unwrap()
+        }
+    }
+
+    impl Drop for OwnDatabase {
+        fn drop(&mut self) {
+            let (admin_url, name) = (self.admin_url.clone(), self.name.clone());
+            // A thread and a runtime of its own: a drop cannot await, and the
+            // test's runtime may be the one unwinding.
+            let _ = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    if let Ok(mut admin) = PgConnection::connect(&admin_url).await {
+                        let _ =
+                            sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+                                .execute(&mut admin)
+                                .await;
+                        let _ = admin.close().await;
+                    }
+                });
+            })
+            .join();
+        }
+    }
+
+    /// Whether the index named `index` is valid, or `None` when there is none.
+    async fn index_valid(conn: &mut PgConnection, index: &str) -> Option<bool> {
+        sqlx::query_scalar(
+            "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+              WHERE c.relname = $1",
+        )
+        .bind(index)
+        .fetch_optional(conn)
+        .await
+        .unwrap()
+    }
+
+    async fn unlock(conn: &mut PgConnection, key: i64) {
+        let released: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+            .bind(key)
+            .fetch_one(conn)
+            .await
+            .unwrap();
+        assert!(released, "the lock was this session's");
+    }
+
+    #[test]
+    fn the_key_s_crc_is_crc_32_iso_hdlc() {
+        // The CRC catalogue's check value for CRC-32/ISO-HDLC.
+        assert_eq!(crc32_iso_hdlc(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32_iso_hdlc(b""), 0);
+    }
+
+    /// sqlx's migration lock and this one are one lock: while either is
+    /// held the other is not to be had, so an engine of an earlier release
+    /// and one of this release migrate in turn.
+    #[tokio::test]
+    async fn sqlx_s_migration_lock_and_this_one_exclude_each_other() {
+        let Some(db) = OwnDatabase::new().await else {
+            return;
+        };
+        let (mut sqlx_s, mut ours) = (db.connect().await, db.connect().await);
+        let key = migration_lock_key(&db.name);
+
+        sqlx_s.lock().await.unwrap();
+        assert!(
+            !try_migration_lock(&mut ours, key).await.unwrap(),
+            "sqlx's lock holds this one off"
+        );
+        sqlx_s.unlock().await.unwrap();
+        assert!(
+            try_migration_lock(&mut ours, key).await.unwrap(),
+            "free once sqlx's is let go"
+        );
+
+        // sqlx's waits in its statement while this one is held.
+        let sqlx_waits = tokio::spawn(async move {
+            sqlx_s.lock().await.unwrap();
+            sqlx_s
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!sqlx_waits.is_finished(), "this lock holds sqlx's off");
+        unlock(&mut ours, key).await;
+        let mut sqlx_s = tokio::time::timeout(Duration::from_secs(10), sqlx_waits)
+            .await
+            .expect("sqlx's lock is taken once this one is let go")
+            .unwrap();
+        assert!(
+            !try_migration_lock(&mut ours, key).await.unwrap(),
+            "sqlx's holds again"
+        );
+        sqlx_s.unlock().await.unwrap();
+        let _ = sqlx_s.close().await;
+        let _ = ours.close().await;
+    }
+
+    /// What became of a concurrent index build that the migration lock's
+    /// holder ran while another session waited for the lock.
+    struct BuiltWhileWaited {
+        build: std::result::Result<(), sqlx::Error>,
+        index_valid: Option<bool>,
+        waiter: Result<()>,
+    }
+
+    /// The holder takes the migration lock, another session comes to wait
+    /// for it (as [`lock_migrations`] waits, or, with `sqlx_s_way`, as sqlx's
+    /// migrator does), and the holder then builds an index concurrently, as a
+    /// `-- no-transaction` migration does, and lets the lock go.
+    async fn build_an_index_while_another_waits(
+        db: &OwnDatabase,
+        sqlx_s_way: bool,
+    ) -> BuiltWhileWaited {
+        let mut holder = db.connect().await;
+        sqlx::query("CREATE TABLE things (id int)")
+            .execute(&mut holder)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO things SELECT generate_series(1, 1000)")
+            .execute(&mut holder)
+            .await
+            .unwrap();
+        let key = lock_migrations(&mut holder).await.unwrap();
+        let mut waiter = db.connect().await;
+        let waits = tokio::spawn(async move {
+            if sqlx_s_way {
+                waiter.lock().await?;
+            } else {
+                lock_migrations(&mut waiter).await?;
+            }
+            Ok::<_, anyhow::Error>(waiter)
+        });
+        // Longer than deadlock_timeout (1 s by default): the waiter's own
+        // deadlock check has run, and found nothing, before the build begins,
+        // as when an engine starts while another is migrating. A cycle the
+        // build then closes is the build's to break.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(!waits.is_finished(), "the waiter waits for the lock");
+        let build = tokio::time::timeout(
+            Duration::from_secs(20),
+            sqlx::query("CREATE INDEX CONCURRENTLY things_id ON things (id)").execute(&mut holder),
+        )
+        .await
+        .expect("the index build ends within 20 s")
+        .map(|_| ());
+        unlock(&mut holder, key).await;
+        let waiter = match tokio::time::timeout(Duration::from_secs(10), waits)
+            .await
+            .expect("the waiter ends within 10 s of the lock's release")
+            .unwrap()
+        {
+            Ok(waiter) => waiter.close().await.map_err(anyhow::Error::from),
+            Err(e) => Err(e),
+        };
+        let index_valid = index_valid(&mut holder, "things_id").await;
+        let _ = holder.close().await;
+        BuiltWhileWaited {
+            build,
+            index_valid,
+            waiter,
+        }
+    }
+
+    /// The deadlock this lock is polled to avoid: with another engine
+    /// waiting for the migration lock, the holder's concurrent index build
+    /// completes, and the index is valid. The waiter then takes the lock.
+    #[tokio::test]
+    async fn an_index_built_while_another_engine_waits_for_the_lock_completes() {
+        let Some(db) = OwnDatabase::new().await else {
+            return;
+        };
+        let outcome = build_an_index_while_another_waits(&db, false).await;
+        outcome.build.expect("the index build completes");
+        assert_eq!(outcome.index_valid, Some(true), "the index is valid");
+        outcome
+            .waiter
+            .expect("the waiter takes the lock once it is let go");
+    }
+
+    /// The same, with the waiter waiting as sqlx's migrator does, in one
+    /// `SELECT pg_advisory_lock`: Postgres finds the build and the waiter
+    /// waiting on each other and fails the build, which leaves the index
+    /// INVALID. Ignored, for it shows the defect rather than guards against
+    /// one: it is what makes the test above a test.
+    #[tokio::test]
+    #[ignore = "shows the deadlock sqlx's own lock meets; run by hand"]
+    async fn an_index_built_while_another_engine_waits_sqlx_s_way_deadlocks() {
+        let Some(db) = OwnDatabase::new().await else {
+            return;
+        };
+        let outcome = build_an_index_while_another_waits(&db, true).await;
+        let err = outcome
+            .build
+            .expect_err("the index build is the deadlock's victim");
+        eprintln!("the index build failed: {err}");
+        let code = err
+            .as_database_error()
+            .and_then(|e| e.code().map(|c| c.into_owned()));
+        assert_eq!(code.as_deref(), Some("40P01"), "deadlock_detected");
+        assert_eq!(
+            outcome.index_valid,
+            Some(false),
+            "the build left the index INVALID"
+        );
+        outcome
+            .waiter
+            .expect("the waiter takes the lock once it is let go");
+    }
+
+    /// Two engines migrating a fresh database at once, over a migration that
+    /// builds an index concurrently: both succeed, one after the other, and
+    /// the index is valid.
+    #[tokio::test]
+    async fn two_engines_migrating_at_once_over_a_concurrent_index_build_both_succeed() {
+        let Some(db) = OwnDatabase::new().await else {
+            return;
+        };
+        let dir =
+            std::env::temp_dir().join(format!("dagron_migration_lock_{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The first migration outlasts deadlock_timeout, so the engine that
+        // waits has waited past its own deadlock check when the index build
+        // begins, as when an engine starts while another is migrating.
+        std::fs::write(
+            dir.join("1_things.sql"),
+            "CREATE TABLE things (id int);\nSELECT pg_sleep(1.5);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("2_things_id.sql"),
+            "-- no-transaction\n\
+             CREATE INDEX CONCURRENTLY IF NOT EXISTS things_id ON things (id);\n",
+        )
+        .unwrap();
+        let (url, source) = (db.url.as_str(), dir.as_path());
+        let engine = || async move {
+            let pool = PgPoolOptions::new()
+                .max_connections(2)
+                .connect(url)
+                .await
+                .unwrap();
+            let mut migrator = Migrator::new(source).await.unwrap();
+            let migrated = migrate(&pool, &mut migrator).await;
+            pool.close().await;
+            migrated
+        };
+        let (a, b) = tokio::join!(engine(), engine());
+        // A third engine finds nothing to migrate and keeps its pool open, as
+        // an engine does once it has migrated: the lock is to be had all the
+        // same, so the connection that took it let it go.
+        let third = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(url)
+            .await
+            .unwrap();
+        let c = migrate(&third, &mut Migrator::new(source).await.unwrap()).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        a.expect("the first engine migrates");
+        b.expect("the second engine migrates");
+        c.expect("the third engine finds nothing to migrate");
+        let mut conn = db.connect().await;
+        let key = migration_lock_key(&db.name);
+        assert!(
+            try_migration_lock(&mut conn, key).await.unwrap(),
+            "the engine let the migration lock go"
+        );
+        unlock(&mut conn, key).await;
+        third.close().await;
+        assert_eq!(
+            index_valid(&mut conn, "things_id").await,
+            Some(true),
+            "the index is valid"
+        );
+        let applied: Vec<(i64, bool)> =
+            sqlx::query_as("SELECT version, success FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(applied, vec![(1, true), (2, true)]);
+        let _ = conn.close().await;
+    }
+}
+
+#[cfg(test)]
+mod run_end_notify_tests {
+    //! migrations_pg/107: a task that ends tells its run's listeners,
+    //! whoever ended it. Each test on a database of its own, made from
+    //! TEST_DATABASE_URL: the reap's slice here walks every running run,
+    //! which on the shared database are other tests'.
+
+    use super::migration_lock_tests::OwnDatabase;
+    use super::*;
+
+    /// The triggers 107 makes.
+    const TRIGGERS: [&str; 3] = [
+        "task_runs_ended_notify",
+        "task_runs_made_over_notify",
+        "task_runs_gone_notify",
+    ];
+
+    async fn fresh() -> Option<(OwnDatabase, Pool)> {
+        let db = OwnDatabase::new().await?;
+        let pool = init_pool(&db.url).await.unwrap();
+        Some((db, pool))
+    }
+
+    async fn sql(pool: &Pool, text: &str, binds: &[&str]) {
+        let mut q = sqlx::query(text);
+        for b in binds {
+            q = q.bind(*b);
+        }
+        q.execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("{text}: {e}"));
+    }
+
+    /// Every notification sent before this was asked, taken. A marker is
+    /// sent and taken: notifications reach a listener in the order their
+    /// transactions committed, so what was sent before it has been taken
+    /// with it. The runs named, the marker left out.
+    async fn settle(pool: &Pool, w: &mut Waker) -> Vec<String> {
+        let marker = format!("settle-{}", Uuid::new_v4());
+        sql(pool, "SELECT pg_notify('task_events', $1)", &[&marker]).await;
+        let mut runs = Vec::new();
+        for _ in 0..500 {
+            match w.take_woken().await {
+                Woken::Runs(named) => runs.extend(named),
+                Woken::All => panic!("the waker lost count of what it heard"),
+            }
+            if let Some(at) = runs.iter().position(|r| *r == marker) {
+                runs.remove(at);
+                return runs;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the marker never came");
+    }
+
+    async fn run_status(pool: &Pool, run: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM workflow_runs WHERE id = $1")
+            .bind(run)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The runs heard of since the last tick, reaped as a tick reaps them:
+    /// `run` among them or not, and not ended.
+    async fn tick_leaves(pool: &Pool, w: &mut Waker, run: &str, case: &str) {
+        let named = settle(pool, w).await;
+        let ended = reap_woken(pool, &Woken::Runs(named)).await.unwrap();
+        assert!(
+            !ended.iter().any(|(id, _)| id == run),
+            "{case}: ended early: {ended:?}"
+        );
+        assert_eq!(run_status(pool, run).await, "running", "{case}");
+    }
+
+    /// With 107: `run` is heard of, and the reap of what was heard ends it
+    /// so. Without: it is not, and is left for the slice.
+    async fn tick_ends(
+        pool: &Pool,
+        w: &mut Waker,
+        run: &str,
+        status: RunStatus,
+        case: &str,
+        notified: bool,
+    ) {
+        let named = settle(pool, w).await;
+        assert_eq!(
+            named.iter().any(|id| id == run),
+            notified,
+            "{case}: {run} heard of: {named:?}"
+        );
+        let ended = reap_woken(pool, &Woken::Runs(named)).await.unwrap();
+        if notified {
+            assert!(
+                ended.iter().any(|(id, s)| id == run && *s == status),
+                "{case}: {run} should have ended {status}: {ended:?}"
+            );
+        } else {
+            assert_eq!(run_status(pool, run).await, "running", "{case}");
+            // What the slice of the reap finds: before 107, these ends.
+            let (swept, _) = reap_slice(pool, None, 10_000).await.unwrap();
+            assert_eq!(
+                swept,
+                vec![(run.to_string(), status)],
+                "{case}: the slice's"
+            );
+        }
+    }
+
+    async fn run_of(pool: &Pool, yaml: &str) -> (String, HashMap<String, String>) {
+        let run = create_run(pool, &DagGraph::from_yaml(yaml).unwrap(), yaml)
+            .await
+            .unwrap();
+        let tasks: Vec<(String, String)> =
+            sqlx::query_as("SELECT name, id FROM task_runs WHERE run_id = $1")
+                .bind(&run)
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        (run, tasks.into_iter().collect())
+    }
+
+    async fn claim_named(pool: &Pool, run: &str, name: &str) -> TaskRun {
+        advance_ready_tasks(pool).await.unwrap();
+        claim_ready(pool, "w", 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.run_id == run && t.name == name)
+            .unwrap_or_else(|| panic!("{name} of {run} is not ready"))
+    }
+
+    /// The ends found to send no notification, each driven by the
+    /// dagron-core function that makes it, with 107's triggers (`notified`)
+    /// and without them. With them each run is heard of and ended by the
+    /// reap of what was heard, and the slice, walked whole after, finds no
+    /// run to end: `scheduler_runs_reaped_by_sweep_total` would count none.
+    /// Without them none is heard of, and the slice ends each.
+    async fn the_quiet_ends(pool: &Pool, notified: bool) {
+        let mut waker = Waker::connect(pool).await.unwrap();
+        assert_eq!(waker.take_woken().await, Woken::All);
+        let w = &mut waker;
+        {
+            let case = "a dependent skipped after a failure";
+            let yaml = "name: chain\ntasks:\n  - name: a\n    command: [\"false\"]\n  - name: b\n    command: [\"true\"]\n    depends_on: [a]\n";
+            let (run, _) = run_of(pool, yaml).await;
+            tick_leaves(pool, w, &run, case).await;
+            let a = claim_named(pool, &run, "a").await;
+            assert!(mark_task_failed(pool, &a.id, "w", a.version + 1, None)
+                .await
+                .unwrap());
+            tick_leaves(pool, w, &run, case).await;
+            advance_ready_tasks(pool).await.unwrap();
+            tick_ends(pool, w, &run, RunStatus::Failed, case, notified).await;
+        }
+        {
+            let case = "a trigger rule's skip";
+            let yaml = "name: rule\ntasks:\n  - name: a\n    command: [\"true\"]\n  - name: c\n    command: [\"true\"]\n    depends_on: [a]\n    trigger_rule: one_failed\n";
+            let (run, _) = run_of(pool, yaml).await;
+            tick_leaves(pool, w, &run, case).await;
+            let a = claim_named(pool, &run, "a").await;
+            assert!(mark_task_succeeded(pool, &a.id, "w", a.version + 1, None)
+                .await
+                .unwrap());
+            tick_leaves(pool, w, &run, case).await;
+            advance_ready_tasks(pool).await.unwrap();
+            tick_ends(pool, w, &run, RunStatus::Succeeded, case, notified).await;
+        }
+        let fan = "name: fan\ntasks:\n  - name: list\n    command: [\"true\"]\n  - name: process\n    command: [\"handle\", \"{{ item }}\"]\n    with_output_of: list\n    depends_on: [list]\n";
+        for (case, output) in [
+            ("a fan-out of nothing", "[]"),
+            ("a fan-out's barrier", r#"["x","y"]"#),
+        ] {
+            let (run, _) = run_of(pool, fan).await;
+            tick_leaves(pool, w, &run, case).await;
+            let list = claim_named(pool, &run, "list").await;
+            assert!(mark_task_succeeded(
+                pool,
+                &list.id,
+                "w",
+                list.version + 1,
+                Some(output.into())
+            )
+            .await
+            .unwrap());
+            advance_ready_tasks(pool).await.unwrap();
+            tick_leaves(pool, w, &run, case).await;
+            reconcile_fanouts(pool).await.unwrap();
+            if output != "[]" {
+                tick_leaves(pool, w, &run, case).await;
+                for t in claim_ready(pool, "w", 10).await.unwrap() {
+                    assert!(mark_task_succeeded(pool, &t.id, "w", t.version + 1, None)
+                        .await
+                        .unwrap());
+                }
+                tick_leaves(pool, w, &run, case).await;
+                reconcile_fanouts(pool).await.unwrap();
+            }
+            tick_ends(pool, w, &run, RunStatus::Succeeded, case, notified).await;
+        }
+        for case in [
+            "a time sensor",
+            "an HTTP sensor",
+            "a dataset sensor",
+            "an external job",
+            "an external job failed",
+        ] {
+            let yaml = match case {
+                "a time sensor" => "name: s\ntasks:\n  - { name: s, type: wait, wait: { for: 1h } }\n",
+                "an HTTP sensor" => "name: s\ntasks:\n  - { name: s, type: wait, wait: { url: \"https://example.com/ready\" } }\n",
+                "a dataset sensor" => "name: s\ntasks:\n  - { name: s, type: wait, wait: { dataset: \"s3://lake/x\" } }\n",
+                _ => "name: s\ntasks:\n  - { name: s, command: [\"true\"] }\n",
+            };
+            let (run, _) = run_of(pool, yaml).await;
+            tick_leaves(pool, w, &run, case).await;
+            let s = claim_named(pool, &run, "s").await;
+            let fence = s.version + 1;
+            let now = chrono::Utc::now().to_rfc3339();
+            let status = match case {
+                "a time sensor" => {
+                    assert!(park_wait(pool, &s.id, fence, "2000-01-01T00:00:00+00:00")
+                        .await
+                        .unwrap());
+                    tick_leaves(pool, w, &run, case).await;
+                    assert_eq!(reconcile_waits(pool).await.unwrap().done.len(), 1);
+                    RunStatus::Succeeded
+                }
+                "an HTTP sensor" => {
+                    assert!(
+                        park_wait_url(pool, &s.id, fence, "https://example.com/ready", &now)
+                            .await
+                            .unwrap()
+                    );
+                    tick_leaves(pool, w, &run, case).await;
+                    assert!(resolve_url_wait(pool, &s.id).await.unwrap());
+                    RunStatus::Succeeded
+                }
+                "a dataset sensor" => {
+                    assert!(park_wait_dataset(pool, &s.id, fence, "s3://lake/x")
+                        .await
+                        .unwrap());
+                    tick_leaves(pool, w, &run, case).await;
+                    record_external_dataset_event(pool, "s3://lake/x")
+                        .await
+                        .unwrap();
+                    assert_eq!(reconcile_dataset_waits(pool).await.unwrap().done.len(), 1);
+                    RunStatus::Succeeded
+                }
+                _ => {
+                    assert!(
+                        park_external(pool, &s.id, fence, "http", "job-1", None, &now, None)
+                            .await
+                            .unwrap()
+                    );
+                    tick_leaves(pool, w, &run, case).await;
+                    if case == "an external job" {
+                        assert!(resolve_external(pool, &s.id, "job-1", Some("DONE"))
+                            .await
+                            .unwrap());
+                        RunStatus::Succeeded
+                    } else {
+                        assert!(fail_external(pool, &s.id, "job-1", "OOM").await.unwrap());
+                        RunStatus::Failed
+                    }
+                }
+            };
+            tick_ends(pool, w, &run, status, case, notified).await;
+        }
+        {
+            let case = "a sub-workflow's trigger";
+            let child = "name: child\ntasks:\n  - { name: c, command: [\"true\"] }\n";
+            let parent =
+                "name: parent\ntasks:\n  - { name: trigger, type: workflow, workflow: child }\n";
+            let (run, _) = run_of(pool, parent).await;
+            tick_leaves(pool, w, &run, case).await;
+            let trigger = claim_named(pool, &run, "trigger").await;
+            let (child_run, _) = run_of(pool, child).await;
+            assert!(
+                park_subworkflow(pool, &trigger.id, trigger.version + 1, &child_run)
+                    .await
+                    .unwrap()
+            );
+            tick_leaves(pool, w, &run, case).await;
+            let c = claim_named(pool, &child_run, "c").await;
+            assert!(mark_task_succeeded(pool, &c.id, "w", c.version + 1, None)
+                .await
+                .unwrap());
+            // The child's own end notifies, as it did before 107.
+            tick_ends(pool, w, &child_run, RunStatus::Succeeded, case, true).await;
+            assert_eq!(reconcile_subworkflows(pool).await.unwrap().done.len(), 1);
+            tick_ends(pool, w, &run, RunStatus::Succeeded, case, notified).await;
+        }
+        // Every run here has ended, by what was heard or by the slice.
+        assert_eq!(
+            reap_slice(pool, None, 10_000).await.unwrap(),
+            (Vec::new(), None)
+        );
+    }
+
+    /// With 107, each quiet end is heard of, and the slice finds nothing.
+    #[tokio::test]
+    async fn each_quiet_end_wakes_its_run() {
+        let Some((_db, pool)) = fresh().await else {
+            return;
+        };
+        the_quiet_ends(&pool, true).await;
+        pool.close().await;
+    }
+
+    /// Without 107's triggers, as before it, none is heard of, and the
+    /// slice ends each: what was found before 107, and what the test above
+    /// would see were the triggers lost.
+    #[tokio::test]
+    async fn without_107_the_quiet_ends_are_the_slice_s() {
+        let Some((_db, pool)) = fresh().await else {
+            return;
+        };
+        for t in TRIGGERS {
+            sql(&pool, &format!("DROP TRIGGER {t} ON task_runs"), &[]).await;
+        }
+        the_quiet_ends(&pool, false).await;
+        pool.close().await;
+    }
+
+    /// Notifications of `run` a listener is sent once `act` has committed.
+    async fn sent_for<F, Fut>(pool: &Pool, run: &str, act: F) -> usize
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let mut listener = PgListener::connect_with(pool).await.unwrap();
+        listener.listen(EVENT_CHANNEL).await.unwrap();
+        act().await;
+        let marker = format!("count-{}", Uuid::new_v4());
+        sql(pool, "SELECT pg_notify('task_events', $1)", &[&marker]).await;
+        let mut n = 0;
+        loop {
+            let one = tokio::time::timeout(Duration::from_secs(10), listener.recv())
+                .await
+                .expect("the marker never came")
+                .unwrap();
+            match one.payload() {
+                p if p == marker => return n,
+                p if p == run => n += 1,
+                _ => {}
+            }
+        }
+    }
+
+    /// What 107 adds to what is sent: a task that ends in a transaction
+    /// that notifies already adds nothing (Postgres folds a transaction's
+    /// equal notifications into one); a cancel of a run's two thousand
+    /// tasks is one notification; an end that notified nobody is one; an
+    /// end whose function notifies after its commit, in a transaction of
+    /// its own, is two. And the payload is the run, on the engine's channel.
+    /// With `ops` alone: the cancel is `cancel_run`.
+    #[cfg(feature = "ops")]
+    #[tokio::test]
+    async fn what_107_sends() {
+        let Some((_db, pool)) = fresh().await else {
+            return;
+        };
+        let one = "name: one\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let (run, _) = run_of(&pool, one).await;
+        let a = claim_named(&pool, &run, "a").await;
+        let n = sent_for(&pool, &run, || async {
+            assert!(mark_task_succeeded(&pool, &a.id, "w", a.version + 1, None)
+                .await
+                .unwrap());
+        })
+        .await;
+        assert_eq!(n, 1, "an end that notified in its transaction");
+
+        let (big, _) = run_of(&pool, one).await;
+        sql(
+            &pool,
+            "INSERT INTO task_runs (id, run_id, name, status, remaining_deps, input)
+             SELECT 'big-' || n || '-' || $1, $1, 'b' || n, 'running', 0, '{}'
+             FROM generate_series(1, 2000) AS n",
+            &[&big],
+        )
+        .await;
+        let n = sent_for(&pool, &big, || async {
+            assert!(cancel_run(&pool, &big).await.unwrap().is_some());
+        })
+        .await;
+        assert_eq!(n, 1, "a cancel of two thousand tasks");
+
+        let (quiet, tasks) = run_of(&pool, one).await;
+        let n = sent_for(&pool, &quiet, || async {
+            sql(
+                &pool,
+                "UPDATE task_runs SET status = 'skipped' WHERE id = $1",
+                &[&tasks["a"]],
+            )
+            .await;
+        })
+        .await;
+        assert_eq!(n, 1, "an end by a statement that notifies nobody");
+
+        // Not finished to finished alone: a task already over, written
+        // over again, and a task's move that is not an end, send nothing.
+        let n = sent_for(&pool, &quiet, || async {
+            sql(
+                &pool,
+                "UPDATE task_runs SET status = 'failed' WHERE id = $1",
+                &[&tasks["a"]],
+            )
+            .await;
+        })
+        .await;
+        assert_eq!(n, 0, "an end written over an end");
+        let (moving, tasks) = run_of(&pool, one).await;
+        let n = sent_for(&pool, &moving, || async {
+            sql(
+                &pool,
+                "UPDATE task_runs SET status = 'ready' WHERE id = $1",
+                &[&tasks["a"]],
+            )
+            .await;
+        })
+        .await;
+        assert_eq!(n, 0, "a move that is not an end");
+        // A task not over taken away, and a task made over.
+        let n = sent_for(&pool, &moving, || async {
+            sql(&pool, "DELETE FROM task_runs WHERE id = $1", &[&tasks["a"]]).await;
+            sql(
+                &pool,
+                "INSERT INTO task_runs (id, run_id, name, status, remaining_deps, input)
+                 VALUES ($1 || '-done', $1, 'done', 'succeeded', 0, '{}')",
+                &[&moving],
+            )
+            .await;
+        })
+        .await;
+        assert_eq!(n, 2, "a task not over taken away, and one made over");
+        pool.close().await;
+    }
+
+    /// 107's text names the channel the waker and dagron-api listen on.
+    #[test]
+    fn the_triggers_notify_the_engine_s_channel() {
+        let sql = include_str!("../../migrations_pg/107_task_runs_end_notify.sql");
+        assert!(sql.contains(&format!("pg_notify('{EVENT_CHANNEL}', NEW.run_id)")));
+        assert!(sql.contains(&format!("pg_notify('{EVENT_CHANNEL}', OLD.run_id)")));
+        for t in TRIGGERS {
+            assert!(sql.contains(&format!("CREATE TRIGGER {t} ")), "{t}");
+        }
     }
 }

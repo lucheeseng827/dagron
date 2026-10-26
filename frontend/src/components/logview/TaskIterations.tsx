@@ -21,16 +21,20 @@ import type { TaskAttemptLog, TaskAttempts } from "@/types/dagron";
 export default function TaskIterations({
   runId,
   taskId,
-  /// The attempt currently on the row — the one the pane above is showing.
-  /// Nothing is offered below 2: there is no history until something has been
-  /// superseded.
+  /// The task's attempts so far. A new one means the history just grew.
   attempt,
+  /// How many attempts are behind the one the pane above shows. Nothing is
+  /// offered at 0: there is no history until something has been superseded.
+  /// It is every attempt the task made, for one a rerun put back that has not
+  /// started again.
+  earlier,
   /// The log filter, so a filter typed above means the same thing here.
   filter,
 }: {
   runId: string;
   taskId: string;
   attempt: number;
+  earlier: number;
   filter: LogFilterState;
 }) {
   const [open, setOpen] = useState(false);
@@ -44,7 +48,7 @@ export default function TaskIterations({
   // its cleanup owns every request: an orphaned one can still resolve after the
   // panel has moved to another task and write that task's history under this
   // one's heading.
-  const key = `${runId}:${taskId}:${attempt}:${JSON.stringify(filter)}`;
+  const key = `${runId}:${taskId}:${attempt}:${earlier}:${JSON.stringify(filter)}`;
 
   const load = useCallback(() => {
     setLoading(true);
@@ -67,12 +71,9 @@ export default function TaskIterations({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, load]);
 
-  // One attempt means nothing has been superseded yet — there is no history to
-  // offer, and a control that opens onto "nothing here" is worse than no
-  // control.
-  if (attempt < 2) return null;
-
-  const earlier = attempt - 1;
+  // Nothing superseded yet means there is no history to offer, and a control
+  // that opens onto "nothing here" is worse than no control.
+  if (earlier < 1) return null;
 
   return (
     <div style={{ border: "1px solid var(--border)", borderRadius: 6, overflow: "hidden" }}>
@@ -159,6 +160,13 @@ export default function TaskIterations({
   );
 }
 
+/// What replaced an attempt, as the row says it.
+const REPLACED_BY: Record<string, string> = {
+  rerun: "rerun",
+  retry: "retried",
+  clear: "cleared",
+};
+
 function AttemptRow({
   a,
   expanded,
@@ -171,6 +179,18 @@ function AttemptRow({
   // A loop pass that simply hadn't converged yet is not a failure, and colouring
   // them the same is how a healthy 30-iteration poll reads as 30 errors.
   const loop = a.reason === "iteration";
+  // An attempt a rerun, a retry or a clear replaced says how it had ended, and
+  // what replaced it. One that had succeeded (a clear's) is not an error.
+  const replaced = a.reason === "rerun" || a.reason === "retry" || a.reason === "clear";
+  const ended = a.status ?? "ended";
+  const label = loop ? "loop pass" : replaced ? `${ended}, then ${REPLACED_BY[a.reason] ?? a.reason}` : "failed";
+  const color = loop
+    ? "var(--blue)"
+    : replaced && ended === "succeeded"
+      ? "var(--green)"
+      : replaced && ended !== "failed"
+        ? "var(--muted)"
+        : "var(--red)";
   return (
     <div style={{ border: "1px solid var(--border)", borderRadius: 5, overflow: "hidden" }}>
       <button
@@ -193,9 +213,7 @@ function AttemptRow({
         <span className="mono" style={{ color: "var(--muted)" }}>
           #{a.attempt}
         </span>
-        <span style={{ color: loop ? "var(--blue)" : "var(--red)" }}>
-          {loop ? "loop pass" : "failed"}
-        </span>
+        <span style={{ color }}>{label}</span>
         <span style={{ color: "var(--dim)" }} title={absTime(a.finished_at)}>
           {timeAgo(a.finished_at)}
         </span>

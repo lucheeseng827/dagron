@@ -1,0 +1,10 @@
+shows: A dispatch of a pipeline with no dispatch trigger does not run it
+event: { kind: dispatch }
+source: |
+  name: ci
+  on:
+    push: { branches: [main] }
+  tasks:
+    - name: build
+      steps:
+        - run: make

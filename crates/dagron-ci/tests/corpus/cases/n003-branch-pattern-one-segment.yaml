@@ -1,0 +1,10 @@
+shows: A star in a branch pattern matches inside one segment of the name
+event: { kind: push, ref: refs/heads/release/1.2 }
+source: |
+  name: ci
+  on:
+    push: { branches: ["release/*"] }
+  tasks:
+    - name: build
+      steps:
+        - run: make

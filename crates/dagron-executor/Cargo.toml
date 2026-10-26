@@ -14,7 +14,8 @@ path = "src/lib.rs"
 default = []
 # Kubernetes pod executor (EXECUTOR=kubernetes). Pure-Rust client; compiles
 # without a cluster, runs only against a live apiserver.
-kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:rustls"]
+# A task pod's log is followed as a futures `AsyncRead`.
+kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:rustls", "futures-util/io"]
 
 [dependencies]
 # Core types: ExecContext borrows dag::{EnvVar, ResourceRequirements}; the worker
@@ -28,6 +29,8 @@ serde_json = "1"
 ractor = "0.10"
 uuid = { version = "1", features = ["v4"] }
 bollard = "0.16"
+# A step's build context, handed to bollard's build as it takes it.
+bytes = "1"
 futures-util = "0.3"
 # Kubernetes pod executor (feature-gated, off by default).
 kube = { version = "3", default-features = false, features = ["client", "rustls-tls"], optional = true }

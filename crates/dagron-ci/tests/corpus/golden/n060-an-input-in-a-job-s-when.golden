@@ -1,0 +1,2 @@
+not a pipeline:
+  tasks[1] (deploy).when: {{ deploy }} is not a value this pipeline may put in a command; pass it as a step's env: and read it as a variable

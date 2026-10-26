@@ -1,0 +1,11 @@
+shows: A task whose workspace is null starts where its image does, with no checkout
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: probe
+      docker_image: docker.io/curlimages/curl:8.11.1
+      workspace: null
+      steps:
+        - run: curl -fsS https://example.com/health

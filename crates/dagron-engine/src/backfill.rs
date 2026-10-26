@@ -269,7 +269,14 @@ async fn sweep_catchup(
                     break;
                 }
             };
-            match db::create_run(pool, &dag, &s.spec).await {
+            // A fire the schedule missed, caught up: the schedule, and the
+            // date it was due.
+            let trigger = crate::models::RunTrigger::engine(
+                crate::models::trigger_kind::BACKFILL,
+                format!("schedule:{}", s.id),
+            )
+            .of_event(logical.clone());
+            match db::create_run_triggered(pool, &dag, &s.spec, &trigger).await {
                 Ok(run_id) => {
                     db::record_backfill_run(pool, &s.id, &logical, &run_id).await?;
                     metrics.inc_runs_created();
@@ -314,26 +321,23 @@ async fn sweep_reruns(
             .await?;
 
     for run_id in candidates {
-        // Bump the ledger FIRST: rerun_from_failed flips the run to `running`, so
-        // it would no longer match the failed-runs query — recording the attempt
-        // up front guarantees the cap is enforced even if the event enqueue below
-        // fails. A lost race (another node re-armed it) yields `None` and we skip.
-        match db::rerun_from_failed(pool, &run_id).await? {
-            Some(reset) => {
+        // The rerun writes its `run.auto_rerun` event in its own transaction
+        // (`RunAgain::AutoRerun`), so the event exists iff the run was re-armed.
+        // A lost race (another node re-armed it) yields `None` and we skip.
+        let rerun = db::rerun_from_failed_as(pool, &run_id, dagron_core::models::RunAgain::AutoRerun).await;
+        match rerun {
+            Ok(Some(reset)) => {
                 db::bump_rerun_attempt(pool, &run_id, &now_s).await?;
                 metrics.inc_auto_reruns();
-                let payload = json!({
-                    "run_id": run_id,
-                    "reset_tasks": reset,
-                    "reason": "auto_rerun_incomplete",
-                })
-                .to_string();
-                if let Err(e) = db::enqueue_outbox_event(pool, &run_id, "run.auto_rerun", &payload).await {
-                    warn!(%run_id, error = %e, "auto-rerun: outbox enqueue failed");
-                }
                 info!(%run_id, reset_tasks = reset, "auto-rerun: re-armed failed run from frontier");
             }
-            None => debug!(%run_id, "auto-rerun: run no longer rerunnable (race or already re-armed)"),
+            Ok(None) => debug!(%run_id, "auto-rerun: run no longer rerunnable (race or already re-armed)"),
+            // Its concurrency key is full: a rerun waits for it as a new run
+            // would, and this sweep comes round again. No attempt is spent.
+            Err(e) if e.downcast_ref::<dagron_core::models::MaxActiveRunsReached>().is_some() => {
+                debug!(%run_id, "auto-rerun: the run's concurrency key is full; left for a later sweep")
+            }
+            Err(e) => return Err(e),
         }
     }
     Ok(())

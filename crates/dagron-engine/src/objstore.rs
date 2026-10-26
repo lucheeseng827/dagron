@@ -4,7 +4,11 @@
 //! * `s3://bucket/prefix`   — feature `archive-s3` (also S3-compatible MinIO /
 //!   Ceph via `AWS_ENDPOINT_URL`),
 //! * `gs://bucket/prefix`   — feature `archive-gcs`,
-//! * `az://container/prefix` (or `azure://`) — feature `archive-azure`.
+//! * `az://container/prefix` (or `azure://`) — feature `archive-azure`;
+//! * `https://<account>.blob.core.windows.net/<container>/prefix` — Azure's
+//!   own URL, the account in it, with `archive-azure`;
+//! * `file:///abs/dir` — a directory, in any build with an object store (17.5:
+//!   a filesystem backup target, an NFS mount on-prem, say).
 //!
 //! Each backend's credentials/region/endpoint come from its standard env
 //! (`AWS_*` / `GOOGLE_*` / `AZURE_*`), matching the `from_env()` convention — so
@@ -70,7 +74,29 @@ pub fn from_url(url: &str) -> Result<(Arc<dyn ObjectStore>, Path)> {
                 bail!("{url} needs the `archive-azure` feature");
             }
         }
-        _ => bail!("archive URL must be s3://, gs://, or az://…, got '{url}'"),
+        // Azure Blob Storage's own URL, which names the account as `az://`
+        // cannot: https://<account>.blob.core.windows.net/<container>/<prefix>.
+        #[cfg(feature = "archive-azure")]
+        Some(("https", rest)) if dagron_artifact::cloud::azure_blob_url(rest).is_some() => {
+            let (account, container, prefix) =
+                dagron_artifact::cloud::azure_blob_url(rest).expect("matched above");
+            let store = object_store::azure::MicrosoftAzureBuilder::from_env()
+                .with_account(account)
+                .with_container_name(container)
+                .build()
+                .map_err(|e| anyhow::anyhow!("{url} Azure config: {e}"))?;
+            Ok((Arc::new(store), Path::from(prefix)))
+        }
+        Some(("file", dir)) => {
+            if !dir.starts_with('/') {
+                bail!("{url}: a file URL's path is absolute: file:///backup, say");
+            }
+            std::fs::create_dir_all(dir).map_err(|e| anyhow::anyhow!("{url}: {e}"))?;
+            let store = object_store::local::LocalFileSystem::new_with_prefix(dir)
+                .map_err(|e| anyhow::anyhow!("{url}: {e}"))?;
+            Ok((Arc::new(store), Path::from("")))
+        }
+        _ => bail!("archive URL must be s3://, gs://, az:// or file://…, got '{url}'"),
     }
 }
 

@@ -1,0 +1,20 @@
+shows: A GitLab job that needs others waits for those alone, whatever their stages
+front: gitlab
+file: gitlab-ci
+source: |
+  image: alpine:3.20
+  stages: [build, test]
+  linux:
+    stage: build
+    script: [make linux]
+  mac:
+    stage: build
+    script: [make mac]
+  test-linux:
+    stage: test
+    needs: [linux]
+    script: [make test]
+  early:
+    stage: test
+    needs: []
+    script: [make check]

@@ -1,0 +1,12 @@
+shows: A task's variables are dagron's list of names and values, passed through
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: test
+      env:
+        - { name: CI, value: "true" }
+        - { name: NODE_ENV, value: test }
+      steps:
+        - run: npm test

@@ -1,0 +1,10 @@
+shows: A job's container is the image it runs in, whatever its runs-on label
+front: github
+source: |
+  on: push
+  jobs:
+    build:
+      runs-on: ubuntu-latest
+      container: docker.io/library/rust:1-bookworm
+      steps:
+        - run: cargo build

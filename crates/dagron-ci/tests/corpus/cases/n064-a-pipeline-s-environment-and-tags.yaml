@@ -1,0 +1,14 @@
+shows: A pipeline's environment, tags and limits are dagron's own and pass through
+source: |
+  name: release
+  on:
+    push: { tags: ["v*"] }
+  environment: release
+  tags: [release, slow]
+  max_active_runs: 1
+  run_timeout_secs: 7200
+  tasks:
+    - name: publish
+      steps:
+        - run: make publish
+event: { kind: tag }

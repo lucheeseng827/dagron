@@ -16,6 +16,10 @@ use dagron_step_spark::{adopt_or_fail, spark_application};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `--version` first: for it nothing is read and nothing is started.
+    if dagron_logging::version_requested("dagron-step-spark") {
+        return Ok(());
+    }
     dagron_logging::init("dagron-step-spark");
 
     let mut args = std::env::args().skip(1);

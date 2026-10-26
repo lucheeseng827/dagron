@@ -1,0 +1,13 @@
+shows: A checkout action that asks for all the history is a workspace of depth 0
+front: github
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on: push
+  jobs:
+    changelog:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+        - run: git describe --tags

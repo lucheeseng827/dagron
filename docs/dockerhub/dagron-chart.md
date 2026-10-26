@@ -2,7 +2,7 @@
 
 **One-command deploy of the dagron stack to Kubernetes — engine + API + console + a throwaway in-cluster Postgres.**
 
-A Helm chart published as an **OCI artifact**. It wires the dagron images together (`dagron-engine`, `dagron-api` — which serves the console — and optionally `dagron-gitops`, all `linux/amd64` + `linux/arm64`) plus an optional test Postgres, with ingress and secrets. Runs on kind / k3d / k3s / EKS.
+A Helm chart published as an **OCI artifact**. It wires the dagron images together (`dagron-engine`, `dagron-api` — which serves the console — and optionally `dagron-gitops` and `dagron-ci`, all `linux/amd64` + `linux/arm64`) plus an optional test Postgres, with ingress and secrets. Runs on kind / k3d / k3s / EKS.
 
 - **Artifact:** `oci://registry-1.docker.io/mancube/dagron`
 - **Deploys:** engine · dagron-api · frontend · (optional) Postgres
@@ -40,6 +40,8 @@ helm template dagron oci://registry-1.docker.io/mancube/dagron --version 0.10.0 
 | `dagronApi.jwtSecret` | **required** — session-cookie signing key (≥32 chars). |
 | `dagronApi.admin.{email,password,name}` | bootstrap admin user. |
 | `ingress.*` | host + TLS for the console. |
+| `ci.enabled` | `true` deploys `dagron-ci`, the CI service (from the release after 0.11.0), as a container in the engine's pod. Its secrets come from Secrets you name under `ci`. |
+| `ci.placement` | `engine` (the default): in the engine's pod, where a private repository's checkout is given its credential. `deployment`: a Deployment of its own, for public repositories. |
 | `postgres.enabled` | `true` deploys a **throwaway** in-cluster Postgres (testing only). |
 | `externalDatabaseUrl` | set `postgres.enabled=false` and point at a managed DB for anything real. |
 

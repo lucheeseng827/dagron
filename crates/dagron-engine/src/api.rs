@@ -29,6 +29,7 @@
 
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use anyhow::Result;
 use axum::{
@@ -70,6 +71,7 @@ use crate::dag::DagGraph;
 use crate::db;
 use crate::metrics::Metrics;
 use crate::models::RunStatus;
+use dagron_core::gauges::GaugeCache;
 
 /// Shared handler state. `Pool` and `Arc<Metrics>` are both cheap to clone, so
 /// the whole struct is `Clone` as axum requires.
@@ -91,6 +93,100 @@ pub struct ApiState {
     /// closed, `POST /runs` answers `503` and creates nothing. Unset = always
     /// open, which is every deployment that has not opted in.
     pub admission: crate::pressure::AdmissionGate,
+    /// The `/metrics` DB gauges in two tiers (SCALE_ROADMAP 0.3, plan
+    /// 10.10): what has not finished, cached for `METRICS_CACHE_SECS`, and
+    /// the history, for `METRICS_HISTORY_CACHE_SECS`. Process counters and
+    /// pool stats stay live. One cache for the API and the OTLP export, so a
+    /// fleet of scrapers and the export together cost one read a TTL.
+    pub gauges: Arc<GaugeCache>,
+}
+
+/// The default for `METRICS_CACHE_SECS`: how long the gauges of what has not
+/// finished may be served before they are read again.
+pub const GAUGE_CACHE_TTL: Duration = Duration::from_secs(10);
+
+/// The default for `METRICS_HISTORY_CACHE_SECS`: how long the counts of what
+/// has finished, and the recent runs that have, may be served before they are
+/// read again. They grow with every run, and change little in a scrape
+/// interval. 0 where `METRICS_CACHE_SECS` is 0.
+pub const HISTORY_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// `METRICS_CACHE_SECS`: whole seconds, `0` for off; unset or unparseable is
+/// the default.
+pub fn parse_gauge_cache_ttl(raw: Option<String>) -> Duration {
+    dagron_core::gauges::ttl_from(raw, GAUGE_CACHE_TTL)
+}
+
+/// The TTLs `METRICS_CACHE_SECS` and `METRICS_HISTORY_CACHE_SECS` give: with
+/// the first 0 and the second not set, both are 0, as `METRICS_CACHE_SECS=0`
+/// alone turned the cache off before it had two tiers.
+pub fn gauge_cache_ttls(live: Option<String>, history: Option<String>) -> (Duration, Duration) {
+    let live = parse_gauge_cache_ttl(live);
+    (
+        live,
+        dagron_core::gauges::history_ttl_from(history, live, HISTORY_CACHE_TTL),
+    )
+}
+
+/// The engine's gauge cache, as `METRICS_CACHE_SECS` and
+/// `METRICS_HISTORY_CACHE_SECS` set it.
+pub fn gauge_cache_from_env() -> GaugeCache {
+    let (live, history) = gauge_cache_ttls(
+        std::env::var("METRICS_CACHE_SECS").ok(),
+        std::env::var("METRICS_HISTORY_CACHE_SECS").ok(),
+    );
+    GaugeCache::new(live, history)
+}
+
+/// The management API's state and the OTLP export's, made with one gauge
+/// cache between them: what one has read the other serves, so a fleet of
+/// scrapers and the export together cost one read a TTL. The engine makes
+/// both here and nowhere else.
+#[cfg_attr(not(feature = "otel"), allow(dead_code))]
+pub struct Served {
+    pub api: ApiState,
+    pub export: ApiState,
+}
+
+/// [`Served`], from what the engine read of its settings.
+pub fn served(
+    pool: db::Pool,
+    metrics: Arc<Metrics>,
+    max_inflight_runs: i64,
+    max_inflight_tasks: i64,
+    admission: crate::pressure::AdmissionGate,
+    gauges: GaugeCache,
+) -> Served {
+    let api = ApiState {
+        pool,
+        metrics,
+        max_inflight_runs,
+        max_inflight_tasks,
+        admission,
+        gauges: Arc::new(gauges),
+    };
+    let export = api.clone();
+    Served { api, export }
+}
+
+/// The DB gauges for `/metrics`, from [`ApiState::gauges`]: what has not
+/// finished read once its TTL is past, by one scrape while the rest wait for
+/// it, and the history served as it is and read again behind the scrape that
+/// found it stale.
+///
+/// A failed read of what has not finished is never cached, and nothing stale
+/// is served for it, because `/metrics` answering 500 while the datastore is
+/// down is the signal an operator alerts on.
+async fn db_gauges(state: &ApiState) -> Result<crate::models::MetricsSnapshot, ApiError> {
+    let pool = &state.pool;
+    let history = state.pool.clone();
+    Ok(state
+        .gauges
+        .read(
+            || db::status_counts_live(pool),
+            move || async move { db::status_counts_history(&history).await },
+        )
+        .await?)
 }
 
 /// Bind `addr` and serve the management API until the process exits.
@@ -159,6 +255,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/runs/{id}/tasks/{task_id}/attempts", get(task_attempts))
         .route("/runs/{id}/cancel", post(cancel_run))
         .route("/runs/{id}/rerun", post(rerun_run))
+        .route("/runs/{id}/tasks/{task_id}/retry", post(retry_task))
         .route("/runs/{id}/tasks/{task_id}/clear", post(clear_task))
         .route("/runs/{id}/tasks/{task_id}/approve", post(approve_task))
         .route("/runs/{id}/tasks/{task_id}/reject", post(reject_task))
@@ -293,19 +390,56 @@ async fn swagger_ui_js() -> Response {
         .into_response()
 }
 
-async fn metrics(State(st): State<ApiState>) -> Result<Response, ApiError> {
-    let snap = db::status_counts(&st.pool).await?;
+/// The exposition `GET /metrics` serves, and the OTLP export sends.
+async fn render_metrics(st: &ApiState) -> Result<String, ApiError> {
+    let snap = db_gauges(st).await?;
     let pool_stats = crate::metrics::DbPoolStats {
         connections: st.pool.size(),
         idle: st.pool.num_idle() as u32,
         max: st.pool.options().get_max_connections(),
     };
-    let body = st.metrics.render(&snap, Some(&pool_stats));
+    Ok(st.metrics.render(&snap, Some(&pool_stats)))
+}
+
+async fn metrics(State(st): State<ApiState>) -> Result<Response, ApiError> {
+    let body = render_metrics(&st).await?;
     Ok((
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
         body,
     )
         .into_response())
+}
+
+/// Send what `GET /metrics` serves to an OTLP collector each
+/// `OTEL_METRIC_EXPORT_INTERVAL`, when the environment names one
+/// ([`dagron_logging::otlp_metrics`]). Independent of `API_ADDR`: a scheduler
+/// that serves no API still has metrics to send. The DB gauges come through
+/// the same cache a scrape's do, so an export costs no more than a scrape.
+#[cfg(feature = "otel")]
+pub(crate) fn spawn_otlp_metrics(state: ApiState) {
+    let Some(export) = dagron_logging::otlp_metrics::MetricsExport::from_env("controller") else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(export.interval());
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // A read is given up after this, so that the next tick goes on: the
+        // cache bounds its own reads, and this the whole of a render.
+        let most = export.interval().max(Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            match tokio::time::timeout(most, render_metrics(&state)).await {
+                Ok(Ok(text)) => export.send(text),
+                Ok(Err(ApiError(_, e))) => {
+                    tracing::warn!(error = %e, "metrics could not be read for the OTLP export")
+                }
+                Err(_) => tracing::warn!(
+                    after_secs = most.as_secs(),
+                    "metrics were not read for the OTLP export in time, and this export is skipped"
+                ),
+            }
+        }
+    });
 }
 
 #[derive(Debug, Deserialize)]
@@ -332,7 +466,12 @@ async fn get_run(
         return Err(ApiError(StatusCode::NOT_FOUND, format!("run '{id}' not found")));
     };
     let tasks = db::list_tasks(&st.pool, &id).await?;
-    Ok(Json(json!({ "run": run, "tasks": tasks })))
+    // What started it, as it was recorded when the run was made: `null` for
+    // a run from before every run had a record.
+    let trigger = db::run_trigger(&st.pool, &id).await?;
+    Ok(Json(
+        json!({ "run": run, "tasks": tasks, "trigger": trigger }),
+    ))
 }
 
 /// Query for `POST /runs`. `wait=true` turns the submit into a **synchronous
@@ -418,6 +557,9 @@ fn admission_refusal(e: &anyhow::Error) -> Option<(StatusCode, serde_json::Value
                 "error": "max_active_runs reached",
                 "workflow": m.name,
                 "active": m.active,
+                // How many of them wait for a turn: more than none where the
+                // workflow queues its runs and as many wait as may.
+                "waiting": m.waiting,
                 "max_active_runs": m.max,
                 "concurrency_key": m.key,
             }),
@@ -527,7 +669,10 @@ async fn submit_run(
         }
     }
 
-    let run_id = match db::create_run(&st.pool, &dag, &body).await {
+    // This API has no login, so the record names nobody: that the run was
+    // asked of it is all there is to say.
+    let trigger = dagron_core::models::RunTrigger::ops_api();
+    let run_id = match db::create_run_triggered(&st.pool, &dag, &body, &trigger).await {
         Ok(id) => id,
         Err(e) => {
             // Capacity conditions — the per-workflow cap (#21) and the
@@ -656,7 +801,9 @@ async fn task_logs(
         ));
     };
 
-    let full = db::task_log(&st.pool, &id, &task.id).await?.unwrap_or_default();
+    let full = crate::logs::task_log(&st.pool, &id, &task.id)
+        .await?
+        .unwrap_or_default();
     let total = full.chars().count();
     let eof = task_is_terminal(&task.status.to_string());
     // Char-boundary slice — never splits a multibyte scalar.
@@ -732,6 +879,11 @@ async fn task_attempts(
     };
 
     let history = db::list_task_attempts(&st.pool, &task_id).await?;
+    // Numbered by the task's life: a rerun or a clear starts its attempts
+    // from 1 again, and the ones before stay under the numbers they had. A
+    // task one of them put back that has not started again reads the number
+    // its next attempt will have, one past the last that is kept.
+    let current_attempt = db::task_attempt_base(&st.pool, &task_id).await? + task.attempt.max(1);
     let evicted = history.first().is_some_and(|a| a.attempt > 1);
     let attempts = history
         .into_iter()
@@ -740,6 +892,10 @@ async fn task_attempts(
             let mut obj = json!({
                 "attempt": a.attempt,
                 "reason": a.reason,
+                // How the attempt had ended and when it was queued, for one a
+                // rerun, a retry or a clear replaced; null for a worker's own.
+                "status": a.status,
+                "scheduled_at": a.scheduled_at,
                 "retention_truncated": a.truncated,
                 "finished_at": a.finished_at,
             });
@@ -767,7 +923,7 @@ async fn task_attempts(
         "name": task.name,
         // The attempt on the row. Deliberately not in `attempts`: its output is
         // in `task_runs.output`, whole, where `task_logs` reads it.
-        "current_attempt": task.attempt,
+        "current_attempt": current_attempt,
         "attempts": attempts,
         "evicted": evicted,
         "filtered": filtering,
@@ -807,7 +963,7 @@ async fn run_logs(
     let mut lines: Vec<serde_json::Value> = Vec::new();
     let (mut total, mut matched, mut truncated, mut eof) = (0usize, 0usize, false, true);
 
-    let logs = db::task_logs(&st.pool, &id).await?;
+    let logs = crate::logs::run_logs(&st.pool, &id).await?;
     for task in db::list_tasks(&st.pool, &id).await? {
         let status = task.status.to_string();
         let selected = (want_tasks.is_empty()
@@ -875,23 +1031,28 @@ async fn cancel_run(
     State(st): State<ApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let cancelled = db::cancel_run(&st.pool, &id).await?;
-    if !cancelled {
+    let Some(did) = db::cancel_run(&st.pool, &id).await? else {
         // Either the run does not exist or it is already terminal — both are
         // "nothing to cancel" from the caller's view.
         return Err(ApiError(
             StatusCode::CONFLICT,
             format!("run '{id}' is not running (missing or already terminal)"),
         ));
-    }
-    info!(run_id = %id, "run cancelled via API");
-    Ok(Json(json!({ "run_id": id, "cancelled": true })))
+    };
+    info!(
+        run_id = %id, cancelled = did.cancelled, stopping = did.stopping,
+        "run cancelled via API"
+    );
+    // `stopping`: tasks a worker holds, asked to stop. While it is not zero
+    // the run reads `running`, and ends `cancelled` when their work is gone.
+    Ok(Json(json!({ "run_id": id, "cancelled": true, "stopping": did.stopping })))
 }
 
-/// Optional body for `POST /runs/{id}/rerun`. `from` selects the rerun mode;
-/// only `"failed"` (the default) is supported today — task-anchored rerun
-/// (`task:<id>`) is reserved. Parameter override (`params`) is offered by the
-/// dagron-api gateway, not this single-binary surface.
+/// Optional body for `POST /runs/{id}/rerun`. `from` selects the rerun mode:
+/// `"failed"` (the default), from the failed tasks; or `"all"`, the run whole,
+/// what succeeded included. Task-anchored rerun (`task:<id>`) is reserved.
+/// Parameter override (`params`) is offered by the dagron-api gateway, not
+/// this single-binary surface.
 #[derive(Debug, Deserialize, Default)]
 struct RerunBody {
     #[serde(default)]
@@ -900,45 +1061,122 @@ struct RerunBody {
 
 /// `POST /runs/{id}/rerun` — cascade rerun a failed/cancelled run from its
 /// failure frontier: every failed/cancelled task is reset to pending and the run
-/// re-armed, while succeeded tasks are left intact. 404 if the run is unknown,
-/// 409 if it is not in a rerunnable state, 400 for an unsupported `from` mode.
+/// re-armed, while succeeded tasks are left intact. With `{"from": "all"}`, an
+/// ended run, one that succeeded too, is rerun whole (`db::rerun_all`), the
+/// implementation dagron-api's route calls. 404 if the run is unknown, 409 if
+/// it is not in a rerunnable state, or is rerun whole while a task of it still
+/// owes the teardown of a remote job, 400 for an unsupported `from` mode.
 async fn rerun_run(
     State(st): State<ApiState>,
     Path(id): Path<String>,
     body: Option<Json<RerunBody>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if let Some(Json(b)) = &body {
-        if let Some(from) = &b.from {
-            if from != "failed" {
-                return Err(ApiError(
-                    StatusCode::BAD_REQUEST,
-                    format!("unsupported rerun mode '{from}'; only 'failed' is supported"),
-                ));
-            }
+    let whole = match body.as_ref().and_then(|Json(b)| b.from.as_deref()) {
+        None | Some("failed") => false,
+        Some("all") => true,
+        Some(from) => {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("unsupported rerun mode '{from}'; 'failed' and 'all' are supported"),
+            ));
         }
-    }
+    };
+    let not_rerunnable = || {
+        let states = if whole {
+            "succeeded/failed/cancelled"
+        } else {
+            "failed/cancelled"
+        };
+        ApiError(
+            StatusCode::CONFLICT,
+            format!("run '{id}' is not in a rerunnable state ({states})"),
+        )
+    };
 
     let Some(run) = db::get_run(&st.pool, &id).await? else {
         return Err(ApiError(StatusCode::NOT_FOUND, format!("run '{id}' not found")));
     };
-    if !matches!(run.status, RunStatus::Failed | RunStatus::Cancelled) {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            format!("run '{id}' is not in a rerunnable state (failed/cancelled)"),
-        ));
+    let ended = matches!(run.status, RunStatus::Failed | RunStatus::Cancelled)
+        || (whole && run.status == RunStatus::Succeeded);
+    if !ended {
+        return Err(not_rerunnable());
     }
 
     // The pre-check above is best-effort; `rerun_from_failed` re-checks atomically.
     // `None` means the run lost its rerunnable state in a concurrent race, so honor
     // the route contract with a 409 rather than reporting a false success.
-    let Some(reset) = db::rerun_from_failed(&st.pool, &id).await? else {
+    let reset = if whole {
+        db::rerun_all(&st.pool, &id).await
+    } else {
+        db::rerun_from_failed(&st.pool, &id).await
+    };
+    let Some(reset) = reset.map_err(run_again_refusal)? else {
+        return Err(not_rerunnable());
+    };
+    if whole {
+        info!(run_id = %id, reset, "run reran whole via API");
+    } else {
+        info!(run_id = %id, reset, "run reran from failure via API");
+    }
+    Ok(Json(json!({ "run_id": id, "rerun": reset })))
+}
+
+/// The answer for a rerun, a retry or a clear that the datastore refused. A
+/// run that had ended asks its concurrency key before it runs again, as a new
+/// run does, and a full key is a `429` that says so. A run rerun whole while a
+/// task of it still owes the teardown of a remote job is a `409`: it can be
+/// rerun once the engine has torn the job down. Anything else is the `500` it
+/// always was.
+fn run_again_refusal(e: anyhow::Error) -> ApiError {
+    if let Some(t) = e.downcast_ref::<dagron_core::models::TeardownOwed>() {
+        return ApiError(StatusCode::CONFLICT, t.to_string());
+    }
+    match e.downcast_ref::<dagron_core::models::MaxActiveRunsReached>() {
+        Some(m) => {
+            let scope = m
+                .key
+                .as_deref()
+                .map(|k| format!(" and concurrency_key '{k}'"))
+                .unwrap_or_default();
+            ApiError(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "max_active_runs reached for workflow '{}'{scope} ({} active, cap {}): \
+                     the run was not set running again",
+                    m.name, m.active, m.max
+                ),
+            )
+        }
+        None => e.into(),
+    }
+}
+
+/// `POST /runs/{id}/tasks/{task_id}/retry` — put one failed or cancelled task
+/// back to run again. Only that task: what its failure cancelled downstream is
+/// a rerun's or a clear's to bring back. Its run is set running again if it had
+/// ended. 404 if the run or task is unknown, 409 if the task is not failed or
+/// cancelled, 429 if the run had ended and its concurrency key is full.
+async fn retry_task(
+    State(st): State<ApiState>,
+    Path((id, task_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if db::get_run(&st.pool, &id).await?.is_none() {
+        return Err(ApiError(StatusCode::NOT_FOUND, format!("run '{id}' not found")));
+    }
+    if !db::task_exists(&st.pool, &id, &task_id).await? {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("task '{task_id}' not found in run '{id}'"),
+        ));
+    }
+    if !db::retry_task_from_ui(&st.pool, &task_id).await.map_err(run_again_refusal)? {
         return Err(ApiError(
             StatusCode::CONFLICT,
-            format!("run '{id}' is not in a rerunnable state (failed/cancelled)"),
+            format!("task '{task_id}' is not in a retryable (failed/cancelled) state"),
         ));
-    };
-    info!(run_id = %id, reset, "run reran from failure via API");
-    Ok(Json(json!({ "run_id": id, "rerun": reset })))
+    }
+    info!(run_id = %id, task_id = %task_id, "task retried via API");
+    Ok(Json(json!({ "run_id": id, "task_id": task_id, "retried": true })))
 }
 
 /// `POST /runs/{id}/tasks/{task_id}/clear` — clear a single completed task and
@@ -956,7 +1194,7 @@ async fn clear_task(
     }
     // `None` distinguishes "unknown task" from "task not terminal"; the DB op
     // guards both under one query, so re-check the task's existence for the 404.
-    match db::clear_task_with_downstream(&st.pool, &id, &task_id).await? {
+    match db::clear_task_with_downstream(&st.pool, &id, &task_id).await.map_err(run_again_refusal)? {
         Some(reset) => {
             info!(run_id = %id, task_id = %task_id, reset, "task cleared with downstream via API");
             Ok(Json(json!({ "run_id": id, "task_id": task_id, "cleared": reset })))
@@ -1261,7 +1499,11 @@ async fn redrive_dead_letter(
     })?;
     // The claim and the run commit together. Rows are never updated in place,
     // so the payload read above is the one being claimed.
-    let run_id = match db::create_run_from_dead_letter(&st.pool, &dag, &dl.payload, &id).await {
+    let trigger =
+        dagron_core::models::RunTrigger::ops_api().from_source(format!("dead-letter:{id}"));
+    let made =
+        db::create_run_from_dead_letter(&st.pool, &dag, &dl.payload, &id, Some(&trigger)).await;
+    let run_id = match made {
         Ok(Some(run_id)) => run_id,
         // Another redrive, or a discard, took the row first. No run here.
         Ok(None) => {
@@ -1388,6 +1630,7 @@ mod tests {
             "/runs/{id}/tasks/{task_id}/attempts",
             "/runs/{id}/cancel",
             "/runs/{id}/rerun",
+            "/runs/{id}/tasks/{task_id}/retry",
             "/runs/{id}/tasks/{task_id}/clear",
             "/runs/{id}/tasks/{task_id}/approve",
             "/runs/{id}/tasks/{task_id}/reject",
@@ -1442,11 +1685,212 @@ mod tests {
             max_inflight_runs,
             max_inflight_tasks,
             admission: crate::pressure::AdmissionGate::default(),
+            gauges: Arc::new(GaugeCache::new(GAUGE_CACHE_TTL, HISTORY_CACHE_TTL)),
         };
         (state, path)
     }
 
+    /// As `temp_state`, with the gauge cache's two TTLs.
+    async fn temp_state_ttls(live: Duration, history: Duration) -> (ApiState, std::path::PathBuf) {
+        let (mut state, path) = temp_state(0).await;
+        state.gauges = Arc::new(GaugeCache::new(live, history));
+        (state, path)
+    }
+
     const ONE_TASK_DAG: &str = "name: t\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+
+    /// SCALE_ROADMAP 0.3: the DB gauges behind `/metrics` are cached for
+    /// their TTL, so a fleet of scrapers cannot turn every poll into
+    /// aggregate queries. Within the TTL the cached snapshot is served even
+    /// when it is not what the DB holds (proof it did not come from the DB);
+    /// once the entry is older than the TTL the next call re-reads the DB.
+    #[tokio::test]
+    async fn metrics_snapshot_is_cached_within_ttl_and_refreshed_after() {
+        let (state, path) = temp_state(0).await;
+
+        // Poison the cache: a value no database here can produce.
+        poison_cache(&state, 999).await;
+        let cached = db_gauges(&state).await.unwrap();
+        assert_eq!(
+            cached.dead_letters, 999,
+            "within the TTL the cache is served"
+        );
+
+        // Let the entry outlive a short TTL: the next call must re-read the DB.
+        let (state, path2) = temp_state_ttls(Duration::from_millis(1), HISTORY_CACHE_TTL).await;
+        poison_cache(&state, 999).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let fresh = db_gauges(&state).await.unwrap();
+        assert_eq!(
+            fresh.dead_letters, 0,
+            "after the TTL the snapshot is refreshed"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
+    }
+
+    /// Both TTLs at 0, which `METRICS_CACHE_SECS=0` alone gives where
+    /// `METRICS_HISTORY_CACHE_SECS` is not set (`gauge_cache_ttls`), is how
+    /// a harness that changes state and then scrapes asks for fresh gauges:
+    /// nothing is cached, nothing is served stale.
+    #[tokio::test]
+    async fn a_zero_ttl_turns_the_gauge_cache_off() {
+        let (state, path) = temp_state_ttls(Duration::ZERO, Duration::ZERO).await;
+
+        poison_cache(&state, 999).await;
+        let read = db_gauges(&state).await.unwrap();
+        assert_eq!(
+            read.dead_letters, 0,
+            "nothing may be cached when the TTL is 0"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The handler itself reads through the cache: reverting `metrics()` to a
+    /// direct `status_counts` call would leave the `db_gauges` tests green but
+    /// fails this one. Process counters and pool stats stay live around it,
+    /// and the age of the history is said beside them.
+    #[tokio::test]
+    async fn the_metrics_handler_serves_the_cached_gauges() {
+        let (state, path) = temp_state(0).await;
+
+        poison_cache(&state, 999).await;
+
+        let resp = metrics(State(state.clone())).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("\nscheduler_dead_letters 999\n"), "handler bypassed the cache:\n{text}");
+        assert!(text.contains("scheduler_db_pool"), "pool stats are rendered live around the cached gauges");
+        assert!(
+            text.contains("\nscheduler_metrics_history_age_seconds "),
+            "{text}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The API's state and the OTLP export's, as the engine makes them
+    /// ([`served`]), read one cache: what one has read the other serves,
+    /// each way.
+    #[tokio::test]
+    async fn the_api_and_the_otlp_export_share_one_cache() {
+        let (state, path) = temp_state(0).await;
+        let Served { api, export } = served(
+            state.pool.clone(),
+            Arc::new(Metrics::new()),
+            0,
+            0,
+            crate::pressure::AdmissionGate::default(),
+            GaugeCache::new(HISTORY_CACHE_TTL, HISTORY_CACHE_TTL),
+        );
+
+        poison_cache(&export, 999).await;
+        assert_eq!(db_gauges(&api).await.unwrap().dead_letters, 999);
+        let text = render_metrics(&export).await.unwrap();
+        assert!(text.contains("\nscheduler_dead_letters 999\n"), "{text}");
+
+        let (state, path2) = temp_state(0).await;
+        let Served { api, export } = served(
+            state.pool.clone(),
+            Arc::new(Metrics::new()),
+            0,
+            0,
+            crate::pressure::AdmissionGate::default(),
+            GaugeCache::new(HISTORY_CACHE_TTL, HISTORY_CACHE_TTL),
+        );
+        poison_cache(&api, 998).await;
+        assert_eq!(db_gauges(&export).await.unwrap().dead_letters, 998);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
+    }
+
+    /// The gauges of what has not finished are read again once their TTL is
+    /// past, while the history is served from its own cache.
+    #[tokio::test]
+    async fn live_gauges_refresh_while_history_is_cached() {
+        let (state, path) = temp_state_ttls(Duration::from_millis(1), HISTORY_CACHE_TTL).await;
+        let history = dagron_core::models::MetricsHistory {
+            runs_by_status: vec![("succeeded".to_string(), 41)],
+            ..Default::default()
+        };
+        state
+            .gauges
+            .read(
+                || async {
+                    Ok(crate::models::MetricsSnapshot {
+                        dead_letters: 999,
+                        ..Default::default()
+                    })
+                },
+                || async { Ok(history) },
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let read = db_gauges(&state).await.unwrap();
+        assert_eq!(read.dead_letters, 0, "the live tier was read from the DB");
+        assert!(
+            read.runs_by_status.contains(&("succeeded".to_string(), 41)),
+            "the history was served from its cache: {:?}",
+            read.runs_by_status
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn metrics_cache_secs_parses_whole_seconds_with_zero_meaning_off() {
+        assert_eq!(parse_gauge_cache_ttl(None), GAUGE_CACHE_TTL);
+        assert_eq!(parse_gauge_cache_ttl(Some(" 30 ".into())), Duration::from_secs(30));
+        assert_eq!(parse_gauge_cache_ttl(Some("0".into())), Duration::ZERO);
+        assert_eq!(parse_gauge_cache_ttl(Some("soon".into())), GAUGE_CACHE_TTL);
+        assert_eq!(parse_gauge_cache_ttl(Some("-1".into())), GAUGE_CACHE_TTL);
+    }
+
+    /// `METRICS_CACHE_SECS=0` alone, as `loadtest/ci/run.sh` sets it, turns
+    /// both tiers off; `METRICS_HISTORY_CACHE_SECS` set is its own.
+    #[test]
+    fn a_zero_metrics_cache_secs_alone_turns_the_history_cache_off_too() {
+        let zero = || Some("0".to_string());
+        assert_eq!(
+            gauge_cache_ttls(zero(), None),
+            (Duration::ZERO, Duration::ZERO)
+        );
+        assert_eq!(
+            gauge_cache_ttls(zero(), Some("300".into())),
+            (Duration::ZERO, Duration::from_secs(300))
+        );
+        assert_eq!(
+            gauge_cache_ttls(Some("10".into()), None),
+            (Duration::from_secs(10), HISTORY_CACHE_TTL)
+        );
+        assert_eq!(
+            gauge_cache_ttls(None, None),
+            (GAUGE_CACHE_TTL, HISTORY_CACHE_TTL)
+        );
+    }
+
+    /// Fill an empty cache with a dead-letter count the datastore cannot
+    /// produce, to tell a cache hit from a re-read.
+    async fn poison_cache(state: &ApiState, dead_letters: i64) {
+        state
+            .gauges
+            .read(
+                || async {
+                    Ok(crate::models::MetricsSnapshot {
+                        dead_letters,
+                        ..Default::default()
+                    })
+                },
+                || async { Ok(dagron_core::models::MetricsHistory::default()) },
+            )
+            .await
+            .unwrap();
+    }
 
     /// The fire-and-forget submit query (no synchronous wait), for tests that
     /// exercise the plain `POST /runs` path.
@@ -1526,6 +1970,75 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A workflow that says a run over its cap waits answers `201` where it
+    /// answered `429`: the run is made, reads `running` with `queued_at`,
+    /// and none of its tasks advances. It is let in when the run before it
+    /// has ended, and a cancel of one that waits ends it at once. A workflow
+    /// that says nothing still answers `429`, and says how many are active.
+    #[tokio::test]
+    async fn a_run_over_a_queueing_workflow_s_cap_is_made_and_waits() {
+        let (state, path) = temp_state(0).await;
+        let queues = "name: deploy\nmax_active_runs: 1\nwhen_full: queue\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        let made = |yaml: &'static str| {
+            let state = state.clone();
+            async move {
+                let resp = submit_run(State(state), no_wait(), yaml.to_string())
+                    .await
+                    .unwrap()
+                    .into_response();
+                let status = resp.status();
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                (status, serde_json::from_slice::<serde_json::Value>(&body).unwrap())
+            }
+        };
+        let seen = |id: String| {
+            let state = state.clone();
+            async move { get_run(State(state), Path(id)).await.unwrap().0 }
+        };
+        let (status, first) = made(queues).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, second) = made(queues).await;
+        assert_eq!(status, StatusCode::CREATED, "made, where it was refused: {second}");
+        let (first, second) = (
+            first["run_id"].as_str().unwrap().to_string(),
+            second["run_id"].as_str().unwrap().to_string(),
+        );
+
+        let waits = seen(second.clone()).await;
+        assert_eq!(waits["run"]["status"], "running");
+        assert!(waits["run"]["queued_at"].is_string() && waits["run"]["admitted_at"].is_null(), "{waits}");
+        assert!(seen(first.clone()).await["run"]["queued_at"].is_null());
+        db::advance_ready_tasks(&state.pool).await.unwrap();
+        assert_eq!(seen(second.clone()).await["tasks"][0]["status"], "pending", "its task is held");
+        assert_eq!(seen(first.clone()).await["tasks"][0]["status"], "ready");
+
+        // The first is cancelled: the second is let in, and its task advances.
+        let Json(did) = cancel_run(State(state.clone()), Path(first.clone())).await.unwrap();
+        assert_eq!(did["cancelled"], true);
+        assert_eq!(db::admit_waiting_runs(&state.pool).await.unwrap(), vec![second.clone()]);
+        db::advance_ready_tasks(&state.pool).await.unwrap();
+        let let_in = seen(second.clone()).await;
+        assert!(let_in["run"]["admitted_at"].is_string(), "{let_in}");
+        assert_eq!(let_in["tasks"][0]["status"], "ready");
+
+        // A third waits behind it, and a cancel of it is over at once.
+        let (_, third) = made(queues).await;
+        let third = third["run_id"].as_str().unwrap().to_string();
+        let Json(did) = cancel_run(State(state.clone()), Path(third.clone())).await.unwrap();
+        assert_eq!(did["stopping"], 0);
+        assert_eq!(seen(third).await["run"]["status"], "cancelled");
+
+        // A workflow that says nothing of a full cap refuses as it did.
+        let refuses = "name: serial\nmax_active_runs: 1\ntasks:\n  - name: a\n    command: [\"true\"]\n";
+        assert_eq!(made(refuses).await.0, StatusCode::CREATED);
+        let (status, said) = made(refuses).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!((&said["active"], &said["waiting"], &said["max_active_runs"]), (&json!(1), &json!(0), &json!(1)));
+
+        state.pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The task cap bounds the dimension that costs something. `MAX_INFLIGHT_TASKS`
     /// used to reach only the IngestActor, so this path — the engine's own ops
     /// API — was capped on runs alone and a single wide submission sailed past.
@@ -1583,6 +2096,52 @@ mod tests {
                 .into_response();
             assert_eq!(r.status(), StatusCode::CREATED);
         }
+        // Each is recorded as asked of this API, which has no login to name
+        // anyone by.
+        let records: Vec<(String, String, Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT kind, principal, actor, source FROM run_triggers")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(records.len(), 3, "a record for each run");
+        for record in records {
+            assert_eq!(
+                record,
+                ("api".to_string(), "ops-api".to_string(), None, None)
+            );
+        }
+        state.pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A run's detail says what started it, in the gateway's own words for
+    /// the record's fields; a run with no record reads `null`.
+    #[tokio::test]
+    async fn a_run_s_detail_says_what_started_it() {
+        let (state, path) = temp_state(0).await;
+        let dag = DagGraph::from_yaml(ONE_TASK_DAG).unwrap();
+        let fire = dagron_core::models::RunTrigger::engine("schedule", "schedule:s1")
+            .of_event("2026-01-01T00:00:00+00:00");
+        let fired = db::create_run_triggered(&state.pool, &dag, ONE_TASK_DAG, &fire)
+            .await
+            .unwrap();
+        let Json(detail) = get_run(State(state.clone()), Path(fired)).await.unwrap();
+        assert_eq!(
+            detail["trigger"],
+            json!({
+                "kind": "schedule", "principal": "engine", "actor": null, "trust": null,
+                "source": "schedule:s1", "forge_host": null, "repo": null, "ref": null,
+                "sha": null, "base_sha": null, "pr": null,
+                "event_id": "2026-01-01T00:00:00+00:00",
+            })
+        );
+
+        let old = db::create_run(&state.pool, &dag, ONE_TASK_DAG)
+            .await
+            .unwrap();
+        let Json(detail) = get_run(State(state.clone()), Path(old)).await.unwrap();
+        assert!(detail["trigger"].is_null(), "{detail}");
+
         state.pool.close().await;
         let _ = std::fs::remove_file(&path);
     }
@@ -1631,6 +2190,189 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ok.0["cleared"], 2, "a and its downstream b are reset");
+
+        state.pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `POST /runs/{id}/tasks/{tid}/retry`: puts a failed task back and sets its
+    /// ended run running (200), tells an unknown run or task (404) from a task
+    /// that is not failed (409), and keeps the attempt it replaces, numbered
+    /// as the task view's `current_attempt` is.
+    #[tokio::test]
+    async fn retry_task_handler_paths() {
+        let (state, path) = temp_state(0).await;
+        let yaml = "name: chain
+tasks:
+  - name: a
+    command: [\"true\"]
+  - name: b
+    command: [\"true\"]
+    depends_on: [\"a\"]
+";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let run_id = db::create_run(&state.pool, &dag, yaml).await.unwrap();
+        let tasks = db::list_tasks(&state.pool, &run_id).await.unwrap();
+        let a = tasks.iter().find(|t| t.name == "a").unwrap();
+
+        let e = retry_task(State(state.clone()), Path(("nope".into(), a.id.clone())))
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
+        let e = retry_task(State(state.clone()), Path((run_id.clone(), "nope".into())))
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
+        // 'a' is pending → 409.
+        let e = retry_task(State(state.clone()), Path((run_id.clone(), a.id.clone())))
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::CONFLICT);
+
+        sqlx::query("UPDATE task_runs SET status = 'failed', attempt = 1, output = 'boom' WHERE id = ?")
+            .bind(&a.id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workflow_runs SET status = 'failed', finished_at = '2026-01-01T00:00:00Z' WHERE id = ?")
+            .bind(&run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let ok = retry_task(State(state.clone()), Path((run_id.clone(), a.id.clone())))
+            .await
+            .unwrap();
+        assert_eq!(ok.0["retried"], true);
+        let run = db::get_run(&state.pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(run.status.to_string(), "running");
+
+        let history = task_attempts(
+            State(state.clone()),
+            Path((run_id.clone(), a.id.clone())),
+            RawQuery(None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(history.0["current_attempt"], 1);
+        assert_eq!(history.0["attempts"][0]["reason"], "retry");
+        assert_eq!(history.0["attempts"][0]["status"], "failed");
+        assert_eq!(history.0["attempts"][0]["output"], "boom");
+
+        state.pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A rerun of an ended run whose concurrency key is full is a 429 that
+    /// names the workflow, as a new run of the key is refused, and not a 500.
+    #[tokio::test]
+    async fn a_rerun_of_a_full_concurrency_key_is_a_429() {
+        let (state, path) = temp_state(0).await;
+        let yaml = "name: serial
+max_active_runs: 1
+tasks:
+  - name: a
+    command: [\"true\"]
+";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let older = db::create_run(&state.pool, &dag, yaml).await.unwrap();
+        sqlx::query("UPDATE task_runs SET status = 'failed', attempt = 1 WHERE run_id = ?")
+            .bind(&older)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workflow_runs SET status = 'failed', finished_at = '2026-01-01T00:00:00Z' WHERE id = ?")
+            .bind(&older)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        // The key's next run holds it.
+        db::create_run(&state.pool, &dag, yaml).await.unwrap();
+
+        let e = rerun_run(State(state.clone()), Path(older.clone()), None).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::TOO_MANY_REQUESTS, "{}", e.1);
+        assert!(e.1.contains("serial"), "{}", e.1);
+        let all = || {
+            Some(Json(RerunBody {
+                from: Some("all".into()),
+            }))
+        };
+        let e = rerun_run(State(state.clone()), Path(older.clone()), all())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.0,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a whole rerun too: {}",
+            e.1
+        );
+        let run = db::get_run(&state.pool, &older).await.unwrap().unwrap();
+        assert_eq!(run.status.to_string(), "failed", "nothing was written");
+
+        state.pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `{"from": "all"}` reruns a run whole, one that succeeded too, through
+    /// the implementation dagron-api's route calls. Without it, a run that
+    /// succeeded is none to rerun; with a mode there is not, the answer is a
+    /// 400.
+    #[tokio::test]
+    async fn a_whole_rerun_reruns_a_run_that_succeeded() {
+        let (state, path) = temp_state(0).await;
+        let yaml = "name: twice
+tasks:
+  - name: a
+    command: [\"true\"]
+  - name: b
+    command: [\"true\"]
+    depends_on: [a]
+";
+        let dag = DagGraph::from_yaml(yaml).unwrap();
+        let run_id = db::create_run(&state.pool, &dag, yaml).await.unwrap();
+        sqlx::query("UPDATE task_runs SET status = 'succeeded', attempt = 1 WHERE run_id = ?")
+            .bind(&run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workflow_runs SET status = 'succeeded', finished_at = '2026-01-01T00:00:00Z' WHERE id = ?")
+            .bind(&run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let mode = |from: &str| {
+            Some(Json(RerunBody {
+                from: Some(from.into()),
+            }))
+        };
+
+        let e = rerun_run(State(state.clone()), Path(run_id.clone()), None)
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::CONFLICT, "{}", e.1);
+        let e = rerun_run(State(state.clone()), Path(run_id.clone()), mode("task:a"))
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST, "{}", e.1);
+
+        let ok = rerun_run(State(state.clone()), Path(run_id.clone()), mode("all"))
+            .await
+            .unwrap();
+        assert_eq!(ok.0["rerun"], 2);
+        let run = db::get_run(&state.pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(run.status.to_string(), "running");
+        let statuses: Vec<String> = db::list_tasks(&state.pool, &run_id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.status.to_string())
+            .collect();
+        assert_eq!(statuses, ["pending", "pending"]);
+
+        let e = rerun_run(State(state.clone()), Path(run_id.clone()), mode("all"))
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::CONFLICT, "running: {}", e.1);
+        assert!(e.1.ends_with("(succeeded/failed/cancelled)"), "{}", e.1);
 
         state.pool.close().await;
         let _ = std::fs::remove_file(&path);
@@ -2248,6 +2990,20 @@ mod tests {
         assert_eq!(won, 1, "exactly one redrive wins the claim");
         assert_eq!(run_count(&state).await, 1);
         assert!(db::get_dead_letter(&state.pool, &id).await.unwrap().is_none());
+        // The one run is recorded as a redrive of that dead letter.
+        let record: (String, String, Option<String>) =
+            sqlx::query_as("SELECT kind, principal, source FROM run_triggers")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            record,
+            (
+                "api".to_string(),
+                "ops-api".to_string(),
+                Some(format!("dead-letter:{id}"))
+            )
+        );
 
         state.pool.close().await;
         let _ = std::fs::remove_file(&path);

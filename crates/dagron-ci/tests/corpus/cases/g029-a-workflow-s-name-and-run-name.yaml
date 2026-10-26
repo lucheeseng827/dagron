@@ -1,0 +1,14 @@
+shows: A workflow's name is what its pipeline is called, where the file's is used without one
+front: github
+file: build-and-test
+github: { runs_on: { ubuntu-22.04: "docker.io/library/ubuntu:22.04" } }
+source: |
+  name: Build and test
+  on: push
+  jobs:
+    build:
+      name: Build (release)
+      runs-on: ubuntu-22.04
+      steps:
+        - name: Compile
+          run: make release

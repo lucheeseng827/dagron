@@ -29,8 +29,15 @@ impl ProgressSink for QueueSink {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // `--version` first: for it nothing is read and nothing is started.
+    if dagron_mcp::version_requested("dagron-mcp") {
+        return Ok(());
+    }
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        // Colour for a person at a terminal, and none into an MCP client's
+        // log of this process's stderr.
+        .with_ansi(dagron_mcp::stderr_takes_colour())
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 

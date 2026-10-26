@@ -1,0 +1,20 @@
+shows: A job that needs a job which was left out is left out with it
+front: github
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on: push
+  jobs:
+    build:
+      runs-on: ubuntu-latest
+      if: github.ref == 'refs/heads/release'
+      steps:
+        - run: make
+    publish:
+      runs-on: ubuntu-latest
+      needs: build
+      steps:
+        - run: make publish
+    lint:
+      runs-on: ubuntu-latest
+      steps:
+        - run: make lint

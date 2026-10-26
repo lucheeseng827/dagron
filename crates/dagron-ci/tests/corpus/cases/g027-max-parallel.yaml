@@ -1,0 +1,14 @@
+shows: A matrix's max-parallel is refused by name, where it would otherwise be dropped
+front: github
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on: push
+  jobs:
+    test:
+      runs-on: ubuntu-latest
+      strategy:
+        max-parallel: 2
+        matrix:
+          shard: [1, 2, 3, 4]
+      steps:
+        - run: make test SHARD=${{ matrix.shard }}

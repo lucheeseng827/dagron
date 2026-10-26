@@ -102,7 +102,7 @@ Open **http://localhost:8080**.
 | Runs workflow | `workflow_ref` | **chain another saved workflow** — see §5. |
 | Calls template | `template` | **call a `templates:` sub-DAG declared in this spec** — see §5.5. |
 | Arguments | `arguments` | values passed to the called template, filling its `parameters`. |
-| (task kind) | `type: approval` | human approval gate: no command/ref; optional `approval_timeout_secs` + `approval_on_timeout` (`reject` by default, or `approve`); `approval_message` (text shown to the approver); `approval_show: ["<task>/<name>"]` (artifacts to review, e.g. `plan/plan.txt`); `binds: ["<task>/<name>"]` (pin the approval to those artifacts' exact bytes: approving needs their sha256, and the digests are written to `<gate>/approved.sha256` for `sha256sum -c` downstream); `approvers: [email or group:<name>]` (who may decide; the gateway answers 403 to anyone else); `not_triggerer: true` (whoever started the run may not approve it). |
+| (task kind) | `type: approval` | human approval gate: no command/ref; optional `approval_timeout_secs` + `approval_on_timeout` (`reject` by default, or `approve`); `approval_message` (text shown to the approver); `approval_show: ["<task>/<name>"]` (artifacts to review, e.g. `plan/plan.txt`); `binds: ["<task>/<name>"]` (pin the approval to those artifacts' exact bytes: approving needs their sha256, and the digests are written to `<gate>/approved.sha256` for `sha256sum -c` downstream); `approvers: [email or group:<name>]` (who may decide; the gateway answers 403 to anyone else); `not_triggerer: true` (whoever caused the run may not approve it: the person who submitted it, or, for a run a CI service or a parent run started, whoever that says asked). |
 
 Run-level fields (top of the spec, beside `name`):
 
@@ -161,7 +161,11 @@ task panel or YAML. Notes for real use:
    succeeded/failed). Updates stream live over SSE — no refresh needed.
 3. Click a task to open its panel: status, attempt count, and **logs/output**.
 4. If something fails: **Retry** the task, or **Rerun from failure** to reset the
-   whole failed frontier and resume. **Cancel** stops a running DAG.
+   whole failed frontier and resume. **Cancel** stops a running DAG: tasks
+   that had not started are cancelled at once, and a running one is told to
+   stop and given its grace (a container is told to stop, then removed). The
+   run reads **stopping** until its running tasks' work is gone, and cancelled
+   then; a task being stopped says so in its panel.
 
 Try the **Diamond** starter next (`a → {b,c} → d`) to see real parallelism and a
 retry policy on `d`.
@@ -428,6 +432,8 @@ param_schema:                   # optional: rules checked when a run is triggere
   action: { enum: [plan, apply], description: "shown to whoever triggers it" }
 max_active_runs: 1              # optional: cap on concurrently running runs of this workflow
 concurrency_key: "{{ stack }}"  # optional: make that cap per key (one run per stack); needs max_active_runs
+when_full: queue                # optional: a run over the cap waits its turn (queue), or takes the place
+                                # of the one before it (supersede, with a cap of 1); refused unless said
 templates:                      # optional: reusable sub-DAGs (§5.5)
   - name: <template-name>
     parameters: { key: default }  # optional defaults, overridable per call

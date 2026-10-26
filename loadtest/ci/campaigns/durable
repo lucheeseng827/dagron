@@ -1,0 +1,25 @@
+# The durability demo: kill a part of the cell with SIGKILL during a
+# pipeline, start it again, and check that the pipeline still finishes, as
+# it should (durable.mjs). Run with REPLICAS=3, in a fresh cell.
+#
+# Each pipeline is three jobs in a line (pipelines/load/durable/proof.yaml):
+# build 10 s, test 30 s, ship 5 s. `mid` kills once every pipeline's test is
+# running; `intake` once a third of the pushes, sent two a second, were
+# taken, so that the rest find the part killed (or what is behind it)
+# down, and are sent again until taken. An engine is down 5 s. dagron-ci
+# and dagron-api are down 20 s at intake, and 40 s mid-pipeline, so that
+# each pipeline's test ends, and its ship runs, while they are down: at 20
+# s nothing of the pipelines began or ended while they were down, and the
+# check that the kill caught them in flight failed (the first pass, on
+# 2026-10-24). Every step also sends five deliveries again once they were
+# taken, which are to make nothing new.
+#
+# durable NAME TARGET AT DOWN [PIPELINES] [SHAPE]
+durable engine-mid        engine   mid     5  30
+durable engines-mid       engines  mid     5  30
+durable engine-intake     engine   intake  5  30
+durable ci-intake         ci       intake  20 30
+durable ci-mid            ci       mid     40 30
+durable api-intake        api      intake  20 30
+durable api-mid           api      mid     40 30
+durable engines-mid-300   engines  mid     5  300

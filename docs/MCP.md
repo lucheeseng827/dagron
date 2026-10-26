@@ -14,6 +14,12 @@ See the [agent event-call sequence](ARCHITECTURE.md#58-mcp-agent-event-call--sub
 and the [system-context diagram](ARCHITECTURE.md#1-system-context) in
 [`docs/ARCHITECTURE.md`](ARCHITECTURE.md).
 
+To see the loop before reading the reference, run
+[`examples/mcp-demo/`](../examples/mcp-demo/README.md): a script registered as a
+workflow, called by an agent with arguments, surviving an engine restart
+mid-call, waiting on a person's approval, and rerunning only the step that
+failed. Its `verify.sh` makes the same calls over stdio without a model.
+
 ## Tools
 
 Forty-two tools spanning the whole loop — author, run, recover, inspect — so an
@@ -108,7 +114,7 @@ offers `tag` and returns the registry whole.
 | Tool | Arguments | dagron-api | Hints |
 |---|---|---|---|
 | **W** `dagron_rerun_run` | `run_id`, `from?` | `POST /api/runs/{id}/rerun` | destructive · open-world |
-| **W** `dagron_resubmit_run` | `run_id` | `POST /api/runs/{id}/resubmit` → `201` fresh run from the same spec | open-world |
+| **W** `dagron_resubmit_run` | `run_id` | `POST /api/runs/{id}/resubmit` → `201` fresh run from the same spec, with the same parameters | open-world |
 | **W** `dagron_retry_task` | `run_id`, `task_id` | `POST /api/runs/{id}/tasks/{tid}/retry` | destructive · open-world |
 | **W** `dagron_clear_task` | `run_id`, `task_id` | `POST /api/runs/{id}/tasks/{tid}/clear` (task + downstream cone) | destructive · open-world |
 | **W** `dagron_redrive_dead_letter` | `id` | `POST /api/dead-letters/{id}/redrive` | destructive · idempotent · open-world |
@@ -193,6 +199,42 @@ poll the tool in a loop instead of holding a long-lived stream.
 | `dagron_list_archived_runs` | `name?`, `limit?`, `offset?` | `GET /api/archive/runs` | read-only |
 | `dagron_get_archived_run` | `run_id` | `GET /api/archive/runs/{id}` — `410` once compacted to Parquet | read-only |
 
+### CI: dagron-ci's run API
+
+Four tools for dagron-ci's runs. They call dagron-ci
+(`DAGRON_CI_URL`), not dagron-api, with the same token: dagron-ci asks its
+cell's dagron-api who the caller is, so who may run, rerun and read is that
+dagron-api's rule, and a viewer may run nothing. Where `DAGRON_CI_URL` is
+unset, each says so.
+
+| Tool | Arguments | dagron-ci | Hints |
+|---|---|---|---|
+| `dagron_ci_run` | `repo`, `ref`, `sha?`, `pipeline?`, `inputs?`, `idempotency_key?`, `bundle_from?` | `POST /ci/v1/runs` — the event, whose `id` the other three take. With `bundle_from`, a change not pushed: `POST /ci/v1/bundles` first, then the run of the bundle on its base (below) | write, starts runs |
+| `dagron_ci_wait` | `id`, `timeout_secs?` (300, at most 600) | `GET /ci/v1/runs/{id}` until no run of the event is going: `finished`, the `outcome`, and for a failure the first failed job with its last 40 lines (`…/logs?status=failed&tail=true`). `finished: false` when it ends first | read-only |
+| `dagron_ci_logs` | `id`, `job?`, `failed_only?` (true), `q?`, `limit?` (200), `max_bytes?` (32000) | `GET /ci/v1/runs/{id}/logs` — the failed jobs' lines when any failed, else every job's, the last of them kept within `max_bytes`, with how many were left out | read-only |
+| `dagron_ci_rerun_failed` | `id` | `POST /ci/v1/runs/{id}/rerun?failed=true` — what runs again from its failed jobs, and what was left, each with why | write |
+
+**A change not pushed.** `bundle_from` names a directory in a git working
+tree; the tool makes a patch bundle of the tree's change since `sha` (any
+revision git names) or its `HEAD`, uploads it, and runs the repository's
+pipelines on that commit with the bundle laid over: the bundle
+`dagron-ci run --remote --bundle-from` makes. The commit must be on `ref`
+at the forge. The run is untrusted (an agent's is an agent's), the forge is
+told nothing of it, and the answer's `bundle` says its `id`, `sha256`,
+`base` and how many files it changes and deletes. This server reads no
+other file of the machine: the directory, and the top of the working tree
+it is in, must be under `DAGRON_MCP_WORKTREE` where that is set, and
+otherwise under the directory it was started in. It needs
+`git`. `idempotency_key` is not taken with it: each upload is a bundle of
+its own.
+
+With an agent's token (`POST /api/tokens` with `agent`), the server is the
+agent `agent:<name>`, and its runs are an agent's: dagron-ci refuses them
+unless its operator has them run (`CI_AGENT_RUNS=untrusted`), and then runs
+them confined, as untrusted runs are. Such a token reruns and cancels the
+runs it asked for, and makes, approves and changes nothing else through
+dagron-api. With a person's token, the runs are that person's.
+
 ### Tool annotations
 
 Every tool in `tools/list` carries MCP `annotations`, the hints a client reads
@@ -235,7 +277,7 @@ The writes whose hints a reader might not expect:
 | Tool | Why |
 |---|---|
 | `dagron_submit_run`, `dagron_run_workflow`, `dagron_resubmit_run` | Not destructive, because each adds a run and touches nothing that exists. Not idempotent, because each call is one more run. `idempotency_key` makes a *keyed* repeat of a submit return the same run, but the hint describes the tool, and an unkeyed repeat is a second run. |
-| `dagron_rerun_run`, `dagron_retry_task`, `dagron_clear_task` | Destructive: each resets tasks in place and clears their captured output. For rerun and retry that is the failed attempt's log; for clear it is the results of the task and everything downstream of it. |
+| `dagron_rerun_run`, `dagron_retry_task`, `dagron_clear_task` | Destructive: each resets tasks in place and replaces their captured output. For rerun and retry that is the failed attempt's log (for a rerun with `from: all`, every task's); for clear it is the results of the task and everything downstream of it. The end of what each replaced attempt printed is kept, with how it ended (`GET …/attempts`), but not the whole of it. A rerun with `from: all` deletes a runtime fan-out's instances, and their kept attempts and logs with them. Each answers `429` for a run that had ended whose concurrency key is full. |
 | `dagron_approve_task` | Not destructive (a step forward), but open-world: the tasks behind the gate run next. |
 | `dagron_reject_task` | Open-world too: failing the gate releases any `one_failed`/`all_done` task behind it. |
 | `dagron_triage_run`, `dagron_put_artifact` | Destructive: each overwrites what was there (a triage note, an artifact's bytes), and nothing keeps the old one. |
@@ -243,6 +285,8 @@ The writes whose hints a reader might not expect:
 | `dagron_update_workflow` | Destructive: it replaces the live definition that the next scheduled or triggered run executes. Earlier versions are kept, but recording one is best-effort. Not idempotent, because a repeat records one more version. |
 | `dagron_set_workflow_state` | Not destructive, because every state can be set back. Open-world, because `active` lets the workflow's schedules fire again, an overdue slot on the next tick. |
 | `dagron_redrive_dead_letter` | Destructive: it deletes the dead letter, error and failure history included, in the transaction that creates the run. A redrive that fails deletes nothing. Idempotent: a repeat after a success is a `404`, never a second run. |
+| `dagron_ci_run` | As a submit: not destructive, since it adds runs; not idempotent, since an unkeyed repeat is another event. Open-world: the pipeline's jobs run, and report to the forge. |
+| `dagron_ci_rerun_failed` | Destructive as `dagron_rerun_run` is: the failed jobs of each run start again in place, their earlier output replaced. Not idempotent: a repeat after they fail again is another round. |
 
 **Hints, not a boundary.** The spec tells a client not to trust annotations
 from a server it does not trust, and nothing here depends on one doing so: the
@@ -735,6 +779,8 @@ Details worth knowing before you write one:
 | `DAGRON_MCP_ALLOW_APPROVE` | `1`/`true`/`yes` offers `dagron_approve_task`. Off by default: approving a gate is a human decision, and an agent that reads text you do not control can be talked into it. `dagron_reject_task` is always available |
 | `DAGRON_MCP_MAX_ARTIFACT_BYTES` | largest artifact returned inline to the agent (default `262144`) |
 | `DAGRON_MCP_ALLOW_PLAINTEXT_TOKEN` | send `DAGRON_MCP_TOKEN` over plaintext `http://` to a non-loopback host (refused otherwise) |
+| `DAGRON_CI_URL` | dagron-ci's base URL, for the `dagron_ci_*` tools, which send it `DAGRON_MCP_TOKEN` too, under the same rule for plaintext `http://` |
+| `DAGRON_MCP_WORKTREE` | the one directory `dagron_ci_run`'s `bundle_from` may name a tree under (default: the directory the server was started in) |
 
 ## Run
 

@@ -172,7 +172,7 @@ pub async fn test_notifications(
         let payload = serde_json::json!({
             "text": "🔔 dagron test notification — global Slack target is configured correctly."
         });
-        send(&client, &body.slack_webhook_url, &payload).await
+        send(&client, &body.slack_webhook_url, &payload, None).await
     } else {
         "skipped (disabled)".to_string()
     };
@@ -184,7 +184,16 @@ pub async fn test_notifications(
             "status": "test",
             "at": chrono::Utc::now().to_rfc3339(),
         });
-        send(&client, &body.webhook_url, &payload).await
+        // A CloudEvent, as the engine's own posts are, so a receiver
+        // that reads one is tested with one.
+        let ce = dagron_core::cloudevents::Event {
+            id: uuid::Uuid::new_v4().to_string(),
+            source: dagron_core::cloudevents::source_from_env(),
+            kind: "notify.test".into(),
+            subject: Some("00000000-0000-0000-0000-000000000000".into()),
+            time: payload["at"].as_str().map(str::to_string),
+        };
+        send(&client, &body.webhook_url, &payload, Some(&ce)).await
     } else {
         "skipped (disabled)".to_string()
     };
@@ -192,8 +201,24 @@ pub async fn test_notifications(
     Ok(Json(TestResult { slack, webhook }))
 }
 
-async fn send(client: &reqwest::Client, url: &str, payload: &serde_json::Value) -> String {
-    match client.post(url).json(payload).send().await {
+async fn send(
+    client: &reqwest::Client,
+    url: &str,
+    payload: &serde_json::Value,
+    ce: Option<&dagron_core::cloudevents::Event>,
+) -> String {
+    let req = match ce {
+        Some(ce) => {
+            let (headers, body) =
+                ce.encode(dagron_core::cloudevents::Mode::Binary, &payload.to_string());
+            headers
+                .into_iter()
+                .fold(client.post(url), |req, (name, value)| req.header(name, value))
+                .body(body)
+        }
+        None => client.post(url).json(payload),
+    };
+    match req.send().await {
         Ok(res) if res.status().is_success() => "ok".to_string(),
         Ok(res) => format!("endpoint answered {}", res.status()),
         Err(e) => format!("request failed: {e}"),

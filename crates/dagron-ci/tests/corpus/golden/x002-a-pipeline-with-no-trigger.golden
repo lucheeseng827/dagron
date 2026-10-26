@@ -1,0 +1,2 @@
+not a pipeline:
+  on: is required: which events run this pipeline

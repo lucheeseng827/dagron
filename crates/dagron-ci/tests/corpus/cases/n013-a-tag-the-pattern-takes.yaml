@@ -1,0 +1,10 @@
+shows: A tag that the tags pattern takes runs the pipeline, as a tag event
+event: { kind: tag, ref: refs/tags/v1.2.3 }
+source: |
+  name: release
+  on:
+    push: { tags: ["v*"] }
+  tasks:
+    - name: publish
+      steps:
+        - run: make publish

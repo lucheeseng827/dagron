@@ -133,6 +133,41 @@ Every term on the right is known before the run starts, which is the property
 that matters: it is a number `budget:` could refuse at submit, the way it
 already refuses a fan-out blow-up.
 
+### The attempts a person replaces
+
+A worker's own retry is one way an attempt is superseded. A rerun, a retry and
+a clear are the other: each puts a task back to run again, and each wiped the
+attempt that was on the row. A task that failed, was rerun and succeeded read
+as one that had only ever succeeded.
+
+Those attempts are kept in the same table, by the same policy, in the
+transaction that resets the task:
+
+| `reason` | The attempt was | `status` |
+|---|---|---|
+| `iteration` | a `repeat:` pass whose `until` had not held yet | none |
+| `failed` | an attempt that errored, and a worker retried | none |
+| `rerun` | on a failed, cancelled or skipped task when its run was rerun | how it had ended |
+| `retry` | on a failed or cancelled task that was retried by hand | how it had ended |
+| `clear` | on a completed task that was cleared, or one downstream of it | how it had ended |
+
+A replaced attempt also keeps when it was queued and when it ended. A task
+that never ran (cancelled before a worker took it, or skipped) has no attempt
+to keep, and gets no row.
+
+**Attempts are numbered through the task's life.** A rerun and a clear start
+the row's own `attempt` again from 0, so that the task has its `max_attempts`
+once more. The attempts of the rounds before are counted beside it
+(`task_runs.attempt_base`), and every kept attempt is numbered by the sum. A
+rerun's first attempt is the task's second, not a second "attempt 1" written
+over the first.
+
+One difference from a worker's retry: the tail of a replaced attempt is cut in
+**characters**, not bytes. It is taken by the statement that reads the rows, so
+that a rerun of ten thousand failed tasks moves none of their output through
+the engine. For output that is not ASCII the tail can be up to four times
+`DAGRON_ATTEMPT_LOG_BYTES` in bytes.
+
 ### Measured cost of the bounded policy
 
 Defaults: keep the last **50** superseded attempts per task, each capped at

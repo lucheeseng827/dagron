@@ -1,0 +1,9 @@
+shows: A filter takes its own form or its ignore form, and not both
+source: |
+  name: ci
+  on:
+    push: { branches: [main], branches_ignore: ["wip/*"] }
+  tasks:
+    - name: build
+      steps:
+        - run: make

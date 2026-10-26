@@ -1,6 +1,6 @@
 //! Shared application state for the dagron management API.
 //!
-//! `AppState` is cheap to clone (PgPool and broadcast::Sender are Arc-backed),
+//! `AppState` is cheap to clone (the pool and broadcast::Sender are Arc-backed),
 //! so it is handed to every handler via axum's `State` extractor.
 
 use std::sync::atomic::AtomicBool;
@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use dagron_identity::IdentityProvider;
 use serde::Serialize;
-use sqlx::postgres::PgPool;
+use crate::db::Pool;
 use tokio::sync::{broadcast, Mutex};
 
 /// A task-state-change event, carrying the affected run_id from the
@@ -25,9 +25,9 @@ pub struct AppState {
     /// Pool for read queries (list/inspect/graph/logs). Points at the primary
     /// for now; a read-replica connection string can be swapped in later
     /// without touching handlers.
-    pub read_pool: PgPool,
+    pub read_pool: Pool,
     /// Pool for control mutations (cancel/retry/submit). Primary.
-    pub write_pool: PgPool,
+    pub write_pool: Pool,
     /// Broadcast channel fed by the shared `task_events` listener (01-04);
     /// each SSE client subscribes a receiver and filters by run_id.
     pub tx: broadcast::Sender<TaskEvent>,
@@ -49,6 +49,15 @@ pub struct AppState {
     /// `POST /api/artifacts/sync` drain through `ArtifactStore::sync`. `None`
     /// disables the artifact endpoints (503).
     pub artifact_store: Option<Arc<dyn dagron_artifact::ArtifactStore>>,
+    /// Where task logs are kept once out of the task rows
+    /// (`DAGRON_LOG_STORE`, the engine's own setting): the log routes read a
+    /// task's closed segments and open part from it. `None`: from the rows.
+    pub log_store: Option<Arc<dagron_artifact::log_segments::SegmentStore>>,
+    /// How the artifact routes are set: whether a transfer goes straight to
+    /// the store, and how long an artifact is kept. See
+    /// [crate::routes::artifact_index::Settings].
+    #[cfg(feature = "postgres")]
+    pub artifacts: crate::routes::artifact_index::Settings,
     /// Single-flight guard shared by the two store-wide sweeps — key rotation
     /// (`POST /api/artifacts/rotate`) and the tiered drain
     /// (`POST /api/artifacts/sync`): a second concurrent request of either kind
@@ -63,4 +72,20 @@ pub struct AppState {
     /// folds it in: a replica whose LISTEN session is down serves stale SSE
     /// and long-polls, so it should not be routed new traffic (LOW_LATENCY R-1).
     pub listener_ready: Arc<AtomicBool>,
+    /// Who each service token was, for a few seconds.
+    pub token_cache: Arc<crate::auth::TokenCache>,
+    /// The OIDC issuer, where `DAGRON_OIDC_ISSUER` is set: its keys
+    /// and how long a token lasts. `None`: its routes answer 404.
+    pub oidc: Option<Arc<crate::oidc::Issuer>>,
+    /// The live log relay: one reader of each run somebody
+    /// follows, for every stream of it (`routes::logstream`).
+    pub relay: Arc<crate::relay::Relay>,
+    /// `GET /api/metrics`'s counts in two tiers, each cached on
+    /// its own: what has not finished, and the history. Per replica.
+    #[cfg(feature = "postgres")]
+    pub metrics_cache: Arc<dagron_core::gauges::GaugeCache>,
+    /// The limits over this replica's sessions, as it last read them,
+    /// for `GET /api/metrics`.
+    #[cfg(feature = "postgres")]
+    pub db_connections: Arc<crate::db::ConnectionGauge>,
 }

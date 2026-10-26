@@ -1,0 +1,63 @@
+# Imported from a GitLab CI pipeline by dagron-import.
+#
+# Changed on the way (7):
+#   test.parallel: the job is 3 instances of one task (with_items)
+#   test.script: it reads $CI_NODE_INDEX, $CI_NODE_TOTAL: each is set at the head of its script
+#   deploy.parallel.matrix: the job is 3 instances of one task (with_items), each given its matrix's variables
+#   single.parallel.matrix: the job is 2 instances of one task (with_items), each given its matrix's variables
+#   test.script: GitLab's variables a script reads are set at its head from dagron-ci's own (CI_SHA, CI_REF, …): a program it runs that reads one the script does not is not given it
+#   test.script: a job's script ran under bash where its image had bash, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   on.dispatch: a pipeline run from GitLab's page or its API is a run asked for here (dispatch), through the run API
+name: 06-parallel-and-matrix
+on:
+  push: {}
+  dispatch: {}
+tasks:
+- name: test
+  docker_image: python:3.12
+  with_items:
+  - 1
+  - 2
+  - 3
+  steps:
+  - name: script
+    run: |-
+      export CI_NODE_INDEX={{ item }}
+      export CI_NODE_TOTAL=3
+      pytest --splits "$CI_NODE_TOTAL" --group "$CI_NODE_INDEX"
+- name: deploy
+  docker_image: '{{ item.DEPLOY_IMAGE }}'
+  depends_on:
+  - test
+  - single
+  with_items:
+  - PROVIDER: aws
+    STACK: monitoring
+    DEPLOY_IMAGE: amazon/aws-cli:2
+  - PROVIDER: aws
+    STACK: app
+    DEPLOY_IMAGE: amazon/aws-cli:2
+  - PROVIDER: gcp
+    STACK: app
+    DEPLOY_IMAGE: google/cloud-sdk:slim
+  env:
+  - name: DEPLOY_IMAGE
+    value: '{{ item.DEPLOY_IMAGE }}'
+  - name: PROVIDER
+    value: '{{ item.PROVIDER }}'
+  - name: STACK
+    value: '{{ item.STACK }}'
+  steps:
+  - name: script
+    run: ./deploy.sh "$PROVIDER" "$STACK"
+- name: single
+  docker_image: ruby:{{ item }}
+  with_items:
+  - '3.2'
+  - '3.3'
+  env:
+  - name: RUBY
+    value: '{{ item }}'
+  steps:
+  - name: script
+    run: bundle exec rake

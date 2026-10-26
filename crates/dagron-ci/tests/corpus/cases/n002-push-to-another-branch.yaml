@@ -1,0 +1,10 @@
+shows: A push to a branch the pipeline does not name is passed over
+event: { kind: push, ref: refs/heads/feature/login }
+source: |
+  name: ci
+  on:
+    push: { branches: [main] }
+  tasks:
+    - name: build
+      steps:
+        - run: make

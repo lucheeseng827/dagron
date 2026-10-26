@@ -1,0 +1,10 @@
+shows: A push trigger that names only branches is passed over for a tag
+event: { kind: tag, ref: refs/tags/v1.2.3 }
+source: |
+  name: ci
+  on:
+    push: { branches: [main] }
+  tasks:
+    - name: build
+      steps:
+        - run: make

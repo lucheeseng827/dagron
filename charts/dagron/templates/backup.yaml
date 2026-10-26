@@ -1,0 +1,132 @@
+{{- if .Values.backup.enabled }}
+{{- $b := .Values.backup }}
+{{- if not $b.to }}
+{{- fail "backup.to: where each dump goes, s3://, gs://, az:// or file:// (values.yaml)" }}
+{{- end }}
+{{- $scheme := index (splitList "://" $b.to) 0 }}
+{{- if not (has $scheme (list "s3" "gs" "az" "azure" "file")) }}
+{{- fail (printf "backup.to: %q is not s3://, gs://, az:// or file://" $b.to) }}
+{{- end }}
+{{- $dir := "" }}
+{{- if eq $scheme "file" }}
+{{- $dir = trimPrefix "file://" $b.to }}
+{{- if not (hasPrefix "/" $dir) }}
+{{- fail (printf "backup.to: %q: a file URL's path is absolute (file:///backup)" $b.to) }}
+{{- end }}
+{{- if not $b.claimName }}
+{{- fail "backup.to is a file:// URL: backup.claimName names the claim it is on" }}
+{{- end }}
+{{- end }}
+{{- if lt (int $b.keep) 1 }}
+{{- fail "backup.keep: at least 1; retention never empties the target" }}
+{{- end }}
+# The backup CronJob's identity: what a cloud target is reached as, through
+# workload identity (backup.serviceAccount.annotations). It asks the cluster
+# for nothing, so no token is mounted (a workload identity webhook projects
+# its own).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "dagron.fullname" . }}-backup
+  labels:
+    {{- include "dagron.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+  {{- with $b.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: false
+---
+# Each night (backup.schedule): pg_dump writes the database to a scratch
+# volume, and `dagron backup put` sends it to backup.to and keeps the newest
+# backup.keep there. Never two at once; a failed run is not retried in place,
+# the next night's is the retry, and the Job's status says it failed.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "dagron.fullname" . }}-backup
+  labels:
+    {{- include "dagron.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+spec:
+  schedule: {{ $b.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            {{- include "dagron.labels" . | nindent 12 }}
+            app.kubernetes.io/component: backup
+            {{- with $b.podLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "dagron.fullname" . }}-backup
+          securityContext:
+            {{- include "dagron.podSecurityContext" (dict "root" $ "uid" 65532 "fsGroup" true) | nindent 12 }}
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          initContainers:
+            # The dump: custom format (what pg_restore takes, compressed), no
+            # owners, so it restores as whoever restores it. Named for when
+            # it was made, which is also its order among the rest.
+            - name: dump
+              image: {{ include "dagron.image" (dict "image" $b.dumpImage "root" $) | quote }}
+              command:
+                - sh
+                - -c
+                - exec pg_dump --format=custom --no-owner --file="/dump/dagron-$(date -u +%Y%m%dT%H%M%SZ).dump" "$DATABASE_URL"
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "dagron.dbSecretName" . }}
+                      key: {{ include "dagron.dbSecretKey" . }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - {name: dump, mountPath: /dump}
+              resources:
+                {{- toYaml $b.resources | nindent 16 }}
+          containers:
+            # The send, from the engine's image (its object stores), and the
+            # retention after it.
+            - name: send
+              image: {{ include "dagron.image" (dict "image" $.Values.engine.image "root" $) | quote }}
+              imagePullPolicy: {{ .Values.engine.imagePullPolicy }}
+              args: ["backup", "put", "/dump", {{ $b.to | quote }}, "--keep", {{ $b.keep | quote }}]
+              {{- with $b.extraEnv }}
+              env:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - {name: dump, mountPath: /dump, readOnly: true}
+                {{- if $dir }}
+                - {name: target, mountPath: {{ $dir | quote }}}
+                {{- end }}
+              resources:
+                {{- toYaml $b.resources | nindent 16 }}
+          volumes:
+            - name: dump
+              emptyDir: {}
+            {{- if $dir }}
+            - name: target
+              persistentVolumeClaim:
+                claimName: {{ $b.claimName | quote }}
+            {{- end }}
+{{- end }}

@@ -11,6 +11,7 @@
 {{- $engineFrom = append $engineFrom (dict "namespaceSelector" (dict "matchLabels" (dict "kubernetes.io/metadata.name" .Values.networkPolicy.engine.monitoringNamespace))) }}
 {{- end }}
 {{- range .Values.networkPolicy.engine.allowFrom }}{{ $engineFrom = append $engineFrom . }}{{- end }}
+{{- $ciHere := eq (include "dagron.ci.inEnginePod" .) "true" }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -24,12 +25,24 @@ spec:
       app.kubernetes.io/instance: {{ .Release.Name }}
       app.kubernetes.io/component: engine
   policyTypes: [Ingress]
-  {{- if $engineFrom }}
+  {{- if or $engineFrom $ciHere }}
   ingress:
+    {{- if $engineFrom }}
     - from:
         {{- toYaml $engineFrom | nindent 8 }}
       ports:
         - {port: {{ .Values.engine.port }}, protocol: TCP}
+    {{- end }}
+    {{- if $ciHere }}
+    # dagron-ci's port, which is in this pod (ci.placement: engine). From
+    # anywhere, as it is where dagron-ci has a pod of its own, which no
+    # policy here selects: a forge's webhook comes through an ingress
+    # controller this chart does not know, and each of dagron-ci's doors
+    # asks for a signature, a credential or a secret. The engine's own port
+    # is as closed as it was.
+    - ports:
+        - {port: {{ .Values.ci.port }}, protocol: TCP}
+    {{- end }}
   {{- else }}
   ingress: []
   {{- end }}
@@ -55,7 +68,7 @@ spec:
             matchLabels:
               app.kubernetes.io/instance: {{ .Release.Name }}
             matchExpressions:
-              - {key: app.kubernetes.io/component, operator: In, values: [engine, dagron-api, gitops, operator]}
+              - {key: app.kubernetes.io/component, operator: In, values: [engine, dagron-api, gitops, operator{{ if .Values.ci.enabled }}, dagron-ci{{ end }}{{ if .Values.backup.enabled }}, backup{{ end }}]}
         {{- with .Values.networkPolicy.postgres.allowFrom }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

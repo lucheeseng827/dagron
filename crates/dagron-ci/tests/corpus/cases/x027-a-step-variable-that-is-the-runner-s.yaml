@@ -1,0 +1,10 @@
+shows: A step variable that begins CI_ is refused, since those are set from the event
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: build
+      steps:
+        - env: { CI_STEP_COUNT: "9", PATH_EXTRA: /opt/bin }
+          run: echo "$CI_STEP_COUNT $PATH_EXTRA"

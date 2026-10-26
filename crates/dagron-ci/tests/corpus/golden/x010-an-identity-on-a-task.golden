@@ -1,0 +1,2 @@
+not a pipeline:
+  tasks[0] (deploy).identity: is `{ oidc: { audience: … } }`: one audience, or a list of up to 8, each the name a cloud gives this installation's tokens (sts.amazonaws.com for AWS)

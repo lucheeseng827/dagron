@@ -1,0 +1,97 @@
+# Imported from a GitLab CI pipeline by dagron-import.
+#
+# To do by hand (11):
+#   include[0]: the file at https://example.com/ci/common.yml is not imported: what it holds is not in this file, and no job of it is here. Write what the pipeline needs of it here
+#   trigger-docs.trigger: a child or another project's pipeline is not started here: write its jobs here, or make it a pipeline of its own
+#   pages: a job named pages published GitLab Pages, which is not here: publish the site in the script
+#   release-job.release: a release is not made here: make it in the script
+#   cloud.script: the script reads $CI_JOB_TOKEN, which a step here is not given: GitLab's registry and the job's own token are not here, and a registry's credentials are an environment's secrets, named in the job's env
+#   cloud.hooks: a job's hooks are not run: put what they run in its script
+#   cloud.id_tokens: a job's token for a cloud is dagron's identity here: `identity: { oidc: { audience: … } }`, and the job asks for one where DAGRON_OIDC_REQUEST_URL says
+#   cloud.secrets: a vault's secrets are not read here: they are an environment's secrets, named in the job's env
+#   cloud.resource_group: a job's own lock (production) is not here: a pipeline's runs of one concurrency key run one at a time (concurrency: { key: … }), and a job that must not run twice at once is the only job of such a pipeline
+#   cloud.unknown_key: a job has no such key here
+#   delayed.when: a delayed job is not taken: it runs when it would have started, and start_in is not waited for
+#
+# Changed on the way (3):
+#   image: the pipeline's image is each job's that does not set its own
+#   pages.script: a job's script ran under bash where its image had bash, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   on.dispatch: a pipeline run from GitLab's page or its API is a run asked for here (dispatch), through the run API
+#
+# Not carried over (2):
+#   pages.artifacts.paths: a job's files are not kept, and not handed to the jobs after it: its workspace goes with it
+#   cloud.coverage: a job's coverage is not read from its log here
+name: 10-what-has-no-place
+on:
+  push: {}
+  dispatch: {}
+tasks:
+- name: trigger-docs
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        include[0]: the file at https://example.com/ci/common.yml is not imported: what it holds is not in this file, and no job of it is here. Write what the pipeline needs of it here
+        trigger-docs.trigger: a child or another project's pipeline is not started here: write its jobs here, or make it a pipeline of its own
+      DAGRON_IMPORT
+      exit 1
+- name: pages
+  docker_image: alpine:3.20
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        include[0]: the file at https://example.com/ci/common.yml is not imported: what it holds is not in this file, and no job of it is here. Write what the pipeline needs of it here
+        pages: a job named pages published GitLab Pages, which is not here: publish the site in the script
+      DAGRON_IMPORT
+      exit 1
+  - name: script
+    run: mkdir public && cp -r site/* public/
+- name: release-job
+  docker_image: alpine:3.20
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        include[0]: the file at https://example.com/ci/common.yml is not imported: what it holds is not in this file, and no job of it is here. Write what the pipeline needs of it here
+        release-job.release: a release is not made here: make it in the script
+      DAGRON_IMPORT
+      exit 1
+  - name: script
+    run: echo release
+- name: cloud
+  docker_image: alpine:3.20
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        include[0]: the file at https://example.com/ci/common.yml is not imported: what it holds is not in this file, and no job of it is here. Write what the pipeline needs of it here
+        cloud.script: the script reads $CI_JOB_TOKEN, which a step here is not given: GitLab's registry and the job's own token are not here, and a registry's credentials are an environment's secrets, named in the job's env
+        cloud.hooks: a job's hooks are not run: put what they run in its script
+        cloud.id_tokens: a job's token for a cloud is dagron's identity here: `identity: { oidc: { audience: … } }`, and the job asks for one where DAGRON_OIDC_REQUEST_URL says
+        cloud.secrets: a vault's secrets are not read here: they are an environment's secrets, named in the job's env
+        cloud.resource_group: a job's own lock (production) is not here: a pipeline's runs of one concurrency key run one at a time (concurrency: { key: … }), and a job that must not run twice at once is the only job of such a pipeline
+        cloud.unknown_key: a job has no such key here
+      DAGRON_IMPORT
+      exit 1
+  - name: script
+    run: |-
+      aws sts get-caller-identity
+      echo "$CI_JOB_TOKEN" | head -c 3
+- name: delayed
+  docker_image: alpine:3.20
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        include[0]: the file at https://example.com/ci/common.yml is not imported: what it holds is not in this file, and no job of it is here. Write what the pipeline needs of it here
+        delayed.when: a delayed job is not taken: it runs when it would have started, and start_in is not waited for
+      DAGRON_IMPORT
+      exit 1
+  - name: script
+    run: echo later

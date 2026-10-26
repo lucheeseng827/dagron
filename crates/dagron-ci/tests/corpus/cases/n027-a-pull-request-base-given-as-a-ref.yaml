@@ -1,0 +1,10 @@
+shows: A pull request's base is read the same whether it is given as a branch or as a ref
+event: { kind: pull_request, base_ref: refs/heads/main }
+source: |
+  name: ci
+  on:
+    pull_request: { branches: [main] }
+  tasks:
+    - name: test
+      steps:
+        - run: make test

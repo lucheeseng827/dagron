@@ -1,0 +1,9 @@
+shows: A task with dagron's own command and no steps passes through as it is
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: hello
+      docker_image: docker.io/library/alpine:3.20
+      command: ["echo", "hello"]

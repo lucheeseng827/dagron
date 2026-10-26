@@ -1,0 +1,10 @@
+shows: A job that depends on a job the pipeline does not have is refused
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: test
+      depends_on: [build]
+      steps:
+        - run: make test

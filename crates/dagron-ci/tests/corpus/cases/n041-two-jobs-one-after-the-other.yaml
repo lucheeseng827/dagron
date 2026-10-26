@@ -1,0 +1,15 @@
+shows: A job that depends on another is compiled to a task that waits for it
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: lint
+      docker_image: docker.io/library/rust:1-bookworm
+      steps:
+        - run: cargo fmt --all -- --check
+    - name: test
+      depends_on: [lint]
+      docker_image: docker.io/library/rust:1-bookworm
+      steps:
+        - run: cargo test --workspace

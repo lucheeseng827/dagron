@@ -1,0 +1,1 @@
+github.event_name == 'push' && contains(github.ref, 'refs/tags/')

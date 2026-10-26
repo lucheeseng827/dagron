@@ -1,0 +1,43 @@
+# Imported from a Jenkinsfile by dagron-import.
+#
+# Changed on the way (5):
+#   on: a multibranch pipeline's builds are each branch and tag pushed, each pull request, and a run asked for (dispatch) here: say on: where it ran for fewer
+#   options.retry: each job is tried 2 times, where Jenkins tried the pipeline again
+#   options.disableConcurrentBuilds: a newer run of a branch or pull request takes the older one's place (concurrency)
+#   stage('Build').options.timeout: the stage's time is each of its steps' here
+#   stage('Build').steps[0]: Jenkins's variables a step reads are set at its head from dagron-ci's own (CI_SHA, CI_REF, …): a program it runs that reads one the step does not is not given it
+#
+# Not carried over (3):
+#   options.timestamps: an option of Jenkins's that has no place here
+#   stage('Checkout').steps[0]: the job's workspace is a checkout of the event's commit already
+#   stage('Integration').agent.docker.args: the variables the agent's container was given are the job's
+name: 13-labels-and-options
+on:
+  push: {}
+  pull_request: {}
+  dispatch: {}
+concurrency:
+  key: '{{ ci_group }}'
+  cancel_superseded: true
+tasks:
+- name: checkout
+  docker_image: docker.io/library/debian:12
+  max_attempts: 2
+  steps:
+  - name: Build
+    run: make -j4
+    timeout_secs: 3600
+- name: integration
+  docker_image: postgres:16
+  image_pull_policy: always
+  depends_on:
+  - checkout
+  env:
+  - name: POSTGRES_PASSWORD
+    value: ci
+  workspace:
+    checkout: false
+  max_attempts: 3
+  steps:
+  - name: Integration
+    run: pg_ctl start && make it

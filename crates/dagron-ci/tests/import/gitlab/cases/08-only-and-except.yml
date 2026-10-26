@@ -1,0 +1,33 @@
+# GitLab's older form: only and except.
+image: maven:3.9-eclipse-temurin-21
+
+build:
+  stage: build
+  script: mvn -B verify
+  except:
+    - schedules
+
+snapshot:
+  stage: deploy
+  script: mvn -B deploy
+  only:
+    - main
+    - /^release-(1|2)$/
+
+release:
+  stage: deploy
+  script: mvn -B deploy -Prelease
+  only:
+    refs: [tags]
+    variables:
+      - $RELEASE == "yes"
+  variables:
+    RELEASE: "yes"
+
+review:
+  stage: test
+  script: mvn -B verify -Preview
+  only: [merge_requests]
+  except:
+    variables:
+      - $CI_COMMIT_MESSAGE =~ /skip review/

@@ -36,9 +36,10 @@ pub struct Workflow {
     /// Current definition version; `workflow_versions` holds the history.
     #[sqlx(default)]
     pub version: i64,
-    /// Organizational labels parsed from the spec (#26). `#[sqlx(default)]` so the
-    /// row query (which doesn't select a `tags` column) maps; set from the spec.
-    #[sqlx(default)]
+    /// Organizational labels parsed from the spec (#26). `#[sqlx(skip)]`: no
+    /// row query selects a `tags` column (an array no SQLite column could
+    /// hold); set from the spec.
+    #[sqlx(skip)]
     pub tags: Vec<String>,
     /// The spec's `parameters:` defaults, so a caller can offer a run form
     /// without parsing YAML.
@@ -65,7 +66,10 @@ pub struct WorkflowRow {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
-    /// "git" (namespaced name from the operator/GitOps) or "manual".
+    /// "git" (namespaced name from the operator/GitOps), "manual", or "ci": a
+    /// pipeline a CI service compiled from a repository ([`ci_pipelines`]),
+    /// which is listed and not stored, so it has no detail and cannot be run,
+    /// paused or deleted from here.
     pub source: String,
     pub created_at: String,
     pub updated_at: String,
@@ -89,10 +93,119 @@ pub struct WorkflowRow {
 }
 
 /// Query params for `GET /api/workflows`. `?tag=<t>` returns only workflows
-/// carrying that tag (#26).
+/// carrying that tag (#26). `?include=ci` lists, after the stored workflows,
+/// the pipelines a CI service compiled ([`ci_pipelines`]); without it the list
+/// is what it always was.
 #[derive(Deserialize)]
 pub struct ListQuery {
     pub tag: Option<String>,
+    pub include: Option<String>,
+}
+
+/// One run of a compiled pipeline, for its row's digest.
+#[derive(sqlx::FromRow)]
+struct CiRunStat {
+    forge_host: String,
+    repo: String,
+    name: String,
+    status: String,
+    created_at: String,
+}
+
+/// A compiled pipeline's newest definition, for its tags.
+#[derive(sqlx::FromRow)]
+struct CiSpec {
+    forge_host: String,
+    repo: String,
+    name: String,
+    spec: String,
+}
+
+/// The pipelines a CI service compiled and submitted inline, one row for each
+/// repository and pipeline name, from the runs whose trigger record says `ci`.
+///
+/// Such a pipeline is not a stored workflow: its definition is the file in its
+/// repository at each commit, compiled for each run. So the row is read-only.
+/// Its id is no workflow's (`ci:<forge>/<repo>:<name>`), its description is
+/// the repository, and its tags are those of the newest run's definition,
+/// which the compiler tagged `ci`. A run of a stored workflow that CI was
+/// bound to is that workflow's, and is not listed a second time here.
+async fn ci_pipelines(state: &AppState) -> Result<Vec<WorkflowRow>, StatusCode> {
+    // The same 14-run window the stored workflows' digests use.
+    let runs = sqlx::query_as::<_, CiRunStat>(
+        "SELECT forge_host, repo, name, status, created_at FROM (
+            SELECT coalesce(rt.forge_host, '') AS forge_host, coalesce(rt.repo, '') AS repo,
+                   d.name AS name, r.status AS status, r.created_at AS created_at,
+                   row_number() OVER (PARTITION BY rt.forge_host, rt.repo, d.name ORDER BY r.created_at DESC) AS rn
+            FROM workflow_runs r
+            JOIN run_triggers rt ON rt.run_id = r.id AND rt.kind = 'ci'
+            JOIN workflow_definitions d ON d.id = r.definition_id
+            WHERE NOT EXISTS (SELECT 1 FROM workflows w WHERE w.name = d.name)
+         ) t WHERE rn <= 14
+         ORDER BY forge_host, repo, name, created_at DESC",
+    )
+    .fetch_all(&state.read_pool)
+    .await
+    .map_err(internal)?;
+    let specs = sqlx::query_as::<_, CiSpec>(
+        // The newest spec of each pipeline: the first row of each partition,
+        // which reads the same on Postgres and SQLite (no DISTINCT ON).
+        "SELECT forge_host, repo, name, spec FROM (
+             SELECT coalesce(rt.forge_host, '') AS forge_host, coalesce(rt.repo, '') AS repo,
+                    d.name AS name, d.spec AS spec,
+                    ROW_NUMBER() OVER (PARTITION BY rt.forge_host, rt.repo, d.name
+                                       ORDER BY r.created_at DESC) AS rn
+             FROM workflow_runs r
+             JOIN run_triggers rt ON rt.run_id = r.id AND rt.kind = 'ci'
+             JOIN workflow_definitions d ON d.id = r.definition_id
+             WHERE NOT EXISTS (SELECT 1 FROM workflows w WHERE w.name = d.name)
+         ) newest WHERE rn = 1
+         ORDER BY forge_host, repo, name",
+    )
+    .fetch_all(&state.read_pool)
+    .await
+    .map_err(internal)?;
+    let tags: HashMap<(&str, &str, &str), Vec<String>> = specs
+        .iter()
+        .map(|s| ((s.forge_host.as_str(), s.repo.as_str(), s.name.as_str()), parse_tags(&s.spec)))
+        .collect();
+
+    let mut rows: Vec<WorkflowRow> = Vec::new();
+    // `runs` is grouped by pipeline and newest first within each.
+    for group in runs.chunk_by(|a, b| (&a.forge_host, &a.repo, &a.name) == (&b.forge_host, &b.repo, &b.name)) {
+        let (newest, oldest) = (&group[0], &group[group.len() - 1]);
+        let total = group.len() as i64;
+        let succeeded = group.iter().filter(|r| r.status == "succeeded").count() as i64;
+        let repository = match (newest.forge_host.as_str(), newest.repo.as_str()) {
+            ("", "") => None,
+            ("", repo) => Some(repo.to_string()),
+            (host, repo) => Some(format!("{host}/{repo}")),
+        };
+        rows.push(WorkflowRow {
+            id: format!("ci:{}:{}", repository.as_deref().unwrap_or(""), newest.name),
+            name: newest.name.clone(),
+            description: repository,
+            source: "ci".into(),
+            created_at: oldest.created_at.clone(),
+            updated_at: newest.created_at.clone(),
+            schedule_id: None,
+            cron_expr: None,
+            next_fire_at: None,
+            paused: false,
+            has_schedule: false,
+            state: "active".into(),
+            last_status: Some(newest.status.clone()),
+            last_at: Some(newest.created_at.clone()),
+            history: group.iter().rev().map(|r| r.status.clone()).collect(),
+            success_rate: Some((succeeded * 100) / total),
+            run_count: total,
+            tags: tags
+                .get(&(newest.forge_host.as_str(), newest.repo.as_str(), newest.name.as_str()))
+                .cloned()
+                .unwrap_or_default(),
+        });
+    }
+    Ok(rows)
 }
 
 #[derive(sqlx::FromRow)]
@@ -236,6 +349,11 @@ pub async fn list_workflows(
             updated_at: w.updated_at,
             state: w.state,
         });
+    }
+    // The pipelines CI compiled, when asked for: after the stored workflows,
+    // and under the same tag filter.
+    if q.include.as_deref().is_some_and(|i| i.split(',').any(|i| i.trim() == "ci")) {
+        rows.extend(ci_pipelines(&state).await?);
     }
     // Optional tag filter (#26): keep only workflows carrying the requested tag.
     if let Some(tag) = q.tag.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
@@ -415,7 +533,7 @@ pub struct ForceQuery {
 /// the `sync-to-git` route that turns a UI edit into a PR). An admin may override with `?force=true`;
 /// the forced edit shows up as `drift` until the next sync puts git's definition back.
 async fn refuse_if_managed(
-    pool: &sqlx::PgPool,
+    pool: &crate::db::Pool,
     id: &str,
     claims: &crate::auth::SessionClaims,
     force: bool,
@@ -472,7 +590,8 @@ pub async fn update_workflow(
     // `workflows.version` can end up pointing at a history row that isn't the
     // spec this request just wrote. Locking here makes the second request wait
     // for the first to commit rather than interleave with it.
-    let locked: Option<i64> = sqlx::query_scalar("SELECT version FROM workflows WHERE id = $1 FOR UPDATE")
+    let lock_sql = format!("SELECT version FROM workflows WHERE id = $1{}", crate::db::FOR_UPDATE);
+    let locked: Option<i64> = sqlx::query_scalar(&lock_sql)
         .bind(&id)
         .fetch_optional(&mut *tx)
         .await
@@ -577,6 +696,10 @@ pub struct RunWorkflowBody {
     /// Arguments for the stored spec's declared `parameters:`.
     #[serde(default)]
     pub parameters: BTreeMap<String, String>,
+    /// What started the run, from a caller that may say
+    /// ([`control::run_trigger`]).
+    #[serde(default)]
+    pub trigger: Option<control::TriggerBody>,
 }
 
 #[cfg(test)]
@@ -653,10 +776,16 @@ mod run_workflow_body_tests {
 /// the spec, splice values in itself, and submit the result as new YAML —
 /// which is a different and much broader operation than "run this workflow",
 /// both to reason about and to authorize.
+///
+/// Optionally idempotent, as `POST /api/runs` is: with an `Idempotency-Key`,
+/// a repeat of the same request (same workflow, same parameters) answers
+/// `200` with the run the first one created. A machine that runs workflows
+/// for events (dagron-ci) retries without making a second run.
 pub async fn run_workflow(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     body: Option<Json<RunWorkflowBody>>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
     // A paused or retired workflow refuses to run here as well as in the
@@ -684,10 +813,44 @@ pub async fn run_workflow(
     // Same pipeline as `POST /api/runs`: `workflow_ref` chains inlined, then the
     // engine's own parser and run writer — now with the caller's arguments fed
     // in as parameter overrides, so substitution happens once, in the engine.
-    let params = body.map(|Json(b)| b.parameters).unwrap_or_default();
+    let Json(body) = body.unwrap_or_default();
+    let params = body.parameters;
     let triggerer = control::caller_identity(&auth.0);
-    let run_id =
-        control::submit_yaml_as(&state, &spec_yaml, &spec_yaml, &params, Some(&triggerer)).await?;
+    // Refused before anything is written, and no part of the fingerprint, as
+    // on `POST /api/runs`.
+    let trigger = control::run_trigger(&auth.0, body.trigger.as_ref())?;
+    // Validated before anything is written; claimed per caller, as on
+    // `POST /api/runs`.
+    let key = control::idempotency_key(&headers)?;
+    let principal = auth.0.sub.as_str();
+    let run_id = match &key {
+        // The claim is resolved by the write that creates the run, and a
+        // refused submit gives the key back, as on `POST /api/runs`.
+        Some(key) => {
+            let fingerprint = control::workflow_run_fingerprint(&id, &params);
+            let submitted = control::submit_yaml_keyed(
+                &state, &spec_yaml, &spec_yaml, &params, &triggerer, trigger.as_ref(),
+                principal, key, &fingerprint,
+            )
+            .await?;
+            match submitted {
+                control::Keyed::Created(run_id) => run_id,
+                // 200, not 201: nothing was created.
+                control::Keyed::Replayed(run_id) => {
+                    return Ok((
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "run_id": run_id, "workflow_id": id })),
+                    ));
+                }
+            }
+        }
+        None => {
+            control::submit_yaml_triggered(
+                &state, &spec_yaml, &spec_yaml, &params, &triggerer, trigger.as_ref(),
+            )
+            .await?
+        }
+    };
     // `201`, not `200`. This route creates a run, and every other route that
     // creates one already says so — `POST /api/runs`, `/resubmit`. The odd one
     // out was not merely inconsistent: a layer in front that counts created
@@ -765,7 +928,7 @@ fn dup_or_internal(err: sqlx::Error, name: &str) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "postgres"))]
 mod managed_tests {
     use super::*;
     use crate::routes::gitrepos::managed_tests::{add_repo, add_workflow, test_pool};

@@ -1,0 +1,11 @@
+shows: A job fanned out over a list is one task that dagron runs once an item
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: test
+      with_items: [stable, beta, nightly]
+      steps:
+        - env: { TOOLCHAIN: "{{ item }}" }
+          run: cargo "+$TOOLCHAIN" test

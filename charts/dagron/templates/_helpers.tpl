@@ -43,6 +43,49 @@ Usage: {{ include "dagron.image" (dict "image" $.Values.engine.image "root" $) }
 {{- end -}}
 
 {{/*
+OpenShift: "true" when pods leave their uid and fsGroup to the
+platform, else empty. `global.openshift` is auto (the cluster serves
+security.openshift.io/v1), true or false; values.yaml says why.
+Usage: {{ if include "dagron.openshift" $ }}
+*/}}
+{{- define "dagron.openshift" -}}
+{{- $mode := "auto" -}}
+{{- with .Values.global -}}
+{{- if and (hasKey . "openshift") (ne (toString .openshift) "") -}}
+{{- $mode = toString .openshift -}}
+{{- end -}}
+{{- end -}}
+{{- if not (has $mode (list "auto" "true" "false")) -}}
+{{- fail (printf "global.openshift: %q is none of auto, true, false" $mode) -}}
+{{- end -}}
+{{- if or (eq $mode "true") (and (eq $mode "auto") ($.Capabilities.APIVersions.Has "security.openshift.io/v1")) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+A pod's securityContext: not root, the runtime's seccomp profile, and the
+image's user `uid` (with `fsGroup` the same, when asked, and `gid` as its
+group, when given), save on OpenShift, whose restricted SCCs give each pod its
+own uid and fsGroup and refuse one that names another (dagron.openshift).
+Usage: {{ include "dagron.podSecurityContext" (dict "root" $ "uid" 65532 "fsGroup" true) | nindent 8 }}
+*/}}
+{{- define "dagron.podSecurityContext" -}}
+runAsNonRoot: true
+{{- if not (include "dagron.openshift" .root) }}
+runAsUser: {{ .uid }}
+{{- with .gid }}
+runAsGroup: {{ . }}
+{{- end }}
+{{- if .fsGroup }}
+fsGroup: {{ .uid }}
+{{- end }}
+{{- end }}
+seccompProfile:
+  type: RuntimeDefault
+{{- end -}}
+
+{{/*
 DATABASE_URL: the in-chart Postgres service when enabled, else the external URL.
 Fails the render if neither is configured, so a misconfigured install errors at
 `helm template` time rather than crash-looping in the cluster.

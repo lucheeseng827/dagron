@@ -482,6 +482,35 @@ mod dagron_core_isolation {
         RuntimeDefault,
     }
 
+    /// `default`, `none` or `allow:<name>`, kept as it is spelled: the
+    /// canonical form spells it the same way. Read as strictly as
+    /// `dagron_core::isolation::Network` reads it, for the reason
+    /// `deny_unknown_fields` is below: a value the engine would have refused
+    /// must not digest as if it had run.
+    #[derive(Deserialize)]
+    #[serde(try_from = "String")]
+    pub struct Network(String);
+
+    impl TryFrom<String> for Network {
+        type Error = String;
+
+        fn try_from(raw: String) -> Result<Self, String> {
+            let named = |name: &str| {
+                (1..=57).contains(&name.len())
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                    && !name.starts_with('-')
+                    && !name.ends_with('-')
+            };
+            match raw.as_str() {
+                "default" | "none" => Ok(Self(raw)),
+                other if other.strip_prefix("allow:").is_some_and(named) => Ok(Self(raw)),
+                other => Err(format!("network expects none|default|allow:<name>, got '{other}'")),
+            }
+        }
+    }
+
     // `deny_unknown_fields` is not decoration here: it is the attribute the real
     // `dagron_core::isolation::IsolationSpec` carries, and without it this
     // mirror accepts a misspelled key, deserializes to an all-`None` envelope
@@ -507,6 +536,8 @@ mod dagron_core_isolation {
         pub run_as_user: Option<i64>,
         #[serde(default)]
         pub service_account_token: Option<bool>,
+        #[serde(default)]
+        pub network: Option<Network>,
     }
 
     impl IsolationSpec {
@@ -544,6 +575,9 @@ mod dagron_core_isolation {
             }
             if let Some(v) = self.run_as_user {
                 f.insert("run_as_user", v.to_string());
+            }
+            if let Some(v) = &self.network {
+                f.insert("network", v.0.clone());
             }
             f.into_iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("\n")
         }

@@ -1,0 +1,8 @@
+shows: A GitLab job with no image runs in the image its runner tag is given
+front: gitlab
+file: gitlab-ci
+gitlab: { tags: { docker: "docker.io/library/debian:12" } }
+source: |
+  build:
+    tags: [docker]
+    script: [make]

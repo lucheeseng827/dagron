@@ -1,0 +1,2 @@
+not a pipeline:
+  concurrency.key: is required: a template such as "{{ ci_group }}"

@@ -1,0 +1,2 @@
+not a pipeline:
+  max_active_runs: must be 1, or left out, beside concurrency.cancel_superseded: a new run takes the place of the one before it

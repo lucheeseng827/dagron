@@ -18,7 +18,7 @@ postgres = ["dagron-core/postgres"]
 # `dagron-logging/logfilter` rides along because the ops API serves log reads and
 # must accept the same filter grammar as dagron-api — a lean reconcile-only
 # daemon (no `ops`) still links no regex engine.
-ops = ["dep:axum", "dep:cron", "dep:chrono-tz", "dagron-core/ops", "dagron-logging/logfilter"]
+ops = ["dep:axum", "dep:futures-util", "dep:cron", "dep:chrono-tz", "dagron-core/ops", "dagron-logging/logfilter"]
 # Kubernetes pod executor (EXECUTOR=kubernetes).
 kubernetes = ["dagron-executor/kubernetes"]
 # MQTT ingestion source (SOURCE=mqtt) — forwards to dagron-source.
@@ -38,9 +38,10 @@ enterprise = ["dagron-core/enterprise", "dagron-artifact/enterprise", "dagron-cr
 # feature per backend; each pulls its object_store backend + the shared URL
 # dispatch (src/objstore.rs). S3-compatible endpoints (MinIO/Ceph) ride
 # `archive-s3` via AWS_ENDPOINT_URL — no separate feature needed.
-archive-s3 = ["archive-cloud", "object_store/aws"]
-archive-gcs = ["archive-cloud", "object_store/gcp"]
-archive-azure = ["archive-cloud", "object_store/azure"]
+# Each also gives the path-cache store (`DAGRON_CACHE_URL`) its backend.
+archive-s3 = ["archive-cloud", "object_store/aws", "dagron-artifact/s3"]
+archive-gcs = ["archive-cloud", "object_store/gcp", "dagron-artifact/gcs"]
+archive-azure = ["archive-cloud", "object_store/azure", "dagron-artifact/azure"]
 # Internal: shared object-store plumbing enabled by the cloud backends above.
 # Not meant to be enabled on its own.
 archive-cloud = ["dep:object_store", "ops"]
@@ -71,7 +72,9 @@ dagron-logging = { path = "../dagron-logging" }
 # trace. Versions track dagron-logging's exporter stack.
 opentelemetry = { version = "0.32", optional = true }
 tracing-opentelemetry = { version = "0.33", optional = true }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "sync", "time", "net"] }
+# `fs` and `io-util` for the actions cache service's uploads, kept on disk
+# until they are finalized (`actions_cache`).
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "sync", "time", "net", "fs", "io-util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -82,12 +85,16 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 dagron-crypto = { path = "../dagron-crypto" }
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
+# A path cache's version: a hash of its paths (`path_cache`).
+sha2 = "0.10"
 # statvfs for the free-disk floor / pressure gate (constrained hosts).
 libc = "0.2"
 tracing = "0.1"
 async-trait = "0.1"
 ractor = "0.10"
 axum = { version = "0.8", optional = true }
+# An upload's body, read as it comes (`actions_cache`).
+futures-util = { version = "0.3", default-features = false, optional = true }
 cron = { version = "0.16", optional = true }
 # IANA timezone database for DST-safe per-schedule cron (ops-only, like `cron`).
 chrono-tz = { version = "0.10", optional = true }
@@ -107,5 +114,10 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 # `test-util` for `#[tokio::test(start_paused = true)]`: the ExternalPoller
 # timeout is 30 s, and a test that proves a hung poller re-parks rather than
 # failing must not spend 30 s of wall clock to do it. Dev-only — the shipped
-# binary links none of it.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
+# binary links none of it. `io-util` for the stub forge the start-announcement
+# test posts to.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util", "io-util"] }
+# The step runner's client of the artifact service, held to the service it
+# speaks to (actions_cache/tests.rs). A workspace crate; tests only.
+dagron-ci-exec = { path = "../dagron-ci-exec" }
+tempfile = "3"

@@ -45,6 +45,21 @@ const USAGE: &str = "usage:\n  \
     -h, --help         this help";
 
 fn main() -> ExitCode {
+    // `--version`: the release this binary was built for, on one line, and
+    // nothing else is done. Every dagron binary answers so. This one links none
+    // of their shared crates, so the answer is its own; `dev` is a build no
+    // release made.
+    const VERSION: &str = match option_env!("APP_VERSION") {
+        Some(version) if !version.is_empty() => version,
+        _ => "dev",
+    };
+    let mut asked = std::env::args_os().skip(1);
+    if matches!(asked.next(), Some(arg) if arg == "--version" || arg == "-V")
+        && asked.next().is_none()
+    {
+        println!("dagron-state {VERSION}");
+        return ExitCode::SUCCESS;
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
         Ok(code) => code,

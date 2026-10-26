@@ -1,29 +1,60 @@
 //! HTTP route handlers for the dagron management API.
+//!
+//! A SQLite build compiles the routes a one-node install
+//! serves; the rest are Postgres's, and answer 501 there (`main.rs`).
 
+#[cfg(feature = "postgres")]
 pub mod archive;
+#[cfg(feature = "postgres")]
+pub mod artifact_index;
+#[cfg(feature = "postgres")]
 pub mod artifacts;
 pub mod audit;
+#[cfg(feature = "postgres")]
 pub mod backfills;
+#[cfg(feature = "postgres")]
 pub mod bundles;
+#[cfg(feature = "postgres")]
 pub mod environments;
+#[cfg(feature = "postgres")]
 pub mod fleet;
 pub mod health;
+#[cfg(feature = "postgres")]
 pub mod badge;
 pub mod control;
+#[cfg(feature = "postgres")]
 pub mod datasets;
 pub mod lifecycle;
+#[cfg(feature = "postgres")]
 pub mod link;
+#[cfg(feature = "postgres")]
 pub mod gitrepos;
+#[cfg(feature = "postgres")]
 pub mod gitsync;
+#[cfg(feature = "postgres")]
 pub mod graph;
 pub mod login;
 pub mod logs;
+pub mod logstream;
+#[cfg(feature = "postgres")]
 pub mod ops;
+#[cfg(feature = "postgres")]
+pub mod outbox;
 pub mod runs;
+#[cfg(feature = "postgres")]
+pub mod runner;
+#[cfg(feature = "postgres")]
 pub mod schedules;
+#[cfg(feature = "postgres")]
 pub mod search;
+#[cfg(feature = "postgres")]
 pub mod settings;
-pub mod tokens;
 pub mod stream;
+#[cfg(feature = "postgres")]
+pub mod task_artifacts;
+pub mod tokens;
+#[cfg(feature = "postgres")]
 pub mod triage;
+#[cfg(feature = "postgres")]
+pub mod workflow_artifacts;
 pub mod workflows;

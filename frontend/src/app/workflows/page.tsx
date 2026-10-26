@@ -17,9 +17,23 @@ import { useLiveRefresh, useLiveUpdates } from "@/lib/live";
 import { timeAgo, fromNow } from "@/lib/time";
 import type { TaskStatus, WorkflowRow } from "@/types/dagron";
 
-type Filter = "all" | "active" | "paused" | "gitops";
+type Filter = "all" | "active" | "paused" | "gitops" | "ci";
 type ViewMode = "table" | "board";
 const GRID = "2.4fr 1.5fr 1.2fr 1.3fr 0.7fr 92px";
+const FILTER_LABEL: Record<Filter, string> = { all: "All", active: "Active", paused: "Paused", gitops: "GitOps", ci: "CI" };
+
+/// A pipeline a CI service compiled from a repository. It is listed, not
+/// stored: its definition is the file in its repository at each commit, so
+/// there is nothing here to edit, run, pause or delete.
+const isCi = (r: WorkflowRow) => r.source === "ci";
+/// Where a row's name leads: a stored workflow's history, or the runs CI made
+/// of a pipeline, which is all of its history there is. A pipeline's row is
+/// one repository's (its `description`): two repositories may each have a
+/// pipeline of one name, so the link names the repository too.
+const rowHref = (r: WorkflowRow) =>
+  isCi(r)
+    ? `/runs/?trigger=ci&name=${encodeURIComponent(r.name)}${r.description ? `&repo=${encodeURIComponent(r.description)}` : ""}`
+    : `/workflows/history/?id=${r.id}`;
 
 export default function WorkflowsPage() {
   const [me, setMe] = useState<Me | null>(null);
@@ -42,7 +56,7 @@ export default function WorkflowsPage() {
   }, []);
 
   const load = useCallback(() => {
-    listWorkflows()
+    listWorkflows({ includeCi: true })
       .then((data) => {
         setRows(data);
         setError(null);
@@ -56,9 +70,10 @@ export default function WorkflowsPage() {
 
   const counts = useMemo(
     () => ({
-      defs: rows.length,
+      defs: rows.filter((r) => !isCi(r)).length,
       schedules: rows.filter((r) => r.has_schedule && !r.paused).length,
       gitops: rows.filter((r) => r.source === "git").length,
+      ci: rows.filter(isCi).length,
     }),
     [rows],
   );
@@ -69,6 +84,7 @@ export default function WorkflowsPage() {
       if (filter === "active" && !(r.has_schedule && !r.paused)) return false;
       if (filter === "paused" && !r.paused) return false;
       if (filter === "gitops" && r.source !== "git") return false;
+      if (filter === "ci" && !isCi(r)) return false;
       if (tagFilter && !(r.tags ?? []).includes(tagFilter)) return false;
       if (needle && !(`${r.name} ${r.description ?? ""} ${(r.tags ?? []).join(" ")}`.toLowerCase().includes(needle))) return false;
       return true;
@@ -112,6 +128,7 @@ export default function WorkflowsPage() {
           </h1>
           <p className="dy-subtitle">
             {counts.defs} definitions · {counts.schedules} active schedules · {counts.gitops} from GitOps
+            {counts.ci > 0 ? ` · ${counts.ci} CI pipeline${counts.ci === 1 ? "" : "s"}` : ""}
           </p>
         </div>
         <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
@@ -138,14 +155,14 @@ export default function WorkflowsPage() {
           style={{ flex: 1, minWidth: 240, maxWidth: 420, background: "var(--panel)", color: "var(--fg)", border: "1px solid var(--border)", borderRadius: 8, padding: "8px 12px" }}
         />
         <div style={{ display: "flex", gap: 4 }}>
-          {(["all", "active", "paused", "gitops"] as const).map((f) => (
+          {(["all", "active", "paused", "gitops", "ci"] as const).map((f) => (
             <button
               key={f}
               onClick={() => setFilter(f)}
               className={`dy-pill ${filter === f ? "dy-pill-active" : ""}`}
-              style={{ cursor: "pointer", textTransform: f === "gitops" ? "none" : "capitalize" }}
+              style={{ cursor: "pointer" }}
             >
-              {f === "gitops" ? "GitOps" : f}
+              {FILTER_LABEL[f]}
             </button>
           ))}
         </div>
@@ -179,7 +196,11 @@ export default function WorkflowsPage() {
               {/* workflow */}
               <div style={{ minWidth: 0 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <Link href={`/workflows/history/?id=${r.id}`} style={{ fontWeight: 600, color: "var(--fg)" }} title="Run history & task health">
+                  <Link
+                    href={rowHref(r)}
+                    style={{ fontWeight: 600, color: "var(--fg)" }}
+                    title={isCi(r) ? "The runs CI made of this pipeline" : "Run history & task health"}
+                  >
                     {r.name}
                   </Link>
                   <SourceBadge source={r.source} />
@@ -200,9 +221,9 @@ export default function WorkflowsPage() {
               </div>
               {/* schedule */}
               <div style={{ fontSize: 13 }}>
-                <span className="mono">{r.cron_expr ? `⏱ ${r.cron_expr}` : "— manual"}</span>
+                <span className="mono">{isCi(r) ? "— on its events" : r.cron_expr ? `⏱ ${r.cron_expr}` : "— manual"}</span>
                 <div style={{ fontSize: 12, color: "var(--dim)", marginTop: 2 }}>
-                  {r.paused ? "next paused" : r.next_fire_at ? `next ${fromNow(r.next_fire_at)}` : "—"}
+                  {isCi(r) ? "from its repository" : r.paused ? "next paused" : r.next_fire_at ? `next ${fromNow(r.next_fire_at)}` : "—"}
                 </div>
               </div>
               {/* last run */}
@@ -213,8 +234,9 @@ export default function WorkflowsPage() {
               <div style={{ fontWeight: 600, fontSize: 13.5, color: rateColor(r.success_rate) }}>
                 {r.success_rate == null ? "—" : `${r.success_rate}%`}
               </div>
-              {/* actions */}
-              <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+              {/* actions: a compiled pipeline has none here. It runs when its
+                  repository's events say so, and is changed in its repository. */}
+              <div style={{ display: isCi(r) ? "none" : "flex", gap: 6, justifyContent: "flex-end" }}>
                 {r.has_schedule ? (
                   <IconBtn
                     title={r.paused ? "Resume" : "Pause"}
@@ -252,7 +274,7 @@ export default function WorkflowsPage() {
             // the chips as siblings that filter exactly as they do in the table.
             <div key={r.id} className="dy-card" style={{ position: "relative", opacity: r.paused ? 0.65 : 1 }}>
               <div style={{ position: "absolute", top: 0, left: 0, width: 3, height: "100%", background: statusColor((r.last_status ?? "pending") as TaskStatus) }} />
-              <Link href={`/workflows/history/?id=${r.id}`} style={{ display: "block", color: "var(--fg)" }}>
+              <Link href={rowHref(r)} style={{ display: "block", color: "var(--fg)" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
                   <strong>{r.name}</strong>
                   <SourceBadge source={r.source} />
@@ -267,7 +289,7 @@ export default function WorkflowsPage() {
                 </div>
                 <Sparkline history={r.history} />
                 <div className="mono" style={{ fontSize: 12, color: "var(--dim)", marginTop: 10 }}>
-                  {r.cron_expr ? `⏱ ${r.cron_expr}` : "manual"}
+                  {isCi(r) ? "on its repository's events" : r.cron_expr ? `⏱ ${r.cron_expr}` : "manual"}
                 </div>
               </Link>
               {(r.tags ?? []).length > 0 && (
@@ -291,7 +313,8 @@ export default function WorkflowsPage() {
   );
 }
 
-function SourceBadge({ source }: { source: "git" | "manual" }) {
+function SourceBadge({ source }: { source: WorkflowRow["source"] }) {
+  if (source === "ci") return <Tag text="CI" color="#3fb950" bg="rgba(63,185,80,0.14)" />;
   return source === "git" ? (
     <Tag text="GitOps" color="var(--accent)" bg="rgba(232,131,58,0.13)" />
   ) : (

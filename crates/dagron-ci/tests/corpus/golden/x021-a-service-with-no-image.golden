@@ -1,0 +1,2 @@
+not a pipeline:
+  tasks[0] (test).services[0].image: is required: the image the service runs

@@ -38,6 +38,7 @@ use tracing::{info, warn};
 
 use dagron_core::dag::DagGraph;
 use dagron_core::db;
+use dagron_core::models::{trigger_kind, RunTrigger};
 use dagron_core::metrics::Metrics;
 use crate::source::{WorkflowMessage, WorkflowSource};
 
@@ -213,9 +214,23 @@ impl Actor for IngestActor {
                     .source
                     .pending_position()
                     .map(|pp| (pp.offset_key(&state.source_name), pp.position));
+                // The source the message came from, and where in it.
+                let mut trigger = RunTrigger::engine(
+                    trigger_kind::SOURCE,
+                    format!("source:{}", state.source_name),
+                );
+                if let Some((_, at)) = &position {
+                    trigger = trigger.of_event(at.clone());
+                }
                 match DagGraph::from_yaml(&message.payload) {
-                    Ok(dag) => match create_run_at(&state.pool, &dag, &message.payload, &position)
-                        .await
+                    Ok(dag) => match create_run_at(
+                        &state.pool,
+                        &dag,
+                        &message.payload,
+                        &position,
+                        &trigger,
+                    )
+                    .await
                     {
                         Ok(run_id) => {
                             state.metrics.inc_runs_created();
@@ -331,17 +346,20 @@ impl Actor for IngestActor {
 }
 
 /// Create the run, committing the source's coordinate in the same transaction
-/// when one is pending (exactly-once); without a coordinate this is plain
-/// [`db::create_run`] (at-least-once).
+/// when one is pending (exactly-once); without a coordinate this is a plain
+/// create (at-least-once). Either way the run is recorded as the source's.
 async fn create_run_at(
     pool: &db::Pool,
     dag: &DagGraph,
     payload: &str,
     position: &Option<(String, String)>,
+    trigger: &RunTrigger,
 ) -> anyhow::Result<String> {
     match position {
-        Some((key, pos)) => db::create_run_with_offset(pool, dag, payload, key, pos).await,
-        None => db::create_run(pool, dag, payload).await,
+        Some((key, pos)) => {
+            db::create_run_with_offset(pool, dag, payload, key, pos, Some(trigger)).await
+        }
+        None => db::create_run_triggered(pool, dag, payload, trigger).await,
     }
 }
 
@@ -491,6 +509,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(runs, 1, "the valid payload still became a run");
+        // And is recorded as a message of this source. A channel has no
+        // position to say where in it.
+        let record: (String, String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT kind, principal, source, event_id FROM run_triggers")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            record,
+            (
+                "source".to_string(),
+                "engine".to_string(),
+                Some("source:channel".to_string()),
+                None
+            )
+        );
 
         pool.close().await;
         let _ = std::fs::remove_file(&path);

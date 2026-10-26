@@ -1,0 +1,25 @@
+# A matrix with two axes, an exclusion and an inclusion, on runners of three systems.
+name: matrix
+on: [push]
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      max-parallel: 2
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [20, 22]
+        exclude:
+          - os: windows-latest
+            node: 20
+        include:
+          - os: ubuntu-latest
+            node: 22
+            coverage: true
+          - os: macos-latest
+            node: 22
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "node ${{ matrix.node }} on ${{ matrix.os }}"
+      - if: matrix.coverage == 'true'
+        run: npm run coverage

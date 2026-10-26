@@ -1,9 +1,9 @@
 # Workspace root. The `dagron` engine binary is the root package; the library
 # crates are members so the whole module shares one Cargo.lock + target dir.
 [workspace]
-members = ["crates/dagron-core", "crates/dagron-executor", "crates/dagron-source", "crates/dagron-engine", "crates/dagron-api", "crates/dagron-identity", "crates/dagron-artifact", "crates/dagron-crypto", "crates/dagron-mcp", "crates/dagron-import", "crates/dagron-plan", "crates/dagron-lineage", "crates/dagron-forge", "crates/dagron-logging", "crates/dagron-gitops", "crates/dagron-step-mcp", "crates/dagron-step-spark", "crates/dagron-step-sql", "crates/dagron-autopsy", "crates/dagron-state"]
-# A sibling `ee/` directory (its own separate workspace, not present here) is
-# excluded so this workspace always builds standalone.
+members = ["crates/dagron-core", "crates/dagron-executor", "crates/dagron-source", "crates/dagron-engine", "crates/dagron-api", "crates/dagron-identity", "crates/dagron-artifact", "crates/dagron-crypto", "crates/dagron-mcp", "crates/dagron-import", "crates/dagron-plan", "crates/dagron-lineage", "crates/dagron-forge", "crates/dagron-logging", "crates/dagron-gitops", "crates/dagron-step-mcp", "crates/dagron-step-spark", "crates/dagron-step-sql", "crates/dagron-autopsy", "crates/dagron-state", "crates/dagron-ci", "crates/dagron-ci-exec", "crates/dagron-ci-expr", "crates/dagron-ci-cache", "crates/dagron-runner"]
+# The enterprise build's sibling directory (its own separate workspace, not
+# present here) is excluded so this workspace always builds standalone.
 #
 # `crates/dagron-gitops` is also excluded: it is a Postgres-only optional worker
 # image, so its `dagron-core/postgres` dependency would unify with this
@@ -44,6 +44,15 @@ kubernetes = ["dagron-engine/kubernetes"]
 mqtt = ["dagron-engine/mqtt"]
 # OpenTelemetry integration (#28): W3C traceparent propagation into task env.
 otel = ["dagron-engine/otel"]
+# Object stores for archive-before-purge (`GC_ARCHIVE_URL=<scheme>://…`), one
+# feature per backend, under the names the engine library gives them. The
+# published engine images are built with all three (.github/workflows/docker.yml).
+archive-s3 = ["dagron-engine/archive-s3"]
+archive-gcs = ["dagron-engine/archive-gcs"]
+archive-azure = ["dagron-engine/archive-azure"]
+# `dagron archive-compact`: archived run documents folded into Parquet. Heavy
+# (arrow and parquet), and in no published image.
+archive-parquet = ["dagron-engine/archive-parquet"]
 # Optional feature: auto-backfill, run_reruns, parameterized rerun, extra
 # metrics, and outbox eventing. Implies `ops`.
 enterprise = ["dagron-engine/enterprise"]
@@ -58,7 +67,10 @@ anyhow = "1"
 
 [dev-dependencies]
 # The crash-recovery integration test runs the built `dagron` binary and inspects
-# its SQLite datastore directly (sqlx) with unique temp paths (uuid).
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }
+# its SQLite datastore directly (sqlx) with unique temp paths (uuid); on a
+# Postgres build pg_run_wakes.rs makes a database of its own and reads it.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres", "macros"] }
 uuid = { version = "1", features = ["v4"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+# `net` and `io-util`: run_lifecycle.rs stands up a stub forge and calls the
+# engine's ops API over plain TCP, so no HTTP client crate is needed.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }

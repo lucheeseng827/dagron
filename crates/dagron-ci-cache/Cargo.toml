@@ -1,0 +1,27 @@
+[package]
+name = "dagron-ci-cache"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Restores and saves a dagron task's path caches (`workspace.cache`) with the signed URLs the engine gives it. A static binary, installed beside dagron-ci-exec, that runs in any image."
+
+[lib]
+name = "dagron_ci_cache"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dagron-ci-cache"
+path = "src/main.rs"
+
+# Static (musl) like dagron-ci-exec: it is copied into job containers of any
+# image. zstd and ring (rustls's) are C, built by musl-gcc there.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tar = { version = "0.4", default-features = false }
+zstd = { version = "0.13", default-features = false }
+ureq = { version = "2", default-features = false, features = ["tls"] }
+
+[dev-dependencies]
+tempfile = "3"

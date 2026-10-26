@@ -1,0 +1,5 @@
+github:
+  workflows: [ci.yml, release.yml]
+  runs_on:
+    ubuntu-latest: docker.io/library/ubuntu:24.04
+  provided: [dtolnay/rust-toolchain]

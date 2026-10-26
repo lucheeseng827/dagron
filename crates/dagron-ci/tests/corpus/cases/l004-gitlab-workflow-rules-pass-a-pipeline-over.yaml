@@ -1,0 +1,10 @@
+shows: GitLab workflow rules that hold for no rule pass the whole pipeline over
+front: gitlab
+file: gitlab-ci
+source: |
+  workflow:
+    rules:
+      - if: $CI_COMMIT_TAG
+  image: alpine:3.20
+  build:
+    script: [make]

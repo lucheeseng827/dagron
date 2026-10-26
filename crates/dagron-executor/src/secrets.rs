@@ -33,6 +33,13 @@ pub fn resolve(env: &[EnvVar]) -> Result<Vec<EnvVar>> {
     for e in env {
         match &e.value_from {
             None => out.push(e.clone()),
+            // An environment's alone, and empty where there is none to read
+            // it from: never this store.
+            Some(r) if r.optional => out.push(EnvVar {
+                name: e.name.clone(),
+                value: String::new(),
+                value_from: e.value_from.clone(),
+            }),
             Some(r) => {
                 let value = lookup(&r.secret).with_context(|| {
                     format!("env '{}' value_from secret '{}'", e.name, r.secret)
@@ -95,6 +102,7 @@ mod tests {
             value: value.to_string(),
             value_from: secret.map(|s| dagron_core::dag::SecretRef {
                 secret: s.to_string(),
+                optional: false,
             }),
         }
     }
@@ -141,6 +149,31 @@ mod tests {
         std::env::set_var("DAGRON_SECRETS_DIR", "/tmp");
         assert!(resolve(&[ev("X", Some("../etc/passwd"), "")]).is_err());
         std::env::remove_var("DAGRON_SECRETS_DIR");
+    }
+
+    /// An optional reference is an environment's alone: this store is not
+    /// read for it, though it holds the name, and it is empty.
+    #[test]
+    fn an_optional_reference_is_empty_and_never_this_store_s() {
+        let name = format!("opt_{}", uuid_like());
+        std::env::set_var(
+            format!("DAGRON_SECRET_{}", name.to_uppercase()),
+            "from-the-host",
+        );
+        let var = EnvVar {
+            name: "X".into(),
+            value: "left over".into(),
+            value_from: Some(dagron_core::dag::SecretRef {
+                secret: name.clone(),
+                optional: true,
+            }),
+        };
+        let got = resolve(&[var]).unwrap();
+        assert_eq!(got[0].value, "");
+        assert!(
+            got[0].value_from.is_some(),
+            "still a secret's, for the redactor"
+        );
     }
 
     // Avoid a uuid dep in the executor's test just for a temp name.

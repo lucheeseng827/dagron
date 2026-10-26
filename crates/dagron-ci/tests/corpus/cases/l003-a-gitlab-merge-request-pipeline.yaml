@@ -1,0 +1,12 @@
+shows: A GitLab merge request runs the jobs whose rules take its event, and none without rules
+front: gitlab
+file: gitlab-ci
+event: { kind: pull_request, ref: refs/merge-requests/7/head, pr: 7, base_ref: main, base_sha: "1111111111111111111111111111111111111111" }
+source: |
+  image: alpine:3.20
+  branch-only:
+    script: [make]
+  review:
+    script: [make review]
+    rules:
+      - if: $CI_PIPELINE_SOURCE == "merge_request_event"

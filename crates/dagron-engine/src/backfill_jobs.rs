@@ -158,7 +158,8 @@ async fn pace_one(
         let mut params = std::collections::BTreeMap::new();
         crate::schedule_time::insert_logical_date(&mut params, &logical);
         // Environment resolution errors split two ways: a *deleted* environment
-        // is permanent (complete the job, like a spec that no longer parses),
+        // and one whose policy does not admit the run are permanent (complete
+        // the job, like a spec that no longer parses),
         // but a transient DB failure must NOT complete it — release the slot,
         // rewind the cursor, and retry this fire next tick.
         let parsed = match crate::environments::template_params(pool, &job.spec).await {
@@ -166,7 +167,11 @@ async fn pace_one(
                 params.extend(extra);
                 DagGraph::from_yaml_with_params(&job.spec, &params)
             }
-            Err(e) if e.downcast_ref::<crate::environments::UnknownEnvironment>().is_some() => {
+            Err(e)
+                if e.downcast_ref::<crate::environments::UnknownEnvironment>()
+                    .is_some()
+                    || crate::environments::is_refusal(&e) =>
+            {
                 Err(e)
             }
             Err(e) => {
@@ -185,7 +190,13 @@ async fn pace_one(
                 break;
             }
         };
-        match db::create_run(pool, &dag, &job.spec).await {
+        // The job that asked for it, and which of its dates this is.
+        let trigger = crate::models::RunTrigger::engine(
+            crate::models::trigger_kind::BACKFILL,
+            format!("backfill:{}", job.id),
+        )
+        .of_event(logical.clone());
+        match db::create_run_triggered(pool, &dag, &job.spec, &trigger).await {
             Ok(run_id) => {
                 db::record_backfill_run(pool, &job.schedule_id, &logical, &run_id).await?;
                 metrics.inc_runs_created();
@@ -320,6 +331,24 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(slots, 5);
+
+        // Each run is recorded as the job's, of the date it was made for.
+        let records: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT kind, principal, source, event_id FROM run_triggers ORDER BY event_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(records.len(), 5, "a record for each run");
+        let job_source = format!("backfill:{}", j.id);
+        for (kind, principal, source, _) in &records {
+            assert_eq!(
+                (kind.as_str(), principal.as_str(), source.as_deref()),
+                ("backfill", "engine", Some(job_source.as_str()))
+            );
+        }
+        assert_eq!(records[0].3.as_deref(), Some("2026-01-01T00:01:00+00:00"));
+        assert_eq!(records[4].3.as_deref(), Some("2026-01-01T00:05:00+00:00"));
 
         // Idempotent: pacing the completed job's list is a no-op (list is empty).
         assert!(db::list_active_backfills(&pool).await.unwrap().is_empty());

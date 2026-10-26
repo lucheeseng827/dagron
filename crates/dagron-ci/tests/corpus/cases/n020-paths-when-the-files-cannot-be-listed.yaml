@@ -1,0 +1,10 @@
+shows: A paths filter lets the pipeline run when the changed files cannot be had
+event: { kind: push, ref: refs/heads/main, unlisted: the change is larger than the forge lists }
+source: |
+  name: ci
+  on:
+    push: { branches: [main], paths: ["src/**"] }
+  tasks:
+    - name: build
+      steps:
+        - run: make

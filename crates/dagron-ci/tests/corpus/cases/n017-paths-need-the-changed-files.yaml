@@ -1,0 +1,10 @@
+shows: A paths filter cannot decide before the files the event changed are known
+event: { kind: push, ref: refs/heads/main }
+source: |
+  name: ci
+  on:
+    push: { branches: [main], paths: ["src/**"] }
+  tasks:
+    - name: build
+      steps:
+        - run: make

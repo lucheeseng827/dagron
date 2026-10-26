@@ -1,0 +1,21 @@
+// No agent for the pipeline: each stage brings its own, and files go
+// between them in a stash.
+pipeline {
+    agent none
+    stages {
+        stage('Build') {
+            agent { docker { image 'golang:1.23' } }
+            steps {
+                sh 'go build -o app ./cmd/app'
+                stash name: 'app', includes: 'app'
+            }
+        }
+        stage('Package') {
+            agent { docker { image 'docker:27'; args '-v /var/run/docker.sock:/var/run/docker.sock' } }
+            steps {
+                unstash 'app'
+                sh 'docker build -t app:latest .'
+            }
+        }
+    }
+}

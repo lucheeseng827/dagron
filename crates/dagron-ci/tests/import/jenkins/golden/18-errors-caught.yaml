@@ -1,0 +1,37 @@
+# Imported from a Jenkinsfile by dagron-import.
+#
+# Changed on the way (4):
+#   on: a multibranch pipeline's builds are each branch and tag pushed, each pull request, and a run asked for (dispatch) here: say on: where it ran for fewer
+#   stage('Lint').steps[0]: the block is one step here, which ends at the first of its steps that fails, as the block did, and does not fail the job (continue_on_error): the job goes on after it, and is not marked for it
+#   stage('Lint').steps[1].returnStatus: the script that fails does not fail the job (continue_on_error), as its status was returned to the pipeline and failed nothing
+#   stage('Lint').steps[0][0]: Jenkins's variables a step reads are set at its head from dagron-ci's own (CI_SHA, CI_REF, …): a program it runs that reads one the step does not is not given it
+#
+# Not carried over (1):
+#   stage('Lint').steps[1].returnStatus: what a step printed or how it ended is not handed to Groovy here
+name: 18-errors-caught
+on:
+  push: {}
+  pull_request: {}
+  dispatch: {}
+tasks:
+- name: lint
+  docker_image: python:3.12
+  steps:
+  - name: Lint
+    run: |-
+      (
+      ruff check .
+      )
+      (
+      ruff format --check .
+      )
+      (
+      mkdir -p 'docs' && cd 'docs'
+      make lint
+      )
+    continue_on_error: true
+  - name: Lint
+    run: pip-audit
+    continue_on_error: true
+  - name: Lint
+    run: pytest -q

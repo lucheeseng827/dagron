@@ -144,8 +144,15 @@ pub async fn run(
                     }
                     Err(e) => Err(e),
                 };
+                // The schedule, and which of its fires this is.
+                let trigger = crate::models::RunTrigger::engine(
+                    crate::models::trigger_kind::SCHEDULE,
+                    format!("schedule:{}", s.id),
+                )
+                .of_event(s.next_fire_at.clone());
                 match parsed {
-                    Ok(dag) => match db::create_run(&pool, &dag, &s.spec).await {
+                    Ok(dag) => match db::create_run_triggered(&pool, &dag, &s.spec, &trigger).await
+                    {
                         Ok(run_id) => {
                             metrics.inc_runs_created();
                             // Stamp the run with its schedule so stopStrategy can

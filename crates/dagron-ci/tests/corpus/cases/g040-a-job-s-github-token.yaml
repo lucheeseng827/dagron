@@ -1,0 +1,25 @@
+shows: A job is given a GITHUB_TOKEN with what its permissions grant, by a GitHub App's names, where the operator gives workflows one; a job granted nothing is given none
+front: github
+github:
+  runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" }
+  github_token: true
+source: |
+  on: push
+  permissions:
+    contents: read
+  jobs:
+    release:
+      runs-on: ubuntu-latest
+      permissions:
+        contents: write
+        pull-requests: write
+        packages: write
+      steps:
+        - run: gh release create "$GITHUB_REF_NAME"
+          env:
+            GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    lint:
+      runs-on: ubuntu-latest
+      permissions: {}
+      steps:
+        - run: make lint

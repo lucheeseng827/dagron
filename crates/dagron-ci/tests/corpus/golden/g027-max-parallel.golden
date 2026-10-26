@@ -1,0 +1,2 @@
+not a pipeline:
+  jobs.test.strategy.max-parallel: `max-parallel` is not taken by dagron-ci's GitHub front-end yet (see docs/CI_GITHUB.md)

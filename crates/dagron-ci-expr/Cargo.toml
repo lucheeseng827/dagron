@@ -1,0 +1,17 @@
+[package]
+name = "dagron-ci-expr"
+version = "0.1.0"
+edition = "2021"
+# MSRV — see the root Cargo.toml for how 1.88 was measured.
+rust-version = "1.88"
+description = "GitHub Actions' expression language (`${{ … }}`), written to its documented grammar: what dagron-ci reads a workflow's conditions and values with, when it compiles one and while a job's steps run."
+
+[lib]
+name = "dagron_ci_expr"
+path = "src/lib.rs"
+
+# One dependency, pure Rust and already in the lock: dagron-ci-exec links
+# this crate, and has to stay a static binary with nothing else to find.
+[dependencies]
+# A context is JSON, and `toJSON` and `fromJSON` read and write it.
+serde_json = "1"

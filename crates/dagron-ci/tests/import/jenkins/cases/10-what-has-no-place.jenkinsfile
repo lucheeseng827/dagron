@@ -1,0 +1,54 @@
+@Library('shared-pipeline@v2') _
+
+def helper() {
+    return 'x'
+}
+
+pipeline {
+    agent any
+    triggers {
+        cron('H 4 * * *')
+        pollSCM('H/5 * * * *')
+    }
+    tools {
+        maven 'M3'
+        jdk 'jdk17'
+    }
+    stages {
+        stage('Windows') {
+            agent { label 'windows' }
+            steps {
+                bat 'build.cmd'
+            }
+        }
+        stage('Image') {
+            agent { dockerfile true }
+            steps {
+                sh 'make'
+            }
+        }
+        stage('Pod') {
+            agent {
+                kubernetes {
+                    yaml 'apiVersion: v1'
+                    defaultContainer 'build'
+                }
+            }
+            steps {
+                container('build') {
+                    sh 'make'
+                }
+            }
+        }
+        stage('Notify') {
+            steps {
+                mail to: 'team@example.com', subject: 'Built', body: 'ok'
+                build job: 'downstream', wait: false
+                someStep 'x'
+                withMaven(maven: 'M3') {
+                    sh 'mvn verify'
+                }
+            }
+        }
+    }
+}

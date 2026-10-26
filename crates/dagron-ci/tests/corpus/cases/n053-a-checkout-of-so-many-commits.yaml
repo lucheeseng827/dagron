@@ -1,0 +1,10 @@
+shows: A checkout's depth is how many commits of its own history it fetches
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: changed
+      workspace: { size: 5Gi, checkout: { depth: 30 } }
+      steps:
+        - run: git log --oneline -30

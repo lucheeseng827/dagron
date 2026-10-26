@@ -1,0 +1,6 @@
+::dagron-ci::step::1::start::cargo test
+::dagron-ci::report::{"tests":12,"failures":1,"errors":0,"skipped":2,"findings":0,"more_annotations":0,"more_failed":0,"problems":[]}
+::dagron-ci::annotation::{"path":"src/lib.rs","start_line":7,"end_line":7,"level":"failure","title":"t::bad","message":"left != right"}
+::dagron-ci::failed::{"name":"t::bad","message":"left != right"}
+::dagron-ci::summary::"## Built\n\n"
+::dagron-ci::result::{"exit_code":101}

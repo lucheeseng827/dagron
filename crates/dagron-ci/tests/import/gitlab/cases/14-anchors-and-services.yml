@@ -1,0 +1,21 @@
+# Anchors, services with their own names and variables.
+.db: &db
+  - name: postgres:16
+    alias: database
+    variables:
+      POSTGRES_DB: app
+  - mysql/mysql-server:8.0
+  - name: redis:7
+    command: ["redis-server", "--appendonly", "yes"]
+  - name: elasticsearch:8.15.0
+    alias: Search_Engine
+
+variables:
+  POSTGRES_PASSWORD: ci
+  MYSQL_ROOT_PASSWORD: ci
+
+integration:
+  image: python:3.12
+  services: *db
+  script:
+    - pytest tests/integration

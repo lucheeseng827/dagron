@@ -1,0 +1,3 @@
+not a pipeline:
+  on.dispatch.inputs.ci_sha: an input is a parameter name: a letter or _, then letters, digits or _, not starting ci_
+  on.dispatch.inputs.two words: an input is a parameter name: a letter or _, then letters, digits or _, not starting ci_

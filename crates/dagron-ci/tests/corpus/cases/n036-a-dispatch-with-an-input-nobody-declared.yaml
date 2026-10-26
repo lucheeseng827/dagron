@@ -1,0 +1,13 @@
+shows: A dispatch that sends an input the pipeline does not declare is refused
+event: { kind: dispatch, inputs: { version: 1.2.3, force: "yes" } }
+source: |
+  name: release
+  on:
+    dispatch:
+      inputs:
+        version: { required: true }
+  tasks:
+    - name: cut
+      steps:
+        - env: { VERSION: "{{ version }}" }
+          run: scripts/release.sh "$VERSION"

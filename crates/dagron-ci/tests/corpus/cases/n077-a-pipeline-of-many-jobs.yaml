@@ -1,0 +1,20 @@
+shows: A pipeline of a dozen jobs in three ranks keeps each job's place among the rest
+source: |
+  name: monorepo
+  on:
+    push: { branches: [main] }
+  task_defaults:
+    docker_image: docker.io/library/alpine:3.20
+  tasks:
+    - { name: plan, steps: [{ run: scripts/plan.sh }] }
+    - { name: api, depends_on: [plan], steps: [{ run: make -C api test }] }
+    - { name: web, depends_on: [plan], steps: [{ run: make -C web test }] }
+    - { name: cli, depends_on: [plan], steps: [{ run: make -C cli test }] }
+    - { name: docs, depends_on: [plan], steps: [{ run: make -C docs build }] }
+    - { name: sdk-python, depends_on: [api], steps: [{ run: make -C sdks/python test }] }
+    - { name: sdk-ts, depends_on: [api], steps: [{ run: make -C sdks/ts test }] }
+    - { name: e2e, depends_on: [api, web, cli], steps: [{ run: make e2e }] }
+    - { name: image-api, depends_on: [e2e], steps: [{ run: make -C api image }] }
+    - { name: image-web, depends_on: [e2e], steps: [{ run: make -C web image }] }
+    - { name: chart, depends_on: [image-api, image-web], steps: [{ run: make chart }] }
+    - { name: notify, depends_on: [chart, docs, sdk-python, sdk-ts], steps: [{ run: scripts/notify.sh }] }

@@ -1,5 +1,8 @@
 //! Programmatic artifact store API (the live G-C2 path): PUT/GET/exists artifacts
 //! by `(run_id, task, name)`, plus the two admin sweeps (key rotation, tier sync).
+//! What is put is recorded in an index, which is what lists, deletes and
+//! expires it, and which says where bytes may go straight to the store: see
+//! `artifact_index`.
 //!
 //! Bytes are **envelope-encrypted at rest** when a KEK provider is configured —
 //! transparently, via `dagron_artifact::store_from_env` (see `AppState`). This is
@@ -14,7 +17,7 @@
 //! `NotFound`).
 
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -25,6 +28,7 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use dagron_artifact::{ArtifactKey, ArtifactStore};
 
 use crate::auth::AuthUser;
+use crate::routes::artifact_index::{self, Keep, Measured};
 use crate::state::AppState;
 
 /// The configured store, or a 503 when artifacts are off.
@@ -92,15 +96,43 @@ pub(crate) async fn artifact_sha256(
 }
 
 /// `PUT /api/runs/{run_id}/artifacts/{task}/{name}` — store the request body under
-/// the key (encrypted at rest when a KEK provider is configured).
+/// the key (encrypted at rest when a KEK provider is configured), and record it
+/// in the artifact index: its size, its sha256 and when it expires
+/// (`?retention_days=N`, no longer than `DAGRON_ARTIFACT_RETENTION_DAYS`).
 pub async fn put_artifact(
     _auth: AuthUser,
     State(state): State<AppState>,
     Path((run_id, task, name)): Path<(String, String, String)>,
+    Query(keep): Query<Keep>,
     body: Body,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let s = store(&state)?;
-    let key = ArtifactKey::new(run_id, task, name);
+    put_body(
+        &state,
+        ArtifactKey::new(run_id, task, name),
+        keep.retention_days,
+        body,
+    )
+    .await
+}
+
+/// Write `body` under `key`, recorded in the index, kept `retention_days`
+/// (the default where `None`): what a `PUT` of an artifact is, through either
+/// door, a person's or a task's ([`crate::routes::task_artifacts`]).
+pub(crate) async fn put_body(
+    state: &AppState,
+    key: ArtifactKey,
+    retention_days: Option<u32>,
+    body: Body,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let s = store(state)?;
+    let now = chrono::Utc::now();
+    let expires = artifact_index::expires_at(&state.artifacts, retention_days, now)?;
+    // Said before a byte is written: the row loses its expiry, so the sweep
+    // cannot delete under this upload, and its size and digest, which were of
+    // the bytes this replaces.
+    artifact_index::begin(&state.write_pool, &key, now, &state.artifacts)
+        .await
+        .map_err(|e| internal("artifact index: begin failed", e))?;
     // Stream the request body straight into the store (encrypted per-chunk when a
     // KEK provider is configured) — the artifact is never fully buffered in memory.
     // The body size is still bounded by the route's RequestBodyLimitLayer.
@@ -108,10 +140,17 @@ pub async fn put_artifact(
         body.into_data_stream()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
     );
+    // Counted and hashed as they pass: a store that seals what it is given
+    // could not say afterwards what that was.
+    let (reader, tally) = Measured::new(reader);
     let loc = s
         .put_stream(&key, Box::new(reader))
         .await
         .map_err(|e| internal("artifact put failed", e))?;
+    let (size, sha256) = tally.read();
+    artifact_index::record(&state.write_pool, &key, size, Some(&sha256), expires.as_deref(), now)
+        .await
+        .map_err(|e| internal("artifact index: record failed", e))?;
     Ok((StatusCode::CREATED, loc))
 }
 
@@ -128,8 +167,16 @@ pub async fn get_artifact(
     State(state): State<AppState>,
     Path((run_id, task, name)): Path<(String, String, String)>,
 ) -> Result<Response, (StatusCode, String)> {
-    let s = store(&state)?;
-    let key = ArtifactKey::new(run_id, task, name);
+    get_body(&state, ArtifactKey::new(run_id, task, name)).await
+}
+
+/// The bytes under `key`, streamed: what a `GET` of an artifact is, through
+/// either door.
+pub(crate) async fn get_body(
+    state: &AppState,
+    key: ArtifactKey,
+) -> Result<Response, (StatusCode, String)> {
+    let s = store(state)?;
     // Open the reader first (not exists()-then-open, which races): a missing
     // artifact is a clean 404, any other open error a logged 500.
     let reader = match s.get_stream(&key).await {

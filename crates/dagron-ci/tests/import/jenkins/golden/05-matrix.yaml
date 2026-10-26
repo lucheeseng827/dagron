@@ -1,0 +1,36 @@
+# Imported from a Jenkinsfile by dagron-import.
+#
+# Changed on the way (5):
+#   on: a multibranch pipeline's builds are each branch and tag pushed, each pull request, and a run asked for (dispatch) here: say on: where it ran for fewer
+#   stage('BuildAndTest').matrix: the matrix is one job of 3 instances (with_items), each given its axes as variables
+#   stage('BuildAndTest').matrix.stage('Test').when: its when is a test at the head of each of its steps, which end there where it is false: the job passes, where Jenkins skipped the stage
+#   stage('BuildAndTest').matrix.stage('Test').steps[0]: what the string interpolated is a variable of the shell's here, which the shell fills in as it runs the script
+#   stage('BuildAndTest').matrix.stage('Build').steps[0]: Jenkins's variables a step reads are set at its head from dagron-ci's own (CI_SHA, CI_REF, …): a program it runs that reads one the step does not is not given it
+name: 05-matrix
+on:
+  push: {}
+  pull_request: {}
+  dispatch: {}
+tasks:
+- name: buildandtest
+  docker_image: eclipse-temurin:{{ item.JDK }}
+  with_items:
+  - JDK: '17'
+    PLATFORM: linux
+  - JDK: '21'
+    PLATFORM: linux
+  - JDK: '21'
+    PLATFORM: alpine
+  env:
+  - name: JDK
+    value: '{{ item.JDK }}'
+  - name: PLATFORM
+    value: '{{ item.PLATFORM }}'
+  steps:
+  - name: Build
+    run: ./gradlew build -Pplatform=$PLATFORM
+  - name: Test
+    run: |-
+      # when { environment name: 'PLATFORM', value: 'linux' }
+      { [ "${PLATFORM:-}" = 'linux' ]; } || exit 0
+      ./gradlew test -Pjdk=${JDK}

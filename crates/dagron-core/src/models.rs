@@ -1,5 +1,19 @@
 use serde::{Deserialize, Serialize};
 
+/// What a cancel did to a run's tasks ([`crate::db::cancel_run`]).
+///
+/// A cancel asks. A task nothing was running for is `cancelled` at once. One a
+/// worker holds is asked to stop, and stays `running` until that worker says
+/// its work is gone; while any is, the run is `running` too.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct Cancelled {
+    /// Tasks that are `cancelled` now: they had not started, or were waiting.
+    pub cancelled: u64,
+    /// Tasks asked to stop, whose work is still to be seen gone. Zero: the run
+    /// has ended. More: it ends when the last of them has stopped.
+    pub stopping: u64,
+}
+
 /// `create_run` refused to start a run because the named workflow already has
 /// `max_active_runs` runs in flight (parity fast-win #21 — Argo #12757 /
 /// Prefect deployment concurrency limits). A typed error so callers can
@@ -7,14 +21,21 @@ use serde::{Deserialize, Serialize};
 /// HTTP 429, the queue source requeues the message instead of dead-lettering it,
 /// and the schedule/backfill loops skip the fire (backfill releases its slot and
 /// retries when capacity frees).
+///
+/// A workflow whose runs wait their turn (`when_full: queue`, `supersede`)
+/// refuses one too, once as many wait as may
+/// ([`crate::dag::max_waiting_runs`]): then `waiting` says how many.
 #[derive(Debug, Clone)]
 pub struct MaxActiveRunsReached {
     /// The workflow (definition) name that is at its concurrency cap.
     pub name: String,
     /// The configured `max_active_runs` for the workflow.
     pub max: u32,
-    /// How many runs of the workflow were active when admission was refused.
+    /// How many runs of the workflow were in flight when admission was
+    /// refused: the ones that run, and the ones that wait to.
     pub active: i64,
+    /// How many of `active` wait for their turn, and have started nothing.
+    pub waiting: i64,
     /// The run's `concurrency_key` when the cap is per key rather than per
     /// workflow; `active` then counts only runs sharing this key.
     pub key: Option<String>,
@@ -22,22 +43,202 @@ pub struct MaxActiveRunsReached {
 
 impl std::fmt::Display for MaxActiveRunsReached {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.key {
-            None => write!(
+        write!(f, "max_active_runs ({}) reached for workflow '{}'", self.max, self.name)?;
+        if let Some(key) = &self.key {
+            write!(f, " and concurrency_key '{key}'")?;
+        }
+        match self.waiting {
+            0 => write!(f, " ({} active)", self.active),
+            waiting => write!(
                 f,
-                "max_active_runs ({}) reached for workflow '{}' ({} active)",
-                self.max, self.name, self.active
-            ),
-            Some(key) => write!(
-                f,
-                "max_active_runs ({}) reached for workflow '{}' and concurrency_key '{}' ({} active)",
-                self.max, self.name, key, self.active
+                " ({} active, {waiting} of them waiting: no more may wait)",
+                self.active
             ),
         }
     }
 }
 
 impl std::error::Error for MaxActiveRunsReached {}
+
+/// A whole rerun (`db::rerun_all`) was refused because tasks of the run still
+/// owe the teardown of a remote job they left running: a deferred task that
+/// was cancelled while its job ran, or failed with its handle kept.
+///
+/// The rerun resets each task's remote job with the rest of its result, and a
+/// handle it dropped would never be swept: the job would run on, and no
+/// orphan would be counted for it. So the run is refused, with nothing
+/// written, until the engine has torn the jobs down or given up on them, as
+/// `gc_old_runs` refuses to collect such a run. A `409` that clears itself:
+/// the same rerun goes ahead once the debt is settled.
+#[derive(Debug, Clone)]
+pub struct TeardownOwed {
+    /// The run that was not rerun.
+    pub run_id: String,
+    /// How many of its tasks still owe a teardown.
+    pub tasks: i64,
+}
+
+impl std::fmt::Display for TeardownOwed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "run '{}' still owes the teardown of {} remote job(s) it left running; it can be \
+             rerun once the engine has torn them down",
+            self.run_id, self.tasks
+        )
+    }
+}
+
+impl std::error::Error for TeardownOwed {}
+
+/// The kinds of thing that start a run: `run_triggers.kind`.
+pub mod trigger_kind {
+    /// A person, or a token of theirs, through the gateway.
+    pub const MANUAL: &str = "manual";
+    /// A call on the engine's own API, which has no login.
+    pub const API: &str = "api";
+    /// A schedule's fire: a cron entry's, or a stored schedule's.
+    pub const SCHEDULE: &str = "schedule";
+    /// A backfill of a schedule: a missed fire caught up, a job's date.
+    pub const BACKFILL: &str = "backfill";
+    /// A dataset's update (`on_datasets:`).
+    pub const DATASET: &str = "dataset";
+    /// A task of a parent run (`type: workflow`).
+    pub const WORKFLOW: &str = "workflow";
+    /// A message of the engine's source: a file, a queue, a stream.
+    pub const SOURCE: &str = "source";
+    /// A CI service, for an event of a repository.
+    pub const CI: &str = "ci";
+}
+
+/// What started a run, as whatever started it recorded it: one row of
+/// `run_triggers`, written in the run's own transaction and never updated.
+///
+/// A run without one predates the record, and has its trigger derived when it
+/// is read (a backfill, a schedule, or else manual). A gateway sets
+/// `principal` from the caller it authenticated; a caller supplies the rest
+/// and is believed only if it may set a trigger at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RunTrigger {
+    /// The kind of thing that started the run: one of [`trigger_kind`].
+    pub kind: String,
+    /// What submitted it: `user:<who>` or `ci:<who>` from a gateway,
+    /// [`RunTrigger::ENGINE`] for a run the engine started itself, and
+    /// [`RunTrigger::OPS_API`] for one asked of its own API.
+    pub principal: String,
+    /// Who caused it at the source: the person who asked, the pusher, a pull
+    /// request's author. A parent run's, for a run its task started.
+    pub actor: Option<String>,
+    /// What the submitter made of the event's origin.
+    pub trust: Option<String>,
+    /// What it came from, where that is no repository: `schedule:<id>`,
+    /// `cron:<name>`, `dataset:<uri>`, `run:<parent run>/<task>`,
+    /// `source:<name>`, `dead-letter:<id>`.
+    pub source: Option<String>,
+    pub forge_host: Option<String>,
+    /// `owner/name` on that forge.
+    pub repo: Option<String>,
+    #[serde(rename = "ref")]
+    pub git_ref: Option<String>,
+    pub sha: Option<String>,
+    pub base_sha: Option<String>,
+    pub pr: Option<i64>,
+    /// The id of the event at its source, to find it again there: a fire's
+    /// time, a backfill's date, a source's position, a CI service's event.
+    pub event_id: Option<String>,
+}
+
+impl RunTrigger {
+    /// The principal of a run the engine started itself.
+    pub const ENGINE: &'static str = "engine";
+    /// The principal of a run asked of the engine's own API, which has no
+    /// login and so nobody to name.
+    pub const OPS_API: &'static str = "ops-api";
+
+    /// A run the engine started itself, of `kind`, from `source`.
+    pub fn engine(kind: &str, source: impl Into<String>) -> Self {
+        Self {
+            kind: kind.to_string(),
+            principal: Self::ENGINE.to_string(),
+            source: Some(source.into()),
+            ..Self::default()
+        }
+    }
+
+    /// A run asked of the engine's own API.
+    pub fn ops_api() -> Self {
+        Self {
+            kind: trigger_kind::API.to_string(),
+            principal: Self::OPS_API.to_string(),
+            ..Self::default()
+        }
+    }
+
+    /// The same record, of the event `id` at its source.
+    pub fn of_event(mut self, id: impl Into<String>) -> Self {
+        self.event_id = Some(id.into());
+        self
+    }
+
+    /// The same record, from `source`.
+    pub fn from_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    /// This record, for a run that is made again from `original`'s: a
+    /// resubmit, which runs what that run ran.
+    ///
+    /// Who asked for it is this record's to say, and it is theirs. But where
+    /// the workflow came from is not changed by who asks for it again: a
+    /// workflow that a fork's pull request wrote is that, whoever presses
+    /// the button. So where `original` was of a class that is not trusted,
+    /// this record is of that class, for the same repository and commit.
+    /// A trusted run's resubmit is its caller's own, as it was.
+    pub fn copying(mut self, original: Option<&RunTrigger>) -> Self {
+        let class = crate::envpolicy::class_of(original);
+        if let (true, Some(original)) = (crate::confine::confined(class), original) {
+            self.trust = Some(class.to_string());
+            self.forge_host = original.forge_host.clone();
+            self.repo = original.repo.clone();
+            self.git_ref = original.git_ref.clone();
+            self.sha = original.sha.clone();
+            self.base_sha = original.base_sha.clone();
+            self.pr = original.pr;
+        }
+        self
+    }
+
+    /// The record of a run that `task` of `parent_run` started.
+    ///
+    /// What started the child is the parent's task, and its kind and source
+    /// say so. Where the work came from is where the parent's did: who caused
+    /// it, how far its origin is trusted, the repository and commit, the
+    /// event. A rule that reads those (an approval's `not_triggerer`, a
+    /// policy on trust) then reads the same for a sub-workflow as for the
+    /// run that called it, and cannot be stepped round by calling one.
+    ///
+    /// One thing is written out that the parent's record left unsaid. A CI
+    /// service's record that names no class is read as `untrusted`, and it
+    /// is read so by its kind ([`crate::envpolicy::class_of`]). The child's
+    /// kind is its own, so the class its parent was read as is put in words.
+    pub fn child_of(parent: Option<&RunTrigger>, parent_run: &str, task: &str) -> Self {
+        let inherited = parent.cloned().unwrap_or_default();
+        let trust = match parent {
+            Some(p) if p.trust.is_none() && p.kind == trigger_kind::CI => {
+                Some(crate::envpolicy::class_of(parent).to_string())
+            }
+            _ => inherited.trust.clone(),
+        };
+        Self {
+            kind: trigger_kind::WORKFLOW.to_string(),
+            principal: Self::ENGINE.to_string(),
+            source: Some(format!("run:{parent_run}/{task}")),
+            trust,
+            ..inherited
+        }
+    }
+}
 
 /// A trigger-time parameter value broke the workflow's `param_schema` (missing
 /// `required`, outside the `enum`, not matching the `pattern`).
@@ -62,7 +263,7 @@ impl std::fmt::Display for ParameterInvalid {
 impl std::error::Error for ParameterInvalid {}
 
 /// A run was refused because the spec's declared `budget.tasks` is smaller than
-/// the number of tasks the run would create (G-AG3).
+/// the number of tasks the run would create.
 ///
 /// A typed error so a caller can tell "this spec asked for more than it
 /// budgeted" from "this spec is malformed" — the first is a deliberate,
@@ -394,6 +595,10 @@ pub struct OutboxEvent {
     pub payload: String,
     /// Delivery attempts so far (0 on first claim).
     pub attempts: i64,
+    /// When the event was written (RFC 3339): when what it tells of
+    /// happened, which a retry keeps.
+    #[serde(default)]
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
@@ -485,9 +690,10 @@ impl std::fmt::Display for RunStatus {
     }
 }
 
-// Used only by the Postgres backend's manual row mapping for the ops read
-// queries (get_run / list_runs); gated so a lean build carries no dead code.
-#[cfg(feature = "ops")]
+// Not ops-gated: besides the ops read queries' row mapping (get_run /
+// list_runs), the reconcile loop reads statuses back when it claims runs that
+// ended outside the reaper (`claim_pending_completions`) and re-reads a run
+// after announcing its start (`run_status`), in the lean daemon too.
 impl std::str::FromStr for RunStatus {
     type Err = anyhow::Error;
 
@@ -579,6 +785,29 @@ pub struct TaskRun {
     pub decided_by: Option<String>,
     #[sqlx(default)]
     pub decision_comment: Option<String>,
+    /// Quota back-pressure (migration 051/066): when the current wait began,
+    /// the last refusal sentence (which quota; what was requested, used and
+    /// limited), and how many times the pod has been refused.
+    ///
+    /// Set **only while the row is `ready` and waiting on a Kubernetes
+    /// namespace `ResourceQuota`**; `None` / `0` on every other row. The
+    /// columns behind them are never cleared, so a projection has to guard them
+    /// with `status = 'ready' AND quota_wait_version = version` rather than
+    /// select them bare — otherwise a task that waited an hour ago and has been
+    /// running since still reads as waiting.
+    #[sqlx(default)]
+    pub quota_wait_since: Option<String>,
+    #[sqlx(default)]
+    pub quota_wait_detail: Option<String>,
+    #[sqlx(default)]
+    pub quota_waits: i64,
+    /// When this task was asked to stop (migration 055/073): its run was
+    /// cancelled or passed its deadline, or a gang sibling failed, while a
+    /// worker held it. Set **only while the row is `running`**: the work is
+    /// still to be seen gone, and the row becomes `cancelled`, with this
+    /// cleared, once it has been. `None` on every other row.
+    #[sqlx(default)]
+    pub stop_requested_at: Option<String>,
 }
 
 /// What one sweep tick did to a parked runtime fan-out barrier.
@@ -611,10 +840,20 @@ pub enum FanoutOutcome {
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct TaskAttempt {
     pub task_id: String,
-    /// 1-based, the same counter `TaskRun::attempt` carries.
+    /// 1-based, and one count for the task's life: `attempt` on its row plus
+    /// the attempts of the rounds a rerun or a clear ended (`attempt_base`).
     pub attempt: i64,
-    /// `iteration` | `failed` — see [`crate::attempt_log::AttemptEnd`].
+    /// Why the attempt is here. `iteration` | `failed`: a worker's own retry
+    /// superseded it ([`crate::attempt_log::AttemptEnd`]). `rerun` | `retry`
+    /// | `clear`: a person's did ([`RunAgain`]), and `status` says how the
+    /// attempt had ended.
     pub reason: String,
+    /// What the task read when a rerun, a retry or a clear replaced this
+    /// attempt: `failed`, `cancelled`, `succeeded`, `skipped`. `None` on a
+    /// row a worker's retry wrote, whose task was not terminal.
+    pub status: Option<String>,
+    /// When the attempt was queued. `None` as `status` is.
+    pub scheduled_at: Option<String>,
     /// The retained tail, or `None` when the attempt printed nothing.
     pub output: Option<String>,
     /// Whether output was dropped to fit the cap. Stored rather than inferred:
@@ -622,6 +861,74 @@ pub struct TaskAttempt {
     /// cap happened to be when the row was written.
     pub truncated: bool,
     pub finished_at: String,
+}
+
+/// What put tasks of a run back to run again. A rerun, a retry and a clear
+/// are asked for through two doors, the engine's API and dagron-api's, and
+/// both call the same functions (`db::rerun_from_failed`, `db::rerun_all`,
+/// `db::retry_task_from_ui`, `db::clear_task_with_downstream`). Each keeps
+/// the attempts it replaces, asks the concurrency key when it sets an ended
+/// run running again, and writes one outbox event, in one transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunAgain {
+    /// A rerun of a failed or cancelled run from its failed tasks.
+    Rerun,
+    /// A rerun of an ended run whole, what succeeded included (`from: all`).
+    RerunAll,
+    /// A retry of one failed or cancelled task.
+    Retry,
+    /// A clear of one completed task, and of what depends on it.
+    Clear,
+    /// The engine's own rerun of a run it found failed (`AUTO_RERUN`).
+    AutoRerun,
+}
+
+impl RunAgain {
+    /// What a replaced attempt is kept under (`task_attempts.reason`), and
+    /// `by` in the event. The engine's own rerun replaces as a person's does.
+    pub fn reason(self) -> &'static str {
+        match self {
+            RunAgain::Rerun | RunAgain::RerunAll | RunAgain::AutoRerun => "rerun",
+            RunAgain::Retry => "retry",
+            RunAgain::Clear => "clear",
+        }
+    }
+
+    /// The outbox event that says it happened: its type and its payload.
+    /// `tasks` is how many were put back, and `task_id` the one a retry or a
+    /// clear was asked for.
+    ///
+    /// The engine's own rerun keeps the event it always wrote
+    /// (`run.auto_rerun`, with its `reason`), so nothing that reads it
+    /// changes. The others are `run.rerun`, with `by`; a whole rerun's also
+    /// says `"from": "all"`.
+    pub fn event(self, run_id: &str, tasks: u64, task_id: Option<&str>) -> (&'static str, String) {
+        match self {
+            RunAgain::AutoRerun => (
+                "run.auto_rerun",
+                serde_json::json!({
+                    "run_id": run_id,
+                    "reset_tasks": tasks,
+                    "reason": "auto_rerun_incomplete",
+                })
+                .to_string(),
+            ),
+            by => {
+                let mut payload = serde_json::json!({
+                    "run_id": run_id,
+                    "by": by.reason(),
+                    "reset_tasks": tasks,
+                });
+                if let Some(task_id) = task_id {
+                    payload["task_id"] = serde_json::json!(task_id);
+                }
+                if by == RunAgain::RerunAll {
+                    payload["from"] = serde_json::json!("all");
+                }
+                ("run.rerun", payload.to_string())
+            }
+        }
+    }
 }
 
 // Constructed only by the ops read API (`db::get_run`); a lean build never
@@ -649,6 +956,31 @@ pub struct WorkflowRun {
     pub clock_offset_ms: Option<i64>,
     #[sqlx(default)]
     pub clock_source: Option<String>,
+    /// A run that was cancelled, or passed its deadline, while a worker held
+    /// one of its tasks (migration 055/073): the status it takes once that
+    /// work has stopped (`cancelled` or `failed`), and when it was asked.
+    /// Set **only while the run is `running`**, and cleared at its end. A run
+    /// with these set holds its concurrency key like any running run.
+    #[sqlx(default)]
+    pub stopping_as: Option<String>,
+    #[sqlx(default)]
+    pub stop_requested_at: Option<String>,
+    /// A run that arrived while its workflow's cap was full, and was made to
+    /// wait (`when_full`; migration 060/082): when it began to, and when it
+    /// was let in. A run with the first and not the second **waits**: it
+    /// reads `running`, has started nothing, and holds a place in its key.
+    /// Neither is set on a run that never waited.
+    #[sqlx(default)]
+    pub queued_at: Option<String>,
+    #[sqlx(default)]
+    pub admitted_at: Option<String>,
+}
+
+impl WorkflowRun {
+    /// Whether the run waits for its workflow's cap, having started nothing.
+    pub fn waits(&self) -> bool {
+        self.status == RunStatus::Running && self.queued_at.is_some() && self.admitted_at.is_none()
+    }
 }
 
 /// One row of the run-list view (v5 management API). Joins
@@ -662,6 +994,15 @@ pub struct RunSummary {
     pub status: RunStatus,
     pub created_at: String,
     pub finished_at: Option<String>,
+    /// The status a run that is being stopped will take ([`WorkflowRun::stopping_as`]).
+    #[sqlx(default)]
+    pub stopping_as: Option<String>,
+    /// When a run that had to wait for its workflow's cap began to, and when
+    /// it was let in ([`WorkflowRun::queued_at`]).
+    #[sqlx(default)]
+    pub queued_at: Option<String>,
+    #[sqlx(default)]
+    pub admitted_at: Option<String>,
 }
 
 /// Snapshot of run/task counts grouped by status, read fresh from the datastore
@@ -688,6 +1029,69 @@ pub struct MetricsSnapshot {
     pub active_tasks: Vec<(String, String, i64)>,
     /// Dead letters grouped by the source that produced them.
     pub dead_letters_by_source: Vec<DeadLetterSource>,
+    /// Tasks waiting on a Kubernetes namespace quota, and when the
+    /// longest-waiting one was first refused (RFC-3339; `None` when none is).
+    /// See [`crate::quota_wait`].
+    pub quota_waiting: i64,
+    pub quota_wait_oldest_since: Option<String>,
+    /// Runs that wait for their workflow's cap (`when_full`), having started
+    /// nothing, and when the one that has waited longest began to (RFC-3339;
+    /// `None` when none waits).
+    pub runs_waiting: i64,
+    pub runs_waiting_oldest_since: Option<String>,
+    /// Tasks whose logs the log store's GC is to look at (`log_sweeps`), how
+    /// many of them its last removal failed for, and when the oldest was
+    /// recorded (RFC-3339; `None` when none waits).
+    pub log_sweeps_waiting: i64,
+    pub log_sweeps_failing: i64,
+    pub log_sweeps_oldest_marked_at: Option<String>,
+    /// How old the history in this snapshot is, in seconds: the finished
+    /// runs and tasks, and the recent runs that have finished
+    /// ([`MetricsHistory`]), read less often than the rest. 0 where it was
+    /// read with it.
+    pub history_age_secs: f64,
+}
+
+/// The part of the `/metrics` gauges that grows with what has run: the runs
+/// and tasks that have finished, by status, and the runs of the last
+/// [`RECENT_RUNS_WINDOW_SECS`] that have. Read apart from the rest of the
+/// [`MetricsSnapshot`], and cached longer.
+#[cfg(feature = "ops")]
+#[derive(Debug, Clone, Default)]
+pub struct MetricsHistory {
+    /// Runs in a status not in [`LIVE_RUN_STATUSES`], by status.
+    pub runs_by_status: Vec<(String, i64)>,
+    /// Tasks in a status not in [`LIVE_TASK_STATUSES`], by status.
+    pub tasks_by_status: Vec<(String, i64)>,
+    /// The recent runs in a status not in [`LIVE_RUN_STATUSES`].
+    pub recent_runs: Vec<RecentRuns>,
+}
+
+/// The statuses of a run that has not finished, whose counts, and recent
+/// runs, every read of the `/metrics` gauges takes. The others are the
+/// history's.
+#[cfg(feature = "ops")]
+pub const LIVE_RUN_STATUSES: [&str; 2] = ["pending", "running"];
+
+/// The statuses of a task that has not finished, as [`LIVE_RUN_STATUSES`]
+/// are a run's.
+#[cfg(feature = "ops")]
+pub const LIVE_TASK_STATUSES: [&str; 4] = ["pending", "ready", "running", "awaiting_approval"];
+
+#[cfg(feature = "ops")]
+impl MetricsSnapshot {
+    /// This snapshot, of what has not finished, with `history` read beside
+    /// it, `age_secs` old: what one read of the whole datastore gives. The
+    /// statuses of the two do not meet, so each status is counted once.
+    pub fn with_history(mut self, history: &MetricsHistory, age_secs: f64) -> Self {
+        self.runs_by_status
+            .extend(history.runs_by_status.iter().cloned());
+        self.tasks_by_status
+            .extend(history.tasks_by_status.iter().cloned());
+        self.recent_runs.extend(history.recent_runs.iter().cloned());
+        self.history_age_secs = age_secs;
+        self
+    }
 }
 
 /// How far back the per-workflow run gauges look, in seconds (24 hours).
@@ -940,6 +1344,89 @@ mod tests {
         statuses.iter().map(|s| s.to_string()).collect()
     }
 
+    /// What started a sub-workflow's run is its parent's task, and the record
+    /// says so. Where the work came from is where the parent's did, and the
+    /// record keeps all of that: a rule on a run's origin reads the same for
+    /// the child as for the run that called it.
+    #[test]
+    fn a_sub_workflow_s_record_names_its_task_and_keeps_where_the_work_came_from() {
+        let parent = RunTrigger {
+            kind: trigger_kind::CI.to_string(),
+            principal: "ci:svc@example.com".to_string(),
+            actor: Some("octocat".to_string()),
+            trust: Some("untrusted".to_string()),
+            source: None,
+            forge_host: Some("github.com".to_string()),
+            repo: Some("acme/widgets".to_string()),
+            git_ref: Some("refs/pull/7/head".to_string()),
+            sha: Some("a1".to_string()),
+            base_sha: Some("b2".to_string()),
+            pr: Some(7),
+            event_id: Some("e-1".to_string()),
+        };
+        let child = RunTrigger::child_of(Some(&parent), "run-1", "deploy");
+        assert_eq!(
+            (
+                child.kind.as_str(),
+                child.principal.as_str(),
+                child.source.as_deref()
+            ),
+            ("workflow", "engine", Some("run:run-1/deploy"))
+        );
+        // Everything else is the parent's.
+        let rest = |t: &RunTrigger| RunTrigger {
+            kind: String::new(),
+            principal: String::new(),
+            source: None,
+            ..t.clone()
+        };
+        assert_eq!(rest(&child), rest(&parent));
+
+        // And a child of that child says the same again, of its own parent.
+        let grandchild = RunTrigger::child_of(Some(&child), "run-2", "notify");
+        assert_eq!(grandchild.source.as_deref(), Some("run:run-2/notify"));
+        assert_eq!(rest(&grandchild), rest(&parent));
+
+        // A parent with no record (a run from before every run had one)
+        // leaves its child with what the child itself knows.
+        let orphan = RunTrigger::child_of(None, "run-0", "t");
+        assert_eq!(
+            orphan,
+            RunTrigger::engine(trigger_kind::WORKFLOW, "run:run-0/t")
+        );
+    }
+
+    #[test]
+    fn the_engine_s_own_records_say_what_made_the_run() {
+        let fire = RunTrigger::engine(trigger_kind::SCHEDULE, "schedule:s1")
+            .of_event("2026-01-01T00:00:00+00:00");
+        assert_eq!(
+            (
+                fire.kind.as_str(),
+                fire.principal.as_str(),
+                fire.source.as_deref(),
+                fire.event_id.as_deref()
+            ),
+            (
+                "schedule",
+                "engine",
+                Some("schedule:s1"),
+                Some("2026-01-01T00:00:00+00:00")
+            )
+        );
+        assert_eq!((fire.actor, fire.trust, fire.repo), (None, None, None));
+
+        let asked = RunTrigger::ops_api().from_source("dead-letter:d1");
+        assert_eq!(
+            (
+                asked.kind.as_str(),
+                asked.principal.as_str(),
+                asked.source.as_deref()
+            ),
+            ("api", "ops-api", Some("dead-letter:d1"))
+        );
+    }
+
     #[test]
     fn trigger_rules_decide_correctly() {
         // Roots (no deps) always run, whatever the rule.
@@ -1108,4 +1595,97 @@ mod tests {
         assert!(any.downcast_ref::<DatastoreLowOnDisk>().is_some());
         assert!(any.downcast_ref::<MaxActiveRunsReached>().is_none());
     }
+}
+
+/// A ready entry of a path cache (`path_caches`): one a task may restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathCacheEntry {
+    pub id: String,
+    pub cache_key: String,
+    pub object_key: String,
+    pub size_bytes: Option<i64>,
+}
+
+/// An entry a task was given a URL to save to: `pending` until the engine's
+/// cache sweep has seen its task succeed and its manifest in the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewPathCache {
+    pub id: String,
+    /// The forge host and repository: the unit of the quota.
+    pub repo: String,
+    /// The repository and ref: where it is read from and written to.
+    pub scope: String,
+    pub prefix: String,
+    pub version: String,
+    pub object_key: String,
+    pub task_id: String,
+}
+
+/// An artifact a workflow's job uploaded (`actions/upload-artifact`), kept
+/// by the engine's results service for its run, by its name, until it
+/// expires. `size_bytes` and `sha256` are `None` until the upload is
+/// complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowArtifact {
+    pub id: String,
+    /// The number the job knows it by: below 2^53.
+    pub artifact_id: i64,
+    pub run_id: String,
+    /// The task that uploaded it.
+    pub task_id: String,
+    pub name: String,
+    pub object_key: String,
+    pub size_bytes: Option<i64>,
+    pub sha256: Option<String>,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
+/// A pending entry, with where its task stands: `None` when the task's row
+/// is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPathCache {
+    pub id: String,
+    pub object_key: String,
+    pub created_at: String,
+    pub task_status: Option<String>,
+}
+
+/// A request credential given to a task that asks for an identity
+/// (`oidc_requests`): dagron-api signs a token for it while its task runs.
+/// The credential itself is never kept, only its SHA-256.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OidcRequest {
+    pub token_sha256: String,
+    pub run_id: String,
+    pub task_id: String,
+    pub task_name: String,
+    /// The attempt it was given for, 1 for the first.
+    pub attempt: i64,
+    pub audiences: Vec<String>,
+    /// The task's environment, where it names one.
+    pub environment: Option<String>,
+    pub expires_at: String,
+}
+
+/// What a remote runner said of a task, taken by an engine to apply as
+/// it applies a result of its own workers ([`crate::db::take_runner_results`]).
+#[derive(Debug, Clone)]
+pub struct RunnerResult {
+    pub task_id: String,
+    /// The claim the runner held, and its fencing token: what the result is
+    /// applied under, so that it changes nothing once the claim is gone.
+    pub claimed_by: String,
+    pub fence: i64,
+    /// `succeeded`, `failed`, `timed_out`, `backpressure` or `cancelled`
+    /// ([`crate::runner::Outcome`]).
+    pub outcome: String,
+    pub exit_code: Option<i32>,
+    pub output: Option<String>,
+    /// The task's row, as it is now: `None` for a task that is gone.
+    pub run_id: Option<String>,
+    /// The attempt before the claim (the claim counted one more).
+    pub attempt: i64,
+    /// The task's stored spec.
+    pub input: Option<String>,
 }

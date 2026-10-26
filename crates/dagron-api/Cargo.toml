@@ -4,13 +4,21 @@ version = "0.1.0"
 edition = "2021"
 # MSRV — see the root Cargo.toml for how 1.88 was measured.
 rust-version = "1.88"
-description = "dagron management API — read-mostly axum service over the dagron Postgres, with LISTEN/NOTIFY → SSE live updates."
+description = "dagron management API — read-mostly axum service over the dagron Postgres (or, for one node, SQLite), with live updates over SSE."
 
 [[bin]]
 name = "dagron-api"
 path = "src/main.rs"
 
 [features]
+# The datastore, one of two (dagron-core holds them exclusive). `postgres`: the
+# whole API, any number of replicas. `sqlite`: one node
+# beside one engine on the same SQLite file, a laptop, an edge site, a small
+# air-gapped site; it serves sign-in, users, tokens, workflows, runs and their
+# logs, and live updates, and answers 501 for the rest of /api.
+default = ["postgres"]
+postgres = ["sqlx/postgres", "sqlx/tls-rustls-ring", "dagron-core/postgres"]
+sqlite = ["sqlx/sqlite", "dagron-core/sqlite"]
 # Optional feature: parameterized rerun (`params` deep-merge). No extra
 # crate dependencies — purely a code-gate on the rerun endpoint.
 enterprise = [
@@ -33,19 +41,24 @@ archive-gcs = ["archive-cloud", "object_store/gcp", "dagron-artifact/gcs"]
 archive-azure = ["archive-cloud", "object_store/azure", "dagron-artifact/azure"]
 # Internal: shared object-store dep enabled by the cloud backends above.
 archive-cloud = ["dep:object_store"]
+# OTLP span delivery. With it built in and `OTEL_EXPORTER_OTLP_ENDPOINT` set,
+# the spans this binary opens go to a collector (dagron-logging installs the
+# exporter); with the variable unset nothing is sent. Off, the build has no
+# opentelemetry dependency. The published image is built with it.
+otel = ["dagron-logging/otel"]
 
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
 badgelib = "0.5.1"
 # `fs` adds ServeDir, which serves the exported console (see main.rs, console_router).
 tower-http = { version = "0.6", features = ["cors", "trace", "limit", "fs"] }
-# tls-rustls-ring: sqlx is declared default-features=false, so without a TLS
+# The `postgres` feature adds tls-rustls-ring: sqlx is declared default-features=false, so without a TLS
 # backend any `sslmode=require` DSN fails at connect with "TLS upgrade
 # required by connect options but SQLx was built without TLS support
 # enabled". That rules out RDS (rds.force_ssl is on by default), Cloud SQL,
 # Azure, and any hardened self-hosted Postgres. Same TLS stack the rest of
 # this workspace's Postgres clients already use, so only one is resolved.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros", "tls-rustls-ring"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "macros"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal", "time", "process"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
@@ -61,6 +74,8 @@ base64 = "0.22"
 # adding strength), and constant-time comparison to verify.
 rand = "0.8"
 sha2 = "0.10"
+# The OIDC issuer's keys (`oidc`): an RSA key's public numbers, for the JWKS.
+rsa = "0.9"
 subtle = "2"
 anyhow = "1"
 tracing = "0.1"
@@ -77,9 +92,9 @@ dagron-artifact = { path = "../dagron-artifact" }
 # The DAG model + the run writer, shared with the engine rather than mirrored.
 # This crate used to re-declare the spec types and re-implement submit, which
 # silently dropped every task field the mirror had not learned about (fan-out,
-# resources, wait, cache, pool, priority, produces, …). `postgres` only — this
-# binary is Postgres-only and the two backends are mutually exclusive.
-dagron-core = { path = "../dagron-core", default-features = false, features = ["postgres", "ops"] }
+# resources, wait, cache, pool, priority, produces, …). Its backend is this
+# crate's: `postgres` or `sqlite`, never both.
+dagron-core = { path = "../dagron-core", default-features = false, features = ["ops"] }
 # The `state` noun: compile a backfill planner's state plan into a run graph.
 # Links neither the planner nor dagron-core (see that crate's Cargo.toml), so it
 # adds nothing to this binary's feature resolution. Mounted in `state_plane.rs`.
@@ -105,3 +120,5 @@ hex = { version = "0.4", optional = true }
 # route table can be asserted without binding a port or a database. Already in
 # the tree — axum 0.8 builds on it.
 tower = { version = "0.5", features = ["util"] }
+# Keys made in the OIDC issuer's tests.
+rsa = { version = "0.9", features = ["getrandom"] }

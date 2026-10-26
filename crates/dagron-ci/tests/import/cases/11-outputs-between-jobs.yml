@@ -1,0 +1,18 @@
+# A value one job makes and a later job reads, which a pipeline's jobs do not hand on.
+name: outputs
+on: push
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.read.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        run: echo "tag=v$(cat VERSION)" >> "$GITHUB_OUTPUT"
+      - run: echo "read ${{ steps.read.outputs.tag }}"
+  publish:
+    needs: [version]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "publishing ${{ needs.version.outputs.tag }}"

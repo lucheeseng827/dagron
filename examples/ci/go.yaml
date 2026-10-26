@@ -1,0 +1,53 @@
+# A starter pipeline for a Go module. Copy it to .dagron/ci/ci.yaml in the
+# repository, and check it with `dagron-ci validate`.
+#
+# A push to main and a pull request run two jobs side by side: one checks
+# the format and vets, one runs the tests. Each job is a container that
+# starts with the commit checked out, and runs its steps in order in that
+# one workspace; a step that fails ends its job.
+#
+# A pull request runs when it comes from one of the repository's own
+# branches and its author is the repository's owner, a member of its
+# organization or a collaborator. One from a fork, or by anyone else, runs
+# nothing: its commit gets one status that says so.
+#
+# Each job starts cold. There is no cache between runs yet, so both jobs
+# download the module's dependencies and compile them every time.
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request: {}
+task_defaults:
+  # A job that runs longer than this is stopped, and fails.
+  timeout_secs: 1800
+tasks:
+  - name: lint
+    docker_image: docker.io/library/golang:1.23-bookworm
+    # A job's env is a list of names and values. (A step's is a map.)
+    env:
+      # Go's build cache, where any user may write it: a job may run as a
+      # user with no home directory, and Go has nowhere else to keep it.
+      - { name: GOCACHE, value: /tmp/go-build }
+      # The workspace is a checkout another user made. Go would ask git
+      # about it to stamp a build, and git would refuse.
+      - { name: GOFLAGS, value: -buildvcs=false }
+    steps:
+      # gofmt lists the files it would change, and succeeds either way.
+      - name: format
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt would change:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: vet
+        run: go vet ./...
+  - name: test
+    docker_image: docker.io/library/golang:1.23-bookworm
+    env:
+      - { name: GOCACHE, value: /tmp/go-build }
+      - { name: GOFLAGS, value: -buildvcs=false }
+    steps:
+      - name: test
+        run: go test ./...

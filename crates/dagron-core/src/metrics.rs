@@ -6,7 +6,9 @@
 //!   created`, `tasks dispatched/succeeded/failed/retried`) accumulated by this
 //!   scheduler since boot. Plain atomics, incremented on the hot path.
 //! * **Datastore gauges** ([`MetricsSnapshot`](crate::models::MetricsSnapshot)) —
-//!   live run/task counts grouped by status, read fresh from the DB per scrape.
+//!   live run/task counts grouped by status, read from the DB (the engine caches
+//!   what has not finished for `METRICS_CACHE_SECS`, 10 s by default, and the
+//!   history for `METRICS_HISTORY_CACHE_SECS`, 300 s: `crate::gauges`).
 //!   The datastore is the source of truth, so these survive a restart and reflect
 //!   the whole cluster, not just this process.
 //!
@@ -14,7 +16,9 @@
 //! no extra registry crate, just the handful of series this scheduler emits.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use crate::sweep::Sweep;
 
 #[cfg(feature = "ops")]
 use std::fmt::Write as _;
@@ -38,13 +42,16 @@ pub enum SignpostGate {
     DeferConnection,
     /// `POST /datasets/events` on the engine API.
     ExternalDatasetEvents,
+    /// `budget.tokens` in a workflow spec.
+    TokenBudget,
 }
 
 impl SignpostGate {
-    pub const ALL: [SignpostGate; 3] = [
+    pub const ALL: [SignpostGate; 4] = [
         SignpostGate::ExternalCostAttribution,
         SignpostGate::DeferConnection,
         SignpostGate::ExternalDatasetEvents,
+        SignpostGate::TokenBudget,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -52,13 +59,14 @@ impl SignpostGate {
             SignpostGate::ExternalCostAttribution => "external_cost_attribution",
             SignpostGate::DeferConnection => "defer_connection",
             SignpostGate::ExternalDatasetEvents => "external_dataset_events",
+            SignpostGate::TokenBudget => "token_budget",
         }
     }
 }
 
 /// Signpost hits, per [`SignpostGate`], for the whole process.
 ///
-/// Process-wide rather than on [`Metrics`], because two of the three gates are
+/// Process-wide rather than on [`Metrics`], because three of the four gates are
 /// spec validation in this crate: a pure function that has no `Metrics` handle
 /// and runs wherever a spec is parsed. Every process counts its own; only the
 /// engine renders them.
@@ -102,6 +110,10 @@ const BATCH_BUCKETS: &[f64] = &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256
 const RUN_DURATION_BUCKETS: &[f64] = &[
     1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0, 7200.0, 14400.0,
 ];
+
+/// Upper bounds (seconds) for how late a sweep acted on what fell due: from
+/// well under a tick to a window of the slowest sweep.
+const LATENESS_BUCKETS: &[f64] = &[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0];
 
 /// Max distinct `workflow` label values per series family. Workflow names come
 /// from submitted specs, so the cap is what stops a client that names every run
@@ -180,6 +192,27 @@ impl Histogram {
         let _ = writeln!(out, "{name}_sum {sum}");
         let _ = writeln!(out, "{name}_count {}", self.count.load(Ordering::Relaxed));
     }
+
+    /// Append this histogram's samples to `out` as one series of a family
+    /// with labels, `labels` being `key="value"` pairs; the family's HELP and
+    /// TYPE are the caller's.
+    #[cfg(feature = "ops")]
+    fn render_labeled(&self, out: &mut String, name: &str, labels: &str) {
+        let mut cumulative = 0u64;
+        for (i, &bound) in self.bounds.iter().enumerate() {
+            cumulative += self.buckets[i].load(Ordering::Relaxed);
+            let _ = writeln!(out, "{name}_bucket{{{labels},le=\"{bound}\"}} {cumulative}");
+        }
+        cumulative += self.overflow.load(Ordering::Relaxed);
+        let _ = writeln!(out, "{name}_bucket{{{labels},le=\"+Inf\"}} {cumulative}");
+        let sum = self.sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        let _ = writeln!(out, "{name}_sum{{{labels}}} {sum}");
+        let _ = writeln!(
+            out,
+            "{name}_count{{{labels}}} {}",
+            self.count.load(Ordering::Relaxed)
+        );
+    }
 }
 
 /// Point-in-time datastore connection-pool stats, read per `/metrics` scrape and
@@ -223,6 +256,16 @@ pub struct Metrics {
     pub runs_deadline_exceeded: AtomicU64,
     /// Soft SLA deadline alerts emitted (spec `deadline`) — run kept running.
     pub deadline_alerts: AtomicU64,
+    /// Runs let in after waiting for their workflow's cap (spec `when_full`).
+    pub runs_admitted: AtomicU64,
+    /// Pulls of a task's image (or a service's, or a step's) the executor
+    /// made.
+    pub image_pulls: AtomicU64,
+    /// Those that failed.
+    pub image_pull_failures: AtomicU64,
+    /// Images a task was given without a pull: held already, or pinned for
+    /// its run.
+    pub image_cache_hits: AtomicU64,
     /// Tasks resolved from the memoization cache without executing (#22).
     pub cache_hits: AtomicU64,
     /// Remote jobs this engine gave up trying to tear down (`defer:`).
@@ -243,6 +286,18 @@ pub struct Metrics {
     /// reap cannot see, because that reap only ever runs when the *same task*
     /// is dispatched again.
     pub orphan_workloads_reaped: AtomicU64,
+    /// Dispatches refused by a full Kubernetes namespace `ResourceQuota` and
+    /// handed back to the queue.
+    ///
+    /// Neither a failure nor a retry — nothing ran and no attempt was consumed —
+    /// so `tasks_failed`, `tasks_retried` and the fault counters do not move
+    /// for one. This is the only place a refusal is counted, which is what
+    /// makes "the namespace is too small for this workload" a rate someone can
+    /// read rather than a pattern in the logs.
+    pub quota_refusals: AtomicU64,
+    /// Tasks failed because they waited on namespace quota past
+    /// `DAGRON_QUOTA_WAIT_MAX_SECS`. Each is also a `tasks_failed`.
+    pub quota_wait_expired: AtomicU64,
     /// Failed attempts by [`crate::fault::FaultClass`], indexed by the class's
     /// position in `FaultClass::ALL`.
     ///
@@ -284,6 +339,44 @@ pub struct Metrics {
     /// `DAGRON_CLOCK_STEP_TOLERANCE_MS`. Each one re-stamped the runs in
     /// flight `drifted`.
     pub clock_steps: AtomicU64,
+    /// Datastore notifications the reconcile loop's waker took. Those that
+    /// were waiting together were taken together and made one tick, so this
+    /// against the tick count says how many each tick answered.
+    pub notifications: AtomicU64,
+    /// Runs the slow sweep of running runs found ended, before the loop had
+    /// taken a notification that named them. A run whose notification was
+    /// still on its way is counted now and then; one that rises steadily
+    /// says tasks are ending with no notification, or that they are lost.
+    pub reaped_by_sweep: AtomicU64,
+    /// Indexes of the datastore that an interrupted build left INVALID, as
+    /// the engine last looked: as it started, and every five minutes after.
+    /// A state gauge: Postgres never reads such an index, so a sweep it was
+    /// made for reads every row it would have spared, and nothing rebuilds
+    /// it by itself.
+    pub db_invalid_indexes: AtomicU64,
+    /// The limits over the engine's sessions, and the sessions under each,
+    /// by scope (`database`, `login`, `server`, and, in a build that adds
+    /// control-database checks, the same there, `control_database` and so
+    /// on), as it last read them (`crate::connections`): `(limit, sessions)`,
+    /// a limit of `None` being none. A read that fails leaves the last one.
+    db_connections: std::sync::Mutex<std::collections::BTreeMap<String, (Option<i64>, i64)>>,
+    /// Files and objects the log store's GC removed: what no
+    /// reader could name any more, of tasks that are gone and of writings a
+    /// later one took the place of. A file:// store's directories count.
+    pub log_store_removed_objects: AtomicU64,
+    /// Their bytes, as stored (compressed, for a closed segment).
+    pub log_store_removed_bytes: AtomicU64,
+    /// Removals the log store's GC tried and the store refused or did not
+    /// answer. Each is tried again later; the records it failed for are the
+    /// `scheduler_log_sweeps_failing` gauge.
+    pub log_sweep_failures: AtomicU64,
+    /// Attempts whose log reached its cap (`DAGRON_LOG_TASK_CAP_BYTES`), and
+    /// so kept its beginning and its end with a line between that says what
+    /// was left out.
+    pub logs_capped: AtomicU64,
+    /// The bytes that line said were left out, of them all, counted as the
+    /// task wrote them, before masking.
+    pub log_bytes_omitted: AtomicU64,
     /// Runs created by the auto-backfill catch-up sweep (QW3 auto-catchup). A schedule that
     /// missed fires while the scheduler was down has them materialized here.
     #[cfg(feature = "enterprise")]
@@ -303,6 +396,8 @@ pub struct Metrics {
     /// this is the scheduler's own queueing latency: claim wait + tick pacing +
     /// per-task dispatch prep. The SLO metric for the low-latency profile.
     pub dispatch_latency: Histogram,
+    /// How long each pull of an image took, to its end or its failure.
+    pub image_pull: Histogram,
     /// Executor finished → reconcile loop drained the result. Measures the
     /// wake-on-completion path directly: before it existed this sat at
     /// "remainder of the poll interval" (up to 500 ms) for every task.
@@ -315,6 +410,24 @@ pub struct Metrics {
     /// Per-workflow finished-run totals and the last run's duration. A lock,
     /// not atomics: it is taken once per finished *run*, never per task.
     workflow_runs: std::sync::Mutex<std::collections::BTreeMap<String, WorkflowRunStats>>,
+    // ── The reconcile loop's sweeps, each by `Sweep as usize` ───────────────
+    /// Passes each sweep made on this engine.
+    pub sweep_passes: [AtomicU64; Sweep::ALL.len()],
+    /// Windows of each sweep this engine left to another, which had taken
+    /// its slot.
+    pub sweep_elsewhere: [AtomicU64; Sweep::ALL.len()],
+    /// Time each sweep's passes took here, in microseconds.
+    pub sweep_micros: [AtomicU64; Sweep::ALL.len()],
+    /// Rows each sweep's passes acted on here.
+    pub sweep_rows: [AtomicU64; Sweep::ALL.len()],
+    /// When each sweep last ran here, in Unix milliseconds; 0 for never.
+    pub sweep_last_pass_millis: [AtomicU64; Sweep::ALL.len()],
+    /// Each sweep's interval on this engine, in milliseconds; 0 for one
+    /// switched off here.
+    pub sweep_interval_millis: [AtomicU64; Sweep::ALL.len()],
+    /// How long after it fell due each sweep acted on what it did, for the
+    /// sweeps that can say ([`Sweep::has_lateness`]).
+    pub sweep_lateness: [Histogram; Sweep::ALL.len()],
     // ── QW3 auto-catchup self-healing state gauges ──────────────────────────────────
     // Unlike the counters above (monotonic, bumped on the hot path) these are
     // *current state* re-published by the auto-backfill loop on every sweep: the
@@ -344,9 +457,15 @@ impl Default for Metrics {
             dead_letters: AtomicU64::new(0),
             runs_deadline_exceeded: AtomicU64::new(0),
             deadline_alerts: AtomicU64::new(0),
+            runs_admitted: AtomicU64::new(0),
+            image_pulls: AtomicU64::new(0),
+            image_pull_failures: AtomicU64::new(0),
+            image_cache_hits: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             external_orphans: AtomicU64::new(0),
             orphan_workloads_reaped: AtomicU64::new(0),
+            quota_refusals: AtomicU64::new(0),
+            quota_wait_expired: AtomicU64::new(0),
             task_faults: std::array::from_fn(|_| AtomicU64::new(0)),
             schedule_gated: AtomicU64::new(0),
             schedules_stopped: AtomicU64::new(0),
@@ -356,6 +475,15 @@ impl Default for Metrics {
             admission_refused_gate: AtomicU64::new(0),
             claims_paused: AtomicU64::new(0),
             clock_steps: AtomicU64::new(0),
+            notifications: AtomicU64::new(0),
+            reaped_by_sweep: AtomicU64::new(0),
+            db_invalid_indexes: AtomicU64::new(0),
+            db_connections: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            log_store_removed_objects: AtomicU64::new(0),
+            log_store_removed_bytes: AtomicU64::new(0),
+            log_sweep_failures: AtomicU64::new(0),
+            logs_capped: AtomicU64::new(0),
+            log_bytes_omitted: AtomicU64::new(0),
             #[cfg(feature = "enterprise")]
             catchup_runs: AtomicU64::new(0),
             #[cfg(feature = "enterprise")]
@@ -363,10 +491,18 @@ impl Default for Metrics {
             task_duration: Histogram::new(DURATION_BUCKETS),
             reconcile_tick: Histogram::new(DURATION_BUCKETS),
             dispatch_latency: Histogram::new(DURATION_BUCKETS),
+            image_pull: Histogram::new(RUN_DURATION_BUCKETS),
             result_wait: Histogram::new(DURATION_BUCKETS),
             claim_batch: Histogram::new(BATCH_BUCKETS),
             run_duration: Histogram::new(RUN_DURATION_BUCKETS),
             workflow_runs: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            sweep_passes: std::array::from_fn(|_| AtomicU64::new(0)),
+            sweep_elsewhere: std::array::from_fn(|_| AtomicU64::new(0)),
+            sweep_micros: std::array::from_fn(|_| AtomicU64::new(0)),
+            sweep_rows: std::array::from_fn(|_| AtomicU64::new(0)),
+            sweep_last_pass_millis: std::array::from_fn(|_| AtomicU64::new(0)),
+            sweep_interval_millis: std::array::from_fn(|_| AtomicU64::new(0)),
+            sweep_lateness: std::array::from_fn(|_| Histogram::new(LATENESS_BUCKETS)),
             #[cfg(feature = "enterprise")]
             overdue_schedules: AtomicU64::new(0),
             #[cfg(feature = "enterprise")]
@@ -402,6 +538,15 @@ impl Metrics {
     pub fn inc_retried(&self) {
         Self::bump(&self.tasks_retried);
     }
+    /// One dispatch refused by a full namespace quota and returned to the
+    /// queue with its attempt given back.
+    pub fn inc_quota_refusal(&self) {
+        Self::bump(&self.quota_refusals);
+    }
+    /// One task failed for waiting on namespace quota past the bound.
+    pub fn inc_quota_wait_expired(&self) {
+        Self::bump(&self.quota_wait_expired);
+    }
     /// One failed attempt attributed to `class`. Counted whether or not the
     /// attempt is retried — the question "what is breaking" is asked separately
     /// from "what did we give up on".
@@ -420,6 +565,22 @@ impl Metrics {
     /// One soft SLA deadline alert emitted (spec `deadline`).
     pub fn inc_deadline_alerts(&self) {
         Self::bump(&self.deadline_alerts);
+    }
+    /// One run let in after waiting for its workflow's cap (spec `when_full`).
+    pub fn inc_runs_admitted(&self) {
+        Self::bump(&self.runs_admitted);
+    }
+    /// One pull of an image, of `secs`, that ended `ok` or not.
+    pub fn observe_image_pull(&self, secs: f64, ok: bool) {
+        Self::bump(&self.image_pulls);
+        if !ok {
+            Self::bump(&self.image_pull_failures);
+        }
+        self.image_pull.observe(secs);
+    }
+    /// One image a task was given without a pull.
+    pub fn inc_image_cache_hits(&self) {
+        Self::bump(&self.image_cache_hits);
     }
     /// One schedule fire skipped by a `when:` gate.
     pub fn inc_schedule_gated(&self) {
@@ -465,6 +626,77 @@ impl Metrics {
     /// One wall-clock step caught by the clock detector.
     pub fn inc_clock_steps(&self) {
         Self::bump(&self.clock_steps);
+    }
+    /// The notifications one wait of the reconcile loop's waker took.
+    pub fn add_notifications(&self, taken: usize) {
+        self.notifications
+            .fetch_add(taken as u64, Ordering::Relaxed);
+    }
+    /// The runs one slice of the slow sweep found ended.
+    pub fn add_reaped_by_sweep(&self, runs: usize) {
+        self.reaped_by_sweep
+            .fetch_add(runs as u64, Ordering::Relaxed);
+    }
+    /// How many of the datastore's indexes the last look found INVALID.
+    pub fn set_db_invalid_indexes(&self, indexes: usize) {
+        self.db_invalid_indexes
+            .store(indexes as u64, Ordering::Relaxed);
+    }
+    /// The limits a read found (`crate::connections`), each scope named with
+    /// `prefix` before it: `""` for the engine's datastore, `"control_"` for
+    /// the control DB.
+    pub fn set_db_connections(&self, prefix: &str, limits: &crate::connections::Limits) {
+        let mut scopes = self
+            .db_connections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (scope, limit, sessions) in limits.scopes() {
+            scopes.insert(format!("{prefix}{scope}"), (limit, sessions));
+        }
+    }
+    /// One pass of a sweep on this engine: how long it took and how many
+    /// rows it acted on.
+    pub fn sweep_ran(&self, sweep: Sweep, took: Duration, rows: usize) {
+        let i = sweep as usize;
+        Self::bump(&self.sweep_passes[i]);
+        self.sweep_micros[i].fetch_add(took.as_micros() as u64, Ordering::Relaxed);
+        self.sweep_rows[i].fetch_add(rows as u64, Ordering::Relaxed);
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        self.sweep_last_pass_millis[i].store(now, Ordering::Relaxed);
+    }
+    /// A window of a sweep this engine left to the engine that took its slot.
+    pub fn sweep_elsewhere(&self, sweep: Sweep) {
+        Self::bump(&self.sweep_elsewhere[sweep as usize]);
+    }
+    /// A sweep's interval on this engine, as it was set at start; zero for
+    /// one switched off here.
+    pub fn set_sweep_interval(&self, sweep: Sweep, every: Duration) {
+        self.sweep_interval_millis[sweep as usize]
+            .store(every.as_millis() as u64, Ordering::Relaxed);
+    }
+    /// How long after it fell due a sweep acted on one thing, in seconds.
+    pub fn observe_sweep_lateness(&self, sweep: Sweep, secs: f64) {
+        self.sweep_lateness[sweep as usize].observe(secs);
+    }
+    /// What one pass of the log store's GC removed: files and objects, and
+    /// their bytes.
+    pub fn add_log_store_removed(&self, objects: u64, bytes: u64) {
+        self.log_store_removed_objects
+            .fetch_add(objects, Ordering::Relaxed);
+        self.log_store_removed_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+    /// The removals one pass of the log store's GC failed to make.
+    pub fn add_log_sweep_failures(&self, failed: usize) {
+        self.log_sweep_failures
+            .fetch_add(failed as u64, Ordering::Relaxed);
+    }
+    /// One attempt whose log reached its cap, and the bytes of what the task
+    /// wrote that its log left out.
+    pub fn add_log_capped(&self, omitted: usize) {
+        Self::bump(&self.logs_capped);
+        self.log_bytes_omitted
+            .fetch_add(omitted as u64, Ordering::Relaxed);
     }
     /// One run materialized by the auto-backfill catch-up sweep (QW3 auto-catchup).
     #[cfg(feature = "enterprise")]
@@ -553,7 +785,7 @@ impl Metrics {
     pub fn render(&self, snap: &MetricsSnapshot, pool: Option<&DbPoolStats>) -> String {
         let mut out = String::with_capacity(2048);
 
-        let counters: [(&str, &str, u64); 18] = [
+        let counters: [(&str, &str, u64); 31] = [
             ("scheduler_runs_created_total", "Runs created by this scheduler since boot.",
              self.runs_created.load(Ordering::Relaxed)),
             ("scheduler_tasks_dispatched_total", "Tasks dispatched to the worker pool.",
@@ -570,6 +802,14 @@ impl Metrics {
              self.runs_deadline_exceeded.load(Ordering::Relaxed)),
             ("scheduler_deadline_alerts_total", "Soft SLA deadline alerts emitted (deadline).",
              self.deadline_alerts.load(Ordering::Relaxed)),
+            ("scheduler_runs_admitted_total", "Runs this scheduler let in after they waited for their workflow's max_active_runs (when_full).",
+             self.runs_admitted.load(Ordering::Relaxed)),
+            ("scheduler_image_pulls_total", "Pulls of a task's, a service's or a step's image this engine's executor made.",
+             self.image_pulls.load(Ordering::Relaxed)),
+            ("scheduler_image_pull_failures_total", "Pulls of an image that failed.",
+             self.image_pull_failures.load(Ordering::Relaxed)),
+            ("scheduler_image_cache_hits_total", "Images a task was given without a pull: held on the host already, or pinned to a digest for its run.",
+             self.image_cache_hits.load(Ordering::Relaxed)),
             ("scheduler_cache_hits_total", "Tasks resolved from the memoization cache without executing.",
              self.cache_hits.load(Ordering::Relaxed)),
             ("scheduler_external_orphans_total", "Remote jobs (defer:) this engine gave up tearing down — each one may still be running and consuming cluster-hours.",
@@ -590,6 +830,24 @@ impl Metrics {
              self.admission_refused_gate.load(Ordering::Relaxed)),
             ("scheduler_clock_steps_total", "Wall-clock steps caught by the clock detector (wall vs monotonic past DAGRON_CLOCK_STEP_TOLERANCE_MS).",
              self.clock_steps.load(Ordering::Relaxed)),
+            ("scheduler_quota_refusals_total", "Dispatches refused by a full Kubernetes namespace ResourceQuota and returned to the queue without consuming an attempt.",
+             self.quota_refusals.load(Ordering::Relaxed)),
+            ("scheduler_quota_wait_expired_total", "Tasks failed after waiting on namespace quota past DAGRON_QUOTA_WAIT_MAX_SECS.",
+             self.quota_wait_expired.load(Ordering::Relaxed)),
+            ("scheduler_notifications_total", "Datastore notifications the reconcile loop took (Postgres LISTEN/NOTIFY). Those waiting together are taken together and make one tick.",
+             self.notifications.load(Ordering::Relaxed)),
+            ("scheduler_runs_reaped_by_sweep_total", "Runs the slow sweep of running runs found ended before the reconcile loop had taken a notification that named them.",
+             self.reaped_by_sweep.load(Ordering::Relaxed)),
+            ("scheduler_log_store_removed_objects_total", "Files and objects the log store's GC removed: of tasks whose rows are gone, and of writings of a log a later one took the place of.",
+             self.log_store_removed_objects.load(Ordering::Relaxed)),
+            ("scheduler_log_store_removed_bytes_total", "Bytes, as stored, of what the log store's GC removed.",
+             self.log_store_removed_bytes.load(Ordering::Relaxed)),
+            ("scheduler_log_sweep_failures_total", "Removals the log store's GC tried and the store refused or did not answer; each is tried again later.",
+             self.log_sweep_failures.load(Ordering::Relaxed)),
+            ("scheduler_task_logs_capped_total", "Attempts whose log reached DAGRON_LOG_TASK_CAP_BYTES.",
+             self.logs_capped.load(Ordering::Relaxed)),
+            ("scheduler_task_log_bytes_omitted_total", "Bytes of task output left out of the middle of logs past their cap, counted before masking.",
+             self.log_bytes_omitted.load(Ordering::Relaxed)),
         ];
         for (name, help, value) in counters {
             let _ = writeln!(out, "# HELP {name} {help}");
@@ -657,7 +915,8 @@ impl Metrics {
             );
         }
 
-        // Datastore gauges (whole-cluster truth, read per scrape).
+        // Datastore gauges (whole-cluster truth; the engine may serve them from
+        // a cache, the finished statuses from a longer one).
         let _ = writeln!(out, "# HELP scheduler_runs Workflow runs grouped by status.");
         let _ = writeln!(out, "# TYPE scheduler_runs gauge");
         for (status, count) in &snap.runs_by_status {
@@ -680,6 +939,60 @@ impl Metrics {
         let _ = writeln!(out, "# HELP scheduler_queue_depth Ready tasks awaiting dispatch (backlog).");
         let _ = writeln!(out, "# TYPE scheduler_queue_depth gauge");
         let _ = writeln!(out, "scheduler_queue_depth {queue_depth}");
+
+        // The part of that backlog waiting on a Kubernetes namespace quota, and
+        // how long the longest wait has run. Emitted at zero as well: the age
+        // is the alert signal, and a gauge that only appears once something is
+        // already waiting cannot be alerted on before then.
+        let quota_wait = crate::quota_wait::QuotaWaitStats {
+            waiting: snap.quota_waiting,
+            oldest_since: snap.quota_wait_oldest_since.clone(),
+        };
+        let _ = writeln!(out, "# HELP scheduler_tasks_waiting_on_quota Ready tasks whose pod was refused by a full Kubernetes namespace ResourceQuota and are waiting to be dispatched again (a subset of scheduler_queue_depth).");
+        let _ = writeln!(out, "# TYPE scheduler_tasks_waiting_on_quota gauge");
+        let _ = writeln!(out, "scheduler_tasks_waiting_on_quota {}", quota_wait.waiting);
+        let _ = writeln!(out, "# HELP scheduler_quota_wait_oldest_age_seconds Seconds since the first refusal of the task that has waited on namespace quota longest (0 when none is waiting).");
+        let _ = writeln!(out, "# TYPE scheduler_quota_wait_oldest_age_seconds gauge");
+        let _ = writeln!(out, "scheduler_quota_wait_oldest_age_seconds {}", quota_wait.oldest_age_secs(chrono::Utc::now()));
+
+        // The log store's GC: the tasks it is to look at, those
+        // its last removal failed for, and how long the oldest has waited.
+        // At zero as well, like the quota gauges: an alert is written on the
+        // age and on the failing.
+        let sweeps_age = snap
+            .log_sweeps_oldest_marked_at
+            .as_deref()
+            .and_then(|since| chrono::DateTime::parse_from_rfc3339(since).ok())
+            .map_or(0, |since| {
+                (chrono::Utc::now() - since.with_timezone(&chrono::Utc))
+                    .num_seconds()
+                    .max(0)
+            });
+        let (waiting, failing) = (snap.log_sweeps_waiting, snap.log_sweeps_failing);
+        let _ = writeln!(out, "# HELP scheduler_log_sweeps_waiting Tasks the log store's GC is to look at: rows gone, or a writing of a log taken the place of (log_sweeps).");
+        let _ = writeln!(out, "# TYPE scheduler_log_sweeps_waiting gauge");
+        let _ = writeln!(out, "scheduler_log_sweeps_waiting {waiting}");
+        let _ = writeln!(out, "# HELP scheduler_log_sweeps_failing Tasks whose last removal from the log store failed, to be tried again.");
+        let _ = writeln!(out, "# TYPE scheduler_log_sweeps_failing gauge");
+        let _ = writeln!(out, "scheduler_log_sweeps_failing {failing}");
+        let _ = writeln!(out, "# HELP scheduler_log_sweeps_oldest_age_seconds Seconds since the oldest task the log store's GC is to look at was recorded (0 when none is).");
+        let _ = writeln!(out, "# TYPE scheduler_log_sweeps_oldest_age_seconds gauge");
+        let _ = writeln!(out, "scheduler_log_sweeps_oldest_age_seconds {sweeps_age}");
+
+        // Runs made and waiting for their workflow's cap (`when_full`), and how
+        // long the longest has waited. At zero as well, like the quota gauges
+        // and for their reason: the age is what an alert is written on.
+        let runs_waiting_age = snap
+            .runs_waiting_oldest_since
+            .as_deref()
+            .and_then(|since| chrono::DateTime::parse_from_rfc3339(since).ok())
+            .map_or(0, |since| (chrono::Utc::now() - since.with_timezone(&chrono::Utc)).num_seconds().max(0));
+        let _ = writeln!(out, "# HELP scheduler_runs_waiting Runs that were made while their workflow's max_active_runs was full and wait for a turn (when_full): they have started nothing.");
+        let _ = writeln!(out, "# TYPE scheduler_runs_waiting gauge");
+        let _ = writeln!(out, "scheduler_runs_waiting {}", snap.runs_waiting);
+        let _ = writeln!(out, "# HELP scheduler_runs_waiting_oldest_age_seconds Seconds the run that has waited longest for its workflow's max_active_runs has waited (0 when none waits).");
+        let _ = writeln!(out, "# TYPE scheduler_runs_waiting_oldest_age_seconds gauge");
+        let _ = writeln!(out, "scheduler_runs_waiting_oldest_age_seconds {runs_waiting_age}");
 
         // Per-runner-class backlog (runner segmentation). The age gauge is the
         // unclaimable-class alarm signal: a class no live scheduler serves
@@ -769,6 +1082,11 @@ impl Metrics {
             &mut out,
             "scheduler_dispatch_latency_seconds",
             "Task became-claimable (scheduled_at) to handed-to-a-worker.",
+        );
+        self.image_pull.render_into(
+            &mut out,
+            "scheduler_image_pull_seconds",
+            "How long a pull of an image took, to its end or its failure.",
         );
         self.result_wait.render_into(
             &mut out,
@@ -899,8 +1217,140 @@ impl Metrics {
             let _ = writeln!(out, "# TYPE scheduler_db_pool_max gauge");
             let _ = writeln!(out, "scheduler_db_pool_max {}", p.max);
         }
+        // Looked for as the engine starts and every five minutes after: an
+        // index is left INVALID by a build that was cut short, and is clear
+        // at the next look once it has been rebuilt.
+        let _ = writeln!(out, "# HELP scheduler_db_invalid_indexes Datastore indexes an interrupted build left INVALID, as this engine last looked (at start, then every 5 minutes; REINDEX INDEX CONCURRENTLY each; alert on > 0).");
+        let _ = writeln!(out, "# TYPE scheduler_db_invalid_indexes gauge");
+        let _ = writeln!(
+            out,
+            "scheduler_db_invalid_indexes {}",
+            self.db_invalid_indexes.load(Ordering::Relaxed)
+        );
+        // The limits over the engine's sessions, read as it starts and every
+        // five minutes after. Only a scope that has a limit has a
+        // limit sample; every scope read has its sessions.
+        {
+            let scopes = self
+                .db_connections
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !scopes.is_empty() {
+                let _ = writeln!(out, "# HELP scheduler_db_connection_limit The connection limits over this engine's sessions, as it last read them (at start, then every 5 minutes): database is its database's CONNECTION LIMIT, login its login's, server max_connections less the reserved slots; control_ the same on the control DB. Absent where there is none. A read that fails leaves the last one.");
+                let _ = writeln!(out, "# TYPE scheduler_db_connection_limit gauge");
+                for (scope, (limit, _)) in scopes.iter() {
+                    if let Some(limit) = limit {
+                        let _ = writeln!(
+                            out,
+                            "scheduler_db_connection_limit{{scope=\"{scope}\"}} {limit}"
+                        );
+                    }
+                }
+                let _ = writeln!(out, "# HELP scheduler_db_connection_sessions The sessions under each of scheduler_db_connection_limit's scopes, as this engine last read them: database and login count every login's sessions (database with its autovacuum and parallel workers), server every login's client sessions where its login has pg_read_all_stats, else its own.");
+                let _ = writeln!(out, "# TYPE scheduler_db_connection_sessions gauge");
+                for (scope, (_, sessions)) in scopes.iter() {
+                    let _ = writeln!(
+                        out,
+                        "scheduler_db_connection_sessions{{scope=\"{scope}\"}} {sessions}"
+                    );
+                }
+            }
+        }
+        // How old the finished runs and tasks, and the recent runs, are in
+        // the gauges above: they are read less often than the rest.
+        let _ = writeln!(out, "# HELP scheduler_metrics_history_age_seconds Seconds since the history in the datastore gauges (finished runs and tasks by status, and the finished runs of the last 24 hours) was read (METRICS_HISTORY_CACHE_SECS).");
+        let _ = writeln!(out, "# TYPE scheduler_metrics_history_age_seconds gauge");
+        let _ = writeln!(
+            out,
+            "scheduler_metrics_history_age_seconds {}",
+            snap.history_age_secs
+        );
 
+        self.render_sweeps(&mut out);
         out
+    }
+
+    /// The reconcile loop's sweeps, every one at zero too, as
+    /// the fault classes are: a series that appears only once its sweep has
+    /// run cannot be alerted on before then.
+    #[cfg(feature = "ops")]
+    fn render_sweeps(&self, out: &mut String) {
+        let load =
+            |a: &[AtomicU64; Sweep::ALL.len()], s: Sweep| a[s as usize].load(Ordering::Relaxed);
+        let _ = writeln!(out, "# HELP scheduler_sweep_passes_total Windows of each of the reconcile loop's sweeps: run on this engine (ran), or left to the engine that took the sweep's slot (elsewhere).");
+        let _ = writeln!(out, "# TYPE scheduler_sweep_passes_total counter");
+        for s in Sweep::ALL {
+            let name = s.name();
+            let _ = writeln!(
+                out,
+                "scheduler_sweep_passes_total{{sweep=\"{name}\",outcome=\"ran\"}} {}",
+                load(&self.sweep_passes, s)
+            );
+            let _ = writeln!(
+                out,
+                "scheduler_sweep_passes_total{{sweep=\"{name}\",outcome=\"elsewhere\"}} {}",
+                load(&self.sweep_elsewhere, s)
+            );
+        }
+        let _ = writeln!(
+            out,
+            "# HELP scheduler_sweep_seconds_total Time each sweep's passes took on this engine."
+        );
+        let _ = writeln!(out, "# TYPE scheduler_sweep_seconds_total counter");
+        for s in Sweep::ALL {
+            let _ = writeln!(
+                out,
+                "scheduler_sweep_seconds_total{{sweep=\"{}\"}} {}",
+                s.name(),
+                load(&self.sweep_micros, s) as f64 / 1_000_000.0
+            );
+        }
+        let _ = writeln!(
+            out,
+            "# HELP scheduler_sweep_rows_total Rows each sweep's passes acted on, on this engine."
+        );
+        let _ = writeln!(out, "# TYPE scheduler_sweep_rows_total counter");
+        for s in Sweep::ALL {
+            let _ = writeln!(
+                out,
+                "scheduler_sweep_rows_total{{sweep=\"{}\"}} {}",
+                s.name(),
+                load(&self.sweep_rows, s)
+            );
+        }
+        let _ = writeln!(out, "# HELP scheduler_sweep_last_pass_timestamp_seconds Unix time each sweep last ran on this engine, with or without anything to do (0 for never); the newest across engines is when it last ran at all.");
+        let _ = writeln!(
+            out,
+            "# TYPE scheduler_sweep_last_pass_timestamp_seconds gauge"
+        );
+        for s in Sweep::ALL {
+            let _ = writeln!(
+                out,
+                "scheduler_sweep_last_pass_timestamp_seconds{{sweep=\"{}\"}} {}",
+                s.name(),
+                load(&self.sweep_last_pass_millis, s) as f64 / 1000.0
+            );
+        }
+        let _ = writeln!(out, "# HELP scheduler_sweep_interval_seconds Each sweep's interval on this engine (SWEEP_INTERVAL_MS, SWEEP_INTERVALS); 0 for a sweep switched off here.");
+        let _ = writeln!(out, "# TYPE scheduler_sweep_interval_seconds gauge");
+        for s in Sweep::ALL {
+            let _ = writeln!(
+                out,
+                "scheduler_sweep_interval_seconds{{sweep=\"{}\"}} {}",
+                s.name(),
+                load(&self.sweep_interval_millis, s) as f64 / 1000.0
+            );
+        }
+        let name = "scheduler_sweep_lateness_seconds";
+        let _ = writeln!(out, "# HELP {name} How long after it fell due a sweep acted on a sensor, a deadline or a gate, on this engine.");
+        let _ = writeln!(out, "# TYPE {name} histogram");
+        for s in Sweep::ALL.into_iter().filter(|s| s.has_lateness()) {
+            self.sweep_lateness[s as usize].render_labeled(
+                out,
+                name,
+                &format!("sweep=\"{}\"", s.name()),
+            );
+        }
     }
 }
 
@@ -1170,8 +1620,13 @@ mod tests {
         m.inc_admission_refused_disk();
         m.inc_clock_steps();
         m.inc_clock_steps();
+        m.add_notifications(1);
+        m.add_notifications(499);
+        m.add_reaped_by_sweep(3);
         crate::clock::publish(crate::clock::ClockStatus::drifted(-2_500, "step"));
         let text = m.render(&snap, None);
+        assert!(text.contains("scheduler_notifications_total 500"), "{text}");
+        assert!(text.contains("scheduler_runs_reaped_by_sweep_total 3"), "{text}");
         assert!(text.contains("scheduler_claims_paused 1"), "{text}");
         assert!(text.contains("scheduler_admission_refused_disk_total 1"), "{text}");
         assert!(text.contains("scheduler_clock_steps_total 2"), "{text}");
@@ -1184,6 +1639,237 @@ mod tests {
         assert!(text.contains("scheduler_clock_confidence 0"), "{text}");
         crate::clock::publish(crate::clock::ClockStatus::unknown());
         assert!(m.render(&snap, None).contains("scheduler_clock_confidence 2"));
+    }
+
+    /// The quota series are there from the first scrape — a counter that only
+    /// appears after its first refusal cannot be alerted on with `increase()`
+    /// over a window that predates it — and the two gauges follow the
+    /// datastore snapshot. A refusal moves neither the failed nor the retried
+    /// counter.
+    #[test]
+    fn quota_wait_series_render_at_zero_and_follow_the_snapshot() {
+        // Whole lines, so `… 3` cannot be satisfied by `… 30`.
+        fn has(text: &str, line: &str) -> bool {
+            text.lines().any(|l| l == line)
+        }
+        let m = Metrics::new();
+        let text = m.render(&MetricsSnapshot::default(), None);
+        for line in [
+            "scheduler_quota_refusals_total 0",
+            "scheduler_quota_wait_expired_total 0",
+            "scheduler_tasks_waiting_on_quota 0",
+            "scheduler_quota_wait_oldest_age_seconds 0",
+        ] {
+            assert!(has(&text, line), "missing `{line}`: {text}");
+        }
+        assert!(text.contains("# TYPE scheduler_quota_refusals_total counter"));
+        assert!(text.contains("# TYPE scheduler_tasks_waiting_on_quota gauge"));
+        assert!(text.contains("# TYPE scheduler_quota_wait_oldest_age_seconds gauge"));
+
+        // The runs that wait for their workflow's cap, the same way: there
+        // from the first scrape, at zero.
+        assert!(text.contains("scheduler_runs_admitted_total 0\n"), "{text}");
+        assert!(text.contains("scheduler_runs_waiting 0\n"), "{text}");
+        assert!(text.contains("scheduler_runs_waiting_oldest_age_seconds 0\n"), "{text}");
+
+        m.inc_quota_refusal();
+        m.inc_quota_refusal();
+        m.inc_quota_wait_expired();
+        m.inc_runs_admitted();
+        let snap = MetricsSnapshot {
+            quota_waiting: 3,
+            quota_wait_oldest_since: Some(
+                (chrono::Utc::now() - chrono::TimeDelta::seconds(120)).to_rfc3339(),
+            ),
+            runs_waiting: 2,
+            runs_waiting_oldest_since: Some(
+                (chrono::Utc::now() - chrono::TimeDelta::seconds(300)).to_rfc3339(),
+            ),
+            ..Default::default()
+        };
+        let text = m.render(&snap, None);
+        assert!(text.contains("scheduler_runs_admitted_total 1\n"), "{text}");
+        assert!(text.contains("scheduler_runs_waiting 2\n"), "{text}");
+        let waited: i64 = text
+            .lines()
+            .find_map(|line| line.strip_prefix("scheduler_runs_waiting_oldest_age_seconds "))
+            .and_then(|age| age.parse().ok())
+            .expect("the age of the longest wait");
+        assert!((300..=305).contains(&waited), "{waited}");
+        assert!(has(&text, "scheduler_quota_refusals_total 2"), "{text}");
+        assert!(has(&text, "scheduler_quota_wait_expired_total 1"), "{text}");
+        assert!(has(&text, "scheduler_tasks_waiting_on_quota 3"), "{text}");
+        let age_line = text
+            .lines()
+            .find(|l| l.starts_with("scheduler_quota_wait_oldest_age_seconds "))
+            .expect("oldest-wait age gauge present");
+        let age: i64 = age_line.rsplit(' ').next().unwrap().parse().unwrap();
+        assert!((115..=130).contains(&age), "age ~120s, got {age}");
+        assert!(has(&text, "scheduler_tasks_failed_total 0"), "{text}");
+        assert!(has(&text, "scheduler_tasks_retried_total 0"), "{text}");
+    }
+
+    /// The log store's GC: its counters add up what each pass removed and
+    /// failed to, and its gauges follow the snapshot, all of them there at
+    /// zero from the first scrape.
+    #[test]
+    fn the_log_store_s_gc_series_add_up_and_follow_the_snapshot() {
+        fn has(text: &str, line: &str) -> bool {
+            text.lines().any(|l| l == line)
+        }
+        let m = Metrics::new();
+        let text = m.render(&MetricsSnapshot::default(), None);
+        for line in [
+            "scheduler_log_store_removed_objects_total 0",
+            "scheduler_log_store_removed_bytes_total 0",
+            "scheduler_log_sweep_failures_total 0",
+            "scheduler_log_sweeps_waiting 0",
+            "scheduler_log_sweeps_failing 0",
+            "scheduler_log_sweeps_oldest_age_seconds 0",
+        ] {
+            assert!(has(&text, line), "missing `{line}`: {text}");
+        }
+        assert!(text.contains("# TYPE scheduler_log_store_removed_objects_total counter"));
+        assert!(text.contains("# TYPE scheduler_log_sweeps_oldest_age_seconds gauge"));
+
+        m.add_log_store_removed(5, 4096);
+        m.add_log_store_removed(2, 100);
+        m.add_log_sweep_failures(3);
+        let snap = MetricsSnapshot {
+            log_sweeps_waiting: 7,
+            log_sweeps_failing: 2,
+            log_sweeps_oldest_marked_at: Some(
+                (chrono::Utc::now() - chrono::TimeDelta::seconds(90)).to_rfc3339(),
+            ),
+            ..Default::default()
+        };
+        let text = m.render(&snap, None);
+        assert!(
+            has(&text, "scheduler_log_store_removed_objects_total 7"),
+            "{text}"
+        );
+        assert!(
+            has(&text, "scheduler_log_store_removed_bytes_total 4196"),
+            "{text}"
+        );
+        assert!(has(&text, "scheduler_log_sweep_failures_total 3"), "{text}");
+        assert!(has(&text, "scheduler_log_sweeps_waiting 7"), "{text}");
+        assert!(has(&text, "scheduler_log_sweeps_failing 2"), "{text}");
+        let age: i64 = text
+            .lines()
+            .find_map(|line| line.strip_prefix("scheduler_log_sweeps_oldest_age_seconds "))
+            .and_then(|age| age.parse().ok())
+            .expect("the age of the oldest record");
+        assert!((90..=95).contains(&age), "{age}");
+    }
+
+    /// The logs that reached their cap, and what their middles left out:
+    /// there at zero from the first scrape, and adding up.
+    #[test]
+    fn the_capped_logs_series_add_up() {
+        fn has(text: &str, line: &str) -> bool {
+            text.lines().any(|l| l == line)
+        }
+        let m = Metrics::new();
+        let text = m.render(&MetricsSnapshot::default(), None);
+        assert!(has(&text, "scheduler_task_logs_capped_total 0"), "{text}");
+        assert!(
+            has(&text, "scheduler_task_log_bytes_omitted_total 0"),
+            "{text}"
+        );
+        assert!(text.contains("# TYPE scheduler_task_logs_capped_total counter"));
+        m.add_log_capped(1_288_490_188);
+        m.add_log_capped(0);
+        let text = m.render(&MetricsSnapshot::default(), None);
+        assert!(has(&text, "scheduler_task_logs_capped_total 2"), "{text}");
+        assert!(
+            has(&text, "scheduler_task_log_bytes_omitted_total 1288490188"),
+            "{text}"
+        );
+    }
+
+    /// The invalid-index gauge is there at zero from the first scrape, and
+    /// says what the last look found.
+    #[test]
+    fn the_invalid_index_gauge_is_there_at_zero_and_says_what_was_found() {
+        let m = Metrics::new();
+        let text = m.render(&MetricsSnapshot::default(), None);
+        assert!(
+            text.lines().any(|l| l == "scheduler_db_invalid_indexes 0"),
+            "{text}"
+        );
+        assert!(text.contains("# TYPE scheduler_db_invalid_indexes gauge"));
+        m.set_db_invalid_indexes(2);
+        let text = m.render(&MetricsSnapshot::default(), None);
+        assert!(
+            text.lines().any(|l| l == "scheduler_db_invalid_indexes 2"),
+            "{text}"
+        );
+    }
+
+    /// Every sweep has its series from the first scrape, at zero, and a pass
+    /// or a window left to another engine moves its own alone.
+    #[test]
+    fn every_sweep_renders_at_zero() {
+        let m = Metrics::new();
+        let text = m.render(&MetricsSnapshot::default(), None);
+        for s in Sweep::ALL {
+            let name = s.name();
+            for line in [
+                format!("scheduler_sweep_passes_total{{sweep=\"{name}\",outcome=\"ran\"}} 0"),
+                format!("scheduler_sweep_passes_total{{sweep=\"{name}\",outcome=\"elsewhere\"}} 0"),
+                format!("scheduler_sweep_seconds_total{{sweep=\"{name}\"}} 0"),
+                format!("scheduler_sweep_rows_total{{sweep=\"{name}\"}} 0"),
+                format!("scheduler_sweep_last_pass_timestamp_seconds{{sweep=\"{name}\"}} 0"),
+                format!("scheduler_sweep_interval_seconds{{sweep=\"{name}\"}} 0"),
+            ] {
+                assert!(text.lines().any(|l| l == line), "missing {line}");
+            }
+        }
+        assert!(text.contains("\nscheduler_metrics_history_age_seconds 0\n"));
+
+        m.set_sweep_interval(Sweep::Waits, Duration::from_millis(500));
+        m.sweep_ran(Sweep::Waits, Duration::from_millis(250), 3);
+        m.sweep_elsewhere(Sweep::Leases);
+        let text = m.render(&MetricsSnapshot::default(), None);
+        for line in [
+            "scheduler_sweep_passes_total{sweep=\"waits\",outcome=\"ran\"} 1",
+            "scheduler_sweep_passes_total{sweep=\"waits\",outcome=\"elsewhere\"} 0",
+            "scheduler_sweep_passes_total{sweep=\"leases\",outcome=\"elsewhere\"} 1",
+            "scheduler_sweep_seconds_total{sweep=\"waits\"} 0.25",
+            "scheduler_sweep_rows_total{sweep=\"waits\"} 3",
+            "scheduler_sweep_interval_seconds{sweep=\"waits\"} 0.5",
+        ] {
+            assert!(text.lines().any(|l| l == line), "missing {line}");
+        }
+        assert!(!text.contains("scheduler_sweep_last_pass_timestamp_seconds{sweep=\"waits\"} 0\n"));
+    }
+
+    /// The lateness histogram has a series for each sweep that can say how
+    /// late it was, with its own buckets, and none for the others.
+    #[test]
+    fn sweep_lateness_has_its_buckets() {
+        let m = Metrics::new();
+        m.observe_sweep_lateness(Sweep::Waits, 0.3);
+        m.observe_sweep_lateness(Sweep::Waits, 400.0);
+        let text = m.render(&MetricsSnapshot::default(), None);
+        assert!(text.contains("# TYPE scheduler_sweep_lateness_seconds histogram"));
+        for line in [
+            "scheduler_sweep_lateness_seconds_bucket{sweep=\"waits\",le=\"0.25\"} 0",
+            "scheduler_sweep_lateness_seconds_bucket{sweep=\"waits\",le=\"0.5\"} 1",
+            "scheduler_sweep_lateness_seconds_bucket{sweep=\"waits\",le=\"300\"} 1",
+            "scheduler_sweep_lateness_seconds_bucket{sweep=\"waits\",le=\"+Inf\"} 2",
+            "scheduler_sweep_lateness_seconds_count{sweep=\"waits\"} 2",
+            "scheduler_sweep_lateness_seconds_count{sweep=\"deadlines\"} 0",
+        ] {
+            assert!(text.lines().any(|l| l == line), "missing {line}");
+        }
+        let buckets = text
+            .lines()
+            .filter(|l| l.starts_with("scheduler_sweep_lateness_seconds_bucket{sweep=\"alerts\""))
+            .count();
+        assert_eq!(buckets, LATENESS_BUCKETS.len() + 1);
+        assert!(!text.contains("scheduler_sweep_lateness_seconds_count{sweep=\"leases\"}"));
     }
 
     /// `observe` lands a value in the correct cumulative bucket and ignores

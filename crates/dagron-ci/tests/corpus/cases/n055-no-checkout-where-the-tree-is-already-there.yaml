@@ -1,0 +1,10 @@
+shows: With the checkout setting off, as dagron-ci run has it, a workspace fetches nothing
+settings: { checkout: false }
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: build
+      steps:
+        - run: make

@@ -1,0 +1,20 @@
+shows: A workflow_dispatch's inputs are read from the dispatch, each with its default
+front: github
+event: { kind: dispatch, inputs: { environment: staging } }
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on:
+    workflow_dispatch:
+      inputs:
+        environment:
+          description: Where to deploy
+          required: true
+          default: dev
+        dry_run:
+          type: boolean
+          default: true
+  jobs:
+    deploy:
+      runs-on: ubuntu-latest
+      steps:
+        - run: ./deploy.sh "${{ inputs.environment }}" "${{ inputs.dry_run }}"

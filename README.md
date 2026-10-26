@@ -277,9 +277,13 @@ DB schedules, backfill catch-up) receive their nominal fire time as the
 `{{ scheduled_time }}` parameter (RFC-3339), so a backfilled task can process
 *its* interval rather than "now".
 
-A workflow can report its result back to a Git forge as a commit status — the
-green/red check on the commit that triggered it — with a `notify.git` block
-(active when `GITHUB_TOKEN` / `GITLAB_TOKEN` is set; best-effort):
+A workflow can report itself to a Git forge as a commit status on the commit
+that triggered it, with a `notify.git` block (active when an engine has
+`GITHUB_TOKEN` / `GITLAB_TOKEN` set; best-effort). The check reads `pending`
+from the moment the run exists, then the run's result when it ends: success;
+failure, for a failed run or one past its `run_timeout_secs`; or cancelled,
+which is GitLab's `canceled` and, as GitHub has no cancelled state, `error`
+there:
 
 ```yaml
 name: ci_build
@@ -299,15 +303,19 @@ tasks:
   - { name: build, docker_image: golang:1.23, command: ["make"] }
 ```
 
-Every field there is `{{ param }}`-templated, which is how `sha` picks up the
-SHA the CI caller submitted. Four `run.*` names also resolve, because the things
+Every field there is `{{ param }}`-templated against the parameters the run was
+created with, which is how `sha` picks up the SHA the CI caller submitted: the
+run stores them, since its YAML's `parameters:` block holds only the defaults.
+Four `run.*` names also resolve, because the things
 worth putting in a check are the ones only the engine knows: `{{ run.id }}` (so
 `target_url` can link to the run without the caller passing an id it cannot
 know), `{{ run.workflow }}`, `{{ run.status }}`, and `{{ run.images }}` — the
 distinct task images the spec declares. `description` is worth setting when the
 run *produces* something the reviewer is looking for; left out, the check reads
-`dagron run succeeded` as it always has. Over GitHub's 140-character ceiling the
-text is cut rather than the status being rejected.
+`dagron run succeeded` as it always has. The `pending` check always reads
+`dagron run in progress`, because a run that has just started has produced
+nothing. Over GitHub's 140-character ceiling the text is cut rather than the
+status being rejected.
 
 Operator notifications ride the same `notify:` block: a **Slack incoming
 webhook** (`notify.slack`, fires on `failed` + `deadline_exceeded` by default)
@@ -632,7 +640,7 @@ to run a workflow except the first five rows.
 | `dagron-core` | DAG model + validation, matrix/call expansion, the SQLite/Postgres datastore facade, the metrics registry |
 | `dagron-executor` | the `Executor` trait + Local / Docker / Kubernetes backends, and the ractor worker pool |
 | `dagron-source` | the `WorkflowSource` trait + File / Dir / Stream / Channel sources, and the ingest actor that turns submissions into runs |
-| `dagron-api` | the authenticated UI edge (Postgres-only): `LISTEN/NOTIFY` → SSE, and the console itself at `/` |
+| `dagron-api` | the authenticated UI edge: `LISTEN/NOTIFY` → SSE, and the console itself at `/`. Postgres, or SQLite beside one engine ([docs/ONE_NODE.md](docs/ONE_NODE.md)) |
 | `dagron-mcp` | MCP server over stdio — the management API as agent tools |
 | `dagron-gitops` | optional worker image: polls connected repos and reconciles their specs into the workflows table |
 | `dagron-autopsy` | standalone job autopsy — **schedules nothing**. Joins Slurm `sacct` + DCGM + NCCL logs + InfiniBand counters into a fault-attributed record for a failed GPU job ([`docs/HPC_AUTOPSY.md`](docs/HPC_AUTOPSY.md)) |
@@ -641,9 +649,10 @@ to run a workflow except the first five rows.
 | `dagron-crypto` | secret-value encryption (AES-256-GCM, env-derived key), shared by the engine and the API |
 | `dagron-logging` | the shared `tracing` bootstrap every binary calls first |
 | `dagron-lineage` | OpenLineage emitter — best-effort `RunEvent`s on run finalization, with the run's input and output datasets |
-| `dagron-import` | importers — Argo Workflows specs → dagron YAML |
+| `dagron-import` | importers — Argo Workflows specs → dagron YAML; GitHub Actions workflows, GitLab CI pipelines and Jenkins Declarative Pipelines → dagron-ci pipelines (also `dagron-ci import`, which checks what they write) |
 | `dagron-plan` | spec diff for a pull request: what a workflow change does before it merges |
 | `dagron-forge` | commit statuses / PR checks on GitHub or GitLab when a run finishes |
+| `dagron-ci` | CI on dagron: forge events in, ordinary runs out, statuses back. It verifies and queues GitHub deliveries, polls each repository for what a delivery missed, and takes runs dagron-api users ask for (`POST /ci/v1/runs`). Its workers compile each trusted event's `.dagron/ci` pipelines at its commit and run them through dagron-api, once per commit (the bound workflow, for a commit without pipelines); it posts a commit status per job, and mints each attempt's checkout credential ([`crates/dagron-ci`](crates/dagron-ci/README.md)) |
 | `dagron-step-mcp` | a task that calls a tool on an MCP server, with dagron's retries and artifacts around it |
 
 The full design reference — component diagrams, the task state machine, and
@@ -654,6 +663,8 @@ recovery, queue ingestion, MCP) — is in
 **Reference docs:** [`docs/CONFIG.md`](docs/CONFIG.md) — every env var,
 positional arg, Cargo feature and config file in one table.
 [`docs/API.md`](docs/API.md) — both HTTP surfaces, endpoint by endpoint.
+[`docs/CI.md`](docs/CI.md) — CI on dagron: what it does, what it refuses, with
+a [quickstart](docs/CI_QUICKSTART.md) and the [pipeline reference](docs/CI_PIPELINES.md).
 [`docs/UPGRADING.md`](docs/UPGRADING.md) — the upgrade procedure, and what each
 release asks of you before you start it.
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — deploy, upgrade, backup per
@@ -684,6 +695,7 @@ something else.
 | External dataset events — data landing from CDC, S3 notifications or another orchestrator announcing itself | a small `produces:` task records the dataset once the external load finishes ([DATASETS.md](docs/DATASETS.md)) |
 | Named connections for external compute (`defer.connection:`) | the endpoint rides with the run — `environment:` variables plus `value_from: { secret: … }` ([EXTERNAL_JOBS.md](docs/EXTERNAL_JOBS.md)) |
 | Cost attribution — a vendor's actual invoice reconciled back to the run, workflow and team that caused it | `budget: { external_cost: N }` plus `defer.cost` per task — a ceiling on numbers **you** declared, summed exactly and refused at run creation before anything submits ([EXTERNAL_JOBS.md](docs/EXTERNAL_JOBS.md)) |
+| A token budget held at dispatch (`budget: { tokens }`) — each task's `tokens:` reserved before it runs, and what it reports it spent kept, across a run and the runs it starts | a call's own `max_tokens`, `budget: { tasks: N }`, and a gateway that keeps a budget of each run's own by a claim of its OIDC token; a task's `dagron::tokens=<n>` report line is taken out of its output either way ([AI_WORKLOADS.md](docs/AI_WORKLOADS.md#what-a-model-call-spent)) |
 | Envelope encryption with KMS-wrapped data keys, and the rotation sweep | AES-256-GCM environment secrets under `DAGRON_ENV_SECRET_KEY` ([CONFIG.md](docs/CONFIG.md)) |
 | Managed artifact transfer with resumable chunks and central dedup | one local tier, one remote tier, a byte budget, dedup within the unit |
 

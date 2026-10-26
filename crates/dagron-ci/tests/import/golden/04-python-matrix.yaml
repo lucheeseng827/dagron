@@ -1,0 +1,40 @@
+# Imported from a GitHub Actions workflow by dagron-import.
+#
+# Changed on the way (4):
+#   name: "Python package" is "python-package": a pipeline's name is letters, digits, '.', '_' and '-', and its checks are called by it
+#   jobs.build.steps[1]: actions/setup-python is the job's image, each instance's own, by its python-version: the toolchain is in the image, and no step installs it
+#   jobs: a step that named no shell ran under bash on a runner GitHub hosts, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   jobs: a job that set no timeout had GitHub's six hours, and has dagron-ci's own here (an hour, unless CI_DEFAULT_TIMEOUT_SECS says another): say timeout_secs where a job needs longer
+#
+# Not carried over (1):
+#   jobs.build.strategy.fail-fast: an instance that fails does not stop the others here, whatever this said
+name: python-package
+on:
+  push:
+    branches:
+    - main
+  pull_request:
+    branches:
+    - main
+tasks:
+- name: build
+  docker_image: '{{ item.python_version_image }}'
+  with_items:
+  - python-version: '3.10'
+    python_version_image: docker.io/library/python:3.10-slim-bookworm
+  - python-version: '3.11'
+    python_version_image: docker.io/library/python:3.11-slim-bookworm
+  - python-version: '3.12'
+    python_version_image: docker.io/library/python:3.12-slim-bookworm
+  steps:
+  - name: Install dependencies
+    run: |
+      python -m pip install --upgrade pip
+      python -m pip install flake8 pytest
+      if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+  - name: Lint with flake8
+    run: |
+      flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+  - name: Test with pytest
+    run: |
+      pytest

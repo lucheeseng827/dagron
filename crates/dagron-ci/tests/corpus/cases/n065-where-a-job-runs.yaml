@@ -1,0 +1,14 @@
+shows: A job's runner class, pool, priority and attempts are dagron's own and pass through
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: build
+      runner_class: large
+      pool: ci-large
+      priority: 5
+      max_attempts: 3
+      retry_delay_secs: 30
+      steps:
+        - run: make

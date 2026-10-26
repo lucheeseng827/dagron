@@ -43,6 +43,11 @@ COPY crates/dagron-gitops/Cargo.toml ./crates/dagron-gitops/Cargo.toml
 WORKDIR /app/crates/dagron-gitops
 RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release --bin dagron-gitops
 COPY crates/dagron-gitops/src ./src
+# The release this is built for, which the binary answers `--version` with. A
+# release's build passes it, and any other build says `dev`. Declared here,
+# just before the build, so that the layers above are reused across versions.
+ARG APP_VERSION=dev
+ENV APP_VERSION=$APP_VERSION
 RUN touch src/main.rs && cargo build --release --bin dagron-gitops
 
 # ── Runtime: alpine + git (no shell needed by us, but git wants one) ──────────
@@ -54,10 +59,14 @@ FROM alpine:3.21
 # it every SSH repo fails with "ssh: not found" no matter how good the key is.
 # Alpine's openssh-client pulls only musl/libcrypto — still no perl, which is
 # the property this base image exists to keep.
-RUN apk add --no-cache git openssh-client ca-certificates
+# `nss_wrapper` is for OpenShift, which runs the image as a uid from the
+# namespace's range that no passwd names: OpenSSH refuses such a uid ("No user
+# exists for uid"), and the entrypoint gives it a name through the wrapper.
+RUN apk add --no-cache git openssh-client ca-certificates nss_wrapper
 # Runs as a non-root user: it clones untrusted repository content into a scratch
 # dir, so it should never have been root.
 RUN adduser -S -h /home/gitops -u 10001 -D gitops
-USER gitops
 COPY --from=builder /app/crates/dagron-gitops/target/release/dagron-gitops /usr/local/bin/dagron-gitops
-ENTRYPOINT ["/usr/local/bin/dagron-gitops"]
+COPY crates/dagron-gitops/entrypoint.sh /usr/local/bin/dagron-gitops-entrypoint
+USER gitops
+ENTRYPOINT ["/usr/local/bin/dagron-gitops-entrypoint"]

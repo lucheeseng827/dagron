@@ -1,0 +1,10 @@
+shows: A pull request into a branch the pipeline does not name is passed over
+event: { kind: pull_request, base_ref: release/1.x }
+source: |
+  name: ci
+  on:
+    pull_request: { branches: [main] }
+  tasks:
+    - name: test
+      steps:
+        - run: make test

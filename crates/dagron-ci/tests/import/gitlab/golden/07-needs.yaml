@@ -1,0 +1,54 @@
+# Imported from a GitLab CI pipeline by dagron-import.
+#
+# Changed on the way (3):
+#   image: the pipeline's image is each job's that does not set its own
+#   build-a.script: a job's script ran under bash where its image had bash, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   on.dispatch: a pipeline run from GitLab's page or its API is a run asked for here (dispatch), through the run API
+#
+# Not carried over (4):
+#   build-b.artifacts.paths: a job's files are not kept, and not handed to the jobs after it: its workspace goes with it
+#   nightly-only: no pipeline here has the job: its rules, or its when: never, leave it out of every one
+#   deploy.needs: nightly-only is in no pipeline here, and the job does not wait for it
+#   nightly-only.rules: no pipeline here is a schedule pipeline: a condition that names one never holds here (a schedule asks for a run through the run API, as a dispatch)
+name: 07-needs
+on:
+  push: {}
+  dispatch: {}
+tasks:
+- name: build-a
+  docker_image: alpine:3.20
+  steps:
+  - name: script
+    run: make a
+- name: build-b
+  docker_image: alpine:3.20
+  steps:
+  - name: script
+    run: make b
+- name: test-a
+  docker_image: alpine:3.20
+  depends_on:
+  - build-a
+  steps:
+  - name: script
+    run: make test-a
+- name: test-b
+  docker_image: alpine:3.20
+  depends_on:
+  - build-b
+  steps:
+  - name: script
+    run: make test-b
+- name: lint
+  docker_image: alpine:3.20
+  steps:
+  - name: script
+    run: make lint
+- name: deploy
+  docker_image: alpine:3.20
+  depends_on:
+  - test-a
+  - test-b
+  steps:
+  - name: script
+    run: make deploy

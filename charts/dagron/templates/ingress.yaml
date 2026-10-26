@@ -8,6 +8,11 @@
 # dagron-api, or the deprecated frontend pod when frontend.enabled puts it in front.
 # Same origin means the HttpOnly session cookie set on /api/login is sent on
 # every request. `/api` is listed first (more specific prefix).
+#
+# With dagron-ci and a webhook secret, the forge's webhook comes in here too:
+# /hooks/github, that one path and no other of dagron-ci's. The receiver checks
+# each delivery's signature; its run API and its checkout credentials stay
+# inside the cluster.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -31,6 +36,15 @@ spec:
     - host: {{ .Values.ingress.host | quote }}
       http:
         paths:
+{{- if and .Values.ci.enabled .Values.ci.webhookSecret.name }}
+          - path: /hooks/github
+            pathType: Exact
+            backend:
+              service:
+                name: {{ include "dagron.fullname" . }}-ci
+                port:
+                  number: {{ .Values.ci.port }}
+{{- end }}
           - path: /api
             pathType: Prefix
             backend:

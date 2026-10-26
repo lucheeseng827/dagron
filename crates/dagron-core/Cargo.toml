@@ -64,3 +64,6 @@ tracing = "0.1"
 libc = "0.2"
 # Whole-value matching for `param_schema` patterns (linear-time engine).
 regex = "1"
+# Decrypting an environment's stored secrets (`secrets`), for the engine and
+# for dagron-api alike. Free of sqlx and of this crate, so no cycle.
+dagron-crypto = { path = "../dagron-crypto" }

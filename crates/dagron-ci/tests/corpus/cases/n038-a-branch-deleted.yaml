@@ -1,0 +1,10 @@
+shows: A branch being deleted runs no pipeline
+event: { kind: delete, ref: refs/heads/feature/login }
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: build
+      steps:
+        - run: make

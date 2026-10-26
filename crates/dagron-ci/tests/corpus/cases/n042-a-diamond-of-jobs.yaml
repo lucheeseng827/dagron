@@ -1,0 +1,21 @@
+shows: Jobs that fan out from one job and join in another keep their order
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: build
+      steps:
+        - run: make
+    - name: unit
+      depends_on: [build]
+      steps:
+        - run: make unit
+    - name: lint
+      depends_on: [build]
+      steps:
+        - run: make lint
+    - name: package
+      depends_on: [unit, lint]
+      steps:
+        - run: make package

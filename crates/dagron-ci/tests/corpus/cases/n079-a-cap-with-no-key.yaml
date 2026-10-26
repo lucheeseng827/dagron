@@ -1,0 +1,11 @@
+shows: A cap with no concurrency is the repository's, and a run over it waits its turn
+event: { kind: push }
+source: |
+  name: ci
+  on:
+    push: {}
+  max_active_runs: 2
+  tasks:
+    - name: test
+      steps:
+        - run: make test

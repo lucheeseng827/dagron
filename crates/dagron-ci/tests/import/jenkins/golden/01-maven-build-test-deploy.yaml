@@ -1,0 +1,43 @@
+# Imported from a Jenkinsfile by dagron-import.
+#
+# Changed on the way (8):
+#   on: a multibranch pipeline's builds are each branch and tag pushed, each pull request, and a run asked for (dispatch) here: say on: where it ran for fewer
+#   options.timeout: the run's time is run_timeout_secs
+#   options.disableConcurrentBuilds: a run of a branch or pull request waits for the one before it (concurrency)
+#   stage('Deploy').when: its when is a test at the head of each of its steps, which end there where it is false: the job passes, where Jenkins skipped the stage
+#   stage('Deploy').steps[0]: it reads $BRANCH_NAME: each is set at the head of its script
+#   post.always: the test report is the job's report: what it holds is said with the job
+#   stage('Build').steps[0]: Jenkins's variables a step reads are set at its head from dagron-ci's own (CI_SHA, CI_REF, …): a program it runs that reads one the step does not is not given it
+#   stage('Deploy').steps[0]: $BRANCH_NAME is a branch's or a tag's name, and PR-<number> for a pull request, as a multibranch pipeline has it
+#
+# Not carried over (2):
+#   options.buildDiscarder: an option of Jenkins's that has no place here
+#   post.always: a job's files are not kept: its workspace goes with it
+name: 01-maven-build-test-deploy
+on:
+  push: {}
+  pull_request: {}
+  dispatch: {}
+run_timeout_secs: 1800
+concurrency:
+  key: '{{ ci_group }}'
+tasks:
+- name: build
+  docker_image: maven:3.9-eclipse-temurin-21
+  env:
+  - name: MAVEN_OPTS
+    value: -Xmx1g
+  report:
+    junit:
+    - target/surefire-reports/TEST-app.xml
+  steps:
+  - name: Build
+    run: mvn -B -DskipTests package
+  - name: Test
+    run: mvn -B test
+  - name: Deploy
+    run: |-
+      case "$CI_EVENT" in pull_request) export BRANCH_NAME="PR-$CI_PR" ;; *) export BRANCH_NAME="${CI_REF#refs/*/}" ;; esac
+      # when { branch 'main' }
+      { case "$BRANCH_NAME" in 'main') true ;; *) false ;; esac; } || exit 0
+      ./deploy.sh target/app.jar

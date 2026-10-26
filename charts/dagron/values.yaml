@@ -9,8 +9,21 @@ fullnameOverride: ""
 # that carry one (postgres:16-alpine → <registry>/postgres:16-alpine) and
 # prepends to bare images. Empty = images used verbatim (unchanged).
 #   --set global.imageRegistry=registry.corp.internal
+#
+# `openshift`: whether every pod leaves its uid and fsGroup to the
+# platform. OpenShift's restricted SCCs (restricted-v2, what an ordinary
+# namespace's pods get) give each pod a uid and an fsGroup from the namespace's
+# range and refuse a pod that names its own, so on OpenShift no pod here names
+# either: it runs as the uid it is given, in group 0, which the images'
+# writable directories are open to. The bundled Postgres is held to the same
+# envelope, and the engine gives its task pods none of their own either
+# (DAGRON_TASK_FS_GROUP=none) and the envelope the SCC holds them to.
+#   auto  - when the cluster serves security.openshift.io/v1 (the default)
+#   true  - always (`helm template` with no cluster, say)
+#   false - never: each pod runs as its image's user, as on any other cluster
 global:
   imageRegistry: ""
+  openshift: auto
 
 # imagePullSecrets applied to every pod (e.g. an ECR pull secret).
 # imagePullSecrets:
@@ -55,6 +68,15 @@ engine:
   # Extra environment variables appended verbatim to the engine container — an
   # escape hatch for knobs the chart doesn't model (e.g. queue-source creds).
   extraEnv: []
+  # Workload identity: the engine's own cloud storage (DAGRON_ARTIFACT_URL,
+  # GC_ARCHIVE_URL) is reached as its ServiceAccount: annotate it for GKE
+  # (iam.gke.io/gcp-service-account), Azure (azure.workload.identity/client-id,
+  # with podLabels azure.workload.identity/use: "true") or EKS
+  # (eks.amazonaws.com/role-arn). A task's own identity is a separate matter
+  # (its `service_account:`, DAGRON_TASK_ALLOWED_SERVICE_ACCOUNTS).
+  serviceAccount:
+    annotations: {}
+  podLabels: {}
   resources:
     requests: {cpu: 100m, memory: 128Mi}
     limits: {memory: 512Mi}
@@ -76,6 +98,108 @@ engine:
   # below the engine's keeps a task from preempting its own engine.
   priorityClassName: ""
   taskPriorityClassName: ""
+  # A task that declares `isolation: { network: none }` gets a pod with no
+  # network. With this on, the chart makes the NetworkPolicy that takes it
+  # (dagron-task-no-network: the pods labelled dagron.dev/network=none, with
+  # nothing allowed in and nothing out), lets the engine read it, and tells
+  # the engine that this cluster enforces NetworkPolicy
+  # (DAGRON_TASK_NETWORK_POLICY=enforced). The engine labels such a task's pod
+  # and makes nothing else.
+  #
+  # Turn it on only where the cluster's CNI enforces NetworkPolicy (Calico,
+  # Cilium, and others do). One that stores a policy and does nothing with it
+  # would leave such a task reaching what any other pod does, and nothing in
+  # the API says which kind a cluster has: it is yours to say. Off, a task
+  # that asks for no network is refused. Needs executor "k8s".
+  #
+  # The engine does not start such a task on that word alone. Its pod gets an
+  # init container, last, which waits until the pod is seen to reach nothing
+  # (it asks the cluster's API server and the pod's name servers for a
+  # connection, and goes on once none is made), and the task fails unstarted
+  # if the pod still has a network after 30 seconds. That container runs from
+  # the dagron-ci-exec image, so this needs DAGRON_CI_EXEC_IMAGE, with a
+  # value, in engine.extraEnv, and the chart refuses to render without it:
+  #
+  #   extraEnv:
+  #     - {name: DAGRON_CI_EXEC_IMAGE, value: mancube/dagron-ci-exec:<release>}
+  #
+  # A pod has what ANY NetworkPolicy that selects it allows. If this
+  # namespace has another policy that selects task pods and allows something
+  # ("every pod may reach the name server" is the usual one), a labelled pod
+  # has that back, and the gate does not see it. The engine reads the
+  # namespace's policies as it starts and before each such task, and refuses
+  # beside one. Keep such a policy from these pods by adding
+  # {key: dagron.dev/network, operator: DoesNotExist} to its podSelector's
+  # matchExpressions.
+  #
+  # The policy is kept when the release is upgraded without this or
+  # uninstalled (helm.sh/resource-policy: keep): the tasks it holds are no
+  # part of the release and go on running. Delete it by hand afterwards.
+  taskNetworkPolicy: false
+  # false: the chart does not make the policy, nor the allowlists' below. For
+  # a namespace whose NetworkPolicies are someone else's to apply, or one
+  # where the policies are already there and are not this release's. The
+  # engine is still told, may still read the namespace's policies, and still
+  # refuses to start where one is missing; it prints the policy to apply.
+  taskNetworkPolicyCreate: true
+  # Allowlists, by name. A task that declares
+  # `isolation: { network: allow:<name> }` reaches what the allowlist of that
+  # name lets it, and nothing else: its pod is labelled
+  # dagron.dev/network=allow-<name>, and the chart makes one NetworkPolicy
+  # for each name here (dagron-task-allow-<name>), which allows such a pod
+  # nothing in, and out only the egress rules you give. A task picks a name;
+  # it cannot write a rule. A task that names one not listed here is refused.
+  # Needs taskNetworkPolicy, and everything said of it above holds here too:
+  # the engine reads each policy as it starts, refuses beside another policy
+  # that gives such a pod more, and holds the task until its pod is seen to
+  # be held.
+  #
+  #   taskNetworkAllowlists:
+  #     registry:
+  #       egress:
+  #         - to:
+  #             - ipBlock: {cidr: 203.0.113.10/32}
+  #           ports:
+  #             - {protocol: TCP, port: 443}
+  #         # Name resolution, where the tasks need it. Without a rule for
+  #         # it a task under this allowlist resolves no name.
+  #         - to:
+  #             - namespaceSelector:
+  #                 matchLabels: {kubernetes.io/metadata.name: kube-system}
+  #               podSelector:
+  #                 matchLabels: {k8s-app: kube-dns}
+  #           ports:
+  #             - {protocol: UDP, port: 53}
+  #             - {protocol: TCP, port: 53}
+  #
+  # The rules are NetworkPolicy egress rules, as you would write them. Two
+  # things are refused: a rule with no `to`, which is every address; and an
+  # allowlist that lets a pod reach the cluster's API server, which is how a
+  # pod is seen to be held. The first is refused at render and by the
+  # engine. The second cannot be read from a rule, and shows as tasks under
+  # that allowlist failing unstarted, saying so. A CNI may judge that
+  # connection by the Service's address or by the API server's own, so an
+  # allowlist of private ranges should leave out both.
+  #
+  # A task with a `checkout:` may name an allowlist. Its checkout is fetched
+  # in the same pod, so the list has to allow the forge.
+  #
+  # A NetworkPolicy knows addresses, and nothing of names. To hold a task to
+  # a list of hostnames, run a proxy of your own that allows those names,
+  # give the allowlist a rule to reach it, and name it as the allowlist's
+  # `proxy` (http:// or https://, a host and a port). A task held to the
+  # allowlist is then told it as HTTP_PROXY, HTTPS_PROXY and their lowercase
+  # names, with NO_PROXY for its own loopback and services:
+  #
+  #   taskNetworkAllowlists:
+  #     web:
+  #       proxy: http://egress.dagron.svc:3128
+  #       egress:
+  #         - to:
+  #             - podSelector: {matchLabels: {app: egress}}
+  #           ports:
+  #             - {protocol: TCP, port: 3128}
+  taskNetworkAllowlists: {}
   service:
     type: ClusterIP
 
@@ -100,6 +224,42 @@ postgres:
   resources:
     requests: {cpu: 100m, memory: 128Mi}
     limits: {memory: 256Mi}
+
+# ── Backups ──────────────────────────────────────────────────────────
+# A CronJob that dumps the database (pg_dump, custom format) and sends the dump
+# to `to`, keeping the newest `keep` there (`dagron backup`, in the engine's
+# image). Any database the engine uses: the bundled one or yours. A managed
+# database has its own backups as well (point-in-time recovery); this is the
+# copy you hold, in a format any Postgres restores, where you choose.
+#
+#   to: s3://bucket/dagron      S3, or MinIO/Ceph/R2 (extraEnv AWS_ENDPOINT_URL)
+#   to: gs://bucket/dagron      Google Cloud Storage
+#   to: az://container/dagron   Azure Blob (extraEnv AZURE_STORAGE_ACCOUNT_NAME)
+#   to: file:///backup          a volume: `claimName` names its claim (NFS, say)
+#
+# A cloud's credentials are the CronJob's ServiceAccount's: annotate it for
+# workload identity (serviceAccount.annotations: GKE's
+# iam.gke.io/gcp-service-account, Azure's azure.workload.identity/client-id
+# with podLabels azure.workload.identity/use: "true", EKS's
+# eks.amazonaws.com/role-arn), or give keys through extraEnv. Restore and the
+# restore drill: docs/BACKUP_RECOVERY.md, docs/BACKUP_ONPREM.md.
+backup:
+  enabled: false
+  to: ""
+  schedule: "17 2 * * *"
+  keep: 14
+  # file:// targets: the PersistentVolumeClaim the path is on, mounted at it.
+  claimName: ""
+  # The pg_dump that makes each dump. Its major version must be at least the
+  # server's: a pg_dump older than its server refuses to dump it.
+  dumpImage: postgres:16-alpine
+  serviceAccount:
+    annotations: {}
+  podLabels: {}
+  extraEnv: []
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {memory: 512Mi}
 
 # Used when postgres.enabled = false. Full connection string, e.g.
 # postgres://user:pass@host:5432/dagron
@@ -188,6 +348,10 @@ dagronApi:
   #   --set dagronApi.cookieSecure=false
   cookieSecure: true
   rustLog: info
+  # A Secret whose DAGRON_AUDIT_SINK_URL and DAGRON_AUDIT_SINK_TOKEN keys say
+  # where a dagron-api built to audit forwards each row it records, and with
+  # what credential (docs/CONFIG.md). Each key is optional. Empty: none.
+  auditSinkSecret: ""
   # HS256 signing key for session JWTs — MUST be >= 32 chars. Stored in a
   # chart-managed Secret unless existingSecret.name is set. CHANGE for any real
   # deploy (this default value will fail the >=32 check intentionally if shortened).
@@ -220,6 +384,225 @@ dagronApi:
   tolerations: []
   affinity: {}
   # The PriorityClass of dagron-api's pod. "" = the cluster's default.
+  priorityClassName: ""
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {memory: 256Mi}
+
+# ── dagron-ci (optional) ─────────────────────────────────────────────────────
+# The CI service: it takes a forge's events (a GitHub webhook, a poll sweep, a
+# dispatch through its run API), turns each into runs in dagron-api, and
+# reports them back as commit statuses. OFF by default.
+#
+# Enabled with nothing else set, it starts, keeps its queue in the release's
+# database and turns ready, and that is all: events it is given stay queued.
+# What makes it of use, each from a Secret YOU create (the chart makes none of
+# these, so none lands in values or helm history):
+#   - apiTokenSecret     a dagron-api API token, to submit runs with. Make one
+#                        in the console once dagron-api is up, then:
+#                          kubectl create secret generic dagron-ci-api \
+#                            --from-literal=token='<the token>'
+#                        With it, `cells` names where runs go, over TLS.
+#   - webhookSecret      the secret of the GitHub webhook. Without it the
+#                        receiver answers 404, and a repository's commits are
+#                        found by the poll sweep alone.
+#   - githubApp          a GitHub App, for private repositories and commit
+#                        statuses: each repository's calls, and each
+#                        checkout, get a token for that repository alone.
+#   - githubTokenSecret  or a token, for the repositories no App is installed
+#                        on.
+# Each named Secret's key is mounted as a file and read once, when the pod
+# starts: a rotated Secret needs `kubectl rollout restart`.
+#
+# Repositories are connected with its own command, in the pod:
+#   kubectl exec deploy/<release>-engine -c dagron-ci -- dagron-ci repo add github.com/OWNER/NAME
+# (deploy/<release>-ci where it has a Deployment of its own: `placement`.)
+#
+# Two of the engine's settings for CI are not made by this block: pipelines
+# whose jobs have a workspace need DAGRON_CI_EXEC_IMAGE and
+# DAGRON_CHECKOUT_IMAGE on the engine (engine.extraEnv; docs/CONFIG.md has
+# each). A private repository's checkout needs `checkoutTokenSecret` below
+# and no more: with dagron-ci in the engine's pod, the chart tells the engine
+# where to ask for the credential and gives it the secret.
+ci:
+  enabled: false
+  # Where dagron-ci runs.
+  #
+  #   engine      a container in the engine's pod, as the compose stack has
+  #               the two. The engine asks dagron-ci for each checkout's
+  #               credential, and takes no address for that over plain http
+  #               but its own machine's. In one pod the address is the pod's
+  #               own, so a private repository is checked out with no TLS to
+  #               set up between them. The default.
+  #   deployment  a Deployment of its own. This chart's engine is then not
+  #               told to ask it, and a private repository's checkout fails:
+  #               it serves public repositories.
+  #
+  # What sharing the pod means:
+  #   - dagron-ci has the engine's replicas (engine.replicas) and the engine's
+  #     place on a node (engine.nodeSelector, tolerations, affinity,
+  #     priorityClassName). `replicas` and those four below are for a
+  #     Deployment of its own, and the render fails if one is set here.
+  #   - The pod is ready when both are. A dagron-ci that does not start (a
+  #     Secret that is named and not made, a key that is not one) holds the
+  #     engine's rollout, and a change to this block restarts the engine.
+  #   - dagron-ci is not given the engine's service-account token: the pod
+  #     mounts none, and the engine's container mounts its own. The two do
+  #     share an address, so dagron-ci reaches the engine's ops API there,
+  #     which networkPolicy cannot close inside a pod. dagron-ci submits runs
+  #     as it is, through dagron-api, with the token you give it.
+  #   - With networkPolicy.enabled, the engine's policy admits dagron-ci's
+  #     port from anywhere, as it is open where dagron-ci has a pod of its
+  #     own. The engine's port stays as closed as it was.
+  placement: engine
+  # First published with the release after 0.11.0. Release packaging rewrites
+  # this tag to the release version (docker.yml), so the pin here only matters
+  # to a repo checkout, where no image of this tag was ever pushed: build one
+  # (crates/dagron-ci/Dockerfile) or name a published tag.
+  image: mancube/dagron-ci:0.10.0
+  imagePullPolicy: IfNotPresent
+  # For a Deployment of its own (placement: deployment); in the engine's pod
+  # it has engine.replicas. Replicas share the queue: each event is leased by
+  # one worker at a time.
+  replicas: 1
+  port: 8090
+  rustLog: info
+  # Its tables and its migration history live in a Postgres schema of their
+  # own, which it creates at first start if its role may. Otherwise create the
+  # schema beforehand and grant the role usage and create on it.
+  databaseSchema: dagron_ci
+  # By default it uses the release's database (the chart's Postgres, or
+  # externalDatabaseUrl / externalDatabaseSecret). To give it a database or a
+  # role of its own, name a Secret whose key holds a postgres:// URL.
+  databaseSecret:
+    name: ""
+    key: CI_DATABASE_URL
+  # Where runs go (CI_CELLS): `name=url` pairs, comma-separated, each the
+  # dagron-api of a cell. Needed with apiTokenSecret, and https://: dagron-ci
+  # sends its token there, and each caller's credential, and starts on no
+  # cell over plain http (but one on its own machine, a sidecar's).
+  #
+  # The chart makes none up, because its own dagron-api Service serves no
+  # TLS. Name what terminates TLS before dagron-api: with ingress.tls.enabled,
+  # the ingress host,
+  #   --set-string ci.cells=default=https://dagron.example.com
+  # which dagron-ci must resolve from inside the cluster and whose
+  # certificate it must trust (the image's roots; SSL_CERT_FILE through
+  # extraEnv for a private one).
+  cells: ""
+  apiTokenSecret:
+    name: ""
+    key: token
+  webhookSecret:
+    name: ""
+    key: secret
+  githubApp:
+    # The App's id, a number. With keySecret; one without the other fails the
+    # render, as it would stop dagron-ci at start.
+    id: ""
+    # The App's private key, PEM.
+    keySecret:
+      name: ""
+      key: private-key.pem
+  githubTokenSecret:
+    name: ""
+    key: token
+  # The secret an engine presents to ask for a checkout's credential
+  # (/ci/v1/checkout-tokens). Without it that door answers 404, and a private
+  # repository's checkout fails. Any long random value will do:
+  #   kubectl create secret generic dagron-ci-checkout \
+  #     --from-literal=secret="$(openssl rand -hex 32)"
+  # With dagron-ci in the engine's pod (placement: engine) the chart mounts
+  # this Secret in the engine's container too, and sets the engine's
+  # DAGRON_CHECKOUT_TOKEN_URL to the pod's own address and its
+  # DAGRON_CHECKOUT_TOKEN_SECRET_FILE to that file: the render fails if
+  # engine.extraEnv sets either as well. With a Deployment of its own, the
+  # engine is given neither.
+  # One secret, for one cell: with more than one cell in `cells` the render
+  # fails, as dagron-ci would not start, since an engine of one cell could
+  # ask for the credential of another's run.
+  checkoutTokenSecret:
+    name: ""
+    key: secret
+  # Fleet mode: a job of GitHub Actions' own that asks for one of these
+  # labels in `runs-on` is run by GitHub's runner, started on this cluster
+  # as a run (crates/dagron-ci/README.md, "Fleet mode"). `labels` is the
+  # label map, as the file CI_GITHUB_FLEET_FILE names has it under `labels:`.
+  # {} = no such job is served.
+  #
+  #   fleet:
+  #     labels:
+  #       dagron:
+  #         image: ghcr.io/actions/actions-runner:2.321.0
+  #       dagron-large:
+  #         image: ghcr.io/actions/actions-runner:2.321.0
+  #         runner_class: large   # the engine's runner class
+  #         pool: ci-large        # the engine's pool
+  #         priority: 5
+  #         timeout_secs: 7200    # six hours unless said
+  #
+  # A label takes `image`, and where said `with` (the labels a job may name
+  # beside it: self-hosted, linux and x64 unless said), `runner_class`,
+  # `pool`, `priority`, `timeout_secs` and `command`; `scope` (repository,
+  # or organization: the owner's runner) and `runner_group`; `max_runners`
+  # and `max_per_repository`; `untrusted` (what a fork's job is given:
+  # refuse unless said, floor or serve) and `untrusted_runner_class`;
+  # `docker` (a Docker daemon beside the runner); `warm` and
+  # `warm_for_secs` (runners kept ready); and `retry` (a job whose runner
+  # died is run again, once: true unless said). The render fails on a map
+  # dagron-ci would not start on: another key, a label GitHub gives every
+  # runner (linux), a label with no image, a key of the wrong kind or out
+  # of its bounds, or one that goes with another it does not (a
+  # runner_group with no organization, warm_for_secs with no warm, warm on
+  # a label that is not untrusted: serve and names no runner_group).
+  #
+  # The chart writes the map to a ConfigMap, mounts it in dagron-ci's
+  # container and names the file to it. dagron-ci reads it once, as it
+  # starts, so a map that changed starts its pod again, which with
+  # `placement: engine` is the engine's.
+  #
+  # It needs what a fleet is served with, and the render fails without:
+  # `cells` and `apiTokenSecret` (a runner is a run in a cell), `githubApp`
+  # (the App registers each runner: it needs the repository permissions
+  # Administration: Read and write and Actions: Read, Actions: Read and
+  # write to run again a job whose runner died, the organization permission
+  # Self-hosted runners: Read and write for scope: organization, and the
+  # Workflow job event), and
+  # `webhookSecret` (a job is heard of by its delivery alone). The cell's
+  # dagron-api has to keep secrets too (envSecrets, below): a runner's
+  # configuration is one while the runner is out.
+  fleet:
+    labels: {}
+    # Warm capacity's other half: each label's runner image pulled onto each
+    # node a runner may be started on, before one is, so that a runner
+    # starts without the pull (a label's `warm` runners are the first half).
+    # A DaemonSet of an init container an image, which runs the image's
+    # `sh -c true`, so an image with no shell is named in `images` of a
+    # build that has one, or left to its first runner. `images` are pulled
+    # beside the labels'. nodeSelector and tolerations are the runners'
+    # nodes': where the engine starts their pods.
+    prepull:
+      enabled: false
+      images: []
+      nodeSelector: {}
+      tolerations: []
+      pauseImage: registry.k8s.io/pause:3.10
+  # The page a commit status links to: a URL in which {run_id} and {cell} are
+  # the run's, e.g. https://dagron.example.com/runs/{run_id}. "" = no link.
+  runUrl: ""
+  # Anything else dagron-ci reads (crates/dagron-ci/README.md): CI_POLL_SECS,
+  # CI_EVENT_WORKERS, CI_GITHUB_API_URL, …
+  extraEnv: []
+  # timeoutSeconds of the startup and readiness probes. /readyz gives the
+  # database one second, so keep this above that.
+  probeTimeoutSeconds: 3
+  # Same node-placement knobs as `engine` above; see the note there. For a
+  # Deployment of its own (placement: deployment): in the engine's pod the
+  # engine's apply, and the render fails if one of these is set.
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # The PriorityClass of dagron-ci's pod. "" = the cluster's default.
   priorityClassName: ""
   resources:
     requests: {cpu: 50m, memory: 64Mi}
@@ -272,7 +655,8 @@ frontend:
 
 # ── Ingress (single host, same-origin) ───────────────────────────────────────
 # /api → dagron-api always; / → dagron-api too, unless frontend.enabled puts the
-# deprecated console pod back in front of it.
+# deprecated console pod back in front of it. With ci.enabled and a
+# ci.webhookSecret, /hooks/github → dagron-ci, and nothing else of it.
 ingress:
   enabled: false
   className: nginx
@@ -299,5 +683,5 @@ networkPolicy:
     allowFrom: []
   postgres:
     # Extra peers allowed to reach the chart-managed Postgres (engine, dagron-api, gitops and
-    # operator pods of this release are always allowed).
+    # operator pods of this release are always allowed, and dagron-ci's with ci.enabled).
     allowFrom: []

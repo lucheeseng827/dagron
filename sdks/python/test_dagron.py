@@ -1344,10 +1344,9 @@ class DagSubmitTests(GatewayTestCase):
 # nothing fails until the run does — so these tests are a cross-language
 # contract, not unit tests of an implementation detail.
 #
-# `recipe-vectors.json` is generated FROM the builder
-# (ee/examples/image-build/sdk/gen-vectors.py); the builder's own test suite
-# asserts against the same file. A change to either side that moves a tag turns
-# both red.
+# `recipe-vectors.json` is generated FROM the builder; the builder's own test
+# suite asserts against the same file. A change to either side that moves a tag
+# turns both red.
 
 VECTORS_PATH = Path(__file__).resolve().parent.parent / "recipe-vectors.json"
 

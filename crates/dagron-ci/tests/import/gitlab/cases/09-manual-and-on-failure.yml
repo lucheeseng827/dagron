@@ -1,0 +1,39 @@
+# What runs on a person's word, on a failure, and whatever happened.
+image: alpine:3.20
+
+stages: [build, deploy, cleanup]
+
+build:
+  stage: build
+  script: [./build.sh]
+  retry:
+    max: 1
+    when: [runner_system_failure]
+
+staging:
+  stage: deploy
+  script: [./deploy.sh staging]
+  environment:
+    name: staging
+    url: https://staging.example.com
+
+production:
+  stage: deploy
+  when: manual
+  allow_failure: false
+  script: [./deploy.sh production]
+  environment: production
+
+smoke:
+  stage: cleanup
+  script: [./smoke.sh]
+
+notify-failure:
+  stage: cleanup
+  when: on_failure
+  script: [./notify.sh failed]
+
+report:
+  stage: .post
+  when: always
+  script: [./report.sh]

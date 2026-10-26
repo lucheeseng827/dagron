@@ -1,0 +1,30 @@
+# Variables of the workflow, a job and a step, some plain, some of the event, some secret.
+name: variables
+on:
+  workflow_dispatch:
+    inputs:
+      region: { default: eu-west-1 }
+env:
+  APP: widgets
+  LEVEL: workflow
+  COMMIT: ${{ github.sha }}
+jobs:
+  show:
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.example.com
+    env:
+      LEVEL: job
+      REGION: ${{ inputs.region }}
+      DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+      API_TOKEN: ${{ secrets.STAGING_API_TOKEN }}
+      ACTOR: ${{ github.actor }}
+      CI_MODE: strict
+    steps:
+      - run: echo "$APP $LEVEL $COMMIT $REGION"
+      - run: ./deploy.sh
+        env:
+          LEVEL: step
+          PR: ${{ github.event.number }}
+          TOKEN: ${{ secrets.DEPLOY_KEY }}

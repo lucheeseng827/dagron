@@ -41,6 +41,10 @@ const TICK: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // `--version` first: for it nothing is read and nothing is started.
+    if dagron_logging::version_requested("dagron-gitops") {
+        return Ok(());
+    }
     dagron_logging::init("gitops");
 
     let db_url = std::env::var("DATABASE_URL")

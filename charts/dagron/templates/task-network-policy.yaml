@@ -1,0 +1,113 @@
+{{- if and .Values.engine.taskNetworkAllowlists (not (and (eq .Values.engine.executor "k8s") .Values.engine.taskNetworkPolicy)) }}
+{{- fail "engine.taskNetworkAllowlists needs engine.taskNetworkPolicy and executor k8s: an allowlist is a NetworkPolicy, and holds a task only where the cluster enforces one" }}
+{{- end }}
+{{- if and (eq .Values.engine.executor "k8s") .Values.engine.taskNetworkPolicy }}
+{{- /* The engine holds such a task's pod behind an init container from the
+       dagron-ci-exec image, and stops at startup without one. Said here, at
+       render, where it costs nothing to find. */}}
+{{- $gate := false }}
+{{- range .Values.engine.extraEnv }}
+{{- /* Named with a value, or with a source for one. An empty value is the
+       engine's "none set", and it would stop as it starts. */}}
+{{- if and (eq (toString .name) "DAGRON_CI_EXEC_IMAGE") (or .value .valueFrom) }}{{- $gate = true }}{{- end }}
+{{- end }}
+{{- if not $gate }}
+{{- fail "engine.taskNetworkPolicy needs DAGRON_CI_EXEC_IMAGE, with a value, in engine.extraEnv: a task that asks for no network is held by an init container from that image until its pod's network is seen to be gone" }}
+{{- end }}
+{{- if .Values.engine.taskNetworkPolicyCreate }}
+# engine.taskNetworkPolicy: a task that declares `isolation: { network: none }`
+# gets a pod with this label, and this policy allows such a pod nothing in and
+# nothing out, name resolution included. It is one policy for the namespace,
+# made before any task, and the engine reads it as it starts and refuses to
+# start without it. A task's container is started only once its pod has been
+# seen to reach nothing: not every CNI holds a pod from its first instant.
+#
+# It does something only where the cluster's CNI enforces NetworkPolicy. One
+# that does not ignores this object, and such a task would reach what any
+# other pod does: which is why this is a value to turn on, and not a default.
+#
+# The name and the label are the engine's, and are not the release's to change.
+#
+# It is kept when the release is upgraded without it or uninstalled. The pods
+# it holds are tasks, which are no part of the release and go on running: one
+# that asked for no network would have its network back in the middle of its
+# run. Left behind it selects only pods carrying the label, which nothing but
+# the engine sets. Delete it by hand once no such task is running.
+#
+# A pod has what ANY policy that selects it allows. Another policy of this
+# namespace that selects task pods and allows something (every pod may reach
+# the name server, say) gives a labelled pod that back, and the engine
+# refuses to start beside one: keep such a policy from these pods with
+# `{key: dagron.dev/network, operator: DoesNotExist}` in its podSelector's
+# matchExpressions.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dagron-task-no-network
+  labels:
+    {{- include "dagron.labels" . | nindent 4 }}
+    app.kubernetes.io/component: engine
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  podSelector:
+    matchLabels:
+      dagron.dev/network: none
+  policyTypes: [Ingress, Egress]
+{{- end }}
+{{- /* engine.taskNetworkAllowlists: one policy for each. A task that
+       declares `isolation: { network: allow:<name> }` gets a pod labelled
+       dagron.dev/network=allow-<name>, which the policy of that name allows
+       nothing in, and out only what its rules say. The rules are yours;
+       the names and the label are the engine's. What the engine refuses in
+       a policy is refused here first, where it costs nothing to find. */}}
+{{- range $name, $list := .Values.engine.taskNetworkAllowlists }}
+{{- if not (regexMatch "^[a-z0-9]([a-z0-9-]{0,55}[a-z0-9])?$" $name) }}
+{{- fail (printf "engine.taskNetworkAllowlists: '%s' cannot name an allowlist: 1 to 57 characters of [a-z0-9-], neither starting nor ending with '-'" $name) }}
+{{- end }}
+{{- $rules := list }}
+{{- if $list }}{{- $rules = $list.egress | default list }}{{- end }}
+{{- $proxy := "" }}
+{{- if $list }}{{- $proxy = $list.proxy | default "" }}{{- end }}
+{{- /* Its port is 1 to 65535, as the engine reads one: atoi of none is 0. */}}
+{{- $port := regexReplaceAll "^.*:([0-9]+)/?$" $proxy "${1}" | atoi }}
+{{- if and $proxy (or (not (regexMatch "^https?://(\\[[0-9A-Fa-f:.]+\\]|[A-Za-z0-9.-]+):[0-9]{1,5}/?$" $proxy)) (lt $port 1) (gt $port 65535)) }}
+{{- fail (printf "engine.taskNetworkAllowlists.%s.proxy: '%s' is not a proxy's URL: http:// or https://, a host and a port, and no user, password or path" $name $proxy) }}
+{{- end }}
+{{- range $n, $rule := $rules }}
+{{- if not $rule.to }}
+{{- fail (printf "engine.taskNetworkAllowlists.%s: egress rule %d names no destination (to), which is every address: an allowlist says where" $name (add1 $n)) }}
+{{- end }}
+{{- end }}
+{{- if $.Values.engine.taskNetworkPolicyCreate }}
+---
+# engine.taskNetworkAllowlists.{{ $name }}: what a task that declares
+# `isolation: { network: allow:{{ $name }} }` may reach, and nothing else.
+# It must not allow the cluster's API server: a pod is seen to be held by
+# that address no longer answering it, and a task whose list allowed it
+# would fail unstarted. Kept through an uninstall, as the policy above is.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dagron-task-allow-{{ $name }}
+  labels:
+    {{- include "dagron.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: engine
+  annotations:
+    helm.sh/resource-policy: keep
+    {{- if $proxy }}
+    # What a task held to this list is told to fetch names through
+    # (HTTP_PROXY and the rest). The proxy is yours, and holds the task to a
+    # list of hostnames; the rules below must let it reach the proxy.
+    dagron.dev/proxy: {{ $proxy | quote }}
+    {{- end }}
+spec:
+  podSelector:
+    matchLabels:
+      dagron.dev/network: allow-{{ $name }}
+  policyTypes: [Ingress, Egress]
+  egress:
+    {{- toYaml $rules | nindent 4 }}
+{{- end }}
+{{- end }}
+{{- end }}

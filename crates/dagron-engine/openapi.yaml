@@ -119,7 +119,18 @@ paths:
         Prometheus text exposition (version 0.0.4): process-lifetime counters
         (`scheduler_runs_created_total`, `scheduler_tasks_*_total`) plus live
         datastore gauges (`scheduler_runs`/`scheduler_tasks` by status) and
-        `scheduler_uptime_seconds`. Gauges are read fresh from the DB per scrape.
+        `scheduler_uptime_seconds`. The datastore gauges are served from a cache in two
+        tiers. What has not finished, the recent runs still pending or running among it,
+        is cached for 10 s by default (`METRICS_CACHE_SECS`; `0` reads it on every scrape,
+        and the history too where `METRICS_HISTORY_CACHE_SECS` is not set), and may lag by
+        up to that. The history, the finished statuses and the recent runs that have
+        finished, is cached for 300 s (`METRICS_HISTORY_CACHE_SECS`) and read again behind
+        the scrape that finds it stale, which is served the last one: it may lag by its
+        TTL, plus the time until that scrape, plus the read, and longer while reads of it
+        fail (`scheduler_metrics_history_age_seconds` says how old). A read that does not
+        return is given up, after 30 s for what has not finished and after the history's
+        TTL or 60 s, whichever is longer, for the history; one a scrape waits for answers
+        500, as a failed read does. The counters and pool stats are live.
       operationId: metrics
       responses:
         "200":
@@ -222,6 +233,16 @@ paths:
         already active, the submit is shed with `429 Too Many Requests` and a
         `Retry-After` header instead of growing an unbounded backlog. Clients
         should back off and retry.
+
+
+        A workflow's own cap (`max_active_runs`, under its `concurrency_key`
+        where it has one) answers `429` too, unless the workflow says a run
+        waits (`when_full: queue`, or `supersede`). Then the run is created,
+        `201`, and waits for a turn: it reads `running` with `queued_at` set
+        and no `admitted_at`, none of its tasks advances, and it is let in
+        when a run before it has ended. With `supersede` the runs of its key
+        before it are cancelled. A queue that is as long as it may be
+        (`DAGRON_MAX_WAITING_RUNS`, 100 unless set) answers `429`.
       operationId: submitRun
       parameters:
         - name: wait
@@ -615,8 +636,14 @@ paths:
       tags: [runs]
       summary: Cancel a run
       description: >
-        Flip a `running` run and all its non-terminal tasks to `cancelled` in one
-        transaction. Idempotent: a missing or already-terminal run yields `409`.
+        Cancel a `running` run. A cancel asks: a task that had not started, or
+        was waiting, is `cancelled` at once, and a task a worker holds is asked
+        to stop and reads `running`, with `stop_requested_at` set, until its
+        container, pod or process is gone. The run ends `cancelled` when the
+        last such task has stopped, and until then reads `running` with
+        `stopping_as: cancelled`, and holds its concurrency key. With nothing
+        running, it ends at once. A second cancel while it is stopping changes
+        nothing; a missing or already-terminal run yields `409`.
       operationId: cancelRun
       parameters:
         - $ref: "#/components/parameters/RunId"
@@ -627,10 +654,18 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [run_id, cancelled]
+                required: [run_id, cancelled, stopping]
                 properties:
                   run_id: { type: string, format: uuid }
                   cancelled: { type: boolean, example: true }
+                  stopping:
+                    type: integer
+                    format: int64
+                    example: 1
+                    description: >-
+                      Tasks a worker holds, asked to stop. While it is not 0
+                      the run reads `running`, and ends `cancelled` once their
+                      work is gone.
         "409":
           description: Run is missing or already terminal (nothing to cancel)
           content:
@@ -649,7 +684,9 @@ paths:
         tasks are left intact, so execution resumes from the point of failure
         rather than re-running the whole DAG. `remaining_deps` is recomputed so
         the frontier becomes ready immediately and tasks behind a reset
-        dependency wait for it to re-succeed.
+        dependency wait for it to re-succeed. With `from: all`, a run that has
+        ended, one that `succeeded` too, is rerun whole: every task is reset
+        and the run starts again from its first tasks.
       operationId: rerunRun
       parameters:
         - $ref: "#/components/parameters/RunId"
@@ -662,11 +699,11 @@ paths:
               properties:
                 from:
                   type: string
-                  enum: [failed]
+                  enum: [failed, all]
                   default: failed
                   description: >
-                    Rerun mode. Only `failed` (the default) is supported on this
-                    single-binary surface.
+                    Rerun mode: `failed` (the default), from the failed tasks;
+                    or `all`, the run whole, what succeeded included.
       responses:
         "200":
           description: Run re-armed; number of tasks reset returned
@@ -689,7 +726,64 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "409":
-          description: Run is not in a rerunnable (failed/cancelled) state
+          description: >
+            Run is not in a rerunnable state: failed/cancelled, or with
+            `from: all` succeeded/failed/cancelled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          description: >
+            The run had ended and its workflow's `max_active_runs` is reached
+            for its concurrency key: it is not set running again, as a new run
+            of the key would not be admitted. Nothing is written
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          $ref: "#/components/responses/Error"
+
+  /runs/{id}/tasks/{task_id}/retry:
+    post:
+      tags: [runs]
+      summary: Retry one failed or cancelled task
+      description: >
+        Put one failed or cancelled task back to run again, and set its run
+        running again if it had ended. Only that task: what its failure
+        cancelled downstream is a rerun's or a clear's to bring back. The
+        attempt it replaces is kept in the task's attempt history, and a
+        `run.rerun` event is written.
+      operationId: retryTask
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "200":
+          description: Task queued to run again
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, task_id, retried]
+                properties:
+                  run_id: { type: string, format: uuid }
+                  task_id: { type: string, format: uuid }
+                  retried: { type: boolean, example: true }
+        "404":
+          description: Run or task not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: Task is not in a retryable (failed/cancelled) state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          description: >
+            The run had ended and its workflow's `max_active_runs` is reached
+            for its concurrency key: it is not set running again, as a new run
+            of the key would not be admitted. Nothing is written
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -730,6 +824,14 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "409":
           description: Task is not in a clearable (completed) state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          description: >
+            The run had ended and its workflow's `max_active_runs` is reached
+            for its concurrency key: it is not set running again, as a new run
+            of the key would not be admitted. Nothing is written
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1311,6 +1413,40 @@ components:
         status: { $ref: "#/components/schemas/RunStatus" }
         created_at: { type: string, format: date-time }
         finished_at: { type: string, format: date-time, nullable: true }
+        stopping_as: { $ref: "#/components/schemas/StoppingAs" }
+        queued_at: { $ref: "#/components/schemas/QueuedAt" }
+        admitted_at: { $ref: "#/components/schemas/AdmittedAt" }
+
+    QueuedAt:
+      type: string
+      format: date-time
+      nullable: true
+      description: >-
+        When a run that arrived while its workflow's `max_active_runs` was
+        full began to wait for a turn (`when_full`). Null on a run that never
+        waited. A `running` run with this set and no `admitted_at` waits: it
+        has started nothing, holds a place in its concurrency key, and is
+        cancelled as any run is.
+
+    AdmittedAt:
+      type: string
+      format: date-time
+      nullable: true
+      description: >-
+        When a run that waited for its workflow's `max_active_runs` was let
+        in. Its `run_timeout_secs` is counted from here. Null on a run that
+        never waited, and on one that still waits.
+
+    StoppingAs:
+      type: string
+      nullable: true
+      enum: [cancelled, failed]
+      description: >-
+        Set on a `running` run that was cancelled, or passed its
+        `run_timeout_secs`, while a worker held one of its tasks: the status it
+        takes once that work has stopped. Null on every other run. Such a run
+        is still running: it holds its concurrency key, and no `run.completed`
+        event has been written for it.
 
     WorkflowRun:
       type: object
@@ -1324,6 +1460,14 @@ components:
         output: { type: string, nullable: true }
         created_at: { type: string, format: date-time }
         finished_at: { type: string, format: date-time, nullable: true }
+        stopping_as: { $ref: "#/components/schemas/StoppingAs" }
+        stop_requested_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When a run with `stopping_as` set was asked to stop.
+        queued_at: { $ref: "#/components/schemas/QueuedAt" }
+        admitted_at: { $ref: "#/components/schemas/AdmittedAt" }
 
     RunResult:
       type: object
@@ -1442,6 +1586,38 @@ components:
           format: uuid
           nullable: true
           description: "Park reason — child run a `type: workflow` trigger is blocked on"
+        quota_wait_since:
+          type: string
+          format: date-time
+          nullable: true
+          description: >-
+            Quota wait — when the Kubernetes namespace ResourceQuota first
+            refused this task's pod. These three fields are set only while the
+            task is `ready` and waiting on that quota: it is back in the queue,
+            `scheduled_at` is its next probe, and the refusals consumed no
+            attempt.
+        quota_wait_detail:
+          type: string
+          nullable: true
+          description: >-
+            Quota wait — the last refusal: which quota, and what was requested,
+            used and limited. Set only while the task is `ready` and waiting on
+            a Kubernetes namespace ResourceQuota.
+        quota_waits:
+          type: integer
+          format: int64
+          description: >-
+            Quota wait — refusals so far in this wait. 0 unless the task is
+            `ready` and waiting on a Kubernetes namespace ResourceQuota.
+        stop_requested_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: >-
+            When a `running` task was asked to stop: its run was cancelled or
+            passed its deadline, or a gang sibling failed, while a worker held
+            it. Its work is still to be seen gone, and the task is `cancelled`
+            once it has been. Null on every other row.
 
     TaskSpec:
       type: object
@@ -1482,6 +1658,14 @@ components:
           type: string
           nullable: true
           description: Image for the Docker/Kubernetes executor; ignored by LocalExecutor
+        image_pull_policy:
+          type: string
+          nullable: true
+          enum: [if_not_present, always, never]
+          description: >-
+            When the executor fetches the image. Absent, the Docker executor
+            pulls an image its host does not hold, and on Kubernetes the pod
+            states no policy, so the kubelet's default applies.
         env:
           type: array
           default: []

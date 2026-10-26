@@ -1,10 +1,10 @@
 //! Forge feedback — post a commit status / PR check to GitHub or GitLab.
 //!
 //! When a workflow declares a `notify.git` block, the engine calls
-//! [`ForgeClient::post_status`] on run finalization so the run's result surfaces
-//! as a green/red check on the commit that triggered it. Best-effort, mirroring
-//! the OpenLineage emitter: a forge being unreachable never affects run
-//! execution.
+//! [`ForgeClient::post_status`] when the run starts (`pending`) and when it ends,
+//! so the run surfaces as a check on the commit that triggered it, from the
+//! moment it exists. Best-effort, mirroring the OpenLineage emitter: a forge
+//! being unreachable never affects run execution.
 //!
 //! Config from env (a client is returned only if at least one token is set):
 //!   `GITHUB_TOKEN` (+ optional `GITHUB_API_BASE`, default `https://api.github.com`)
@@ -16,30 +16,38 @@ use serde_json::{json, Value};
 const GITHUB_DEFAULT: &str = "https://api.github.com";
 const GITLAB_DEFAULT: &str = "https://gitlab.com/api/v4";
 
-/// The check outcome to publish. `Pending` is available for a future
-/// run-started hook; the engine posts `Success`/`Failure` on finalize today.
+/// The check outcome to publish: `Pending` when a run starts, a terminal state
+/// when it ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitState {
     Pending,
     Success,
     Failure,
+    /// The run was cancelled: it neither passed nor found a problem.
+    Cancelled,
 }
 
 impl CommitState {
-    /// From a dagron run status string (`succeeded` → success, else failure).
+    /// From a dagron run status string: `succeeded` → success, `cancelled` →
+    /// cancelled, still going → pending, anything else → failure.
     pub fn from_run_status(status: &str) -> Self {
         match status {
             "succeeded" => CommitState::Success,
+            "cancelled" => CommitState::Cancelled,
             "running" | "pending" => CommitState::Pending,
-            _ => CommitState::Failure, // failed, cancelled, …
+            _ => CommitState::Failure,
         }
     }
 
+    /// GitHub's Statuses API has no cancelled state. `error` is the closest:
+    /// the check did not complete, where `failure` says it ran and found a
+    /// problem. Both block a required check, as a cancelled one should.
     fn github(self) -> &'static str {
         match self {
             CommitState::Pending => "pending",
             CommitState::Success => "success",
             CommitState::Failure => "failure",
+            CommitState::Cancelled => "error",
         }
     }
 
@@ -48,6 +56,7 @@ impl CommitState {
             CommitState::Pending => "pending",
             CommitState::Success => "success",
             CommitState::Failure => "failed",
+            CommitState::Cancelled => "canceled",
         }
     }
 
@@ -56,6 +65,7 @@ impl CommitState {
             CommitState::Pending => "dagron run in progress",
             CommitState::Success => "dagron run succeeded",
             CommitState::Failure => "dagron run failed",
+            CommitState::Cancelled => "dagron run cancelled",
         }
     }
 }
@@ -98,7 +108,14 @@ impl GitTarget {
     /// What the check should say: the author's line if they wrote one, else the
     /// state's. An author's line that resolved to nothing (an empty parameter)
     /// falls back too — a blank check is worse than a generic one.
+    ///
+    /// `Pending` always says the state's own line. An author's line describes
+    /// what the run produced ("built {{ run.images }}"), and a run that has
+    /// just started has produced nothing.
     fn text(&self, state: CommitState) -> String {
+        if state == CommitState::Pending {
+            return state.description().to_string();
+        }
         match self.description.as_deref().map(str::trim) {
             Some(d) if !d.is_empty() => clamp(d),
             _ => state.description().to_string(),
@@ -125,12 +142,7 @@ impl ForgeClient {
             return None;
         }
         Some(Self {
-            // Bounded timeout so a slow/hung forge can't keep this best-effort
-            // finalization call pending indefinitely.
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_default(),
+            http: http_client(),
             github_token,
             github_base: env_nonempty("GITHUB_API_BASE")
                 .unwrap_or_else(|| GITHUB_DEFAULT.to_string()),
@@ -138,6 +150,19 @@ impl ForgeClient {
             gitlab_base: env_nonempty("GITLAB_API_BASE")
                 .unwrap_or_else(|| GITLAB_DEFAULT.to_string()),
         })
+    }
+
+    /// A client for GitHub alone, at `base` (`https://api.github.com`, or a
+    /// GitHub Enterprise `https://host/api/v3`), with `token`: for a caller
+    /// that configures itself instead of reading the environment.
+    pub fn github(token: impl Into<String>, base: impl Into<String>) -> Self {
+        Self {
+            http: http_client(),
+            github_token: Some(token.into()),
+            github_base: base.into(),
+            gitlab_token: None,
+            gitlab_base: GITLAB_DEFAULT.to_string(),
+        }
     }
 
     /// Post a commit status for `target` in `state`. Errors (unknown provider,
@@ -246,6 +271,15 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+/// Bounded timeout so a slow/hung forge can't keep a best-effort status post
+/// pending indefinitely.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default()
+}
+
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
@@ -346,7 +380,7 @@ mod tests {
         assert_eq!(CommitState::from_run_status("failed"), CommitState::Failure);
         assert_eq!(
             CommitState::from_run_status("cancelled"),
-            CommitState::Failure
+            CommitState::Cancelled
         );
         assert_eq!(
             CommitState::from_run_status("running"),
@@ -375,6 +409,35 @@ mod tests {
         );
         assert_eq!(body["state"], "failed"); // GitLab spells failure "failed"
         assert_eq!(body["name"], "dagron/nightly");
+    }
+
+    /// A run that has just started has produced nothing, so its `pending`
+    /// check must not claim the result the author's line describes.
+    #[test]
+    fn a_pending_check_ignores_the_authors_description() {
+        let mut t = target("github");
+        t.description = Some("built registry.local/ws/etl:r-d086f3af2829d4cf".into());
+        let (_, body) = github_request(GITHUB_DEFAULT, &t, CommitState::Pending);
+        assert_eq!(body["state"], "pending");
+        assert_eq!(body["description"], "dagron run in progress");
+        let (_, body) = github_request(GITHUB_DEFAULT, &t, CommitState::Success);
+        assert_eq!(
+            body["description"],
+            "built registry.local/ws/etl:r-d086f3af2829d4cf"
+        );
+    }
+
+    /// A cancelled run reads as cancelled where the forge can say so (GitLab's
+    /// `canceled`), and as `error` on GitHub, which cannot: never "failed", a
+    /// verdict the run never reached.
+    #[test]
+    fn a_cancelled_run_is_not_reported_as_failed() {
+        let (_, body) = github_request(GITHUB_DEFAULT, &target("github"), CommitState::Cancelled);
+        assert_eq!(body["state"], "error");
+        assert_eq!(body["description"], "dagron run cancelled");
+        let (_, body) = gitlab_request(GITLAB_DEFAULT, &target("gitlab"), CommitState::Cancelled);
+        assert_eq!(body["state"], "canceled"); // GitLab's spelling
+        assert_eq!(body["description"], "dagron run cancelled");
     }
 
     #[test]

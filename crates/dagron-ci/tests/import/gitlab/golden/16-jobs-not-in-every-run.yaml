@@ -1,0 +1,61 @@
+# Imported from a GitLab CI pipeline by dagron-import.
+#
+# Changed on the way (5):
+#   image: the pipeline's image is each job's that does not set its own
+#   flaky_e2e.allow_failure: the job may fail: a step of it that fails does not end it (continue_on_error), and it ends as a success, which the jobs after it wait for, as on GitLab. The job's log says the step failed, where GitLab marked the job
+#   build.script: a job's script ran under bash where its image had bash, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   on.pull_request: a merge request's pipeline is a pull request's here; GitLab's merged-results and merge-train pipelines are not told apart from it
+#   on.dispatch: a pipeline run from GitLab's page or its API is a run asked for here (dispatch), through the run API
+name: 16-jobs-not-in-every-run
+on:
+  push: {}
+  pull_request: {}
+  dispatch: {}
+tasks:
+- name: build
+  docker_image: alpine:3.20
+  when: '{{ ci_event }} in [push, tag, dispatch]'
+  steps:
+  - name: script
+    run: make
+- name: security_scan
+  docker_image: alpine:3.20
+  depends_on:
+  - build
+  when: '{{ ci_event }} == push and {{ ci_group }} in [refs/heads/main] or {{ ci_event }} == dispatch and {{ ci_group }} in [refs/heads/main]'
+  steps:
+  - name: script
+    run: make scan
+- name: review_app
+  docker_image: alpine:3.20
+  when: '{{ ci_event }} == pull_request'
+  steps:
+  - name: script
+    run: make review-app
+- name: flaky_e2e
+  docker_image: alpine:3.20
+  depends_on:
+  - build
+  when: '{{ ci_event }} in [push, tag, dispatch]'
+  steps:
+  - name: script
+    run: make e2e
+    continue_on_error: true
+- name: deploy
+  docker_image: alpine:3.20
+  depends_on:
+  - security_scan
+  - flaky_e2e
+  when: '{{ ci_event }} == push and {{ ci_group }} in [refs/heads/develop, refs/heads/main] or {{ ci_event }} == dispatch and {{ ci_group }} in [refs/heads/develop, refs/heads/main]'
+  steps:
+  - name: script
+    run: make deploy
+- name: rollback
+  docker_image: alpine:3.20
+  depends_on:
+  - deploy
+  when: '{{ ci_event }} == push and {{ ci_group }} in [refs/heads/develop, refs/heads/main] or {{ ci_event }} == dispatch and {{ ci_group }} in [refs/heads/develop, refs/heads/main]'
+  trigger_rule: one_failed
+  steps:
+  - name: script
+    run: make rollback

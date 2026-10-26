@@ -1,0 +1,10 @@
+shows: A merge group for a branch the pipeline does not name is passed over
+event: { kind: merge_group, base_ref: release/1.x }
+source: |
+  name: ci
+  on:
+    merge_group: { branches: [main] }
+  tasks:
+    - name: test
+      steps:
+        - run: make test

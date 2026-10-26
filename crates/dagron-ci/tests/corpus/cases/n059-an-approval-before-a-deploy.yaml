@@ -1,0 +1,17 @@
+shows: An approval is a task of dagron's own, and the job behind it waits for it
+source: |
+  name: deploy
+  on:
+    push: { branches: [main] }
+  tasks:
+    - name: build
+      steps:
+        - run: make
+    - name: approve
+      type: approval
+      depends_on: [build]
+      approvers: ["release@example.com"]
+    - name: deploy
+      depends_on: [build, approve]
+      steps:
+        - run: make deploy

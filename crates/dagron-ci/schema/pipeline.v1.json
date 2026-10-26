@@ -1,0 +1,412 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "dagron-ci pipeline (.dagron/ci/*.yaml), v1",
+  "description": "A dagron workflow with on: (which events run it) and steps: (commands run in order inside a task). Every other key is dagron's own: it passes through as written and dagron checks it when the run is submitted. dagron-ci validate checks what this schema cannot: references between tasks, cycles, and what a command may name.",
+  "type": "object",
+  "required": ["name", "on", "tasks"],
+  "properties": {
+    "name": { "$ref": "#/$defs/name" },
+    "on": { "$ref": "#/$defs/on" },
+    "concurrency": {
+      "description": "Runs of the same key take turns: a newer one waits for the older, or with cancel_superseded takes its place. Compiles to dagron's concurrency_key and when_full, which the pipeline may not set itself.",
+      "type": "object",
+      "required": ["key"],
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "description": "A template, such as \"{{ ci_group }}\": the one place a branch name may go.",
+          "type": "string",
+          "minLength": 1
+        },
+        "cancel_superseded": {
+          "description": "A newer run of the key takes the place of the ones before it: they are cancelled, and it runs when what they had running has stopped. Needs max_active_runs to be 1, or left out.",
+          "type": "boolean"
+        }
+      }
+    },
+    "tasks": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/task" }
+    },
+    "budget": { "description": "dagron's own; see its documentation." },
+    "datasets_mode": { "description": "dagron's own." },
+    "deadline": { "description": "dagron's own." },
+    "environment": { "description": "dagron's own: the environment whose variables and secrets the run resolves." },
+    "max_active_runs": { "description": "dagron's own." },
+    "notify": { "description": "dagron's own." },
+    "on_datasets": { "description": "dagron's own." },
+    "param_schema": { "description": "dagron's own." },
+    "parameters": {
+      "description": "dagron's own: parameter defaults. A command may name these, unless they are dispatch inputs.",
+      "type": ["object", "null"]
+    },
+    "result_from": { "description": "dagron's own." },
+    "run_timeout_secs": { "description": "dagron's own." },
+    "runner_class": { "description": "dagron's own." },
+    "tags": { "description": "dagron's own." },
+    "task_defaults": {
+      "description": "dagron's own: settings every task starts from.",
+      "type": ["object", "null"],
+      "properties": { "env": { "$ref": "#/$defs/dagron_env" } }
+    },
+    "templates": { "description": "dagron's own." },
+    "use": { "description": "dagron's own." }
+  },
+  "not": { "anyOf": [{ "required": ["concurrency_key"] }, { "required": ["when_full"] }] },
+  "additionalProperties": false,
+  "$defs": {
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,100}$"
+    },
+    "reportPath": {
+      "description": "A file in the workspace: no leading /, and no .. (which the parser refuses).",
+      "type": "string",
+      "maxLength": 240,
+      "pattern": "^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$"
+    },
+    "reportPaths": {
+      "oneOf": [
+        { "$ref": "#/$defs/reportPath" },
+        { "type": "array", "minItems": 1, "maxItems": 8, "items": { "$ref": "#/$defs/reportPath" } }
+      ]
+    },
+    "patterns": {
+      "description": "Globs: * within a path segment, ** across segments, ? one character, [a-z] a class. In a list without _ignore, a pattern starting ! excludes, and the last pattern that matches decides.",
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } }
+      ]
+    },
+    "filters": {
+      "type": ["object", "null"]
+    },
+    "pipeline_names": {
+      "description": "Pipelines, each by its file's name in .dagron/ci.",
+      "oneOf": [
+        { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,100}$" },
+        { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,100}$" } }
+      ]
+    },
+    "on": {
+      "description": "The events that run this pipeline, each with optional filters. An event left out never runs it.",
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "push": {
+          "description": "A push to a branch or a tag. With neither branches nor tags, both kinds run; with one of them, only that kind. paths is not read for tags.",
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "branches": { "$ref": "#/$defs/patterns" },
+            "branches_ignore": { "$ref": "#/$defs/patterns" },
+            "tags": { "$ref": "#/$defs/patterns" },
+            "tags_ignore": { "$ref": "#/$defs/patterns" },
+            "paths": { "$ref": "#/$defs/patterns" },
+            "paths_ignore": { "$ref": "#/$defs/patterns" }
+          },
+          "allOf": [
+            { "not": { "type": "object", "required": ["branches", "branches_ignore"] } },
+            { "not": { "type": "object", "required": ["tags", "tags_ignore"] } },
+            { "not": { "type": "object", "required": ["paths", "paths_ignore"] } }
+          ]
+        },
+        "pull_request": {
+          "description": "A pull request opened, updated or reopened. branches is the branch it merges into.",
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "branches": { "$ref": "#/$defs/patterns" },
+            "branches_ignore": { "$ref": "#/$defs/patterns" },
+            "paths": { "$ref": "#/$defs/patterns" },
+            "paths_ignore": { "$ref": "#/$defs/patterns" }
+          },
+          "allOf": [
+            { "not": { "type": "object", "required": ["branches", "branches_ignore"] } },
+            { "not": { "type": "object", "required": ["paths", "paths_ignore"] } }
+          ]
+        },
+        "merge_group": {
+          "description": "A merge-queue group asking for checks. branches is the branch the queue merges into.",
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "branches": { "$ref": "#/$defs/patterns" },
+            "branches_ignore": { "$ref": "#/$defs/patterns" }
+          },
+          "not": { "type": "object", "required": ["branches", "branches_ignore"] }
+        },
+        "failed": {
+          "description": "A trusted run of another of the repository's pipelines failed: the pipelines named by their file's name in .dagron/ci, as a list, or with the branches it runs for (a push's branch, or the branch a pull request merges into). Its run is given the failed run's id, pipeline, job, fault class and disposition as CI_FAILED_* variables. A failure's own run raises no failure.",
+          "oneOf": [
+            { "$ref": "#/$defs/pipeline_names" },
+            {
+              "type": "object",
+              "required": ["pipelines"],
+              "additionalProperties": false,
+              "properties": {
+                "pipelines": { "$ref": "#/$defs/pipeline_names" },
+                "branches": { "$ref": "#/$defs/patterns" },
+                "branches_ignore": { "$ref": "#/$defs/patterns" }
+              },
+              "not": { "type": "object", "required": ["branches", "branches_ignore"] }
+            }
+          ]
+        },
+        "dispatch": {
+          "description": "A run asked for through the run API (POST /ci/v1/runs), and the inputs it takes.",
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "inputs": {
+              "type": ["object", "null"],
+              "propertyNames": { "pattern": "^(?!ci_)[A-Za-z_][A-Za-z0-9_]{0,63}$" },
+              "additionalProperties": {
+                "type": ["object", "null"],
+                "additionalProperties": false,
+                "properties": {
+                  "description": { "type": ["string", "number", "boolean", "null"] },
+                  "default": { "type": ["string", "number", "boolean", "null"] },
+                  "required": { "type": "boolean" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "step": {
+      "type": "object",
+      "required": ["run"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "run": {
+          "description": "A shell command. Event data is in CI_* variables; a {{ … }} here may name only ci_event, ci_group, ci_sha, ci_base_sha, ci_pr, ci_trust, ci_repo, ci_forge_host, the pipeline's parameters, item and index. A task's output (tasks.X.output) is read in when: alone.",
+          "type": "string",
+          "minLength": 1
+        },
+        "continue_on_error": { "type": "boolean" },
+        "timeout_secs": { "type": "integer", "minimum": 1 },
+        "env": {
+          "type": "object",
+          "propertyNames": { "pattern": "^(?!CI_)[A-Za-z_][A-Za-z0-9_]*$" },
+          "additionalProperties": { "type": ["string", "number", "boolean"] }
+        }
+      }
+    },
+    "dagron_env": {
+      "description": "dagron's own env, of a task or of task_defaults: a list of names and values, each with a value or a value_from. Not a map: a step's env is one, and this written so is refused. A name does not start CI_: those are set from the event.",
+      "type": ["array", "null"],
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": { "name": { "type": "string", "pattern": "^(?!CI_)" } }
+      }
+    },
+    "service": {
+      "description": "A container a job has beside it. ready is a command run in the service's own container until it exits 0: one line for sh -c, or a program and its arguments. Its env is plain values.",
+      "type": "object",
+      "required": ["name", "image"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "pattern": "^(?!localhost$)[a-z]([a-z0-9-]{0,38}[a-z0-9])?$" },
+        "image": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "args": { "type": ["array", "null"], "items": { "type": "string" } },
+        "env": {
+          "type": ["array", "null"],
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+              "value": { "type": ["string", "null"] }
+            }
+          }
+        },
+        "ready": {
+          "oneOf": [
+            { "type": "string", "pattern": "\\S" },
+            { "type": "array", "minItems": 1, "items": { "type": "string" } },
+            { "type": "null" }
+          ]
+        },
+        "ready_timeout_secs": { "type": ["integer", "null"], "minimum": 1, "maximum": 600 },
+        "resources": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "requests": { "type": ["object", "null"], "additionalProperties": { "type": "string" } },
+            "limits": { "type": ["object", "null"], "additionalProperties": { "type": "string" } }
+          }
+        }
+      }
+    },
+    "task": {
+      "description": "A job: one container, one workspace, retried as a unit. steps run in order inside it; or dagron's own command, or neither (an approval, a call, a wait).",
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "$ref": "#/$defs/name" },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1000,
+          "items": { "$ref": "#/$defs/step" }
+        },
+        "depends_on": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        },
+        "allow_failure": {}, "approval_message": {}, "approval_on_timeout": {},
+        "approval_show": {}, "approval_timeout_secs": {}, "approvers": {},
+        "arguments": {}, "binds": {}, "cache": {}, "command": {}, "defer": {},
+        "artifact_api": {
+          "description": "dagron's own: the run's artifacts over dagron-api's API, for a job that does not see the store's directory (in a container): DAGRON_ARTIFACTS_API and a credential of the attempt's own, DAGRON_ARTIFACTS_TOKEN, with which it reads the run's artifacts and writes its own while it runs, where the engine's operator offers it (DAGRON_ARTIFACT_API_URL).",
+          "type": "boolean"
+        },
+        "docker_daemon": {
+          "description": "dagron's own: a Docker daemon of the job's own beside it, as a service named docker that it reaches as DOCKER_HOST, where the engine's operator offers one (DAGRON_DOCKER_DAEMON). Its container is privileged. Not for a run that is not trusted.",
+          "type": "boolean"
+        },
+        "docker_image": {},
+        "env": { "$ref": "#/$defs/dagron_env" },
+        "env_from": {
+          "description": "dagron's own: variables the job is given from what earlier jobs of the run came to, each a job's status or the last line it printed, read when the job starts. The job named is one this job depends on.",
+          "type": ["array", "null"],
+          "maxItems": 256,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "task", "read"],
+            "properties": {
+              "name": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+              "task": { "type": "string" },
+              "read": { "enum": ["status", "last_line"] }
+            }
+          }
+        },
+        "environment": {
+          "description": "dagron's own: the environment this job's secrets are resolved from, in place of the pipeline's. Whether the run may use it is that environment's policy to say.",
+          "type": ["string", "null"]
+        },
+        "gang": {}, "gang_member": {}, "hook": {},
+        "identity": {
+          "description": "OIDC tokens a cloud's federation trades for credentials, for the audiences named: the job asks dagron's issuer for one with its request credential (DAGRON_OIDC_REQUEST_URL, DAGRON_OIDC_REQUEST_TOKEN). Given to a trusted run's job alone.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["oidc"],
+          "properties": {
+            "oidc": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["audience"],
+              "properties": {
+                "audience": {
+                  "oneOf": [
+                    { "type": "string", "minLength": 1, "maxLength": 256 },
+                    { "type": "array", "minItems": 1, "maxItems": 8, "items": { "type": "string", "minLength": 1, "maxLength": 256 } }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "forge_token": {
+          "description": "A token for the repository the job checks out, as GitHub gives a workflow's job its GITHUB_TOKEN: the engine asks the operator's token service for it as each attempt starts, with these permissions (a GitHub App's names), and has it revoked after. The service gives a run that is not trusted read alone. The job has it as GITHUB_TOKEN, masked in its log.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["permissions"],
+          "properties": {
+            "permissions": {
+              "type": "object",
+              "minProperties": 1,
+              "propertyNames": { "enum": ["actions", "checks", "contents", "deployments", "discussions", "issues", "metadata", "pages", "pull_requests", "security_events", "statuses"] },
+              "additionalProperties": { "enum": ["read", "write"] }
+            }
+          }
+        },
+        "image_pull_policy": {}, "input": {}, "instance_key": {}, "isolation": {}, "max_attempts": {},
+        "not_triggerer": {}, "pool": {}, "priority": {},
+        "privileged": {
+          "description": "dagron's own: the job's own container runs privileged, root on its host with every device and capability, for a job that runs a daemon or a cluster inside itself. Where the engine's operator allows it, on a dedicated pool the job reaches by its runner_class (DAGRON_TASK_PRIVILEGED). Not for a run that is not trusted.",
+          "type": "boolean"
+        },
+        "produces": {},
+        "repeat": {}, "resources": {}, "retry_budgets": {}, "retry_delay_secs": {},
+        "retry_max_delay_secs": {}, "retry_on_timeout": {}, "runner_class": {},
+        "report": {
+          "description": "The pipeline's own: files the task's steps write of its tests, read when the steps are over, whatever became of them. JUnit XML and SARIF. What they hold is said with the job: on its check run, its counts, each failure by name, and each that names a place in the repository as an annotation there. Each is a path in the workspace, or a list of up to 8. Read by dagron-ci-exec: a job whose image has none reads no report.",
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "junit": { "$ref": "#/$defs/reportPaths" },
+            "sarif": { "$ref": "#/$defs/reportPaths" }
+          }
+        },
+        "service_account": {},
+        "services": {
+          "description": "dagron's own: containers the job has beside it while it runs, each started before the first step and seen ready, and removed with the job. The job reaches one at its name (pg:5432). Not on the local executor.",
+          "type": ["array", "null"],
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/service" }
+        },
+        "template": {}, "timeout_secs": {},
+        "tokens": {
+          "description": "dagron's own: the model tokens the task may spend, which it reserves of a token budget over its run before it is dispatched, where the engine keeps the meter. At least 1.",
+          "type": "integer", "minimum": 1
+        },
+        "trigger_rule": {},
+        "type": {}, "wait": {}, "when": {}, "with_items": {}, "with_output_of": {},
+        "with_param": {}, "workflow": {},
+        "workspace": {
+          "description": "The directory the task starts in, made for each attempt, with the event's commit checked out unless checkout is false. A task with steps has one unless this is null. size binds on Kubernetes.",
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "size": { "type": "string", "pattern": "^([0-9]+\\.?[0-9]*|\\.[0-9]+)(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?$" },
+                "checkout": {
+                  "description": "Whether the workspace starts with the event's commit checked out in it: true unless set. Or { depth: N } for how much of the commit's history comes with it: 1 is the commit alone, and 0 is all of it, every branch's.",
+                  "oneOf": [
+                    { "type": "boolean" },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["depth"],
+                      "properties": { "depth": { "type": "integer", "minimum": 0 } }
+                    }
+                  ]
+                },
+                "cache": {
+                  "description": "Directories the job keeps between runs, each one entry of the engine's cache store (DAGRON_CACHE_URL) under a key of its prefix and the contents of key_files. Restored before the steps, from the job's own ref and then the base branch of a pull request; saved after they succeed, by a trusted run only.",
+                  "type": "array",
+                  "maxItems": 8,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["prefix", "paths"],
+                    "properties": {
+                      "prefix": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$" },
+                      "key_files": { "type": "array", "maxItems": 32, "items": { "type": "string", "minLength": 1 } },
+                      "paths": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "type": "string", "minLength": 1 } }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "not": { "required": ["steps", "command"] },
+      "additionalProperties": false
+    }
+  }
+}

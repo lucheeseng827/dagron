@@ -1,0 +1,42 @@
+# Imported from a GitHub Actions workflow by dagron-import.
+#
+# Changed on the way (6):
+#   name: "Rust" is "rust": a pipeline's name is letters, digits, '.', '_' and '-', and its checks are called by it
+#   jobs.build.steps[1]: dtolnay/rust-toolchain is the job's image, docker.io/library/rust:1-bookworm: the toolchain is in the image, and no step installs it
+#   jobs.build.steps[1].with.components: a step adds them to the image's toolchain: rustup component add
+#   jobs.build.steps[2]: Swatinem/rust-cache is the job's cache "cargo", keyed by **/Cargo.lock: restored before the steps and saved after they succeed, from the run's own branch and then a pull request's base, the entry of that key or else the newest of the prefix
+#   jobs: a step that named no shell ran under bash on a runner GitHub hosts, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   jobs: a job that set no timeout had GitHub's six hours, and has dagron-ci's own here (an hour, unless CI_DEFAULT_TIMEOUT_SECS says another): say timeout_secs where a job needs longer
+name: rust
+on:
+  push:
+    branches:
+    - main
+  pull_request:
+    branches:
+    - main
+tasks:
+- name: build
+  docker_image: docker.io/library/rust:1-bookworm
+  env:
+  - name: CARGO_TERM_COLOR
+    value: always
+  workspace:
+    cache:
+    - prefix: cargo
+      key_files:
+      - '**/Cargo.lock'
+      paths:
+      - /usr/local/cargo/registry
+      - /usr/local/cargo/git
+      - ~/.cargo/registry
+      - ~/.cargo/git
+      - target
+  steps:
+  - run: rustup component add rustfmt clippy
+  - name: Format
+    run: cargo fmt --all -- --check
+  - name: Build
+    run: cargo build --verbose
+  - name: Run tests
+    run: cargo test --verbose

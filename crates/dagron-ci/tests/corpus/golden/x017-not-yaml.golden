@@ -1,0 +1,2 @@
+not a pipeline:
+  not YAML a pipeline can be read from: did not find expected ',' or ']' at line 7 column 1, while parsing a flow sequence at line 6 column 12

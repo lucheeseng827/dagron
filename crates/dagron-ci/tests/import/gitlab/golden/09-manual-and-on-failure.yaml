@@ -1,0 +1,74 @@
+# Imported from a GitLab CI pipeline by dagron-import.
+#
+# Changed on the way (6):
+#   image: the pipeline's image is each job's that does not set its own
+#   build.retry.when: the job is tried again whatever made it fail
+#   build.retry: retry: 1 is max_attempts: 2, which counts the first attempt
+#   production.when: a manual job is run by a person's approval here (a gate before it)
+#   build.script: a job's script ran under bash where its image had bash, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   on.dispatch: a pipeline run from GitLab's page or its API is a run asked for here (dispatch), through the run API
+#
+# Not carried over (1):
+#   staging.environment.url: an environment is named here, for its secrets and who may use it; there is no page of deployments
+name: 09-manual-and-on-failure
+on:
+  push: {}
+  dispatch: {}
+tasks:
+- name: build
+  docker_image: alpine:3.20
+  max_attempts: 2
+  steps:
+  - name: script
+    run: ./build.sh
+- name: staging
+  docker_image: alpine:3.20
+  depends_on:
+  - build
+  environment: staging
+  steps:
+  - name: script
+    run: ./deploy.sh staging
+- name: approve-production
+  type: approval
+  depends_on:
+  - build
+  approval_message: Run production?
+- name: production
+  docker_image: alpine:3.20
+  depends_on:
+  - approve-production
+  environment: production
+  steps:
+  - name: script
+    run: ./deploy.sh production
+- name: smoke
+  docker_image: alpine:3.20
+  depends_on:
+  - staging
+  - production
+  steps:
+  - name: script
+    run: ./smoke.sh
+- name: notify-failure
+  docker_image: alpine:3.20
+  depends_on:
+  - build
+  - staging
+  - production
+  trigger_rule: one_failed
+  steps:
+  - name: script
+    run: ./notify.sh failed
+- name: report
+  docker_image: alpine:3.20
+  depends_on:
+  - build
+  - staging
+  - production
+  - smoke
+  - notify-failure
+  trigger_rule: all_done
+  steps:
+  - name: script
+    run: ./report.sh

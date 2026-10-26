@@ -1,0 +1,14 @@
+shows: A step that only names a script keeps its name in the job's log
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: all
+      steps:
+        - name: one
+          run: "true"
+        - name: two words
+          run: "true"
+        - name: three
+          run: exit 0

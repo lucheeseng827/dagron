@@ -14,7 +14,7 @@
 //! hardened one; the unhardened behaviour is what every other test in the crate
 //! already runs under.
 //!
-//! The environment is the build pool's, from `ee/compose.image-build.yaml`:
+//! The environment is the build pool's, from its compose file:
 //! a datastore DSN, the key that decrypts stored task secrets, an image-signing
 //! key, and a daemon socket. Each of those was read by a task before this.
 
@@ -79,7 +79,7 @@ async fn streamed(command: &[&str], env: &[EnvVar]) -> anyhow::Result<String> {
     );
     ctx.env = env.to_vec();
     ctx.log_sink = Some(sink);
-    LocalExecutor.execute(&ctx).await.map(|o| o.output)
+    LocalExecutor::default().execute(&ctx).await.map(|o| o.output)
 }
 
 /// The escalation that motivated all of this: `sh -c` on the build pool. It ran

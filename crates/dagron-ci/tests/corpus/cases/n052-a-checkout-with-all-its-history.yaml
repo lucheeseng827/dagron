@@ -1,0 +1,10 @@
+shows: A checkout of depth 0 fetches all of the repository's history
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: changelog
+      workspace: { checkout: { depth: 0 } }
+      steps:
+        - run: git describe --tags

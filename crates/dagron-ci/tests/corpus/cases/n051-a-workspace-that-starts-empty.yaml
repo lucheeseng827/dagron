@@ -1,0 +1,10 @@
+shows: A workspace with its checkout turned off starts empty
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: notify
+      workspace: { checkout: false }
+      steps:
+        - run: echo "nothing of the repository is needed here"

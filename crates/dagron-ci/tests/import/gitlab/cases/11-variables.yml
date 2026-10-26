@@ -1,0 +1,44 @@
+# Variables: the pipeline's, a job's, with and without expansion.
+image: debian:12-slim
+
+variables:
+  GIT_DEPTH: "10"
+  GIT_SUBMODULE_STRATEGY: recursive
+  APP: widgets
+  VERSION: "1.2"
+  TAG: "$APP-$VERSION"
+  LITERAL:
+    value: "cost: $5"
+    expand: false
+  DEPLOY_TARGET:
+    value: staging
+    description: Where to deploy
+    options: [staging, production]
+  CI_DEBUG_TRACE: "false"
+
+package:
+  variables:
+    VERSION: "2.0"
+    GIT_STRATEGY: none
+    OUT: "out/$TAG.tar.gz"
+    CI_MY_OWN: x
+  script:
+    - echo "$TAG $LITERAL $OUT"
+    - echo "$CI_COMMIT_REF_NAME on $CI_PIPELINE_SOURCE"
+
+bash-only:
+  script:
+    - |
+      if [[ "$APP" == widgets ]]; then
+        echo yes
+      fi
+  after_script:
+    - echo "done with $CI_JOB_NAME in $CI_JOB_STAGE"
+
+no-inherit:
+  inherit:
+    variables: false
+    default: false
+  image: busybox:1.36
+  script:
+    - echo "${APP:-none}"

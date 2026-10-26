@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 # MSRV — see the root Cargo.toml for how 1.88 was measured.
 rust-version = "1.88"
-description = "dagron importers — convert other orchestrators' workflow specs to dagron DAG YAML. Argo Workflows today; more to come."
+description = "dagron importers — convert other orchestrators' workflow specs to dagron's. Argo Workflows to a dagron DAG; GitHub Actions workflows, GitLab CI pipelines and Jenkins Declarative Pipelines to a dagron-ci pipeline."
 
 [[bin]]
 name = "dagron-import"
@@ -18,6 +18,8 @@ path = "src/lib.rs"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 anyhow = "1"
+# GitLab's `rules:if` patterns, matched as GitLab does (RE2's syntax).
+regex = "1"
 
 [dev-dependencies]
 # Validate generated specs against the real dagron parser.

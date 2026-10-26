@@ -1,0 +1,85 @@
+# Imported from a GitHub Actions workflow by dagron-import.
+#
+# To do by hand (2):
+#   jobs.build.steps[4]: its condition, `contains(github.event.head_commit.message, '[full]')`, could not be read as a test: write it in the script
+#   jobs.on-main.if: `github.ref == 'refs/heads/main'` is not a condition a job's when: can hold (a when: may name the event's kind, and nothing an outsider chose): put it in on:, or test it in a step
+#
+# Changed on the way (12):
+#   jobs.build.steps[1], jobs.build.steps[2], jobs.build.steps[3]: its `if:` is a test at the head of the script, which leaves the step where it is false: the two are compared as text, letter for letter
+#   jobs.build.runs-on, jobs.deploy.runs-on, jobs.preview.runs-on, jobs.manual.runs-on, jobs.on-main.runs-on, jobs.cleanup.runs-on, jobs.alert.runs-on: ubuntu-latest is the image docker.io/library/ubuntu:24.04: an operating system, with none of the tools a hosted runner holds
+#   jobs: a step that named no shell ran under bash on a runner GitHub hosts, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   jobs: a job that set no timeout had GitHub's six hours, and has dagron-ci's own here (an hour, unless CI_DEFAULT_TIMEOUT_SECS says another): say timeout_secs where a job needs longer
+name: conditions
+on:
+  push: {}
+  pull_request: {}
+  dispatch: {}
+tasks:
+- name: build
+  docker_image: docker.io/library/ubuntu:24.04
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        jobs.build.steps[4]: its condition, `contains(github.event.head_commit.message, '[full]')`, could not be read as a test: write it in the script
+      DAGRON_IMPORT
+      exit 1
+  - run: make
+  - run: |-
+      case "$CI_EVENT" in 'pull_request') ;; *) exit 0 ;; esac
+      make preview
+  - run: |-
+      case "$CI_REF" in 'refs/heads/main') ;; *) exit 0 ;; esac
+      case "$CI_EVENT" in 'pull_request') exit 0 ;; esac
+      make snapshot
+  - run: |-
+      case "$CI_REF" in 'refs/tags/v'*) ;; *) exit 0 ;; esac
+      make dist
+  - run: make full
+- name: deploy
+  docker_image: docker.io/library/ubuntu:24.04
+  depends_on:
+  - build
+  when: '{{ ci_event }} in [push, tag]'
+  steps:
+  - run: make deploy
+- name: preview
+  docker_image: docker.io/library/ubuntu:24.04
+  depends_on:
+  - build
+  when: '{{ ci_event }} == pull_request'
+  steps:
+  - run: make preview
+- name: manual
+  docker_image: docker.io/library/ubuntu:24.04
+  when: '{{ ci_event }} == dispatch'
+  steps:
+  - run: make manual
+- name: on-main
+  docker_image: docker.io/library/ubuntu:24.04
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        jobs.on-main.if: `github.ref == 'refs/heads/main'` is not a condition a job's when: can hold (a when: may name the event's kind, and nothing an outsider chose): put it in on:, or test it in a step
+      DAGRON_IMPORT
+      exit 1
+  - run: make main
+- name: cleanup
+  docker_image: docker.io/library/ubuntu:24.04
+  depends_on:
+  - build
+  - deploy
+  trigger_rule: all_done
+  steps:
+  - run: make clean
+- name: alert
+  docker_image: docker.io/library/ubuntu:24.04
+  depends_on:
+  - build
+  trigger_rule: one_failed
+  allow_failure: true
+  steps:
+  - run: make alert

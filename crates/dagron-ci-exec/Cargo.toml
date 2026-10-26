@@ -1,0 +1,52 @@
+[package]
+name = "dagron-ci-exec"
+version = "0.1.0"
+edition = "2021"
+# MSRV — see the root Cargo.toml for how 1.88 was measured.
+rust-version = "1.88"
+description = "The step runner of a dagron-ci task: runs its steps in order, each in its own `sh -e`, with step markers, per-step timeouts and a result. A static binary that runs in any image with a shell."
+
+[lib]
+name = "dagron_ci_exec"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dagron-ci-exec"
+path = "src/main.rs"
+
+# Each dependency already in the lock or of this workspace, and pure Rust, so
+# the binary links statically on musl with nothing else to find.
+[dependencies]
+# GitHub's expression language: a step's `if:` and its values, read as the
+# job runs (step protocol 2).
+dagron-ci-expr = { path = "../dagron-ci-expr" }
+# `hashFiles`: the SHA-256 of a job's files. Pure Rust, already in the lock.
+sha2 = "0.10"
+# What the standard library does not expose: signalling a process group,
+# waiting on any child, becoming a child subreaper, the parent-death signal.
+libc = "0.2"
+# The result, written as JSON.
+serde_json = "1"
+# A step in an image of its own asks the engine's results service for its
+# container (`container`): the client dagron-ci-cache speaks to a store with.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+# A Docker action's Dockerfile's directory, sent to the engine to build its
+# image from. Already in the lock.
+tar = { version = "0.4", default-features = false }
+# A local action's action.yml, read as the step that uses it starts (step
+# protocol 4). The one dagron-core and dagron-ci read YAML with.
+serde_yaml = "0.9"
+# A GitLab job's artifacts, a zip as the artifact service keeps one:
+# deflated, each file's CRC-32. Both pure Rust, and already in the lock.
+crc32fast = "1"
+flate2 = "1"
+# A directory of its own for a zip on its way, made new, removed when done.
+# Pure Rust, and already in the lock.
+tempfile = "3"
+
+[dev-dependencies]
+# The conformance test compiles pipelines with dagron-ci's own compiler and
+# runs the task each compiles to twice: with this binary, and with the shell
+# fallback the compiled command carries.
+dagron-ci = { path = "../dagron-ci" }
+tempfile = "3"

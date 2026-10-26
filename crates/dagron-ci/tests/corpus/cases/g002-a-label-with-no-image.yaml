@@ -1,0 +1,9 @@
+shows: A job whose runs-on label the repository gives no image for is refused
+front: github
+source: |
+  on: push
+  jobs:
+    build:
+      runs-on: ubuntu-latest
+      steps:
+        - run: make

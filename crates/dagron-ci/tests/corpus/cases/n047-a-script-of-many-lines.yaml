@@ -1,0 +1,16 @@
+shows: A step's script is carried as it is written, its quotes and substitutions with it
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: build
+      steps:
+        - name: versions
+          run: |
+            set -eu
+            echo "building $(git rev-parse --short HEAD) on $(uname -m)"
+            for f in src/*.rs; do
+              printf '%s\n' "$f"
+            done
+            test "${CI:-}" = "true" && echo 'in CI; not a "tty"'

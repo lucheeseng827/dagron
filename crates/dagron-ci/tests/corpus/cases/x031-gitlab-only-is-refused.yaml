@@ -1,0 +1,8 @@
+shows: GitLab only and except are refused, with rules named in their place
+front: gitlab
+file: gitlab-ci
+source: |
+  image: alpine:3.20
+  build:
+    only: [main]
+    script: [make]

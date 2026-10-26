@@ -1,0 +1,44 @@
+# compose.ci.yaml with its images built from this checkout, where a release
+# has not published them (or to try a change):
+#
+#   docker compose -f compose.ci.yaml -f compose.ci.build.yaml up -d --build
+#
+# The first build compiles four Rust binaries, and takes a while. After it,
+# everything in docs/CI_QUICKSTART.md is the same, with both files named in
+# each `docker compose` command.
+
+services:
+  engine:
+    image: localhost/dagron-engine:dev
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # As the published engine is built, less what CI here does not use.
+        FEATURES: postgres,ops
+    environment:
+      DAGRON_CI_EXEC_IMAGE: localhost/dagron-ci-exec:dev
+    depends_on:
+      ci-exec:
+        condition: service_completed_successfully
+
+  dagron-api:
+    image: localhost/dagron-api:dev
+    build:
+      context: .
+      dockerfile: crates/dagron-api/Dockerfile
+
+  dagron-ci:
+    image: localhost/dagron-ci:dev
+    build:
+      context: .
+      dockerfile: crates/dagron-ci/Dockerfile
+
+  # Not a service. It is here so that `--build` makes the image the engine
+  # installs into each job's workspace: it says its version, and exits.
+  ci-exec:
+    image: localhost/dagron-ci-exec:dev
+    build:
+      context: .
+      dockerfile: crates/dagron-ci-exec/Dockerfile
+    command: ["--version"]

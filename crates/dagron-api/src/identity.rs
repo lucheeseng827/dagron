@@ -7,17 +7,17 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use dagron_identity::{IdentityProvider, VerifiedUser};
-use sqlx::postgres::PgPool;
+use crate::db::Pool;
 
 use crate::pwhash;
 
 /// Verifies email + password against the `users` table (argon2 PHC hashes).
 pub struct LocalIdentityProvider {
-    pool: PgPool,
+    pool: Pool,
 }
 
 impl LocalIdentityProvider {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: Pool) -> Self {
         Self { pool }
     }
 }

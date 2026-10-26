@@ -1,0 +1,14 @@
+shows: A dispatch's input takes the place of the default the pipeline declares
+event: { kind: dispatch, inputs: { suite: full } }
+source: |
+  name: suite
+  on:
+    dispatch:
+      inputs:
+        suite: { default: quick }
+        shards: { default: "4" }
+  tasks:
+    - name: run
+      steps:
+        - env: { SUITE: "{{ suite }}", SHARDS: "{{ shards }}" }
+          run: scripts/suite.sh "$SUITE" "$SHARDS"

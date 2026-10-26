@@ -8,3 +8,11 @@ this software except in compliance with the License. You may obtain a copy of th
 License in the LICENSE file or at:
 
     http://www.apache.org/licenses/LICENSE-2.0
+
+Third-party notices
+-------------------
+
+crates/dagron-ci/src/github.rs follows the shape of the GitHub webhook receiver
+in AGAS (agas-controller): an HMAC-SHA256 check of X-Hub-Signature-256 over the
+raw body before parsing, and the X-GitHub-Delivery id as the replay key. AGAS is
+licensed under the MIT License.

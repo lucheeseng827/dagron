@@ -3,7 +3,10 @@
 `dagron-api` is the **public, authenticated edge** for the dagron engine.
 It is a stateless, read-mostly axum service over the dagron **Postgres** datastore
 that the schedulers write to — it holds no scheduler state of its own and scales
-to N replicas.
+to N replicas. Built `--no-default-features --features sqlite`, it is instead
+one process beside one engine on the same SQLite file, serving sign-in, tokens,
+workflows, runs, logs and live updates (polled), and `501` for the rest:
+[docs/ONE_NODE.md](../../docs/ONE_NODE.md).
 
 ## Architecture
 
@@ -24,7 +27,7 @@ dagron has **two** HTTP surfaces. They are intentionally separate:
 |---|---|---|
 | Role | **internal ops** API, in-process beside the reconcile loop | **external UI** gateway |
 | Auth | **none** — must be bound to a private/cluster-internal interface | self-contained JWT (argon2 login → own HS256 session cookie) |
-| Backend | whatever feature the engine is built with | Postgres only (needs LISTEN/NOTIFY for SSE) |
+| Backend | whatever feature the engine is built with | Postgres (LISTEN/NOTIFY for SSE); SQLite for one node, a subset, polled |
 | Exposes | `/metrics` (Prometheus), `/openapi`, `/docs`, dead-letter mgmt, runs, cancel | runs, run detail, **DAG graph**, **task logs**, **SSE live stream**, cancel, **task retry**, submit, **metrics (JSON)**, **dead-letters** |
 
 > **Security boundary:** the engine `src/api.rs` is unauthenticated. Bind it to
@@ -111,7 +114,7 @@ curl -b cookies.txt localhost:8080/api/runs                  # authenticated rea
 dagron-api inlines its queries (mirroring engine `db::postgres`) rather than
 depending on the engine crate: the engine's `db.rs` has a `compile_error!` when
 both the `sqlite` and `postgres` features are enabled, which Cargo's workspace
-feature unification would trip if this Postgres-only service depended on
+feature unification would trip if this service, Postgres by default, depended on
 `dagron[postgres]` alongside the engine's default `sqlite` build. Keep the
 inlined statements in sync if the engine schema changes (the submitted/redriven
 task `input` JSON must match `dag::TaskSpec`).
@@ -120,7 +123,7 @@ task `input` JSON must match `dag::TaskSpec`).
 
 | Env | Purpose |
 |-----|---------|
-| `DATABASE_URL` | Postgres connection string (same DB the schedulers use; a read replica may be wired into the read path later) |
+| `DATABASE_URL` | Postgres connection string (same DB the schedulers use; a read replica may be wired into the read path later); in the `sqlite` build, the engine's file (`sqlite://<path>` or the path) |
 | `DAGRON_JWT_SECRET` | HS256 secret dagron-api uses to sign + validate its own session JWT (≥ 32 bytes) |
 | `DAGRON_COOKIE_SECURE` | set the session cookie's `Secure` attribute (enable behind HTTPS/TLS termination) |
 | `PORT` | listen port (default 8080) |

@@ -1,0 +1,11 @@
+shows: A concurrency whose newer run cancels is a key whose newer run takes the older one's place, and waits for what it had running to stop
+event: { kind: pull_request, pr: 9, ref: refs/pull/9/head }
+source: |
+  name: ci
+  on:
+    pull_request: {}
+  concurrency: { key: "{{ ci_group }}", cancel_superseded: true }
+  tasks:
+    - name: test
+      steps:
+        - run: make test

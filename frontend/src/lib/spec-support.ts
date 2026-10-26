@@ -66,6 +66,10 @@ const CARRIED_SPEC_KEYS = new Set([
   "tags",
   "run_timeout_secs",
   "max_active_runs",
+  // What a full cap does, and what the cap is counted under: neither changes
+  // the graph that is drawn.
+  "when_full",
+  "concurrency_key",
   "deadline",
   "notify",
   "result_from",

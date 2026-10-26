@@ -1,0 +1,13 @@
+shows: A GitLab cache keyed by files becomes a workspace cache of those key files
+front: gitlab
+file: gitlab-ci
+source: |
+  image: node:22
+  install:
+    cache:
+      - key:
+          files: [package-lock.json]
+        paths: [node_modules/]
+      - key: $CI_COMMIT_REF_SLUG
+        paths: [.npm/]
+    script: [npm ci]

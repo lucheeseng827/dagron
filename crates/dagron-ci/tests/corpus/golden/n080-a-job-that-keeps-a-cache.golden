@@ -1,0 +1,111 @@
+runs
+
+parameters:
+  ci_base_ref: ""
+  ci_base_sha: ""
+  ci_event: "push"
+  ci_forge_host: "github.com"
+  ci_group: "refs/heads/main"
+  ci_pr: ""
+  ci_ref: "refs/heads/main"
+  ci_repo: "acme/widgets"
+  ci_sha: "4b4708e725f29891d22b4c96af9f0a403ff51c7c"
+  ci_trust: "trusted"
+
+workflow:
+name: ci
+parameters:
+  ci_event: ''
+  ci_ref: ''
+  ci_sha: ''
+  ci_base_sha: ''
+  ci_base_ref: ''
+  ci_pr: ''
+  ci_repo: ''
+  ci_forge_host: ''
+  ci_group: ''
+  ci_trust: ''
+tags:
+- ci
+task_defaults:
+  timeout_secs: 3600
+  env:
+  - name: CI_EVENT
+    value: '{{ ci_event }}'
+  - name: CI_REF
+    value: '{{ ci_ref }}'
+  - name: CI_SHA
+    value: '{{ ci_sha }}'
+  - name: CI_BASE_SHA
+    value: '{{ ci_base_sha }}'
+  - name: CI_BASE_REF
+    value: '{{ ci_base_ref }}'
+  - name: CI_PR
+    value: '{{ ci_pr }}'
+  - name: CI_REPO
+    value: '{{ ci_repo }}'
+  - name: CI_FORGE_HOST
+    value: '{{ ci_forge_host }}'
+  - name: CI_GROUP
+    value: '{{ ci_group }}'
+  - name: CI_TRUST
+    value: '{{ ci_trust }}'
+tasks:
+- name: build
+  docker_image: rust:1.86-bookworm
+  command:
+  - sh
+  - -c
+  - |
+    # dagron-ci: this task's steps, in order, each in its own `sh -e`. They run
+    # under dagron-ci-exec (step protocol 1) where the image has it, at
+    # /dagron/bin or on PATH, and under the lines below where it does not.
+    # Either way the markers go to stderr: the output is the steps'.
+    for ci_exec in /dagron/bin/dagron-ci-exec "$(command -v dagron-ci-exec 2>/dev/null)"; do
+      if [ -x "$ci_exec" ] && "$ci_exec" --speaks 1 >/dev/null 2>&1; then
+        exec "$ci_exec"
+      fi
+    done
+    ci_run() {
+      if [ "$1" -gt 0 ]; then
+        if command -v timeout >/dev/null 2>&1; then
+          timeout -k 10 "$1" sh -ec "$2"
+          return $?
+        fi
+        printf '%s\n' "::dagron-ci::warning::no timeout(1) in this image; the step runs without its $1 s limit" >&2
+      fi
+      sh -ec "$2"
+    }
+    ci_start() {
+      printf '%s\n' "::dagron-ci::step::$1::start::$2" >&2
+    }
+    # A failed step ends the task, unless it may fail (its third argument, 1).
+    ci_end() {
+      printf '%s\n' "::dagron-ci::step::$1::end::$2" >&2
+      [ "$2" -eq 0 ] && return 0
+      [ "$3" = 1 ] || exit "$2"
+      printf '%s\n' "::dagron-ci::step::$1::continued" >&2
+    }
+    ci_start 1 "$CI_STEP_1_NAME"; ( ci_run 0 "$CI_STEP_1_RUN" ); ci_end 1 $? 0
+    exit 0
+  workspace:
+    cache:
+    - key_files:
+      - Cargo.lock
+      paths:
+      - /usr/local/cargo/registry
+      - ~/.cargo/git
+      prefix: cargo
+      restore_from: '{{ ci_base_ref }}'
+    checkout:
+      commit: '{{ ci_sha }}'
+      repository: https://{{ ci_forge_host }}/{{ ci_repo }}.git
+  env:
+  - name: CI_STEP_PROTOCOL
+    value: '1'
+  - name: CI_STEP_COUNT
+    value: '1'
+  - name: CI_STEP_1_NAME
+    value: cargo build --locked
+  - name: CI_STEP_1_RUN
+    value: cargo build --locked

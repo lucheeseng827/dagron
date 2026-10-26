@@ -1,0 +1,11 @@
+shows: A key that neither dagron-ci nor dagron takes is refused, with the nearest key there is
+source: |
+  name: ci
+  on:
+    push: {}
+  task_default:
+    timeout_secs: 600
+  tasks:
+    - name: build
+      steps:
+        - run: make

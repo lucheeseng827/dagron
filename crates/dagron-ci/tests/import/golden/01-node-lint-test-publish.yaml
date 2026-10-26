@@ -1,0 +1,55 @@
+# Imported from a GitHub Actions workflow by dagron-import.
+#
+# Changed on the way (9):
+#   concurrency: a newer run of the group waits its turn, and every run that waits has one, where GitHub keeps the newest of them alone
+#   concurrency: the group is keyed by {{ ci_group }}: the branch, or the pull request
+#   jobs.lint.steps[1]: actions/setup-node is the job's image, docker.io/library/node:22-bookworm-slim: the toolchain is in the image, and no step installs it
+#   jobs.test.steps[1]: actions/setup-node is the job's image, each instance's own, by its node: the toolchain is in the image, and no step installs it
+#   jobs.publish.runs-on: ubuntu-latest is the image docker.io/library/ubuntu:24.04: an operating system, with none of the tools a hosted runner holds
+#   jobs.publish: what was read from `secrets` (NPM_TOKEN) is read from the job's environment, as npm_token: keep it there, in dagron-api
+#   jobs.publish: NPM_TOKEN: given to the job, and so to every step of it, where the workflow gave it to the steps that read it. A step that must not hold it is a job of its own
+#   jobs: a step that named no shell ran under bash on a runner GitHub hosts, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   jobs: a job that set no timeout had GitHub's six hours, and has dagron-ci's own here (an hour, unless CI_DEFAULT_TIMEOUT_SECS says another): say timeout_secs where a job needs longer
+name: ci
+on:
+  push:
+    branches:
+    - main
+  pull_request:
+    branches:
+    - main
+concurrency:
+  key: '{{ ci_group }}'
+tasks:
+- name: lint
+  docker_image: docker.io/library/node:22-bookworm-slim
+  steps:
+  - run: npm ci
+  - run: npm run lint
+- name: test
+  docker_image: '{{ item.node_image }}'
+  depends_on:
+  - lint
+  with_items:
+  - node: 18
+    node_image: docker.io/library/node:18-bookworm-slim
+  - node: 20
+    node_image: docker.io/library/node:20-bookworm-slim
+  - node: 22
+    node_image: docker.io/library/node:22-bookworm-slim
+  timeout_secs: 900
+  steps:
+  - run: npm ci
+  - run: npm test
+- name: publish
+  docker_image: docker.io/library/ubuntu:24.04
+  depends_on:
+  - test
+  when: '{{ ci_event }} in [push, tag]'
+  environment: release
+  env:
+  - name: NPM_TOKEN
+    value_from:
+      secret: npm_token
+  steps:
+  - run: npm publish

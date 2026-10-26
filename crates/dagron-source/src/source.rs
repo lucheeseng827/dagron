@@ -879,6 +879,7 @@ tasks: []").await.unwrap();
             &msg.payload,
             &pos.offset_key("dir"),
             &pos.position,
+            None,
         )
         .await
         .unwrap();

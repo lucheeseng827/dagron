@@ -1,0 +1,2 @@
+not a pipeline:
+  tasks[0] (build).workspace.cache[0].restore_from: is dagron-ci's to say: a job restores from its own ref, then from the base branch of a pull request or merge group

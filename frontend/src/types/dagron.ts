@@ -12,17 +12,64 @@ export type TaskStatus =
 
 export type RunStatus = "pending" | "running" | "succeeded" | "failed" | "cancelled";
 
+/// The status a run that is being stopped will take once its work has: it
+/// was cancelled, or passed its deadline, while a worker held one of its
+/// tasks. Set only on a `running` run; absent or null on every other.
+export type StoppingAs = "cancelled" | "failed";
+
 /// Outcome of resolving a `type: approval` gate — mirrors the OpenAPI
 /// `resolution: { enum: [approved, rejected] }` on the approve/reject routes.
 export type TaskResolution = "approved" | "rejected";
 
-/// What started a run — derived server-side (schedule stamp / backfill ledger).
-export type TriggerKind = "manual" | "schedule" | "backfill";
+/// What started a run: the kind its trigger record names. Every run has a
+/// record, written when the run is made. A run from before that has its kind
+/// decided as it was: a backfill, a schedule's fire, or else manual.
+export type TriggerKind =
+  | "manual"
+  | "api"
+  | "schedule"
+  | "backfill"
+  | "dataset"
+  | "workflow"
+  | "source"
+  | "ci";
+
+/// A run's trigger record: what started it, as whatever started it wrote it
+/// down. `principal` is what submitted the run: a caller the API
+/// authenticated (`user:…`, `ci:…`), or the engine itself.
+export interface RunTrigger {
+  kind: TriggerKind;
+  principal: string;
+  /// Who caused it at the source: the person who asked, the pusher, a pull
+  /// request's author. A parent run's, for a run its task started.
+  actor: string | null;
+  trust: string | null;
+  /// What it came from, where that is no repository: a schedule, a cron
+  /// entry, a dataset, a parent run's task, a source, a dead letter.
+  source: string | null;
+  forge_host: string | null;
+  /// `owner/name` on that forge.
+  repo: string | null;
+  ref: string | null;
+  sha: string | null;
+  base_sha: string | null;
+  pr: number | null;
+  /// The id of the event at its source: a fire's time, a backfill's date, a
+  /// source's position, a CI service's event.
+  event_id: string | null;
+}
 
 export interface RunSummary {
   id: string;
   definition_id: string;
   status: RunStatus;
+  /// Absent from an API older than the stop request.
+  stopping_as?: StoppingAs | null;
+  /// A run that waits for its workflow's `max_active_runs` (`when_full`) has
+  /// the first and not the second: it reads `running`, and has started
+  /// nothing. Absent from an API older than the queue.
+  queued_at?: string | null;
+  admitted_at?: string | null;
   created_at: string;
   finished_at: string | null;
   /// Workflow/DAG name (from the run's definition); may be null for legacy rows.
@@ -105,6 +152,10 @@ export interface TaskRow {
   output: string | null;
   scheduled_at: string | null;
   finished_at: string | null;
+  /// When a `running` task was asked to stop (its run was cancelled or
+  /// passed its deadline while a worker held it). It is `cancelled` once its
+  /// work is gone. Null on every other row; absent from an older API.
+  stop_requested_at?: string | null;
   /// Why a parked task is parked — at most one is set. Every park form (time /
   /// HTTP / dataset sensor, sub-workflow trigger) keeps the row `running` with
   /// no lease, so without these a parked task and a hung one look identical.
@@ -121,6 +172,13 @@ export interface TaskRow {
   /// Approval gate decision: who resolved it (`timeout` when the sweep did) and why.
   decided_by?: string | null;
   decision_comment?: string | null;
+  /// Why a `ready` task is not being dispatched: its pod was refused by a full
+  /// Kubernetes namespace ResourceQuota, so it is back in the queue with no
+  /// attempt consumed. When the wait began, the last refusal, and the refusals
+  /// so far — set only while the task waits.
+  quota_wait_since?: string | null;
+  quota_wait_detail?: string | null;
+  quota_waits?: number;
 }
 
 /// A dataset in the registry: current state plus who consumes it.
@@ -165,7 +223,20 @@ export interface RunDetail {
   finished_at: string | null;
   /// Workflow/DAG name for the header + backlink; null for legacy rows.
   name: string | null;
+  /// Set while a `running` run is being stopped: what it will end as, and
+  /// when it was asked. Absent from an API older than the stop request.
+  stopping_as?: StoppingAs | null;
+  stop_requested_at?: string | null;
+  /// When a run that arrived at a full `max_active_runs` began to wait
+  /// (`when_full`), and when it was let in. With the first and not the
+  /// second it waits, and has started nothing. Absent from an API older
+  /// than the queue.
+  queued_at?: string | null;
+  admitted_at?: string | null;
   trigger_kind: TriggerKind;
+  /// What the run was started for, when its submitter said; absent from an
+  /// API older than the record.
+  trigger?: RunTrigger | null;
   tasks: TaskRow[];
 }
 
@@ -184,6 +255,10 @@ export interface GraphNode {
   sub_run_id: string | null;
   /// Resolved from the memoization store instead of executed (#22).
   cache_hit: boolean;
+  /// Quota wait, if any — set only while a `ready` node is back in the queue
+  /// because the namespace ResourceQuota refused its pod.
+  quota_wait_since?: string | null;
+  quota_wait_detail?: string | null;
 }
 
 export interface GraphEdge {
@@ -269,7 +344,13 @@ export interface TaskLogs {
   /// was printed somewhere inside this window.
   started_at?: string;
   finished_at?: string;
+  /// The task's attempts so far, counted through its life: a rerun or a clear
+  /// does not set it back.
   attempt: number;
+  /// How many attempts are behind the one shown. Not `attempt - 1` for a task
+  /// a rerun put back that has not started again. Absent from the engine's
+  /// own API and from a dagron-api older than the field.
+  earlier_attempts?: number;
   output: string | null;
   /// Char offset this response starts at (tail metadata, see routes/logs.rs).
   offset: number;
@@ -298,8 +379,14 @@ export interface TaskLogs {
 export interface TaskAttemptLog {
   /// 1-based, the same counter `TaskLogs.attempt` reports.
   attempt: number;
-  /// `iteration` — a loop pass — or `failed`, an attempt that errored.
-  reason: "iteration" | "failed";
+  /// `iteration` — a loop pass — or `failed`, an attempt that errored and a
+  /// worker retried. `rerun`, `retry` or `clear`: an attempt a person
+  /// replaced, by that; `status` then says how it had ended.
+  reason: "iteration" | "failed" | "rerun" | "retry" | "clear";
+  /// How a replaced attempt had ended: failed, cancelled, succeeded, skipped.
+  status?: string;
+  /// When a replaced attempt was queued.
+  scheduled_at?: string;
   output: string;
   /// Output was dropped to fit the retention cap. Distinct from `truncated`,
   /// which is the *filter's* line cap on this response.
@@ -343,6 +430,9 @@ export interface MetricsResponse {
   runs_by_status: StatusCount[];
   tasks_by_status: StatusCount[];
   dead_letters: number;
+  /// How old the counts of the finished statuses are, in seconds: they are
+  /// read less often than the rest (DAGRON_METRICS_HISTORY_CACHE_SECS).
+  history_age_secs: number;
 }
 
 export interface DeadLetter {
@@ -418,7 +508,10 @@ export interface WorkflowRow {
   id: string;
   name: string;
   description: string | null;
-  source: "git" | "manual";
+  /// `ci` is a pipeline a CI service compiled from a repository: listed only
+  /// when asked for, and not a stored workflow. Its `id` is no workflow's, its
+  /// description is the repository, and nothing about it is changed here.
+  source: "git" | "manual" | "ci";
   created_at: string;
   updated_at: string;
   schedule_id: string | null;
@@ -775,4 +868,44 @@ export interface StateSubmitted {
   run_id: string;
   model_count: number;
   models: string[];
+}
+
+/// A repository that runs came from, as their trigger records name it
+/// (`GET /api/runs/sources`).
+export interface RunSource {
+  /// `host/owner/name`: what narrows a run list, and a ref list, to it.
+  repo: string;
+  runs: number;
+  last_run_at: string;
+}
+
+/// One run of an event, as a repository's ref lists it.
+export interface RefRun {
+  id: string;
+  /// The workflow's name: a CI pipeline's.
+  name: string | null;
+  status: RunStatus;
+  created_at: string;
+  finished_at: string | null;
+  stopping_as?: StoppingAs | null;
+  queued_at?: string | null;
+  admitted_at?: string | null;
+}
+
+/// One of a repository's refs, with the runs for its latest commit
+/// (`GET /api/runs/refs`): the latest run of each workflow for the commit
+/// of the latest run on the ref.
+export interface RefRuns {
+  ref: string;
+  /// The pull request's number, where the ref is one's.
+  pr: number | null;
+  sha: string | null;
+  /// Who caused the latest run's event at its source.
+  actor: string | null;
+  /// The latest run's event, by its id at its source: what narrows a run
+  /// list to that event's runs.
+  event_id: string | null;
+  /// When the latest run was made.
+  at: string;
+  runs: RefRun[];
 }

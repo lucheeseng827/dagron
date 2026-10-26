@@ -1,0 +1,11 @@
+shows: A job's isolation is dagron's own and passes through to the task
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: test
+      isolation: { network: none }
+      resources: { cpu: "2", memory: 4Gi }
+      steps:
+        - run: make test

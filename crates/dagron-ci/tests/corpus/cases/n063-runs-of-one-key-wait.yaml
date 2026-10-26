@@ -1,0 +1,10 @@
+shows: A concurrency key makes the pipeline's runs of one key wait for one another
+source: |
+  name: deploy
+  on:
+    push: { branches: [main] }
+  concurrency: { key: "deploy-{{ ci_group }}" }
+  tasks:
+    - name: deploy
+      steps:
+        - run: make deploy

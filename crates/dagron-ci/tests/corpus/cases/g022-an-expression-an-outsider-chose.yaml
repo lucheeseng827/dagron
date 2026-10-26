@@ -1,0 +1,11 @@
+shows: An expression whose value an outsider chooses reaches a script as a variable, never as text
+front: github
+event: { kind: pull_request }
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on: pull_request
+  jobs:
+    greet:
+      runs-on: ubuntu-latest
+      steps:
+        - run: echo "checking ${{ github.head_ref }} for ${{ github.actor }} at ${{ github.sha }}"

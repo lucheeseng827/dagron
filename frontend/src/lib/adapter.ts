@@ -4,6 +4,7 @@
 // attempt, scheduled_at, finished_at), so we derive them here.
 
 import type { TaskRow, TaskStatus } from "@/types/dagron";
+import { duration } from "@/lib/time";
 
 /// dagron Step shape consumed by StepTimeline-like components.
 export interface Step {
@@ -60,13 +61,48 @@ export function statusColor(status: string): string {
   }
 }
 
+/// What of a run says whether it is stopping, or waits.
+type RunReading = {
+  status: string;
+  stopping_as?: string | null;
+  queued_at?: string | null;
+  admitted_at?: string | null;
+};
+
+/// Whether a run waits for its workflow's `max_active_runs` (`when_full`):
+/// it was made, reads `running`, and has started nothing.
+export function runWaits(run: RunReading): boolean {
+  return run.status === "running" && !!run.queued_at && !run.admitted_at;
+}
+
+/// What a run reads as: its status, or "stopping" for a running run that was
+/// cancelled, or passed its deadline, and whose work has not stopped yet, or
+/// "queued" for one that waits for its workflow's cap. The status itself
+/// stays `running` through both, which is what it is.
+export function runReads(run: RunReading): string {
+  if (run.status === "running" && run.stopping_as) return "stopping";
+  return runWaits(run) ? "queued" : run.status;
+}
+
+/// The colour a run is drawn in: its status's, and a waiting run's is the
+/// colour of what has not started.
+export function runColor(run: RunReading): string {
+  return statusColor((runWaits(run) && !run.stopping_as ? "pending" : run.status) as TaskStatus);
+}
+
+/// What a run's duration reads: "queued" while it waits for its workflow's
+/// cap, since it has started nothing to time; else its time so far, or in all.
+export function runDuration(run: RunReading & { created_at: string; finished_at?: string | null }): string {
+  return runWaits(run) ? "queued" : duration(run.created_at, run.finished_at ?? null);
+}
+
 /// Human label for a status (title-cased; underscores become spaces).
 export function statusLabel(status: TaskStatus): string {
   if (status === "awaiting_approval") return "Awaiting approval";
   return status.charAt(0).toUpperCase() + status.slice(1);
 }
 
-/// Why a task is parked, or `null` if it isn't.
+/// Why a task is waiting, or `null` if it isn't.
 ///
 /// Every park form — the time / HTTP / dataset wait sensors and the
 /// sub-workflow trigger — deliberately leaves the row `running` with no lease
@@ -74,21 +110,51 @@ export function statusLabel(status: TaskStatus): string {
 /// task and a hung one are indistinguishable in a status column, so the API
 /// carries the reason and this turns it into something readable. `runLink` is
 /// set only for a sub-workflow trigger: the child run is navigable.
+///
+/// A quota wait is the one reason on a `ready` row: the Kubernetes namespace
+/// ResourceQuota refused the pod, so the task went back to the queue instead
+/// of parking, and without the reason it reads as a task nobody is claiming.
 export interface WaitingOn {
   /// Short badge text, e.g. "Waiting on dataset".
   label: string;
-  /// The specific thing waited on (URI, endpoint, wake time, child run id).
+  /// The specific thing waited on (URI, endpoint, wake time, child run id, or
+  /// the quota's last refusal).
   detail: string;
   /// Run id to link to, when the thing waited on is a run.
   runLink?: string;
 }
 
 export function waitingOn(
-  task: Pick<TaskRow, "status" | "wake_at" | "wait_url" | "wait_dataset" | "sub_run_id"> | null | undefined,
+  task:
+    | Pick<
+        TaskRow,
+        | "status"
+        | "wake_at"
+        | "wait_url"
+        | "wait_dataset"
+        | "sub_run_id"
+        | "quota_wait_since"
+        | "quota_wait_detail"
+        | "stop_requested_at"
+      >
+    | null
+    | undefined,
 ): WaitingOn | null {
+  // A quota wait sits on a `ready` row, so it is checked before the parked
+  // forms. The API sends these fields only while the task is waiting, so
+  // unlike a sensor's wake_at there is no stale value to filter out here.
+  if (task?.status === "ready" && task.quota_wait_since) {
+    return { label: "Waiting on quota", detail: task.quota_wait_detail || task.quota_wait_since };
+  }
   // Only a live row is parked: a resolved sensor keeps its wake_at/wait_url for
   // the record, and showing "waiting" on a succeeded task would be a lie.
   if (!task || task.status !== "running") return null;
+  // Asked to stop, and still running: its container, pod or process is being
+  // stopped, and the task is cancelled once that is gone. Without this it
+  // reads as a task that ignored the cancel.
+  if (task.stop_requested_at) {
+    return { label: "Stopping", detail: `asked to stop at ${task.stop_requested_at}` };
+  }
   if (task.sub_run_id) {
     return { label: "Waiting on sub-workflow", detail: task.sub_run_id, runLink: task.sub_run_id };
   }

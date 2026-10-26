@@ -1,0 +1,11 @@
+shows: A step's key that is not one of its five is refused by name
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: build
+      steps:
+        - run: make
+          shell: bash
+          working_directory: src

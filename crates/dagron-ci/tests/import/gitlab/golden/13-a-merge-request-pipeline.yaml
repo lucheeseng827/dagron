@@ -1,0 +1,30 @@
+# Imported from a GitLab CI pipeline by dagron-import.
+#
+# Changed on the way (6):
+#   image: the pipeline's image is each job's that does not set its own
+#   workflow.rules: $CI_OPEN_MERGE_REQUESTS is taken as unset: a branch's pipeline runs whether or not the branch has a merge request open, where GitLab left it out for one that had
+#   check.script: a job's script ran under bash where its image had bash, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   audit.rules: a run asked for here (dispatch, through the run API) is GitLab's web, api and trigger pipelines alike
+#   on.pull_request: a merge request's pipeline is a pull request's here; GitLab's merged-results and merge-train pipelines are not told apart from it
+#   on.dispatch: a pipeline run from GitLab's page or its API is a run asked for here (dispatch), through the run API
+name: 13-a-merge-request-pipeline
+on:
+  push:
+    branches:
+    - '**'
+  pull_request:
+    branches:
+    - main
+  dispatch: {}
+tasks:
+- name: check
+  docker_image: rust:1.86-bookworm
+  steps:
+  - name: script
+    run: cargo check
+- name: audit
+  docker_image: rust:1.86-bookworm
+  when: '{{ ci_event }} == dispatch'
+  steps:
+  - name: script
+    run: cargo audit

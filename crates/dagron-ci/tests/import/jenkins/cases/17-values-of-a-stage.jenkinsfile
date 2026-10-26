@@ -1,0 +1,23 @@
+// A variable the pipeline sets from another, set again by a stage and a
+// block: each step reads the value closest to it.
+pipeline {
+    agent { docker { image 'alpine:3.20' } }
+    environment {
+        REGION = 'eu'
+        TARGET = "app-${REGION}"
+    }
+    stages {
+        stage('Build') {
+            steps { sh 'echo "target=$TARGET"' }
+        }
+        stage('Deploy US') {
+            environment { TARGET = 'app-us' }
+            steps {
+                sh 'echo "target=$TARGET"'
+                withEnv(['TARGET=app-asia']) {
+                    sh 'echo "target=$TARGET"'
+                }
+            }
+        }
+    }
+}

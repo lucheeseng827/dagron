@@ -1,0 +1,15 @@
+shows: A job keeps its cargo registry between runs, keyed by its lock file; it restores from the base branch's after its own ref's, and a push has none
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: build
+      docker_image: rust:1.86-bookworm
+      workspace:
+        cache:
+          - prefix: cargo
+            key_files: [Cargo.lock]
+            paths: [/usr/local/cargo/registry, ~/.cargo/git]
+      steps:
+        - run: cargo build --locked

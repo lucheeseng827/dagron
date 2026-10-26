@@ -10,11 +10,15 @@ import type { HealthResponse } from "@/types/dagron";
 // `@ee/cloud` is the hosted service's workspace switcher; the public build's stub
 // renders nothing and reports "not hosted".
 import { CloudWorkspaceSwitcher, useIsCloud } from "@ee/cloud";
+// `@ee/edition` marks the brand with the edition a build was made from; the
+// public build's stub marks nothing.
+import { EditionMark, PRODUCT_NAME } from "@ee/edition";
 
 type IconName =
   | "overview"
   | "workflows"
   | "runs"
+  | "repos"
   | "submit"
   | "gitops"
   | "dead"
@@ -45,6 +49,7 @@ const MAIN: NavItem[] = [
   { href: "/overview", label: "Overview", icon: "overview" },
   { href: "/workflows", label: "Workflows", icon: "workflows", badge: "wfCount" },
   { href: "/runs", label: "Runs", icon: "runs" },
+  { href: "/repos", label: "Repositories", icon: "repos" },
   { href: "/approvals", label: "Approvals", icon: "approvals", badge: "approvalCount" },
   { href: "/submit", label: "Submit", icon: "submit" },
   { href: "/gitops", label: "GitOps", icon: "gitops", badge: "dot" },
@@ -192,7 +197,7 @@ export default function Sidebar() {
           the content. In the flow it cannot be clipped, and in rail mode the
           row stacks so the toggle sits under the logo instead of on top of it. */}
       <div className="dy-side-head">
-        <Link href="/overview" className="dy-brand-row" style={{ color: "var(--fg)" }} title={rail ? "dagron" : undefined}>
+        <Link href="/overview" className="dy-brand-row" style={{ color: "var(--fg)" }} title={rail ? PRODUCT_NAME : undefined}>
         {/* Same mark as the favicon (app/icon.svg): orange gradient tile + the
             two-tone double-chevron, so the tab icon and the brand logo match. */}
         <div className="dy-logo">
@@ -210,10 +215,14 @@ export default function Sidebar() {
             <polyline points="20,21 31,32 20,43" />
             <polyline points="33,21 44,32 33,43" strokeOpacity="0.5" />
           </svg>
+          {/* The rail hides the name, and the mark beside it; the tile is
+              then the only place left to carry one. */}
+          {rail && <EditionMark where="tile" />}
         </div>
         <div style={{ lineHeight: 1 }}>
           <div className="dy-brand-name" style={{ fontSize: 17 }}>
             dagron
+            <EditionMark />
           </div>
           <div className="dy-brand-sub">
             WORKFLOWS
@@ -378,6 +387,13 @@ function NavIcon({ name }: { name: IconName }) {
         <svg {...p}>
           <circle cx="12" cy="12" r="9" />
           <polygon points="10 8 16 12 10 16 10 8" fill="currentColor" stroke="none" />
+        </svg>
+      );
+    case "repos":
+      return (
+        <svg {...p}>
+          <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+          <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
         </svg>
       );
     case "submit":

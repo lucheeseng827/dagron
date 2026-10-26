@@ -1,0 +1,4 @@
+.release-build:
+  script:
+    - cargo build --release
+  timeout: 1h 30m

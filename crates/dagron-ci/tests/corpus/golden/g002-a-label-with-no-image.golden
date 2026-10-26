@@ -1,0 +1,2 @@
+not a pipeline:
+  jobs.build.runs-on: ubuntu-latest is no label .dagron/ci.yaml gives an image for (github.runs_on), and the job names no container

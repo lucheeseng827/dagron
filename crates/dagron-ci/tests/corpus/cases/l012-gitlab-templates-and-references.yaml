@@ -1,0 +1,17 @@
+shows: GitLab extends, !reference, anchors and default are resolved before a job is read
+front: gitlab
+file: gitlab-ci
+source: |
+  default:
+    image: ruby:3.3
+    before_script: [bundle install]
+  .vars: &vars
+    variables: { RAILS_ENV: test }
+  .db:
+    script: [rake db:setup]
+  rspec:
+    extends: .db
+    <<: *vars
+    script:
+      - !reference [.db, script]
+      - rspec

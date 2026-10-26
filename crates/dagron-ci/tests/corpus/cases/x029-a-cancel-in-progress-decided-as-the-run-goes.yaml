@@ -1,0 +1,13 @@
+shows: Whether a newer run cancels is said when a run is made, so a cancel-in-progress that is an expression is refused
+front: github
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on: push
+  concurrency:
+    group: ci-${{ github.ref }}
+    cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  jobs:
+    test:
+      runs-on: ubuntu-latest
+      steps:
+        - run: make test

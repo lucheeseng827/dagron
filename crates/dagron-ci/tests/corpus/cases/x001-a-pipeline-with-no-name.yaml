@@ -1,0 +1,8 @@
+shows: A pipeline with no name is no pipeline, and is told what it lacks
+source: |
+  on:
+    push: {}
+  tasks:
+    - name: build
+      steps:
+        - run: make

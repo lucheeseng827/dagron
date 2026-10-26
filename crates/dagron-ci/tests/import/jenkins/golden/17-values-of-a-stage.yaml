@@ -1,0 +1,30 @@
+# Imported from a Jenkinsfile by dagron-import.
+#
+# Changed on the way (3):
+#   on: a multibranch pipeline's builds are each branch and tag pushed, each pull request, and a run asked for (dispatch) here: say on: where it ran for fewer
+#   environment.TARGET: its value names other variables: it is set at the head of each step, where the shell fills them in as Groovy did
+#   stage('Build').steps[0]: Jenkins's variables a step reads are set at its head from dagron-ci's own (CI_SHA, CI_REF, …): a program it runs that reads one the step does not is not given it
+name: 17-values-of-a-stage
+on:
+  push: {}
+  pull_request: {}
+  dispatch: {}
+tasks:
+- name: build
+  docker_image: alpine:3.20
+  env:
+  - name: REGION
+    value: eu
+  steps:
+  - name: Build
+    run: |-
+      export TARGET="app-${REGION}"
+      echo "target=$TARGET"
+  - name: Deploy US
+    env:
+      TARGET: app-us
+    run: echo "target=$TARGET"
+  - name: Deploy US
+    env:
+      TARGET: app-asia
+    run: echo "target=$TARGET"

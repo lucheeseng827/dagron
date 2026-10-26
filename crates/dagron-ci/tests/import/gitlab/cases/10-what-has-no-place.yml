@@ -1,0 +1,43 @@
+# What a pipeline here has no place for.
+include:
+  - remote: https://example.com/ci/common.yml
+
+image: alpine:3.20
+
+trigger-docs:
+  trigger:
+    project: group/docs
+    branch: main
+
+pages:
+  script:
+    - mkdir public && cp -r site/* public/
+  artifacts:
+    paths: [public]
+
+release-job:
+  script: [echo release]
+  release:
+    tag_name: $CI_COMMIT_TAG
+    description: Release
+
+cloud:
+  id_tokens:
+    AWS_TOKEN:
+      aud: https://sts.amazonaws.com
+  secrets:
+    DB_PASSWORD:
+      vault: production/db/password@secret
+  resource_group: production
+  hooks:
+    pre_get_sources_script: [echo hi]
+  coverage: '/Coverage: \d+%/'
+  unknown_key: 1
+  script:
+    - aws sts get-caller-identity
+    - echo "$CI_JOB_TOKEN" | head -c 3
+
+delayed:
+  when: delayed
+  start_in: 30 minutes
+  script: [echo later]

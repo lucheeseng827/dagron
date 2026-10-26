@@ -23,6 +23,7 @@
 
 pub mod attest;
 pub mod bundle;
+pub mod provenance;
 
 /// Serializes the tests that mutate the process environment. `setenv` is not
 /// thread-safe against a concurrent read anywhere in the process, and cargo runs
@@ -603,6 +604,32 @@ impl KeyProvider for CommandKmsProvider {
             .try_into()
             .context("unwrapped data key is not 32 bytes")
     }
+}
+
+/// **Signing with a KMS key** (enterprise), through a command, as
+/// [`CommandKmsProvider`] wraps with one: the SHA-256 `digest` of what is
+/// signed goes in, base64, on stdin, and the key's signature of it comes out,
+/// base64, on stdout. A digest, because that is what a KMS signs: `aws kms
+/// sign --message-type DIGEST`, Cloud KMS's `asymmetricSign`, Key Vault's
+/// `sign`. The signature is the key's own: ASN.1 DER for ECDSA, PKCS#1 v1.5
+/// for RSA. Bounded by `DAGRON_ENV_KMS_TIMEOUT_SECS`, as wrapping is.
+///
+/// Used for the provenance of build outputs ([`provenance::CommandSigner`])
+/// and for dagron-api's OIDC tokens. A caller checks what comes back against
+/// the public key it publishes: a command that signs with another key is
+/// caught where it is run, not by a verifier.
+pub fn sign_digest_by_command(cmd: &[String], digest: &[u8; 32]) -> Result<Vec<u8>> {
+    if !cfg!(feature = "enterprise") {
+        bail!("signing with a KMS key is in the enterprise build");
+    }
+    let out = run_pipe(cmd, b64().encode(digest).as_bytes())?;
+    b64_from_output(&out).context("the signing command did not write a base64 signature")
+}
+
+/// A command line, as the variables that name a KMS command give one: split
+/// on whitespace, run with no shell.
+pub fn command_line(raw: &str) -> Vec<String> {
+    split_cmd(raw)
 }
 
 fn b64_from_output(out: &[u8]) -> Result<Vec<u8>> {
@@ -1538,6 +1565,17 @@ mod open_core_tests {
         assert!(matches!(build_provider(&get), Ok(None)));
         let none = |n: &str| (n == PROVIDER_ENV).then(|| "none".to_string());
         assert!(matches!(build_provider(&none), Ok(None)));
+    }
+
+    /// Signing with a KMS key is the enterprise build's: an open build is
+    /// refused, naming the edition, and runs no command.
+    #[cfg(not(feature = "enterprise"))]
+    #[test]
+    fn open_build_refuses_to_sign_with_a_kms_command() {
+        let e = sign_digest_by_command(&["true".to_string()], &[0u8; 32])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("enterprise"), "{e}");
     }
 
     /// Asking for a KEK in an open build must FAIL, naming the edition — never

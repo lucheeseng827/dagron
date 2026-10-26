@@ -5,7 +5,7 @@ import Link from "next/link";
 import LiveToggle from "@/components/LiveToggle";
 import TriggerBadge from "@/components/TriggerBadge";
 import { listArchivedRuns, listRuns, listWorkflows } from "@/lib/dagron-api";
-import { statusColor } from "@/lib/adapter";
+import { runColor, runDuration, runReads, statusColor } from "@/lib/adapter";
 import { errMsg } from "@/lib/err";
 import { useLiveRefresh, useLiveUpdates } from "@/lib/live";
 import { PAGE_SIZES, usePageSize, type PageSize } from "@/lib/shell-prefs";
@@ -20,6 +20,8 @@ const GRID = "24px 1.4fr 1.2fr 1fr 1fr 1fr";
 
 const STATUS_FILTERS = ["all", "running", "succeeded", "failed", "cancelled"] as const;
 type StatusFilter = (typeof STATUS_FILTERS)[number];
+/// The trigger kinds the list filters by, as `?trigger=` may name them.
+const TRIGGERS = ["manual", "api", "schedule", "backfill", "dataset", "workflow", "source", "ci"] as const;
 type Tab = "live" | "archive";
 
 export default function RunsPage() {
@@ -35,6 +37,9 @@ export default function RunsPage() {
   const [status, setStatus] = useState<StatusFilter>("all");
   const [name, setName] = useState("");
   const [trigger, setTrigger] = useState("");
+  // The repository a CI pipeline's row came with (`?repo=`). It has no control
+  // of its own here: it is shown, and can be dropped.
+  const [repo, setRepo] = useState("");
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = usePageSize();
   // One extra row is requested per page purely to detect "has next page".
@@ -47,8 +52,20 @@ export default function RunsPage() {
     // `tab` seeds the same way, so archiving a run can land the operator where
     // the run just went instead of on a live list it is no longer in.
     if (qs.get("tab") === "archive") setTab("archive");
-    listWorkflows()
-      .then((ws) => setNames(ws.map((w) => w.name).sort()))
+    // `trigger`, `name` and `repo` seed too: a pipeline CI compiled has no page
+    // of its own, so its row on the Workflows page lands here, on its runs.
+    // The repository is part of which pipeline it is: two repositories may
+    // each have one of the same name.
+    const t = qs.get("trigger");
+    if (t && (TRIGGERS as readonly string[]).includes(t)) setTrigger(t);
+    const n = qs.get("name");
+    if (n) setName(n);
+    const r = qs.get("repo");
+    if (r) setRepo(r);
+    // With CI's pipelines: they have runs to filter to like any workflow. Two
+    // repositories may each have a pipeline of one name, so names are listed once.
+    listWorkflows({ includeCi: true })
+      .then((ws) => setNames([...new Set(ws.map((w) => w.name).concat(n ? [n] : []))].sort()))
       .catch(() => {});
   }, []);
 
@@ -58,6 +75,7 @@ export default function RunsPage() {
         status: status === "all" ? undefined : status,
         name: name || undefined,
         trigger: trigger || undefined,
+        repo: repo || undefined,
         limit: pageSize + 1,
         offset: page * pageSize,
       })
@@ -76,7 +94,7 @@ export default function RunsPage() {
         })
         .catch((e) => setError(errMsg(e)));
     }
-  }, [tab, status, name, trigger, page, pageSize]);
+  }, [tab, status, name, trigger, repo, page, pageSize]);
   useEffect(() => load(), [load]);
   // Live mode: refetch on activity from the account-wide event stream. Task
   // events only move the live list — the archive tab holds no stream open.
@@ -202,9 +220,24 @@ export default function RunsPage() {
           >
             <option value="">All triggers</option>
             <option value="manual">Manual</option>
+            <option value="api">API</option>
             <option value="schedule">Schedule</option>
             <option value="backfill">Backfill</option>
+            <option value="dataset">Dataset</option>
+            <option value="workflow">Workflow</option>
+            <option value="source">Source</option>
+            <option value="ci">CI</option>
           </select>
+        )}
+        {tab === "live" && repo && (
+          <button
+            onClick={() => setFilter(() => setRepo(""))}
+            className="dy-pill dy-pill-active"
+            style={{ cursor: "pointer" }}
+            title="Show this pipeline's runs in every repository"
+          >
+            <span className="mono">{repo}</span> ×
+          </button>
         )}
         {/* Page size belongs with the filters too, not only under the table:
             deciding how much to look at is the same kind of decision as
@@ -241,7 +274,7 @@ export default function RunsPage() {
 
         {tab === "live" &&
           runs.map((r) => {
-            const color = statusColor(r.status as TaskStatus);
+            const color = runColor(r);
             return (
               <Link
                 key={r.id}
@@ -249,7 +282,7 @@ export default function RunsPage() {
                 className="dy-runrow"
                 style={{ display: "grid", gridTemplateColumns: GRID, gap: 12 }}
               >
-                <span className="dy-dot" style={{ width: 9, height: 9, background: color }} title={r.status} />
+                <span className="dy-dot" style={{ width: 9, height: 9, background: color }} title={runReads(r)} />
                 <span style={{ fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                   {r.name ?? "—"}
                 </span>
@@ -260,7 +293,7 @@ export default function RunsPage() {
                   {timeAgo(r.created_at)}
                 </span>
                 <span className="mono" style={{ color: "#c9d1d9" }}>
-                  {duration(r.created_at, r.finished_at)}
+                  {runDuration(r)}
                 </span>
                 <span>
                   <TriggerBadge kind={r.trigger_kind} />
@@ -270,7 +303,7 @@ export default function RunsPage() {
           })}
         {tab === "live" && runs.length === 0 && !error && (
           <p className="dy-empty" style={{ padding: 16 }}>
-            {page > 0 || status !== "all" || name || trigger ? "No runs match." : "No runs yet."}
+            {page > 0 || status !== "all" || name || trigger || repo ? "No runs match." : "No runs yet."}
           </p>
         )}
 

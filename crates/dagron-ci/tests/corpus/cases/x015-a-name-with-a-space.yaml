@@ -1,0 +1,9 @@
+shows: A pipeline's name and a job's take letters, digits, a dot, an underscore and a dash
+source: |
+  name: my pipeline
+  on:
+    push: {}
+  tasks:
+    - name: build it
+      steps:
+        - run: make

@@ -410,7 +410,7 @@ and filtering client-side.",
             json!({
                 "status": sstr("only runs in this status (pending, running, succeeded, failed, cancelled)"),
                 "name": sstr("only runs of this workflow definition name (exact match)"),
-                "trigger": sstr("only runs from this trigger: manual, schedule or backfill"),
+                "trigger": sstr("only runs from this trigger: manual, schedule, backfill or ci (a CI service's runs)"),
                 "limit": sint("page size (default 100)", 1, 500),
                 "offset": sint("rows to skip", 0, i64::from(u32::MAX)),
             }),
@@ -447,7 +447,10 @@ landed: a repeat with the same key returns the SAME run_id instead of creating a
         // Ends the run's unfinished tasks; a repeat finds nothing left to cancel.
         Access::Write(Effect { destructive: true, idempotent: true, open_world: false }),
         "dagron_cancel_run",
-        "Cancel a running workflow by id.",
+        "Cancel a running workflow by id. A cancel asks: tasks that had not started are cancelled \
+         at once, and a running one is stopped. The answer's `stopping` counts those; while it is \
+         not 0 the run still reads running, and reads cancelled once their work is gone \
+         (dagron_wait_run waits for that).",
         obj(json!({ "run_id": sstr("the run id") }), &["run_id"]),
     ));
     t.push(tool(
@@ -465,18 +468,102 @@ replaces N round trips. A timed-out wait returns `finished: false` — call agai
         ),
     ));
 
+    // ── CI: dagron-ci's run API (DAGRON_CI_URL) ─────────────────────────────
+    t.push(tool(
+        Access::Write(Effect::STARTS_RUN),
+        "dagron_ci_run",
+        "Run a repository's CI pipelines at a ref, as dagron-ci's run API does: every pipeline \
+whose `on:` takes dispatch, or the one named. Returns the event: its `id` is what \
+dagron_ci_wait, dagron_ci_logs and dagron_ci_rerun_failed take. A run is the caller's: the \
+token's dagron-api says who that is, and a viewer may run nothing. With `bundle_from`, a \
+change not pushed: the git working tree's change since `sha` (or its HEAD), uploaded as a patch \
+bundle and run on that commit, which must be on `ref` at the forge. A bundle's run is untrusted \
+(an agent's is an agent's), the forge is told nothing of it, and the answer's `bundle` says its \
+id and SHA-256.",
+        obj(
+            json!({
+                "repo": sstr("the repository, HOST/OWNER/NAME (github.com/acme/widgets)"),
+                "ref": sstr("a full branch or tag ref (refs/heads/main)"),
+                "sha": sstr("the commit, 40 hex digits; unset: where the ref points now. With bundle_from: the base, any revision git names; unset: the tree's HEAD"),
+                "bundle_from": sstr("a directory in a git working tree under the one this server was started in (or DAGRON_MCP_WORKTREE): run its change without pushing it"),
+                "pipeline": sstr("the one pipeline to run: a file of .dagron/ci, `deploy` or `deploy.yaml`"),
+                "inputs": {
+                    "type": "object",
+                    "description": "the pipeline's dispatch inputs (string values)",
+                    "additionalProperties": { "type": "string" }
+                },
+                "idempotency_key": sstr("a retry under the same key returns the first call's event"),
+            }),
+            &["repo", "ref"],
+        ),
+    ));
+    t.push(tool(
+        Access::Read,
+        "dagron_ci_wait",
+        "Wait up to timeout_secs (at most 600) for a CI event's runs to end. Returns `finished`, \
+the `outcome` (succeeded, failed, cancelled, or the event's own state when it ran nothing), \
+the event, and for a failure the first failed job with the last lines it wrote. A wait that \
+ends first returns `finished: false`: call again.",
+        obj(
+            json!({
+                "id": sstr("the event's id, as dagron_ci_run returned it, or one engine run's"),
+                "timeout_secs": sint("how long to wait (default 300)", 1, 600),
+            }),
+            &["id"],
+        ),
+    ));
+    t.push(tool(
+        Access::Read,
+        "dagron_ci_logs",
+        "What a CI event's jobs wrote, failures first: the failed jobs' lines when any job \
+failed, else every job's; the last lines kept within max_bytes. Narrow by job or by text.",
+        obj(
+            json!({
+                "id": sstr("the event's id, or one engine run's"),
+                "job": sstr("one job's name"),
+                "failed_only": {
+                    "type": "boolean",
+                    "description": "the failed jobs' lines when any failed (default true)"
+                },
+                "q": sstr("keep the lines that hold this text"),
+                "limit": sint("lines a run, the last of them (default 200)", 1, 2000),
+                "max_bytes": sint("the most text returned (default 32000)", 1024, 1_000_000),
+            }),
+            &["id"],
+        ),
+    ));
+    t.push(tool(
+        // Its failed jobs run again in place: a second call is a second round.
+        Access::Write(Effect {
+            destructive: true,
+            idempotent: false,
+            open_world: true,
+        }),
+        "dagron_ci_rerun_failed",
+        "Run a CI event's failed and cancelled runs again from their failed jobs, keeping what \
+succeeded: the same checks on the same commit. Returns the runs running again and those left, \
+each with why.",
+        obj(
+            json!({ "id": sstr("the event's id, or one engine run's") }),
+            &["id"],
+        ),
+    ));
+
     // ── Runs: recover ────────────────────────────────────────────────────────
     t.push(tool(
-        // Resets the failed tasks in place, clearing their captured output, and
-        // runs them again: a second call is a second round.
+        // Resets the failed tasks in place, replacing their captured output (the
+        // end of it is kept in the attempt history), and runs them again: a
+        // second call is a second round.
         Access::Write(Effect { destructive: true, idempotent: false, open_world: true }),
         "dagron_rerun_run",
         "Cascade-rerun a failed or cancelled run from its failure frontier: failed tasks reset \
-and re-run, succeeded ones stay intact. 409 when the run is not in a rerunnable state.",
+and re-run, succeeded ones stay intact. With from 'all', a run that has ended, one that \
+succeeded too, reruns whole. 409 when the run is not in a rerunnable state; 429 when its \
+concurrency key is full.",
         obj(
             json!({
                 "run_id": sstr("the run id"),
-                "from": sstr("rerun mode; only 'failed' (the default) is supported"),
+                "from": sstr("rerun mode: 'failed' (the default), or 'all' for every task"),
             }),
             &["run_id"],
         ),
@@ -484,12 +571,14 @@ and re-run, succeeded ones stay intact. 409 when the run is not in a rerunnable 
     t.push(tool(
         Access::Write(Effect::STARTS_RUN),
         "dagron_resubmit_run",
-        "Submit a fresh run from the same spec this run was created from. Unlike rerun, nothing \
-of the original run is reused — you get a new run_id starting from the top.",
+        "Submit a fresh run from the same spec this run was created from, with the same \
+parameters. Unlike rerun, nothing of the original run is reused — you get a new run_id starting \
+from the top.",
         obj(json!({ "run_id": sstr("the run id") }), &["run_id"]),
     ));
     t.push(tool(
-        // Clears the failed attempt's output and runs the task again.
+        // Replaces the failed attempt's output (its end is kept in the attempt
+        // history) and runs the task again.
         Access::Write(Effect { destructive: true, idempotent: false, open_world: true }),
         "dagron_retry_task",
         "Retry one failed or cancelled task in place. 409 when the task is not in a retryable \
@@ -1017,6 +1106,55 @@ fn idempotency_key(raw: &str) -> Result<String> {
     Ok(key.to_string())
 }
 
+/// Make the bundle of the working tree at `dir` (`bundle.rs`) and upload it
+/// for `repo` (`POST /ci/v1/bundles`): `{id, sha256, base, files, deleted}`.
+async fn upload_bundle(
+    client: &DagronClient,
+    repo: &str,
+    dir: &str,
+    base: Option<&str>,
+) -> Result<Value> {
+    // It is put in the query as it is, so only what a repository's name is.
+    if repo.is_empty()
+        || !repo
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "./-_".contains(c))
+    {
+        anyhow::bail!("`repo` {repo:?} is not HOST/OWNER/NAME");
+    }
+    let (root, dir, base) = (
+        client.worktree()?,
+        dir.to_string(),
+        base.map(str::to_string),
+    );
+    let made =
+        tokio::task::spawn_blocking(move || crate::bundle::make(&root, &dir, base.as_deref()))
+            .await
+            .context("the bundle could not be made")??;
+    let path = format!("/ci/v1/bundles?repo={repo}&base={}", made.base);
+    let resp = client.ci_upload(&path, made.bytes).await?;
+    if resp.status != 201 {
+        anyhow::bail!(
+            "dagron-ci did not take the bundle ({}): {}",
+            resp.status,
+            resp.body
+        );
+    }
+    let kept: Value =
+        serde_json::from_str(&resp.body).context("dagron-ci's answer to the bundle is not JSON")?;
+    // A run that names no bundle is a run of the ref: never what was asked.
+    if !kept["id"].as_str().is_some_and(|id| !id.is_empty()) {
+        anyhow::bail!("dagron-ci kept the bundle and gave no id: {}", resp.body);
+    }
+    Ok(json!({
+        "id": kept["id"],
+        "sha256": kept["sha256"],
+        "base": made.base,
+        "files": made.files,
+        "deleted": made.deleted,
+    }))
+}
+
 /// Serialize a JSON body for a POST/PUT.
 fn body(v: Value) -> Option<(String, &'static str)> {
     Some((v.to_string(), "application/json"))
@@ -1098,6 +1236,96 @@ pub async fn call_tool_with_progress(
                 None => wait.await,
                 Some(p) => wait_reporting_progress(client, &run_id, wait, p).await,
             }
+        }
+
+        // ── CI ───────────────────────────────────────────────────────────────
+        "dagron_ci_run" => {
+            let repo = a.str("repo")?;
+            let mut payload = json!({ "repo": repo, "ref": a.str("ref")? });
+            let mut uploaded = None;
+            match a.opt_str("bundle_from")? {
+                Some(dir) => {
+                    if a.opt_str("idempotency_key")?.is_some() {
+                        anyhow::bail!(
+                            "`idempotency_key` is not taken with `bundle_from`: each upload is a \
+                             bundle of its own, so a retry under the key would name another"
+                        );
+                    }
+                    let bundle = upload_bundle(client, repo, dir, a.opt_str("sha")?).await?;
+                    payload["bundle"] = bundle["id"].clone();
+                    uploaded = Some(bundle);
+                }
+                None => {
+                    if let Some(sha) = a.opt_str("sha")? {
+                        payload["sha"] = json!(sha);
+                    }
+                }
+            }
+            if let Some(pipeline) = a.opt_str("pipeline")? {
+                payload["pipeline"] = json!(pipeline);
+            }
+            if let Some(inputs) = a.str_map("inputs")? {
+                payload["inputs"] = json!(inputs);
+            }
+            let headers = match a.opt_str("idempotency_key")? {
+                Some(k) => vec![("idempotency-key", idempotency_key(k)?)],
+                None => vec![],
+            };
+            let mut resp = client
+                .ci_request(Method::Post, "/ci/v1/runs", body(payload), &headers)
+                .await?;
+            if let Some(bundle) = uploaded {
+                if let Ok(Value::Object(mut event)) = serde_json::from_str(&resp.body) {
+                    event.insert("bundle".into(), bundle);
+                    resp.body = Value::Object(event).to_string();
+                }
+            }
+            render(resp)
+        }
+        "dagron_ci_wait" => {
+            let id = a.id("id")?;
+            let timeout = a.int("timeout_secs", 1, 600, 300)?;
+            ci_wait(
+                client,
+                &id,
+                Duration::from_secs(u64::try_from(timeout).unwrap_or(300)),
+            )
+            .await
+        }
+        "dagron_ci_logs" => {
+            let id = a.id("id")?;
+            let failed_only = match args.get("failed_only") {
+                None | Some(Value::Null) => true,
+                Some(Value::Bool(b)) => *b,
+                Some(other) => anyhow::bail!("`failed_only` must be true or false, got {other}"),
+            };
+            let max_bytes = a.int("max_bytes", 1024, 1_000_000, 32_000)?;
+            let mut q = Query::new();
+            q.opt("job", a.opt_str("job")?);
+            q.opt("q", a.opt_str("q")?);
+            q.opt_int("limit", Some(a.int("limit", 1, 2000, 200)?));
+            q.opt("tail", Some("true"));
+            ci_logs(
+                client,
+                &id,
+                q,
+                failed_only,
+                usize::try_from(max_bytes).unwrap_or(32_000),
+            )
+            .await
+        }
+        "dagron_ci_rerun_failed" => {
+            let id = a.id("id")?;
+            render(
+                client
+                    .ci_request(
+                        Method::Post,
+                        &format!("/ci/v1/runs/{id}/rerun?failed=true"),
+                        None,
+                        &[],
+                    )
+                    .await?,
+            )
         }
 
         // ── Runs: recover ────────────────────────────────────────────────────
@@ -1344,6 +1572,176 @@ pub async fn call_tool_with_progress(
 /// `GET path`, rendered.
 async fn get(client: &DagronClient, path: &str) -> Result<String> {
     render(client.request(Method::Get, path, None, &[]).await?)
+}
+
+/// A CI event's answer as JSON, or the tool's error in dagron-ci's words.
+async fn ci_get(client: &DagronClient, path: &str) -> Result<Value> {
+    let resp = client.ci_request(Method::Get, path, None, &[]).await?;
+    if !resp.is_success() {
+        anyhow::bail!("dagron-ci returned {}: {}", resp.status, resp.body);
+    }
+    serde_json::from_str(&resp.body).context("dagron-ci's answer is not JSON")
+}
+
+/// The states of a CI event still on its way to its runs.
+const CI_EVENT_PENDING: [&str; 2] = ["new", "claimed"];
+
+/// Whether an event's runs have all ended, and how: `None` while any is
+/// still going.
+fn ci_outcome(event: &Value) -> Option<String> {
+    let state = event["state"].as_str().unwrap_or_default();
+    if CI_EVENT_PENDING.contains(&state) {
+        return None;
+    }
+    let runs = event["engine_runs"].as_array().cloned().unwrap_or_default();
+    let statuses: Vec<&str> = runs.iter().filter_map(|r| r["status"].as_str()).collect();
+    if statuses.contains(&"submitted") {
+        return None;
+    }
+    Some(if statuses.is_empty() {
+        // An event that ran nothing: skipped, refused, or a pipeline that
+        // did not take it. Its own state says which.
+        state.to_string()
+    } else if statuses.contains(&"failed") {
+        "failed".into()
+    } else if statuses.contains(&"cancelled") {
+        "cancelled".into()
+    } else if statuses.iter().all(|s| *s == "succeeded") {
+        "succeeded".into()
+    } else {
+        statuses.join(",")
+    })
+}
+
+/// `dagron_ci_wait`: read the event every [`DagronClient::progress_poll`]
+/// until its runs have ended or `budget` is spent; for a failure, the first
+/// failed job and the last lines it wrote.
+async fn ci_wait(client: &DagronClient, id: &str, budget: Duration) -> Result<String> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let event = ci_get(client, &format!("/ci/v1/runs/{id}")).await?;
+        if let Some(outcome) = ci_outcome(&event) {
+            let first_failure = if outcome == "failed" {
+                ci_first_failure(client, id).await.unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            };
+            return Ok(json!({
+                "finished": true,
+                "outcome": outcome,
+                "event": event,
+                "first_failure": first_failure,
+            })
+            .to_string());
+        }
+        if tokio::time::Instant::now() + client.progress_poll() > deadline {
+            return Ok(json!({ "finished": false, "event": event }).to_string());
+        }
+        tokio::time::sleep(client.progress_poll()).await;
+    }
+}
+
+/// The first failed job of an event's runs, and the last lines it wrote.
+async fn ci_first_failure(client: &DagronClient, id: &str) -> Result<Value> {
+    let logs = ci_get(
+        client,
+        &format!("/ci/v1/runs/{id}/logs?status=failed&tail=true&limit=40"),
+    )
+    .await?;
+    for run in logs["runs"].as_array().into_iter().flatten() {
+        let Some(job) = run["logs"]["tasks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|t| t["status"] == "failed")
+            .and_then(|t| t["name"].as_str())
+        else {
+            continue;
+        };
+        let lines: Vec<&str> = run["logs"]["lines"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|l| l["task"] == job)
+            .filter_map(|l| l["text"].as_str())
+            .collect();
+        return Ok(json!({
+            "run": run["id"],
+            "pipeline": run["pipeline"],
+            "job": job,
+            "lines": lines,
+        }));
+    }
+    Ok(Value::Null)
+}
+
+/// `dagron_ci_logs`: the failed jobs' lines when any failed (else every
+/// job's), the last kept within `max_bytes` across the event's runs.
+async fn ci_logs(
+    client: &DagronClient,
+    id: &str,
+    q: Query,
+    failed_only: bool,
+    max_bytes: usize,
+) -> Result<String> {
+    let query = q.finish();
+    let sep = if query.is_empty() { "?" } else { "&" };
+    let mut logs = Value::Null;
+    let mut failures_only = false;
+    if failed_only {
+        logs = ci_get(
+            client,
+            &format!("/ci/v1/runs/{id}/logs{query}{sep}status=failed"),
+        )
+        .await?;
+        failures_only = logs["runs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|r| r["logs"]["lines"].as_array().is_some_and(|l| !l.is_empty()));
+    }
+    if !failures_only {
+        logs = ci_get(client, &format!("/ci/v1/runs/{id}/logs{query}")).await?;
+    }
+    // The budget is spent from the end: the last lines of the last run are
+    // what a failure is read from.
+    let mut left = max_bytes;
+    let mut dropped = 0usize;
+    let mut runs: Vec<Value> = Vec::new();
+    for run in logs["runs"].as_array().into_iter().flatten().rev() {
+        let mut kept: Vec<String> = Vec::new();
+        for line in run["logs"]["lines"].as_array().into_iter().flatten().rev() {
+            let text = format!(
+                "[{}] {}",
+                line["task"].as_str().unwrap_or("?"),
+                line["text"].as_str().unwrap_or_default()
+            );
+            if text.len() + 1 > left {
+                dropped += 1;
+                continue;
+            }
+            left -= text.len() + 1;
+            kept.push(text);
+        }
+        kept.reverse();
+        runs.push(json!({
+            "id": run["id"],
+            "pipeline": run["pipeline"],
+            "status": run["status"],
+            "jobs": run["logs"]["tasks"],
+            "lines": kept,
+            "eof": run["logs"]["eof"],
+        }));
+    }
+    runs.reverse();
+    Ok(json!({
+        "id": logs["id"],
+        "state": logs["state"],
+        "failures_only": failures_only,
+        "runs": runs,
+        "lines_left_out": dropped,
+    })
+    .to_string())
 }
 
 /// Task statuses a task does not leave. Progress counts these.
@@ -1652,6 +2050,8 @@ mod tests {
             ("dagron_put_artifact", true, true, false),
             ("dagron_redrive_dead_letter", true, true, true),
             ("dagron_delete_dead_letter", true, true, false),
+            ("dagron_ci_run", false, false, true),
+            ("dagron_ci_rerun_failed", true, false, true),
         ];
         let writes: Vec<(String, Effect)> = catalogue()
             .into_iter()
@@ -2236,5 +2636,342 @@ mod tests {
             head.starts_with("GET /api/runs?status=failed&name=nightly%20etl&limit=25 "),
             "got {head}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ci_tests {
+    //! The `dagron_ci_*` tools against a stand-in for dagron-ci's run API.
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Answer each request, in order, with the next of `bodies` (JSON, 200,
+    /// or the status given before a `|`), one connection a request; hand back
+    /// each request's head and body.
+    async fn dagron_ci(
+        bodies: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<Vec<(String, String)>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for answer in bodies {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&raw).into_owned();
+                    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                        continue;
+                    };
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse().ok())?
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= len {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&raw).into_owned();
+                let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+                seen.push((head.to_string(), body.to_string()));
+                let (status, json) = answer.split_once('|').unwrap_or(("200 OK", &answer));
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{json}",
+                    json.len()
+                );
+                sock.write_all(reply.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+            seen
+        });
+        (base, handle)
+    }
+
+    fn event(state: &str, runs: &[(&str, &str)]) -> String {
+        json!({
+            "id": "ev-1", "repo": "github.com/acme/widgets", "state": state,
+            "engine_runs": runs.iter().map(|(id, status)| json!({"id": id, "pipeline": ".dagron/ci/ci.yaml", "status": status})).collect::<Vec<_>>(),
+        })
+        .to_string()
+    }
+
+    fn logs(lines: &[(&str, &str)], failed: &[&str]) -> String {
+        json!({
+            "id": "ev-1", "state": "done", "reason": null,
+            "runs": [{
+                "id": "run-a", "cell": "default", "pipeline": ".dagron/ci/ci.yaml", "status": "failed",
+                "logs": {
+                    "run_id": "run-a",
+                    "tasks": failed.iter().map(|n| json!({"id": format!("t-{n}"), "name": n, "status": "failed"})).collect::<Vec<_>>(),
+                    "lines": lines.iter().enumerate().map(|(i, (task, text))| json!({"task": task, "attempt": 1, "n": i + 1, "text": text})).collect::<Vec<_>>(),
+                    "eof": true,
+                },
+            }],
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn the_ci_tools_say_where_dagron_ci_is_not_set() {
+        let client = DagronClient::new("http://127.0.0.1:1", None);
+        let err = call_tool(&client, "dagron_ci_wait", &json!({ "id": "ev-1" }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("DAGRON_CI_URL"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_ci_run_is_asked_of_the_run_api_with_its_key() {
+        let (base, server) = dagron_ci(vec![format!("202 Accepted|{}", event("new", &[]))]).await;
+        let client = DagronClient::new("http://127.0.0.1:1", Some("tok".into())).with_ci(base);
+        let out = call_tool(
+            &client,
+            "dagron_ci_run",
+            &json!({ "repo": "github.com/acme/widgets", "ref": "refs/heads/main", "pipeline": "ci",
+                     "inputs": { "level": "full" }, "idempotency_key": "agent-run-1" }),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("ev-1"), "{out}");
+        let seen = server.await.unwrap();
+        let (head, body) = &seen[0];
+        assert!(head.starts_with("POST /ci/v1/runs "), "{head}");
+        let lower = head.to_lowercase();
+        assert!(lower.contains("authorization: bearer tok"), "{head}");
+        assert!(lower.contains("idempotency-key: agent-run-1"), "{head}");
+        let sent: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            sent,
+            json!({ "repo": "github.com/acme/widgets", "ref": "refs/heads/main", "pipeline": "ci", "inputs": { "level": "full" } })
+        );
+    }
+
+    /// `bundle_from` uploads the tree's change, then runs the bundle on its
+    /// base: the run names the bundle and no commit, and the answer says it.
+    #[tokio::test]
+    async fn a_ci_run_of_a_working_tree_uploads_its_bundle_first() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("lib.rs"), "a\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("lib.rs"), "b\n").unwrap();
+
+        let id = "0190f0a0-0000-7000-8000-000000000001";
+        let (base, server) = dagron_ci(vec![
+            format!(
+                "201 Created|{}",
+                json!({ "id": id, "base": head, "sha256": "ab".repeat(32) })
+            ),
+            format!("202 Accepted|{}", event("new", &[])),
+        ])
+        .await;
+        let client = DagronClient::new("http://127.0.0.1:1", Some("tok".into()))
+            .with_ci(base)
+            .with_worktree(root.path());
+        let args = json!({ "repo": "github.com/acme/widgets", "ref": "refs/heads/main", "bundle_from": "repo" });
+        let out: Value =
+            serde_json::from_str(&call_tool(&client, "dagron_ci_run", &args).await.unwrap())
+                .unwrap();
+        assert_eq!(out["id"], "ev-1");
+        assert_eq!(
+            out["bundle"],
+            json!({ "id": id, "sha256": "ab".repeat(32), "base": head, "files": 1, "deleted": 0 })
+        );
+        let seen = server.await.unwrap();
+        assert!(
+            seen[0].0.starts_with(&format!(
+                "POST /ci/v1/bundles?repo=github.com/acme/widgets&base={head} "
+            )),
+            "{}",
+            seen[0].0
+        );
+        assert!(seen[0]
+            .0
+            .to_lowercase()
+            .contains("content-type: application/octet-stream"));
+        assert!(
+            seen[0].1.contains("lib.rs") && seen[0].1.contains("b\n"),
+            "the tar of the change"
+        );
+        let sent: Value = serde_json::from_str(&seen[1].1).unwrap();
+        assert_eq!(
+            sent,
+            json!({ "repo": "github.com/acme/widgets", "ref": "refs/heads/main", "bundle": id })
+        );
+
+        // A tree outside the worktree is never read, and a key is refused.
+        for (args, says) in [
+            (
+                json!({ "repo": "github.com/acme/widgets", "ref": "refs/heads/main", "bundle_from": ".." }),
+                "is not under",
+            ),
+            (
+                json!({ "repo": "github.com/acme/widgets", "ref": "refs/heads/main", "bundle_from": "repo",
+                        "idempotency_key": "k" }),
+                "not taken with `bundle_from`",
+            ),
+            (
+                json!({ "repo": "x?y", "ref": "refs/heads/main", "bundle_from": "repo" }),
+                "is not HOST/OWNER/NAME",
+            ),
+        ] {
+            let err = call_tool(&client, "dagron_ci_run", &args)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(says), "{args}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_ci_wait_follows_the_event_to_its_end_and_names_the_first_failure() {
+        let (base, server) = dagron_ci(vec![
+            event("claimed", &[]),
+            event("done", &[("run-a", "submitted")]),
+            event("done", &[("run-a", "failed")]),
+            logs(
+                &[
+                    ("lint", "ok"),
+                    ("test", "assertion failed: 2 == 3"),
+                    ("test", "1 test failed"),
+                ],
+                &["test"],
+            ),
+        ])
+        .await;
+        let client = DagronClient::new("http://127.0.0.1:1", None)
+            .with_ci(base)
+            .with_progress_poll(Duration::from_millis(10));
+        let out: Value = serde_json::from_str(
+            &call_tool(
+                &client,
+                "dagron_ci_wait",
+                &json!({ "id": "ev-1", "timeout_secs": 5 }),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["finished"], true);
+        assert_eq!(out["outcome"], "failed");
+        assert_eq!(out["first_failure"]["job"], "test");
+        assert_eq!(
+            out["first_failure"]["lines"],
+            json!(["assertion failed: 2 == 3", "1 test failed"])
+        );
+        let seen = server.await.unwrap();
+        assert!(
+            seen[3]
+                .0
+                .starts_with("GET /ci/v1/runs/ev-1/logs?status=failed&tail=true"),
+            "{}",
+            seen[3].0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ci_wait_that_ends_first_says_it_has_not_finished() {
+        let (base, _server) = dagron_ci(vec![event("claimed", &[]); 4]).await;
+        let client = DagronClient::new("http://127.0.0.1:1", None)
+            .with_ci(base)
+            .with_progress_poll(Duration::from_millis(400));
+        let out: Value = serde_json::from_str(
+            &call_tool(
+                &client,
+                "dagron_ci_wait",
+                &json!({ "id": "ev-1", "timeout_secs": 1 }),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["finished"], false);
+        assert_eq!(out["event"]["state"], "claimed");
+    }
+
+    #[tokio::test]
+    async fn ci_logs_are_the_failures_first_and_the_last_lines_within_the_budget() {
+        let long = "x".repeat(300);
+        let lines: Vec<(&str, &str)> = (0..10).map(|_| ("test", long.as_str())).collect();
+        let (base, server) = dagron_ci(vec![logs(&lines, &["test"])]).await;
+        let client = DagronClient::new("http://127.0.0.1:1", None).with_ci(base);
+        let out: Value = serde_json::from_str(
+            &call_tool(
+                &client,
+                "dagron_ci_logs",
+                &json!({ "id": "ev-1", "max_bytes": 1024, "q": "x y" }),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["failures_only"], true);
+        let kept = out["runs"][0]["lines"].as_array().unwrap();
+        assert_eq!(kept.len(), 3, "three lines of 308 bytes in 1024");
+        assert_eq!(out["lines_left_out"], 7);
+        let seen = server.await.unwrap();
+        assert!(
+            seen[0].0.starts_with(
+                "GET /ci/v1/runs/ev-1/logs?q=x%20y&limit=200&tail=true&status=failed "
+            ),
+            "{}",
+            seen[0].0
+        );
+    }
+
+    #[test]
+    fn an_events_outcome_is_its_runs_once_none_is_going() {
+        let ev = |state: &str, runs: &[(&str, &str)]| -> Value {
+            serde_json::from_str(&event(state, runs)).unwrap()
+        };
+        assert_eq!(ci_outcome(&ev("new", &[])), None);
+        assert_eq!(
+            ci_outcome(&ev("done", &[("a", "succeeded"), ("b", "submitted")])),
+            None
+        );
+        assert_eq!(
+            ci_outcome(&ev("done", &[("a", "succeeded"), ("b", "succeeded")])).as_deref(),
+            Some("succeeded")
+        );
+        assert_eq!(
+            ci_outcome(&ev("done", &[("a", "succeeded"), ("b", "failed")])).as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            ci_outcome(&ev("done", &[("a", "cancelled")])).as_deref(),
+            Some("cancelled")
+        );
+        assert_eq!(ci_outcome(&ev("skipped", &[])).as_deref(), Some("skipped"));
     }
 }

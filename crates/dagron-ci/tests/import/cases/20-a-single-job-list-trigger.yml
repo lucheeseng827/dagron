@@ -1,0 +1,7 @@
+# The shortest workflow there is: one event as a word, one job, one command.
+on: push
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hello

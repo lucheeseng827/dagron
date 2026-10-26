@@ -1,0 +1,12 @@
+shows: A GitLab parallel matrix makes an instance of each combination, its variables set
+front: gitlab
+file: gitlab-ci
+source: |
+  image: alpine:3.20
+  build:
+    parallel:
+      matrix:
+        - TARGET: [x86_64, aarch64]
+          PROFILE: release
+        - TARGET: wasm32
+    script: [cargo build --target $TARGET]

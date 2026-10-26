@@ -84,8 +84,8 @@ export default function RerunMenu({
         >
           <MenuItem
             label="Re-run unchanged"
-            sub="Same spec, brand-new run"
-            title="Start a fresh run from this run's stored definition"
+            sub="Same spec and parameters, brand-new run"
+            title="Start a fresh run from this run's stored definition, with the parameters it was created with"
             onClick={onResubmit}
           />
           <MenuItem

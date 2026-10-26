@@ -1,0 +1,16 @@
+shows: A job whose if is true for the event runs with the rest
+front: github
+event: { kind: pull_request }
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on: [push, pull_request]
+  jobs:
+    test:
+      runs-on: ubuntu-latest
+      steps:
+        - run: make test
+    preview:
+      runs-on: ubuntu-latest
+      if: ${{ github.event_name == 'pull_request' && github.base_ref == 'main' }}
+      steps:
+        - run: make preview

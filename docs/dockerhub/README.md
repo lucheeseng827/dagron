@@ -57,16 +57,19 @@ along that path.
 | [`mancube/dagron-step-mcp`](https://hub.docker.com/r/mancube/dagron-step-mcp) | [`dagron-step-mcp.md`](./dagron-step-mcp.md) | MCP-tool *step* (drive an agent's tools from a DAG) — a task binary, usually `COPY --from`'d into your task's image |
 | [`mancube/dagron-step-spark`](https://hub.docker.com/r/mancube/dagron-step-spark) | [`dagron-step-spark.md`](./dagron-step-spark.md) | Spark *step* (submit a job, hand back its id, park on it) — a task binary |
 | [`mancube/dagron-step-sql`](https://hub.docker.com/r/mancube/dagron-step-sql) | [`dagron-step-sql.md`](./dagron-step-sql.md) | SQL *step* (one statement against an analytical store, bounded result) — a task binary |
+| [`mancube/dagron-ci`](https://hub.docker.com/r/mancube/dagron-ci) | [`dagron-ci.md`](./dagron-ci.md) | the CI service (a forge's events in, runs in dagron-api, commit statuses back); first published with the release after 0.11.0 |
 | [`mancube/dagron-engine-localdev`](https://hub.docker.com/r/mancube/dagron-engine-localdev) | [`dagron-engine-localdev.md`](./dagron-engine-localdev.md) | the engine on debian-slim — has a shell, so `EXECUTOR=local` tasks resolve |
 | `oci://registry-1.docker.io/mancube/dagron` | [`dagron-chart.md`](./dagron-chart.md) | Helm chart (the full stack) |
 
-The five service images (`dagron-engine`, `-engine-localdev`, `-api`, `-mcp`,
-`-gitops`) and the chart are published **`linux/amd64` + `linux/arm64`** at the
-release version, the floating minor and `latest` — `0.10.0`, `0.10` and `latest`
-as of 0.10.0. The three step images are built by the image workflow but are
-**not on Docker Hub yet**: their repositories do not exist. Until they do, build
-one from the repository root with `podman build -f crates/dagron-step-<name>/Dockerfile .`
-(or `docker build`).
+All eight images and the chart are published **`linux/amd64` + `linux/arm64`** at
+the release version, the floating minor and `latest` — `0.10.0`, `0.10` and
+`latest` as of 0.10.0.
+
+A new repository is created by its first push, and Docker Hub makes it
+**private** by default. That is why the three step images, first pushed with
+0.9.3, could not be pulled until their repositories were made public on
+2026-10-03. When a release adds an image, make its repository public before
+announcing it, then publish its description with the script below.
 
 Publish them with [`../../scripts/publish-dockerhub-descriptions.py`](../../scripts/publish-dockerhub-descriptions.py)
 rather than pasting: it carries UTF-8 through (hand-pasting once replaced every em

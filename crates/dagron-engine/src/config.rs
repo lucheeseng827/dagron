@@ -62,7 +62,33 @@ pub fn knobs() -> &'static [Knob] {
             KR("AZURE_TENANT_ID", "—"),
             K("BACKFILL_PACE_PER_TICK", "1"),
             K("CRON_CONFIG", "— (cron disabled)"),
+            // How long the results service keeps a run's artifacts
+            // (`actions_cache::artifacts`), and how large one may be.
+            K("DAGRON_ACTIONS_ARTIFACT_MAX_BYTES", "5368709120 (5 GiB)"),
+            K("DAGRON_ACTIONS_ARTIFACT_RETENTION_DAYS", "90"),
+            // The results service a workflow's `actions/cache` and artifact
+            // actions speak (`actions_cache`): where it listens, the URL jobs
+            // reach it at, whether that may be plain http, and where uploads
+            // wait.
+            K(
+                "DAGRON_ACTIONS_CACHE_DIR",
+                "<temp dir>/dagron-actions-cache",
+            ),
+            K("DAGRON_ACTIONS_CACHE_INSECURE", "— (https only)"),
+            K(
+                "DAGRON_ACTIONS_CACHE_LISTEN",
+                "— (no cache service: actions/cache misses)",
+            ),
+            K("DAGRON_ACTIONS_CACHE_URL", "— (no cache service)"),
             K("DAGRON_ADMISSION_FILE", "— (admission always open)"),
+            // Where a task that asks for its run's artifacts over dagron-api's
+            // API reaches it (`dagron_core::artifact_api`), and whether
+            // that may be plain http.
+            K("DAGRON_ARTIFACT_API_INSECURE", "— (https only)"),
+            K(
+                "DAGRON_ARTIFACT_API_URL",
+                "— (a task that asks for the artifact API is refused)",
+            ),
             K("DAGRON_ARTIFACT_DIR", "— (artifacts off)"),
             K("DAGRON_ARTIFACT_SYNC_SECS", "60 (0 disables)"),
             K("DAGRON_ARTIFACT_TIER", "— (tiering off)"),
@@ -76,10 +102,87 @@ pub fn knobs() -> &'static [Knob] {
             K("DAGRON_ATTEMPT_LOG_BYTES", "4096 (0 = retention off)"),
             K("DAGRON_ATTEMPT_LOG_KEEP", "50 (0 = unlimited)"),
             K("DAGRON_BUNDLE_PUBKEYS", "— (signed bundles refused)"),
+            // Path caches (`path_cache`): the store `workspace.cache` keeps
+            // entries in, and what it keeps to.
+            K("DAGRON_CACHE_MAX_ENTRY_BYTES", "4294967296 (4 GiB)"),
+            K(
+                "DAGRON_CACHE_QUOTA_BYTES",
+                "10737418240 (10 GiB a repository)",
+            ),
+            K("DAGRON_CACHE_SWEEP_SECS", "30"),
+            K("DAGRON_CACHE_UNUSED_DAYS", "7"),
+            K(
+                "DAGRON_CACHE_URL",
+                "— (path caches off: every task starts cold)",
+            ),
+            K(
+                "DAGRON_CACHE_URL_SECS",
+                "21600 (a task with a timeout: it and 15 minutes)",
+            ),
+            K("DAGRON_CDEVENTS_SOURCE", "dagron"),
+            // A receiver's URL can carry userinfo, so it is redacted.
+            KR("DAGRON_CDEVENTS_URL", "— (CDEvents off)"),
+            // What a workspace's checkout is fetched with on Docker and
+            // Kubernetes, and the service each attempt's credential comes from
+            // (dagron-executor's `checkout` module).
+            K(
+                "DAGRON_CHECKOUT_IMAGE",
+                "— (a checkout fails on Docker and Kubernetes)",
+            ),
+            K(
+                "DAGRON_CHECKOUT_PATCH_INSECURE",
+                "— (a patch's link is https, or http:// to this machine)",
+            ),
+            K(
+                "DAGRON_CHECKOUT_TOKEN_SECRET_FILE",
+                "— (with DAGRON_CHECKOUT_TOKEN_URL)",
+            ),
+            K(
+                "DAGRON_CHECKOUT_TOKEN_URL",
+                "— (every checkout without a credential)",
+            ),
+            // The image that installs dagron-ci-exec into each workspace task
+            // on Docker and Kubernetes (dagron-executor's `workspace` module).
+            K("DAGRON_CI_EXEC_IMAGE", "— (no init container)"),
             K("DAGRON_CLOCK_CHECK_SECS", "30"),
             K("DAGRON_CLOCK_STEP_TOLERANCE_MS", "1000"),
             K("DAGRON_CLOCK_SYNC_FILE", "— (no positive sync evidence)"),
             K("DAGRON_CONSOLE", "— (console mounted)"),
+            // Where a deferred task's job is polled, pinned onto its row when
+            // it is parked (docs/EXTERNAL_JOBS.md). Read since `defer:`
+            // landed and listed nowhere here: an engine that set it was told
+            // at every start that it looked mistyped.
+            K("DAGRON_DEFER_ENDPOINT", "— (none pinned)"),
+            // Whether a trusted run's step may have its image built from a
+            // Dockerfile on the Docker executor's daemon.
+            K(
+                "DAGRON_DOCKER_BUILD_ACTIONS",
+                "— (no step's image is built)",
+            ),
+            // A Docker daemon beside a task that asks for one, and its image.
+            K(
+                "DAGRON_DOCKER_DAEMON",
+                "— (a task that asks for one is refused)",
+            ),
+            K(
+                "DAGRON_DOCKER_DAEMON_IMAGE",
+                dagron_core::docker_daemon::DEFAULT_IMAGE,
+            ),
+            K(
+                "DAGRON_DOCKER_DAEMON_RUNTIME",
+                "— (the daemon is privileged, on the host's default runtime)",
+            ),
+            // What every Docker task container gets from the operator: mounts
+            // and a working directory. The local `dagron-ci run` sets both to
+            // put the working tree into every task.
+            K(
+                "DAGRON_DOCKER_LOG_DRIVER",
+                "— (the daemon's own; `json-file` keeps what is read back of a container whole)",
+            ),
+            K("DAGRON_DOCKER_MOUNTS", "— (none)"),
+            // The network every container the Docker executor makes is on.
+            K("DAGRON_DOCKER_NETWORK", "— (the daemon's default)"),
+            K("DAGRON_DOCKER_WORKDIR", "— (the image's)"),
             // The KEK/KMS envelope family (dagron-crypto, docs/CONFIG.md
             // "Encryption at rest"): the current provider's inputs plus their
             // `*_OLD` twins, which the key-rotation sweep reads for the
@@ -104,12 +207,44 @@ pub fn knobs() -> &'static [Knob] {
             KR("DAGRON_ENV_KMS_VAULT_URL_OLD", "—"),
             K("DAGRON_ENV_KMS_WRAP_CMD", "— (command provider only)"),
             K("DAGRON_ENV_KMS_WRAP_CMD_OLD", "—"),
+            // The key stored environment secrets are decrypted with at
+            // dispatch (dagron-crypto's `KEY_ENV`, docs/CONFIG.md). The chart
+            // sets it on every engine that has the store, and it was not
+            // here: each such engine warned of a typo, and `dagron config`
+            // did not show that it was set.
+            KR("DAGRON_ENV_SECRET_KEY", "— (stored secrets not read)"),
+            // The `source` of the CloudEvents a `notify.webhook` sends
+            // (dagron_core::cloudevents).
+            K("DAGRON_EVENTS_SOURCE", "/dagron"),
+            // The image cache (dagron-executor's `images` module):
+            // a trusted run's pod's pull secrets on Kubernetes, the engine's
+            // registry credentials on Docker, and each registry's mirror.
+            K("DAGRON_IMAGE_PULL_SECRETS", "— (a pod names none)"),
+            // The fleet sweep's installation, its pace and its floor (the
+            // DAGRON_ORPHAN_* pair, below). Documented in docs/CONFIG.md and
+            // read since the sweep landed, yet listed nowhere here: an engine
+            // that armed the sweep warned of a typo, and `dagron config` left
+            // the three out.
+            K("DAGRON_INSTALLATION", "— (fleet sweep off)"),
             // The two local-pool knobs (dagron-executor's `pool` module). A
             // pool is an engine process with RUNNER_CLASSES set, so these are
             // per-pool by construction. Both unset = a local pool behaves
             // exactly as it always has.
             K("DAGRON_LOCAL_COMMAND_ALLOWLIST", "— (any command)"),
             K("DAGRON_LOCAL_ENV_PASSTHROUGH", "— (inherit the pool's env)"),
+            // Where every local task process starts, and each workspace task
+            // works; `dagron-ci run --executor local` sets it to the tree.
+            K("DAGRON_LOCAL_WORKDIR", "— (the engine's; a new directory per workspace task)"),
+            // Where task logs are kept once out of the task rows, and the size
+            // a segment closes at (dagron-artifact's log_segments).
+            K("DAGRON_LOG_SEGMENT_BYTES", "8388608 (8 MiB)"),
+            K("DAGRON_LOG_STORE", "— (each log in its task row)"),
+            // How often the store's GC sweeps it (`log_sweep`).
+            K("DAGRON_LOG_SWEEP_SECS", "30 (0 = removes nothing)"),
+            // How much of the end of a log past its cap is kept, on top of
+            // the cap.
+            K("DAGRON_LOG_TAIL_BYTES", "a quarter of the cap (no more than it; 0 = none)"),
+            K("DAGRON_LOG_TASK_CAP_BYTES", "67108864 (64 MiB, of each attempt's log and output)"),
             K("DAGRON_MAX_TASKS_PER_RUN", "100000 (compiled ceiling)"),
             // Registered late: the executor has read this since the task-clock
             // ceiling landed and `docs/CONFIG.md` documents it, but it was
@@ -117,32 +252,102 @@ pub fn knobs() -> &'static [Knob] {
             // provisioner stamps it on every workspace engine) drew a "looks
             // like a dagron knob but is not one" warning for a knob that is.
             K("DAGRON_MAX_TASK_TIMEOUT_SECS", "— (no ceiling)"),
+            // How many runs may wait for one workflow's `max_active_runs`
+            // (`when_full`), read where a run is made: dagron-core's.
+            K("DAGRON_MAX_WAITING_RUNS", "100 (floor 1)"),
             K("DAGRON_MIN_FREE_BYTES", "0 (off)"),
+            // Whether that URL may be plain http (a closed network's).
+            K("DAGRON_OIDC_REQUEST_INSECURE", "— (https only)"),
+            // Where a task that asks for an identity asks dagron-api for
+            // tokens (`dagron_core::oidc::request_credential`).
+            K(
+                "DAGRON_OIDC_REQUEST_URL",
+                "— (a task that asks for an identity is refused)",
+            ),
+            K("DAGRON_ORPHAN_MIN_AGE_SECS", "600 (floor 60)"),
+            K("DAGRON_ORPHAN_SWEEP_SECS", "300 (floor 30)"),
             K("DAGRON_PRESSURE_FILE", "— (no pressure gate)"),
+            // Signed provenance of each workflow artifact
+            // (`actions_cache::provenance`): a key of the operator's, or a KMS
+            // command and its public half (enterprise), and who the builder
+            // says it is.
+            K(
+                "DAGRON_PROVENANCE_BUILDER_ID",
+                "https://dagron.dev/builders/dagron-engine",
+            ),
+            K("DAGRON_PROVENANCE_KEY", "— (artifacts kept without provenance)"),
+            K("DAGRON_PROVENANCE_PUBLIC_KEY", "— (with DAGRON_PROVENANCE_SIGN_CMD)"),
+            K("DAGRON_PROVENANCE_SIGN_CMD", "— (enterprise: a KMS key signs)"),
+            K("DAGRON_QUOTA_WAIT_MAX_SECS", "21600 (0 = quota refusals are failed attempts)"),
             K("DAGRON_READY_TIMEOUT_MS", "500 (floor 50)"),
             K("DAGRON_REDACT_ENV", "true"),
+            K("DAGRON_REGISTRY_AUTH_FILE", "— (images pulled with no credential)"),
+            K("DAGRON_REGISTRY_MIRRORS", "— (each image from its own registry)"),
             K("DAGRON_SECRETS_DIR", "—"),
             K("DAGRON_SENSITIVE_ENV_PATTERNS", "built-in patterns"),
             K("DAGRON_TASK_ACTIVE_DEADLINE_SECS", "—"),
-            // The task ServiceAccounts a workflow may name. dagron Cloud's
-            // Workspace operator sets it to the workspace's task identity,
+            // The task ServiceAccounts a workflow may name. A hosted
+            // deployment's operator sets it to the workspace's task identity,
             // `dagron-task`, and each such engine warned of a typo until it was
             // listed here.
             K("DAGRON_TASK_ALLOWED_SERVICE_ACCOUNTS", "— (a task that names one is refused)"),
             K("DAGRON_TASK_AUTOMOUNT_SA_TOKEN", "— (off)"),
             K("DAGRON_TASK_DROP_ALL_CAPABILITIES", "— (off)"),
+            // A claim workspace's group; `none` leaves it to the platform, as
+            // OpenShift's restricted SCCs want.
+            K("DAGRON_TASK_FS_GROUP", "65532 (none: the platform's)"),
             K("DAGRON_TASK_ISOLATION_FLOOR", "— (no floor)"),
+            // The allowlists the operator has made, by name: what a task
+            // that names one (isolation.network: allow:<name>) needs. A
+            // NetworkPolicy of theirs on Kubernetes, an internal network of
+            // theirs on Docker.
+            K(
+                "DAGRON_TASK_NETWORK_ALLOWLISTS",
+                "— (a task that names an allowlist is refused)",
+            ),
+            // The operator's word that the cluster's CNI enforces
+            // NetworkPolicy: what a task that asks for no network needs.
+            K(
+                "DAGRON_TASK_NETWORK_POLICY",
+                "— (a task that asks for no network is refused on Kubernetes)",
+            ),
             K("DAGRON_TASK_NODE_SELECTOR", "—"),
-            // A task pod's PriorityClass and tolerations: dagron Cloud's
+            K("DAGRON_TASK_POD_WATCH", "on"),
+            // A task pod's PriorityClass and tolerations: a hosted deployment's
             // operator sets the class on every engine of a tiered workspace,
             // and each such engine warned of a typo until it was listed here.
             K("DAGRON_TASK_PRIORITY_CLASS", "— (none)"),
+            // A task that asks to be privileged, on a dedicated pool.
+            K("DAGRON_TASK_PRIVILEGED", "— (a task that asks is refused)"),
             K("DAGRON_TASK_READ_ONLY_ROOT_FS", "— (off)"),
             K("DAGRON_TASK_RUNTIME_CLASS", "—"),
+            // Non-root without a uid of the engine's, which a platform that
+            // gives one (OpenShift's SCCs) wants.
+            K("DAGRON_TASK_RUN_AS_NON_ROOT", "— (off)"),
             K("DAGRON_TASK_RUN_AS_USER", "—"),
             K("DAGRON_TASK_SECCOMP_RUNTIME_DEFAULT", "— (off)"),
             K("DAGRON_TASK_SECRET_ENV", "secret"),
+            // Labels a task pod that runs as a service account of its own is
+            // given, for a workload identity webhook (AKS's).
+            K("DAGRON_TASK_SERVICE_ACCOUNT_POD_LABELS", "— (none)"),
             K("DAGRON_TASK_TOLERATIONS", "— (none)"),
+            // The floor for the tasks of a run that is not trusted, and the
+            // limits of a container made for one.
+            K(
+                "DAGRON_UNTRUSTED_IMAGES",
+                "— (a task of a run that is not trusted may name any image)",
+            ),
+            K(
+                "DAGRON_UNTRUSTED_ISOLATION_FLOOR",
+                "— (a run that is not trusted has no task run here)",
+            ),
+            K(
+                "DAGRON_UNTRUSTED_LIMITS",
+                "memory=4g,pids=2048,cpus=2,timeout=3600,attempts=3,tasks=256,services=4",
+            ),
+            // Kubernetes workspaces from a size up are volumes of their own.
+            K("DAGRON_WORKSPACE_PVC_FROM", "— (always an emptyDir)"),
+            K("DAGRON_WORKSPACE_STORAGE_CLASS", "— (the cluster's default)"),
             KR("DATABASE_LISTEN_URL", "— (share the pool DSN)"),
             KR("DATABASE_URL", "postgres://localhost/workflow (pg builds)"),
             K("DATASET_TRIGGERS", "true"),
@@ -173,6 +378,11 @@ pub fn knobs() -> &'static [Knob] {
             K("LOG_SPAN_EVENTS", "— (off)"),
             K("MAX_INFLIGHT_RUNS", "64 (0 disables)"),
             K("MAX_INFLIGHT_TASKS", "0 (off)"),
+            K("METRICS_CACHE_SECS", "10 (0 disables)"),
+            K(
+                "METRICS_HISTORY_CACHE_SECS",
+                "300, 0 with METRICS_CACHE_SECS=0 (0 disables)",
+            ),
             K("MQTT_CLEAN_SESSION", "false with MQTT_CLIENT_ID, else true"),
             K("MQTT_CLIENT_ID", "dagron-<uuid>"),
             K("MQTT_DLQ_TOPIC", "— (datastore dead_letters only)"),
@@ -192,6 +402,10 @@ pub fn knobs() -> &'static [Knob] {
             K("POOLS", "— (no pools)"),
             K("READY_AGE_ALERT_SECS", "300 (0 disables)"),
             K("READY_AGE_CHECK_INTERVAL_SECS", "60"),
+            K(
+                "REAP_INTERVAL_MS",
+                "5000 (0: every tick looks at every run)",
+            ),
             K("RUNNER_CLASSES", "— (claim every class)"),
             K("RUNNER_GANGS", "— (off)"),
             K("RUST_LOG", "— (LOG_LEVEL applies)"),
@@ -205,7 +419,12 @@ pub fn knobs() -> &'static [Knob] {
             K("STREAM_POLL_MS", "500"),
             K("STREAM_SUFFIX", ".ndjson"),
             K("SUBWORKFLOW_MAX_DEPTH", "8"),
+            K(
+                "SWEEP_INTERVALS",
+                "— (each sweep at SWEEP_INTERVAL_MS, or its own default)",
+            ),
             K("SWEEP_INTERVAL_MS", "= POLL_INTERVAL_MS (floor 10)"),
+            K("SWEEP_SHARE", "on (one engine a window)"),
             K("TASK_LEASE_HEARTBEAT", "true"),
             K("WAIT_POLL_SECS", "15"),
             K("WAIT_URL_DENY_PRIVATE", "— (off)"),
@@ -235,6 +454,8 @@ const FOREIGN_PREFIXES: &[&str] = &[
     "DAGRON_DB_",
     "DAGRON_SHUTDOWN_",
     "DAGRON_ARTIFACT_MAX_",
+    // dagron-api's cache of `GET /api/metrics`.
+    "DAGRON_METRICS_",
     "DAGRON_KEK",
     "DAGRON_MCP_",
     "DAGRON_API_",
@@ -248,6 +469,13 @@ const FOREIGN_PREFIXES: &[&str] = &[
     // per variable at every boot, for a dozen variables its own chart sets.
     // Over-warning is what trains an operator to ignore the scan.
     "DAGRON_BUILD_",
+    // dagron-ci's commands that speak to a server (`run --remote`, `logs`,
+    // `rerun`, `cancel`) read where it is, and the caller's token, from
+    // these. They are a person's shell's, and an engine started from that
+    // shell reads none of them. Named whole, and not as `DAGRON_CI_`: the
+    // engine's own DAGRON_CI_EXEC_IMAGE starts so, and stays in the scan.
+    "DAGRON_CI_URL",
+    "DAGRON_CI_TOKEN",
 ];
 
 /// Prefix families the typo scan claims: an env var starting with one of these
@@ -264,7 +492,8 @@ const OUR_PREFIXES: &[&str] = &[
     "SUBWORKFLOW_",
     "OPENLINEAGE_",
     "POLL_INTERVAL",
-    "SWEEP_INTERVAL",
+    // `SWEEP_INTERVAL_MS`, `SWEEP_INTERVALS` and `SWEEP_SHARE`.
+    "SWEEP_",
     "LEASE_SECS",
 ];
 
@@ -464,11 +693,45 @@ pub fn fingerprint() -> String {
     format!("{h:016x}")
 }
 
+/// Every cargo feature the manifest declares that names a part of the engine,
+/// in the manifest's order, and whether this build has it. `default` is a set
+/// of the others and `archive-cloud` is plumbing the three object stores
+/// share: neither is a part.
+const FEATURES: &[(&str, bool)] = &[
+    ("sqlite", cfg!(feature = "sqlite")),
+    ("postgres", cfg!(feature = "postgres")),
+    ("ops", cfg!(feature = "ops")),
+    ("kubernetes", cfg!(feature = "kubernetes")),
+    ("mqtt", cfg!(feature = "mqtt")),
+    ("otel", cfg!(feature = "otel")),
+    ("enterprise", cfg!(feature = "enterprise")),
+    ("archive-s3", cfg!(feature = "archive-s3")),
+    ("archive-gcs", cfg!(feature = "archive-gcs")),
+    ("archive-azure", cfg!(feature = "archive-azure")),
+    ("archive-parquet", cfg!(feature = "archive-parquet")),
+];
+
+/// The optional parts this engine was built with, as the cargo features that
+/// compile them in.
+///
+/// Logged once at startup. A setting that needs a part the build lacks is
+/// refused when it is read (`EXECUTOR=kubernetes`, `GC_ARCHIVE_URL=s3://…`):
+/// this is how an operator knows what an image can do before asking it to.
+pub fn built_with() -> Vec<&'static str> {
+    FEATURES
+        .iter()
+        .filter_map(|(name, built)| built.then_some(*name))
+        .collect()
+}
+
 /// Warn once per env var that matches one of our prefix families but is
 /// neither a registered knob nor a known other-component var — the
 /// `POLL_INTERVAL_M`-style silent typo. `DAGRON_CONFIG_NO_WARN=1` silences the
 /// scan for environments that intentionally carry look-alike vars.
-pub fn warn_unknown_vars() {
+///
+/// `also_known` is what the build this engine runs in reads for itself
+/// ([`crate::Seams::env_names`]).
+pub fn warn_unknown_vars(also_known: &[&str]) {
     if std::env::var_os("DAGRON_CONFIG_NO_WARN").is_some() {
         return;
     }
@@ -478,7 +741,7 @@ pub fn warn_unknown_vars() {
     let names: Vec<String> = std::env::vars_os()
         .filter_map(|(name, _)| name.into_string().ok())
         .collect();
-    for name in unknown_vars(&names) {
+    for name in unknown_vars(&names, also_known) {
         tracing::warn!(
             var = %name,
             "environment variable looks like a dagron knob but is not one — typo? \
@@ -488,9 +751,10 @@ pub fn warn_unknown_vars() {
 }
 
 /// The names in `names` the typo scan warns about: in one of our prefix
-/// families, and neither a registered knob, a known other-component var, nor
-/// one of Kubernetes' service links.
-fn unknown_vars(names: &[String]) -> Vec<&str> {
+/// families, and neither a registered knob, a known other-component var, one
+/// of Kubernetes' service links, nor one of `also_known`: a name as it is
+/// set, or a family's prefix, which ends in `_`.
+fn unknown_vars<'a>(names: &'a [String], also_known: &[&str]) -> Vec<&'a str> {
     let services: Vec<&str> = names
         .iter()
         .filter_map(|name| name.strip_suffix("_SERVICE_HOST"))
@@ -501,6 +765,10 @@ fn unknown_vars(names: &[String]) -> Vec<&str> {
             || knobs().iter().any(|k| k.name == name)
             || FOREIGN_PREFIXES.iter().any(|p| name.starts_with(p))
             || services.iter().any(|s| is_service_link(name, s))
+            || also_known.iter().any(|known| match known.ends_with('_') {
+                true => name.starts_with(known),
+                false => name == *known,
+            })
     };
     names
         .iter()
@@ -610,12 +878,59 @@ mod tests {
             // it hands a task its secret env.
             "DAGRON_TASK_ALLOWED_SERVICE_ACCOUNTS",
             "DAGRON_TASK_SECRET_ENV",
+            // Its one watch of the task pods.
+            "DAGRON_TASK_POD_WATCH",
             // Its task placement: the class a tier gives every task, and the
             // tolerations a pool's taint asks for.
             "DAGRON_TASK_PRIORITY_CLASS",
             "DAGRON_TASK_TOLERATIONS",
-            // The isolation floor a sandbox mode gives every task.
+            // The isolation floor a sandbox mode gives every task, and the
+            // operator's word that the cluster enforces NetworkPolicy.
             "DAGRON_TASK_ISOLATION_FLOOR",
+            "DAGRON_TASK_NETWORK_POLICY",
+            dagron_core::isolation::ENV_NETWORK_ALLOWLISTS,
+            // The floor and the limits of a run that is not trusted.
+            dagron_core::confine::ENV_FLOOR,
+            dagron_core::confine::ENV_IMAGES,
+            dagron_core::confine::ENV_LIMITS,
+            // A privileged task, on a dedicated pool.
+            dagron_core::privileged::ENV,
+            // A task's Docker daemon.
+            dagron_core::docker_daemon::ENV,
+            dagron_core::docker_daemon::ENV_IMAGE,
+            dagron_core::docker_daemon::ENV_RUNTIME,
+            // The Docker executor's task mounts and working directory.
+            dagron_executor::docker_executor::ENV_MOUNTS,
+            dagron_executor::docker_executor::ENV_WORKDIR,
+            // And the log driver each of its containers is made with, and the
+            // network each is made on.
+            dagron_executor::docker_executor::ENV_LOG_DRIVER,
+            dagron_executor::docker_executor::ENV_NETWORK,
+            // And whether a trusted run's step may have its image built.
+            dagron_executor::docker_executor::ENV_BUILD_ACTIONS,
+            // Where images are pulled from, and with what.
+            dagron_executor::images::ENV_AUTH_FILE,
+            dagron_executor::images::ENV_MIRRORS,
+            dagron_executor::images::ENV_PULL_SECRETS,
+            // Where task logs are kept.
+            dagron_artifact::log_segments::ENV_STORE,
+            dagron_artifact::log_segments::ENV_SEGMENT_BYTES,
+            // A task's workspace: the image that installs dagron-ci-exec, the
+            // local directory, and when a Kubernetes one is its own volume.
+            dagron_executor::workspace::ENV_CI_EXEC_IMAGE,
+            dagron_executor::workspace::ENV_LOCAL_WORKDIR,
+            dagron_executor::workspace::ENV_PVC_FROM,
+            dagron_executor::workspace::ENV_STORAGE_CLASS,
+            // Which installation the fleet sweep works for.
+            dagron_executor::executor::DAGRON_INSTALLATION,
+            // How much of an attempt's log, and of its output, is kept; and
+            // of the end of a log past its cap.
+            dagron_executor::executor::ENV_LOG_TASK_CAP,
+            dagron_executor::executor::ENV_LOG_TAIL,
+            "DAGRON_ORPHAN_SWEEP_SECS",
+            "DAGRON_ORPHAN_MIN_AGE_SECS",
+            // How often the log store's GC sweeps it.
+            crate::log_sweep::ENV_SWEEP_SECS,
         ] {
             assert!(
                 registered(name),
@@ -623,6 +938,38 @@ mod tests {
                  setting it draws a typo warning"
             );
         }
+    }
+
+    /// A feature added to the manifest and not to [`FEATURES`] would be a part
+    /// an image has and its startup line does not say.
+    #[test]
+    fn every_part_the_manifest_declares_can_be_said() {
+        let manifest = include_str!("../Cargo.toml");
+        let table = manifest
+            .split("\n[features]")
+            .nth(1)
+            .and_then(|rest| rest.split("\n[").next())
+            .expect("the manifest's [features] table");
+        // A feature is a line that starts at the margin with its name: not a
+        // comment, and not a line of a list that runs over several.
+        let declared: Vec<&str> = table
+            .lines()
+            .filter(|line| line.starts_with(|c: char| c.is_ascii_lowercase()))
+            .filter_map(|line| line.split_once(" = ").map(|(name, _)| name))
+            .filter(|name| !matches!(*name, "default" | "archive-cloud"))
+            .collect();
+        let said: Vec<&str> = FEATURES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(said, declared);
+    }
+
+    /// A build has one datastore, and says which.
+    #[test]
+    fn a_build_says_its_one_datastore() {
+        let stores: Vec<&str> = built_with()
+            .into_iter()
+            .filter(|part| matches!(*part, "sqlite" | "postgres"))
+            .collect();
+        assert_eq!(stores.len(), 1, "{stores:?}");
     }
 
     /// The registry is kept sorted by name so a reader can find a knob and a
@@ -689,7 +1036,7 @@ mod build_pool_warning_tests {
 
     /// The build pool's own knobs must not read as typos.
     ///
-    /// `OUR_PREFIXES` claims the bare `DAGRON_` prefix, and `ee/dagron-build`
+    /// `OUR_PREFIXES` claims the bare `DAGRON_` prefix, and the image builder
     /// reads its deployment configuration from `DAGRON_BUILD_*` — variables the
     /// engine binary never reads and so can never register. Before
     /// `DAGRON_BUILD_` joined `FOREIGN_PREFIXES`, every build pool logged one
@@ -735,6 +1082,26 @@ mod build_pool_warning_tests {
             "DAGRON_BUNDLE_PUBKEYS is the engine's own and must stay in the scan"
         );
     }
+
+    /// dagron-ci's command line reads its server and its token from a
+    /// person's shell. An engine started there must not take them for
+    /// typos, and its own setting that starts the same way stays one the
+    /// scan knows.
+    #[test]
+    fn the_ci_commands_variables_are_not_reported_as_typos() {
+        let foreign = |name: &str| FOREIGN_PREFIXES.iter().any(|p| name.starts_with(p));
+        for name in ["DAGRON_CI_URL", "DAGRON_CI_TOKEN", "DAGRON_CI_TOKEN_FILE"] {
+            assert!(foreign(name), "{name} would be warned about as a typo");
+        }
+        for own in [
+            "DAGRON_CI_EXEC_IMAGE",
+            "DAGRON_CI_EXEC_IMAGES",
+            "DAGRON_CI_TOKENS",
+        ] {
+            assert_eq!(foreign(own), own == "DAGRON_CI_TOKENS", "{own}");
+        }
+        assert!(knobs().iter().any(|k| k.name == "DAGRON_CI_EXEC_IMAGE"));
+    }
 }
 
 #[cfg(test)]
@@ -765,7 +1132,61 @@ mod service_link_warning_tests {
             "DAGRON_MAX_TASK_TIMEOUT_SECS",
             "DAGRON_MAX_TASK_TIMEOUT_SEC",
         ]);
-        assert_eq!(unknown_vars(&names), ["DAGRON_MAX_TASK_TIMEOUT_SEC"]);
+        assert_eq!(unknown_vars(&names, &[]), ["DAGRON_MAX_TASK_TIMEOUT_SEC"]);
+    }
+
+    /// What the build around the engine reads for itself is not a typo: a
+    /// name it gives, or a family by its prefix. A name that only starts like
+    /// one it gave still is, and with none given so are they all.
+    #[test]
+    fn a_build_s_own_variables_are_not_typos() {
+        let names = env(&[
+            "DAGRON_SITE_ID",
+            "DAGRON_SITE_IDS",
+            "DAGRON_HOOK_URL",
+            "DAGRON_HOOKS",
+        ]);
+        assert_eq!(
+            unknown_vars(&names, &[]),
+            [
+                "DAGRON_SITE_ID",
+                "DAGRON_SITE_IDS",
+                "DAGRON_HOOK_URL",
+                "DAGRON_HOOKS"
+            ]
+        );
+        assert_eq!(
+            unknown_vars(&names, &["DAGRON_SITE_ID", "DAGRON_HOOK_"]),
+            ["DAGRON_SITE_IDS", "DAGRON_HOOKS"]
+        );
+    }
+
+    /// The two settings the engine read and its registry did not list are in
+    /// it, the key among the values never printed.
+    #[test]
+    fn the_settings_the_engine_reads_are_registered() {
+        let names = env(&["DAGRON_DEFER_ENDPOINT", "DAGRON_ENV_SECRET_KEY"]);
+        assert_eq!(unknown_vars(&names, &[]), Vec::<&str>::new());
+        let key = knobs()
+            .iter()
+            .find(|knob| knob.name == "DAGRON_ENV_SECRET_KEY")
+            .expect("registered");
+        assert!(key.redact, "a key is never printed");
+    }
+
+    /// The sweeps' settings are known, and one misspelt draws
+    /// the warning: `SWEEP_SHARE=off` is the rollback, and a typo of it
+    /// would leave every sweep shared with no word said.
+    #[test]
+    fn a_misspelt_sweep_setting_is_a_typo() {
+        let names = env(&[
+            "SWEEP_INTERVAL_MS",
+            "SWEEP_INTERVALS",
+            "SWEEP_SHARE",
+            "SWEEP_SHAER",
+            "METRICS_HISTORY_CACHE_SECS",
+        ]);
+        assert_eq!(unknown_vars(&names, &[]), ["SWEEP_SHAER"]);
     }
 
     /// A link counts only beside its Service's `_SERVICE_HOST`, which nothing
@@ -775,7 +1196,7 @@ mod service_link_warning_tests {
     fn only_the_kubelets_shapes_beside_their_host_are_links() {
         let names = env(&["DAGRON_ENGINE_PORT", "DAGRON_ENGINE_SERVICE_PORT"]);
         assert_eq!(
-            unknown_vars(&names),
+            unknown_vars(&names, &[]),
             ["DAGRON_ENGINE_PORT", "DAGRON_ENGINE_SERVICE_PORT"]
         );
         let names = env(&[
@@ -787,7 +1208,7 @@ mod service_link_warning_tests {
             "DAGRON_ENGINE_PORT_8080_TCP_ADDR_2",
         ]);
         assert_eq!(
-            unknown_vars(&names),
+            unknown_vars(&names, &[]),
             [
                 "DAGRON_ENGINE_PORTS",
                 "DAGRON_ENGINE_PORT_HTTP",

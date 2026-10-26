@@ -1,0 +1,40 @@
+# A job with a database beside it, in a directory of the repository.
+name: api
+on:
+  push:
+    branches: [main]
+    paths: ["api/**"]
+defaults:
+  run:
+    shell: bash
+    working-directory: api
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: pw
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+    env:
+      DATABASE_URL: postgres://postgres:pw@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: npm
+      - run: npm ci
+      - run: npm test
+        working-directory: api/server
+        env:
+          NODE_ENV: test

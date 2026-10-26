@@ -1,0 +1,12 @@
+shows: A pull request's run is told its base branch as a full ref, which its caches restore from after its own ref's
+event: { kind: pull_request, base_ref: main }
+source: |
+  name: ci
+  on:
+    pull_request: {}
+  tasks:
+    - name: test
+      workspace:
+        cache: [{ prefix: npm, key_files: ["**/package-lock.json"], paths: [~/.npm] }]
+      steps:
+        - run: npm ci && npm test

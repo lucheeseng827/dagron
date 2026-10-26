@@ -1,0 +1,16 @@
+shows: A job is given how an earlier job ended, as a variable read when it is claimed
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: build
+      steps:
+        - run: make
+    - name: report
+      depends_on: [build]
+      trigger_rule: all_done
+      env_from:
+        - { name: BUILD, task: build, read: status }
+      steps:
+        - run: echo "the build $BUILD"

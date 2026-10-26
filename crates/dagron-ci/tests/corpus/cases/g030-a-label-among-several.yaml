@@ -1,0 +1,10 @@
+shows: A job that asks for several labels runs in the image of the one the repository names
+front: github
+github: { runs_on: { linux: "docker.io/library/debian:12" } }
+source: |
+  on: push
+  jobs:
+    build:
+      runs-on: [self-hosted, linux, x64]
+      steps:
+        - run: make

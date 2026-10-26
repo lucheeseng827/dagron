@@ -1,0 +1,13 @@
+shows: A dispatch that leaves out a required input is refused
+event: { kind: dispatch }
+source: |
+  name: release
+  on:
+    dispatch:
+      inputs:
+        version: { required: true }
+  tasks:
+    - name: cut
+      steps:
+        - env: { VERSION: "{{ version }}" }
+          run: scripts/release.sh "$VERSION"

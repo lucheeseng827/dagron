@@ -9,9 +9,11 @@
 # poor first impression and, for the single-binary/edge story the project makes,
 # an odd gap.
 #
-# Only the root `dagron` binary is published. It is the one a person runs
-# (`dagron dev`, `dagron validate`, a one-shot run); dagron-api, the GitOps
-# worker and the MCP server are services and ship as images.
+# Two binaries are published. The root `dagron` binary is the one a person
+# runs (`dagron dev`, `dagron validate`, a one-shot run); dagron-api, the GitOps
+# worker and the MCP server are services and ship as images. `dagron-ci-exec`,
+# the step runner a CI task's image carries, ships beside it on the two Linux
+# musl legs, the only platforms it is for.
 #
 # Five legs. Four build natively on a runner of the target's own architecture
 # and smoke-test what they built; the fifth (armv7, the 32-bit ARM gateways
@@ -140,12 +142,42 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # The release's version, compiled into each binary for `--version`: the
+      # tag without its `v`.
+      - name: Resolve version
+        id: appver
+        shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
       # --locked so a release binary is built from the committed lockfile and
       # not from whatever resolved that morning. Default features = sqlite +
       # ops: the embedded datastore and the management API, which is what
       # `dagron dev` needs and what a single-binary deployment means.
       - name: Build
+        env:
+          APP_VERSION: ${{ steps.appver.outputs.version }}
         run: cargo build --release --locked --bin dagron --target ${{ matrix.target }}
+      # The step runner goes into whatever image a CI task uses, so it is
+      # static: musl, x86_64 and arm64, each built natively like `dagron`.
+      - name: Build dagron-ci-exec
+        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'
+        env:
+          APP_VERSION: ${{ steps.appver.outputs.version }}
+        # -p, not --bin: this workspace's root is a package, so a bare --bin
+        # looks in `dagron` alone and finds no such binary.
+        run: cargo build --release --locked -p dagron-ci-exec -p dagron-ci-cache --target ${{ matrix.target }}
+
+      # The remote runner: a BYO runner for a Mac, a Windows host, an arm64
+      # box, which dials the API and holds no database credentials. On every
+      # native leg; not the cross-compiled armv7 one, which it is not
+      # promised for.
+      - name: Build dagron-runner
+        if: ${{ !matrix.cross }}
+        env:
+          APP_VERSION: ${{ steps.appver.outputs.version }}
+        run: cargo build --release --locked -p dagron-runner --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'
@@ -187,27 +219,175 @@ jobs:
       - name: Smoke test
         if: ${{ !matrix.cross }}
         shell: bash
+        env:
+          APP_VERSION: ${{ steps.appver.outputs.version }}
         run: |
           set -euo pipefail
           bin="target/${{ matrix.target }}/release/dagron"
           # Note: not `[ -f "$bin.exe" ] && bin=...` — under `set -e` a false
           # test would end the step, which is every non-Windows target.
           if [ -f "$bin.exe" ]; then bin="$bin.exe"; fi
+          # It says which release it is, on one line, and starts nothing.
+          said=$("$bin" --version | tr -d '\r')
+          if [ "$said" != "dagron $APP_VERSION" ]; then
+            echo "::error::--version says '$said', not 'dagron $APP_VERSION'"
+            exit 1
+          fi
           # `validate` parses, expands and graph-checks a spec with no server
           # and no network — the cheapest end-to-end proof the binary runs.
           "$bin" validate examples/simple_dag.yaml
           echo "smoke test passed for ${{ matrix.target }}"
+      # It says which release it is, and on musl it is static: it is copied
+      # onto hosts and into images that have nothing else.
+      - name: Smoke test dagron-runner
+        if: ${{ !matrix.cross }}
+        shell: bash
+        env:
+          APP_VERSION: ${{ steps.appver.outputs.version }}
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/dagron-runner"
+          if [ -f "$bin.exe" ]; then bin="$bin.exe"; fi
+          said=$("$bin" --version | tr -d '\r')
+          if [ "$said" != "dagron-runner $APP_VERSION" ]; then
+            echo "::error::--version says '$said', not 'dagron-runner $APP_VERSION'"
+            exit 1
+          fi
+          case "${{ matrix.target }}" in
+            *-musl)
+              if readelf -l "$bin" | grep -q INTERP; then
+                echo "dagron-runner is dynamically linked"
+                exit 1
+              fi ;;
+          esac
+          # With nothing set it refuses to start, and says what it needs.
+          if "$bin" run 2>err.txt; then
+            echo "::error::dagron-runner started with no DAGRON_RUNNER_URL"
+            exit 1
+          fi
+          grep -q DAGRON_RUNNER_URL err.txt
+          echo "dagron-runner smoke test passed for ${{ matrix.target }}"
+      - name: Package dagron-runner
+        if: ${{ !matrix.cross }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ github.event.inputs.tag || github.ref_name }}"
+          name="dagron-runner-${version}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          bin="target/${{ matrix.target }}/release/dagron-runner"
+          if [ -f "$bin.exe" ]; then bin="$bin.exe"; fi
+          cp "$bin" "dist/$name/"
+          cp LICENSE "dist/$name/" 2>/dev/null || true
+          if [ "${{ matrix.archive }}" = zip ]; then
+            (cd dist && 7z a "${name}.zip" "$name" >/dev/null)
+            echo "RUNNER_ASSET=dist/${name}.zip" >> "$GITHUB_ENV"
+          else
+            tar -C dist -czf "dist/${name}.tar.gz" "$name"
+            echo "RUNNER_ASSET=dist/${name}.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      # Static, and it runs a step: an ELF naming an interpreter (a dynamic
+      # loader) would fail in the minimal images it is copied into.
+      - name: Smoke test dagron-ci-exec
+        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/dagron-ci-exec"
+          if readelf -l "$bin" | grep -q INTERP; then
+            echo "dagron-ci-exec is dynamically linked"
+            exit 1
+          fi
+          out=$(env -i PATH="$PATH" CI_STEP_PROTOCOL=1 CI_STEP_COUNT=1 \
+            CI_STEP_1_RUN='echo ok' "$bin" 2>/dev/null)
+          test "$out" = ok
+          "$bin" --speaks 1
+          # Its cache tool goes with it, static too (zstd and ring are C).
+          cache="target/${{ matrix.target }}/release/dagron-ci-cache"
+          if readelf -l "$cache" | grep -q INTERP; then
+            echo "dagron-ci-cache is dynamically linked"
+            exit 1
+          fi
+          "$cache" --version
+          echo "dagron-ci-exec smoke test passed for ${{ matrix.target }}"
+      - name: Package dagron-ci-exec
+        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ github.event.inputs.tag || github.ref_name }}"
+          name="dagron-ci-exec-${version}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/dagron-ci-exec" "dist/$name/"
+          cp "target/${{ matrix.target }}/release/dagron-ci-cache" "dist/$name/"
+          cp LICENSE "dist/$name/" 2>/dev/null || true
+          tar -C dist -czf "dist/${name}.tar.gz" "$name"
+          echo "EXEC_ASSET=dist/${name}.tar.gz" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.target }}
           path: ${{ env.ASSET }}
           if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'
+        with:
+          name: dagron-ci-exec-${{ matrix.target }}
+          path: ${{ env.EXEC_ASSET }}
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !matrix.cross }}
+        with:
+          name: dagron-runner-${{ matrix.target }}
+          path: ${{ env.RUNNER_ASSET }}
+          if-no-files-found: error
+
+  # A CycloneDX SBOM of each binary: what its build links, from the lockfile
+  # the release was built with. One job and not one a leg: the dependencies
+  # are the lockfile's on every platform but for the few a target adds, and
+  # this says what the Linux build has.
+  sbom:
+    name: SBOMs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install cargo-cyclonedx
+        run: cargo install --locked cargo-cyclonedx --version 0.5.9
+
+      - name: Write them
+        env:
+          VERSION: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # A file beside each crate that builds a binary; the three that are
+          # published are kept, under the names their archives have.
+          cargo cyclonedx --format json --spec-version 1.5 --describe binaries --no-build-deps
+          mkdir -p dist
+          cp dagron_bin.cdx.json "dist/dagron-${VERSION}.cdx.json"
+          cp crates/dagron-ci-exec/dagron-ci-exec_bin.cdx.json "dist/dagron-ci-exec-${VERSION}.cdx.json"
+          cp crates/dagron-runner/dagron-runner_bin.cdx.json "dist/dagron-runner-${VERSION}.cdx.json"
+          for sbom in dist/*.cdx.json; do
+            jq -e '.bomFormat == "CycloneDX" and (.components | length) > 0' "$sbom" > /dev/null \
+              || { echo "::error::$sbom is not an SBOM with components"; exit 1; }
+          done
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom
+          path: dist/*.cdx.json
+          if-no-files-found: error
 
   publish:
     name: Attach to the release
-    needs: build
+    needs: [build, sbom]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # uploading release assets
+      # What is attached is signed with this workflow's own identity, which
+      # GitHub vouches for with a short-lived token: there is no key to keep.
+      id-token: write
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -227,6 +407,69 @@ jobs:
           sha256sum dagron-* > ../SHA256SUMS
           mv ../SHA256SUMS .
           cat SHA256SUMS
+
+      - name: Install cosign
+        # The installer and the release it installs are the pair this
+        # repository's other signed release pins: v4.1.0 is the first
+        # installer that can check a cosign v3 download.
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+        with:
+          cosign-release: "v3.1.3"
+
+      # One signature over the checksums covers every file they list. And
+      # for each file, a statement of where it was built (SLSA provenance),
+      # signed the same way. Keyless: each certificate says which repository,
+      # workflow, ref and commit signed, and each signing is recorded in a
+      # public log. The statement is written here, by the workflow that built
+      # the files; what vouches for it is that certificate.
+      - name: Sign the checksums, and say where each file was built
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          jq -n --arg repo "$repo" --arg ref "$GITHUB_REF" --arg sha "$GITHUB_SHA" \
+            --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" --arg event "$GITHUB_EVENT_NAME" '{
+              buildDefinition: {
+                buildType: "https://actions.github.io/buildtypes/workflow/v1",
+                externalParameters: {
+                  workflow: { ref: $ref, repository: $repo, path: ".github/workflows/binaries.yml" }
+                },
+                internalParameters: { github: { event_name: $event, runner_environment: "github-hosted" } },
+                resolvedDependencies: [
+                  { uri: ("git+" + $repo + "@" + $ref), digest: { gitCommit: $sha } }
+                ]
+              },
+              runDetails: {
+                builder: { id: ($repo + "/.github/workflows/binaries.yml@" + $ref) },
+                metadata: { invocationId: ($repo + "/actions/runs/" + $run + "/attempts/" + $attempt) }
+              }
+            }' > "$RUNNER_TEMP/provenance.json"
+          cd dist
+          cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
+          # The names as the checksums list them: every file but what is
+          # written here.
+          awk '{print $2}' SHA256SUMS > "$RUNNER_TEMP/files"
+          while read -r file; do
+            cosign attest-blob --yes --type slsaprovenance1 \
+              --predicate "$RUNNER_TEMP/provenance.json" \
+              --bundle "$file.provenance.sigstore.json" "$file"
+          done < "$RUNNER_TEMP/files"
+
+      # What a user would run, run here before anything is attached.
+      - name: Verify what was signed
+        run: |
+          set -euo pipefail
+          identity="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/.github/workflows/binaries.yml@$GITHUB_REF"
+          issuer=https://token.actions.githubusercontent.com
+          cd dist
+          cosign verify-blob --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" \
+            --bundle SHA256SUMS.sigstore.json SHA256SUMS
+          sha256sum -c SHA256SUMS
+          while read -r file; do
+            cosign verify-blob-attestation --certificate-identity "$identity" \
+              --certificate-oidc-issuer "$issuer" --type slsaprovenance1 \
+              --bundle "$file.provenance.sigstore.json" "$file" > /dev/null
+          done < "$RUNNER_TEMP/files"
+          echo "verified: the checksums' signature, and the provenance of $(wc -l < "$RUNNER_TEMP/files") files"
 
       - name: Upload
         env:

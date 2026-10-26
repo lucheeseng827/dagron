@@ -22,9 +22,16 @@
 //! | `LOG_THREAD_NAMES` | `1`/`0`                                              | `0`     | Include the thread name. |
 //! | `LOG_LINE`         | `1`/`0`                                              | `0`     | Include source file + line number. |
 //! | `LOG_SPAN_EVENTS`  | `none`/`new`/`enter`/`exit`/`close`/`active`/`full` | `none`  | Emit span lifecycle events (e.g. `close` to time spans). |
-//! | `LOG_ANSI`         | `1`/`0`                                              | auto    | Force ANSI colors on/off (auto-disabled for `json`). |
+//! | `LOG_ANSI`         | `1`/`0`                                              | auto    | Force ANSI colors on/off. Unset, lines are coloured only when stdout is a terminal and `NO_COLOR` is not set. Never for `json`. |
+//! | `NO_COLOR`         | any value but empty                                 | —       | No colour, as <https://no-color.org> has it: set and not empty. `LOG_ANSI` wins over it. |
 //!
 //! Verbosity precedence: `RUST_LOG` (if set and parseable) → `LOG_LEVEL` → `info`.
+//!
+//! ## What release a binary is
+//!
+//! [`VERSION`] is the release a binary was built for, and
+//! [`version_requested`] answers `--version` with it: every dagron binary
+//! calls it first, before it reads a setting or starts anything.
 //!
 //! ## Reading logs back
 //!
@@ -36,11 +43,71 @@
 
 #[cfg(feature = "logfilter")]
 pub mod logfilter;
+#[cfg(feature = "otel")]
+pub mod otlp_metrics;
+
+use std::ffi::OsStr;
+use std::io::IsTerminal;
 
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
+
+/// The release this binary was built for: `APP_VERSION` as it was set when the
+/// binary was compiled, which a release's build sets (each image's build
+/// argument, each published binary's environment). Any other build is `dev`.
+///
+/// Not the crate's version. The crates of a release are not numbered with it,
+/// and the open and the commercial releases are numbered apart, so a number
+/// read from a manifest would be the same for every release and right for
+/// none.
+pub const VERSION: &str = match option_env!("APP_VERSION") {
+    Some(version) if !version.is_empty() => version,
+    _ => "dev",
+};
+
+/// What `--version` prints for `binary`: its name and [`VERSION`], on one
+/// line. The name is the build's own, not the one it was run by: an image may
+/// install a binary under another name.
+pub fn version_line(binary: &str) -> String {
+    format!("{binary} {VERSION}")
+}
+
+/// Whether a process's arguments (without its own name) ask for its version
+/// and for nothing else: `--version` or `-V`, alone.
+pub fn asks_version<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut args = args.into_iter();
+    let first = args.next();
+    let asked = first
+        .as_ref()
+        .is_some_and(|arg| arg.as_ref() == "--version" || arg.as_ref() == "-V");
+    asked && args.next().is_none()
+}
+
+/// Answer `--version`: print [`version_line`] and return `true`, where that
+/// is what this process was asked. The caller then returns, having started
+/// nothing. Call it first in `main`, before [`init`]: logging writes a line
+/// of its own to the same stream.
+pub fn version_requested(binary: &str) -> bool {
+    if !asks_version(std::env::args_os().skip(1)) {
+        return false;
+    }
+    println!("{}", version_line(binary));
+    true
+}
+
+/// Whether log lines carry ANSI colour. `LOG_ANSI` decides where it is set.
+/// Otherwise colour is for a person at a terminal: on when stdout is one and
+/// `NO_COLOR` is not set, and off into a file, a pipe or a container's log,
+/// where the escape codes are noise to whatever reads them.
+fn ansi(log_ansi: Option<bool>, no_color: bool, terminal: bool) -> bool {
+    log_ansi.unwrap_or(terminal && !no_color)
+}
 
 /// Read a boolean-ish env var (`1`/`true`/`yes`/`on` → true, anything else →
 /// false), falling back to `default` when unset.
@@ -110,9 +177,18 @@ where
         .with_thread_names(env_bool("LOG_THREAD_NAMES", false))
         .with_line_number(env_bool("LOG_LINE", false))
         .with_span_events(span_events())
-        // JSON output must never carry ANSI escapes; otherwise honor LOG_ANSI
-        // (defaulting on — the fmt layer still auto-detects non-TTY downstream).
-        .with_ansi(!json && env_bool("LOG_ANSI", true));
+        // JSON output never carries ANSI escapes. Otherwise LOG_ANSI decides,
+        // and unset, a terminal does. The fmt layer does not look for one
+        // itself, and an explicit `with_ansi` overrides its reading of
+        // NO_COLOR, so both are read here.
+        .with_ansi(
+            !json
+                && ansi(
+                    std::env::var_os("LOG_ANSI").map(|_| env_bool("LOG_ANSI", true)),
+                    std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()),
+                    std::io::stdout().is_terminal(),
+                ),
+        );
 
     match format.as_str() {
         "json" => base
@@ -131,12 +207,15 @@ where
 #[cfg(feature = "otel")]
 static TRACER_PROVIDER: std::sync::OnceLock<opentelemetry_sdk::trace::SdkTracerProvider> =
     std::sync::OnceLock::new();
+#[cfg(feature = "otel")]
+static LOGGER_PROVIDER: std::sync::OnceLock<opentelemetry_sdk::logs::SdkLoggerProvider> =
+    std::sync::OnceLock::new();
 
-/// Flush and stop the OTLP span exporter, if one was installed.
+/// Flush and stop the OTLP span and log exporters, if they were installed.
 ///
 /// Call once on a clean shutdown path, after the last work you want traced. The
-/// batch exporter holds spans between export intervals, so without this the
-/// final window is lost — precisely the spans that explain a shutdown. A no-op
+/// batch exporters hold spans and records between export intervals, so without
+/// this the final window is lost — precisely what explains a shutdown. A no-op
 /// when the `otel` feature is off or no exporter was configured.
 pub fn shutdown() {
     #[cfg(feature = "otel")]
@@ -145,6 +224,56 @@ pub fn shutdown() {
             eprintln!("dagron: OTLP span exporter shutdown failed: {e}");
         }
     }
+    #[cfg(feature = "otel")]
+    if let Some(provider) = LOGGER_PROVIDER.get() {
+        if let Err(e) = provider.shutdown() {
+            eprintln!("dagron: OTLP log exporter shutdown failed: {e}");
+        }
+    }
+}
+
+/// The resource every signal a process sends carries: `service.name` is
+/// `dagron-<service>`, over what the SDK finds itself (`OTEL_RESOURCE_ATTRIBUTES`
+/// among it), so spans, logs and metrics of one process name it alike.
+#[cfg(feature = "otel")]
+pub(crate) fn otel_resource(service: &str) -> opentelemetry_sdk::Resource {
+    opentelemetry_sdk::Resource::builder()
+        .with_service_name(service_name(service))
+        .build()
+}
+
+/// `dagron-<service>`, or `service` itself where it is a binary's whole name
+/// already (`dagron-ci`, `dagron-step-sql`): never `dagron-dagron-…`.
+pub fn service_name(service: &str) -> String {
+    match service.starts_with("dagron-") {
+        true => service.to_string(),
+        false => format!("dagron-{service}"),
+    }
+}
+
+/// The service this process named as it began logging ([`init`]), for
+/// what it sends outside the logging layers (its metrics), so that every
+/// signal of one process has one name.
+pub fn service() -> Option<&'static str> {
+    SERVICE.get().map(String::as_str)
+}
+
+static SERVICE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The endpoint a signal (`TRACES`, `LOGS`, `METRICS`) goes to, when it goes:
+/// its own `OTEL_EXPORTER_OTLP_<SIGNAL>_ENDPOINT` or the base
+/// `OTEL_EXPORTER_OTLP_ENDPOINT`, and `OTEL_<SIGNAL>_EXPORTER` not `none`. The
+/// exporters read the rest of the standard variables themselves.
+#[cfg(feature = "otel")]
+fn otlp_signal(signal: &str) -> Option<String> {
+    let var = |k: String| {
+        std::env::var(k).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    };
+    if var(format!("OTEL_{signal}_EXPORTER")).is_some_and(|v| v.eq_ignore_ascii_case("none")) {
+        return None;
+    }
+    var(format!("OTEL_EXPORTER_OTLP_{signal}_ENDPOINT"))
+        .or_else(|| var("OTEL_EXPORTER_OTLP_ENDPOINT".to_string()))
 }
 
 /// Initialize the global tracing subscriber for `service` (e.g. `"controller"`,
@@ -155,14 +284,18 @@ pub fn shutdown() {
 /// practice each dagron process runs as its own container/pod, so the
 /// orchestrator's metadata already tags its downstream events.)
 ///
-/// With the `otel` feature built in **and** `OTEL_EXPORTER_OTLP_ENDPOINT` set, an
-/// OTLP (HTTP/protobuf) span exporter is also installed (#28 follow-on) so the
-/// stack's tracing spans are delivered to a collector; otherwise logging is
-/// unchanged.
+/// With the `otel` feature built in **and** an OTLP endpoint set
+/// (`OTEL_EXPORTER_OTLP_ENDPOINT`, or a signal's own), OTLP (HTTP/protobuf)
+/// exporters are also installed: spans (#28 follow-on), and each log event as
+/// an OTLP log record, each unless its `OTEL_<SIGNAL>_EXPORTER` is
+/// `none`; otherwise logging is unchanged. Metrics go by
+/// [`otlp_metrics::MetricsExport`], which a process with metrics starts
+/// itself.
 ///
 /// Idempotent-ish: uses `try_init` so a double-call (e.g. in tests) is a no-op
 /// rather than a panic.
 pub fn init(service: &str) {
+    let _ = SERVICE.set(service.to_string());
     let format = std::env::var("LOG_FORMAT").unwrap_or_else(|_| "full".to_string());
 
     let subscriber = tracing_subscriber::registry()
@@ -170,14 +303,11 @@ pub fn init(service: &str) {
         .with(fmt_layer());
 
     #[cfg(feature = "otel")]
-    match otel_layer(service) {
-        Some(layer) => {
-            subscriber.with(layer).try_init().ok();
-        }
-        None => {
-            subscriber.try_init().ok();
-        }
-    }
+    subscriber
+        .with(otel_layer(service))
+        .with(otel_logs_layer(service))
+        .try_init()
+        .ok();
     #[cfg(not(feature = "otel"))]
     subscriber.try_init().ok();
 
@@ -209,11 +339,8 @@ where
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
 
-    // Gate on the standard endpoint env var: unset ⇒ exporter stays off.
-    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())?;
+    // Gate on the standard endpoint env vars: unset ⇒ exporter stays off.
+    let endpoint = otlp_signal("TRACES")?;
 
     // A second call (a double `init` in tests, or an embedder) must not build a
     // *second* provider: only the one in the OnceLock is reachable from
@@ -238,13 +365,9 @@ where
         }
     };
 
-    let resource = opentelemetry_sdk::Resource::builder()
-        .with_service_name(format!("dagron-{service}"))
-        .build();
-
     let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
-        .with_resource(resource)
+        .with_resource(otel_resource(service))
         .build();
 
     let tracer = provider.tracer("dagron");
@@ -263,6 +386,50 @@ where
     Some(tracing_opentelemetry::layer().with_tracer(tracer).boxed())
 }
 
+/// Targets whose events never become OTLP log records: the exporter's own
+/// HTTP stack logs as it sends, and a record of sending a record would be
+/// sent in turn, without end. They still reach stdout.
+#[cfg(feature = "otel")]
+fn exporter_internal(target: &str) -> bool {
+    ["opentelemetry", "hyper", "h2", "reqwest", "tower", "rustls", "tonic"]
+        .iter()
+        .any(|t| target == *t || target.starts_with(&format!("{t}::")) || target.starts_with(&format!("{t}_")))
+}
+
+/// Build the OTLP log layer: every event the subscriber lets through
+/// also goes to the collector as a log record, with its level, its fields and
+/// the span it was in, under the same resource as the spans. `None` when no
+/// endpoint is set, `OTEL_LOGS_EXPORTER=none`, or the exporter can't be built.
+#[cfg(feature = "otel")]
+fn otel_logs_layer<S>(service: &str) -> Option<Box<dyn Layer<S> + Send + Sync>>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + Send + Sync,
+{
+    use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+    use tracing_subscriber::filter::filter_fn;
+
+    let endpoint = otlp_signal("LOGS")?;
+    let not_internal = filter_fn(|meta| !exporter_internal(meta.target()));
+    // One provider per process, as for spans: only the stored one is flushed.
+    if let Some(existing) = LOGGER_PROVIDER.get() {
+        return Some(OpenTelemetryTracingBridge::new(existing).with_filter(not_internal).boxed());
+    }
+    let exporter = match opentelemetry_otlp::LogExporter::builder().with_http().build() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("dagron: OTLP log export disabled (exporter build failed): {e}");
+            return None;
+        }
+    };
+    let provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(otel_resource(service))
+        .build();
+    let _ = LOGGER_PROVIDER.set(provider.clone());
+    eprintln!("dagron: OTLP log export enabled → {endpoint}");
+    Some(OpenTelemetryTracingBridge::new(&provider).with_filter(not_internal).boxed())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,7 +437,7 @@ mod tests {
 
     /// Tests here mutate process-global env vars; the default test harness runs
     /// them in parallel, so serialize env access to keep them deterministic.
-    fn env_lock() -> &'static Mutex<()> {
+    pub(crate) fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
@@ -285,6 +452,58 @@ mod tests {
         std::env::remove_var("DAGRON_TEST_BOOL");
         assert!(env_bool("DAGRON_TEST_BOOL", true));
         assert!(!env_bool("DAGRON_TEST_BOOL", false));
+    }
+
+    /// Colour is for a person at a terminal. `LOG_ANSI` decides where it is
+    /// set. Unset, a file, a pipe or a container's log gets none, and neither
+    /// does a terminal under `NO_COLOR`.
+    #[test]
+    fn lines_are_coloured_for_a_terminal_only_unless_told() {
+        // LOG_ANSI, NO_COLOR, a terminal: coloured
+        let cases = [
+            (None, false, true, true),
+            (None, false, false, false),
+            (None, true, true, false),
+            (None, true, false, false),
+            (Some(true), true, false, true),
+            (Some(false), false, true, false),
+        ];
+        for (log_ansi, no_color, terminal, coloured) in cases {
+            assert_eq!(
+                ansi(log_ansi, no_color, terminal),
+                coloured,
+                "LOG_ANSI={log_ansi:?} NO_COLOR={no_color} terminal={terminal}"
+            );
+        }
+    }
+
+    /// `--version` or `-V`, alone, asks for the version. With anything beside
+    /// it, or anywhere but first, it is the program's own to read.
+    #[test]
+    fn a_version_is_asked_for_by_the_flag_alone() {
+        assert!(asks_version(["--version"]));
+        assert!(asks_version(["-V"]));
+        let others: [&[&str]; 5] = [
+            &[],
+            &["version"],
+            &["--version", "x"],
+            &["run", "--version"],
+            &["-v"],
+        ];
+        for args in others {
+            assert!(!asks_version(args), "{args:?}");
+        }
+    }
+
+    /// The line is the build's name and the release, and a build no release
+    /// made says so rather than give a number.
+    #[test]
+    fn the_version_line_is_the_name_and_the_release() {
+        assert_eq!(version_line("dagron-api"), format!("dagron-api {VERSION}"));
+        match option_env!("APP_VERSION") {
+            Some(version) if !version.is_empty() => assert_eq!(VERSION, version),
+            _ => assert_eq!(VERSION, "dev"),
+        }
     }
 
     #[test]
@@ -306,6 +525,13 @@ mod tests {
         let _ = build_filter().to_string();
     }
 
+    #[test]
+    fn a_service_is_named_dagron_once() {
+        assert_eq!(service_name("controller"), "dagron-controller");
+        assert_eq!(service_name("dagron-ci"), "dagron-ci");
+        assert_eq!(service_name("dagron-step-sql"), "dagron-step-sql");
+    }
+
     /// The OTLP exporter must stay OFF unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set,
     /// even when the `otel` feature is compiled in (#28 follow-on): no endpoint ⇒
     /// no exporter layer, no background exporter thread.
@@ -319,6 +545,49 @@ mod tests {
         std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "   ");
         assert!(super::otel_layer::<tracing_subscriber::Registry>("test").is_none());
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+    }
+
+    /// Each signal goes where its own endpoint or the base one says, and not at
+    /// all when its exporter is `none`.
+    #[cfg(feature = "otel")]
+    #[test]
+    fn each_signal_is_gated_on_an_endpoint_and_its_exporter() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        for k in [
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+            "OTEL_LOGS_EXPORTER",
+        ] {
+            std::env::remove_var(k);
+        }
+        assert!(super::otlp_signal("LOGS").is_none());
+        assert!(super::otel_logs_layer::<tracing_subscriber::Registry>("test").is_none());
+        std::env::set_var("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "http://logs:4318/v1/logs");
+        assert_eq!(super::otlp_signal("LOGS").as_deref(), Some("http://logs:4318/v1/logs"));
+        assert!(super::otlp_signal("TRACES").is_none(), "one signal's endpoint is not another's");
+        std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318");
+        assert_eq!(super::otlp_signal("TRACES").as_deref(), Some("http://collector:4318"));
+        std::env::set_var("OTEL_LOGS_EXPORTER", "none");
+        assert!(super::otlp_signal("LOGS").is_none());
+        for k in [
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+            "OTEL_LOGS_EXPORTER",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    /// The exporter's own HTTP stack is kept out of the log records it sends.
+    #[cfg(feature = "otel")]
+    #[test]
+    fn the_exporters_own_events_are_not_exported() {
+        for t in ["hyper", "hyper_util::client", "reqwest::connect", "opentelemetry_sdk", "h2::codec"] {
+            assert!(super::exporter_internal(t), "{t}");
+        }
+        for t in ["dagron", "dagron_engine::worker", "hyperloop", "towers"] {
+            assert!(!super::exporter_internal(t), "{t}");
+        }
     }
 
     /// The OTLP HTTP/protobuf exporter builds successfully with the selected

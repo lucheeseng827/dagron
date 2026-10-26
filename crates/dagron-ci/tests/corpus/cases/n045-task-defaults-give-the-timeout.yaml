@@ -1,0 +1,16 @@
+shows: A pipeline's task_defaults give a task its timeout before the setting does
+source: |
+  name: ci
+  on:
+    push: {}
+  task_defaults:
+    timeout_secs: 1800
+    docker_image: docker.io/library/alpine:3.20
+  tasks:
+    - name: build
+      steps:
+        - run: make
+    - name: slow
+      timeout_secs: 7200
+      steps:
+        - run: make slow

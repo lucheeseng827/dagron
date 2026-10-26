@@ -1,0 +1,4 @@
+not a pipeline:
+  tasks[0] (build).steps[0].continue_on_error: must be true or false
+  tasks[0] (build).steps[0].timeout_secs: must be a whole number of at least 1
+  tasks[0] (build).depends_on: must be a list of strings

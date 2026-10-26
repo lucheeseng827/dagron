@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="widgets" tests="4" failures="2" skipped="1">
+    <testcase classname="widgets.size" name="is_small" file="src/lib.rs" line="1"/>
+    <testcase classname="widgets.size" name="is_round" file="src/lib.rs" line="2">
+      <failure message="expected round, got square">at src/lib.rs:2 &amp; &lt;here&gt;</failure>
+    </testcase>
+    <testcase classname="widgets.size" name="is_new"><skipped/></testcase>
+  </testsuite>
+</testsuites>

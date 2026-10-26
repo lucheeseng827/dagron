@@ -5,6 +5,8 @@ import Link from "next/link";
 import LogFilterBar from "@/components/logview/LogFilterBar";
 import LogLines, { type RenderedLine } from "@/components/logview/LogLines";
 import TaskIterations from "@/components/logview/TaskIterations";
+import CiLogView from "@/components/ci/CiLogView";
+import { hasCiSteps } from "@/lib/ci-log";
 import { getTaskLogs } from "@/lib/dagron-api";
 import { statusColor, statusLabel, type WaitingOn } from "@/lib/adapter";
 import {
@@ -75,6 +77,10 @@ export default function TaskPanel({
   const [error, setError] = useState<string | null>(null);
   const paneRef = useRef<HTMLDivElement | null>(null);
   const preRef = useRef<HTMLPreElement | null>(null);
+  const stepsRef = useRef<HTMLDivElement | null>(null);
+  // A CI job's log reads by step. The raw text is one click away, for the
+  // reader who wants it whole, or as the runner wrote it.
+  const [raw, setRaw] = useState(false);
   // Tail cursor lives in a ref so the poll interval reads the latest value.
   const offsetRef = useRef(0);
   // Running totals over every slice fetched so far. The server reports these per
@@ -170,12 +176,13 @@ export default function TaskPanel({
 
   // Follow-scroll: stick to the bottom while new output streams in, but only
   // when the user is already near the bottom — don't fight an upward scroll.
+  const steps = !filtering && hasCiSteps(output);
   useEffect(() => {
-    const el = filtering ? paneRef.current : preRef.current;
+    const el = filtering ? paneRef.current : steps && !raw ? stepsRef.current : preRef.current;
     if (!el) return;
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
     if (nearBottom) el.scrollTop = el.scrollHeight;
-  }, [output, lines, filtering]);
+  }, [output, lines, filtering, steps, raw]);
 
   const rendered: RenderedLine[] = useMemo(
     () =>
@@ -294,7 +301,10 @@ export default function TaskPanel({
                 </span>
               )}
               <span style={{ color: "var(--dim)", fontSize: 11 }}>
-                Parked — holds no worker slot. It stays “running” until this resolves.
+                {/* A quota wait is not a park: the row is `ready`, not `running`. */}
+                {waiting.label === "Waiting on quota"
+                  ? "Back in the queue — the pod never started, so no attempt was used. Retried as the quota frees up."
+                  : "Parked — holds no worker slot. It stays “running” until this resolves."}
               </span>
             </div>
           )}
@@ -304,7 +314,13 @@ export default function TaskPanel({
               last pass; for a retried task it is the attempt that passed. This
               is where the rest of them are, and it stays closed (and unfetched)
               until asked: the pane below polls, and this must not. */}
-          <TaskIterations runId={runId} taskId={logs.task_id} attempt={logs.attempt} filter={filter} />
+          <TaskIterations
+            runId={runId}
+            taskId={logs.task_id}
+            attempt={logs.attempt}
+            earlier={logs.earlier_attempts ?? Math.max(logs.attempt - 1, 0)}
+            filter={filter}
+          />
           <LogFilterBar
             value={filter}
             onChange={onFilterChange}
@@ -316,13 +332,33 @@ export default function TaskPanel({
               raw text, copyable in one selection, exactly as before. A filtered
               view needs per-line structure (source line number, level colour,
               dimmed context), which a single text blob can't carry. */}
+          {steps && (
+            <div style={{ display: "flex", gap: 4, alignItems: "center", fontSize: 11 }}>
+              {(["steps", "raw"] as const).map((v) => (
+                <button
+                  key={v}
+                  onClick={() => setRaw(v === "raw")}
+                  className={`dy-pill ${raw === (v === "raw") ? "dy-pill-active" : ""}`}
+                  style={{ cursor: "pointer" }}
+                  title={v === "raw" ? "The log as it was written, the step runner's own lines among it" : "The log by step, with what the job said of its tests"}
+                >
+                  {v === "raw" ? "Raw" : "By step"}
+                </button>
+              ))}
+            </div>
+          )}
           {filtering ? (
             <LogLines
               ref={paneRef}
               lines={rendered}
+              fold={false}
               style={{ minHeight: 80, maxHeight: "60vh" }}
               empty="No lines match this filter."
             />
+          ) : steps && !raw ? (
+            <div ref={stepsRef} style={{ maxHeight: "60vh", overflow: "auto" }}>
+              <CiLogView output={output} running={streaming} />
+            </div>
           ) : (
             <pre
               ref={preRef}

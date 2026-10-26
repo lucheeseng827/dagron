@@ -1,0 +1,10 @@
+shows: A tag that the tags pattern does not take is passed over
+event: { kind: tag, ref: refs/tags/nightly-2026 }
+source: |
+  name: release
+  on:
+    push: { tags: ["v*"] }
+  tasks:
+    - name: publish
+      steps:
+        - run: make publish

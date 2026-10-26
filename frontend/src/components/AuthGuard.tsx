@@ -7,6 +7,8 @@ import Sidebar from "@/components/Sidebar";
 import { checkSession, login } from "@/lib/dagron-api";
 // The hosted service's single sign-on button; the public build's stub renders nothing.
 import { CloudSignInExtras } from "@ee/cloud";
+// What this build calls itself: the name alone, in the public build.
+import { PRODUCT_NAME } from "@ee/edition";
 
 // Gate the app on a valid session. The token lives in an HttpOnly cookie that JS
 // can't read, so we probe `/api/me` (the cookie rides along automatically) to
@@ -118,7 +120,7 @@ function SignInGate({ onSet }: { onSet: () => void }) {
         }}
       >
         <p style={{ color: "var(--muted)", lineHeight: 1.6 }}>
-          Sign in to dagron with your email and password.
+          Sign in to {PRODUCT_NAME} with your email and password.
         </p>
         <label htmlFor="signin-email" style={labelStyle}>
           Email

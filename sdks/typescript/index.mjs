@@ -200,7 +200,7 @@ function whenOutputRefs(condition) {
  * Identifies the recipe format *and* the Dockerfile the builder synthesises from
  * it. It is hashed with the recipe, so bumping it re-tags every image on
  * purpose: two images with the same tag must have been built the same way.
- * Must equal `GENERATOR_VERSION` in `ee/dagron-build/src/recipe.rs` and
+ * Must equal the image builder's `GENERATOR_VERSION` and
  * `BUILD_GENERATOR_VERSION` in the Python SDK.
  */
 export const BUILD_GENERATOR_VERSION = "dagron-build/v2";
@@ -279,11 +279,11 @@ export class RecipeFile {
  * unchanged recipe is a registry lookup rather than a build.
  *
  * That makes this class a *contract*, not a convenience. The program that
- * actually produces the image is written in another language
- * (`ee/dagron-build`), and if the two disagree about the canonical form by one
- * byte, an author pins a task to an image no build will ever push and nothing
- * fails until the run does. `sdks/recipe-vectors.json` holds golden vectors
- * generated from the builder; `recipe.test.mjs` asserts against them.
+ * actually produces the image is written in another language, and if the two
+ * disagree about the canonical form by one byte, an author pins a task to an
+ * image no build will ever push and nothing fails until the run does.
+ * `sdks/recipe-vectors.json` holds golden vectors generated from the builder;
+ * `recipe.test.mjs` asserts against them.
  */
 export class Recipe {
   /**
@@ -1414,7 +1414,7 @@ export class Client {
   /**
    * Runs newest-first, optionally filtered and paged. `name` is the
    * workflow/DAG name (exact match) and `trigger` is what started the run —
-   * `manual`, `schedule` or `backfill`.
+   * `manual`, `schedule`, `backfill` or `ci` (a CI service's runs).
    */
   async listRuns({ status, name, trigger, limit, offset } = {}) {
     return this._request("GET", "/api/runs", {

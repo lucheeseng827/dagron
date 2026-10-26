@@ -20,6 +20,7 @@ nothing but its password.
 | Policy | Selects | Allows ingress on | From |
 |---|---|---|---|
 | `<release>-engine` | engine pods | the engine port | the Prometheus namespace (`networkPolicy.engine.monitoringNamespace`, default `monitoring`) and `networkPolicy.engine.allowFrom` |
+| the same policy, with dagron-ci in the engine's pod (`ci.enabled`, `ci.placement: engine`) | engine pods | dagron-ci's port | anywhere, as that port is where dagron-ci has a pod of its own: each of its doors asks for a signature, a credential or a secret |
 | `<release>-postgres` (only with the bundled Postgres) | postgres pods | 5432 | the release's engine, dagron-api, gitops and operator pods, plus `networkPolicy.postgres.allowFrom` |
 
 Everything else is dropped: task pods, the gitops worker (for the engine), other pods in the namespace,
@@ -41,7 +42,7 @@ loadtest/deploy/security-e2e/netpol.sh --cleanup
 
 ```yaml
 networkPolicy:
-  enabled: true                      # false renders nothing
+  enabled: true                      # false renders neither of the two policies above
   engine:
     monitoringNamespace: monitoring  # "" = nobody may scrape
     allowFrom: []                    # extra raw NetworkPolicy peers that may reach the engine API
@@ -58,12 +59,25 @@ so operator access keeps working — gate it with RBAC.
 - **It only works on a CNI that enforces NetworkPolicy** (Calico, Cilium, kindnet, the AWS VPC CNI with network
   policy enabled…). On one that does not, the objects are accepted and protect nothing. Check with the control
   test in `netpol.sh`.
-- **Ingress only. There is no egress policy.** A task pod can still reach anything the namespace's egress
-  allows — the internet, the metadata service, other namespaces, the Kubernetes API if its service account allows
-  it. Egress control is the next step and needs to know what your tasks legitimately talk to.
+- **Ingress only. These two policies say nothing of egress.** A task pod can still reach anything the namespace's
+  egress allows — the internet, the metadata service, other namespaces, the Kubernetes API if its service account
+  allows it. One task at a time can give that up: a task that declares `isolation: { network: none }` runs in
+  a pod with no network, in or out, under a third policy the chart makes with `engine.taskNetworkPolicy`
+  (`dagron-task-no-network`; it is separate from `networkPolicy.enabled`, and off by default). See
+  "No network, on Kubernetes" in `docs/FAMILIES.md`. If you add an egress policy of your own to this namespace,
+  keep it from those pods (`{key: dagron.dev/network, operator: DoesNotExist}` in its `podSelector`): a pod
+  has what any policy that selects it allows, and the engine refuses to start beside one that gives a labelled pod
+  something back.
 - **The API is still unauthenticated for the peers you allow.** A NetworkPolicy filters by address and port, not
   by path: the monitoring namespace can reach `/metrics` **and** `POST /runs` on the same port, so treat that
   namespace as trusted, or set `monitoringNamespace: ""` and scrape another way.
+- **dagron-ci in the engine's pod reaches the engine's API.** With `ci.enabled` the chart runs dagron-ci as a
+  container of the engine's pod (`ci.placement: engine`), so that the engine can ask it for a private repository's
+  checkout credential on the pod's own address. The two then share that address, and a NetworkPolicy does not reach
+  inside a pod: dagron-ci, which takes a forge's webhooks, can call the engine's unauthenticated API there. It is
+  not given the engine's service-account token (the pod mounts none, and the engine's container mounts its own).
+  `ci.placement: deployment` keeps the two in separate pods, with the policy above between them, and a private
+  repository's checkout is then not served.
 - **Task pods share the namespace with the engine** and are not isolated from each other.
 - **An external Postgres** (`externalDatabaseUrl`) is not covered: the policy only selects the chart's own pod.
 - **`dagron-api` ingress is not restricted** (it serves users); front it with your ingress and its own controls.

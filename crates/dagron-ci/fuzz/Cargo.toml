@@ -1,0 +1,110 @@
+# Fuzz targets for every parser of dagron-ci's that reads something written
+# outside it: a pipeline, a workflow file, an expression, a forge's bytes, a
+# job's own lines and reports. `cargo fuzz` builds them with a sanitizer, on
+# a nightly toolchain; `fuzz/run.sh` runs each for a while. README.md here
+# says how.
+[package]
+name = "dagron-ci-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+dagron-ci = { path = ".." }
+dagron-ci-expr = { path = "../../dagron-ci-expr" }
+dagron-ci-exec = { path = "../../dagron-ci-exec" }
+
+# A workspace of its own: it is not one of the module's members, which build
+# on stable and without a sanitizer.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "pipeline"
+path = "fuzz_targets/pipeline.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "workflow"
+path = "fuzz_targets/workflow.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "settings"
+path = "fuzz_targets/settings.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "expr"
+path = "fuzz_targets/expr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "glob"
+path = "fuzz_targets/glob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "webhook"
+path = "fuzz_targets/webhook.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "git"
+path = "fuzz_targets/git.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pack"
+path = "fuzz_targets/pack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "said"
+path = "fuzz_targets/said.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fleet"
+path = "fuzz_targets/fleet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reports"
+path = "fuzz_targets/reports.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "steps"
+path = "fuzz_targets/steps.rs"
+test = false
+doc = false
+bench = false

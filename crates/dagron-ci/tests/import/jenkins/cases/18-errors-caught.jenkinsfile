@@ -1,0 +1,20 @@
+// Errors a stage goes on after: a block that catches them, and a script
+// whose status is returned.
+pipeline {
+    agent { docker { image 'python:3.12' } }
+    stages {
+        stage('Lint') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    sh 'ruff check .'
+                    sh 'ruff format --check .'
+                    dir('docs') {
+                        sh 'make lint'
+                    }
+                }
+                sh(script: 'pip-audit', returnStatus: true)
+                sh 'pytest -q'
+            }
+        }
+    }
+}

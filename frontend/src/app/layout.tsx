@@ -4,6 +4,8 @@ import { Archivo } from "next/font/google";
 import AuthGuard from "@/components/AuthGuard";
 import { LEGACY_REDIRECT } from "@/lib/legacy-redirect";
 import ToastProvider from "@/components/Toasts";
+// What this build calls itself: the name alone, in the public build.
+import { PRODUCT_NAME } from "@ee/edition";
 
 // Self-hosted at build time. globals.css used to @import this family from
 // fonts.googleapis.com, which is a render-blocking request the console cannot
@@ -18,7 +20,7 @@ const archivo = Archivo({
 });
 
 export const metadata: Metadata = {
-  title: "dagron",
+  title: PRODUCT_NAME,
   description: "dagron workflow orchestrator",
 };
 

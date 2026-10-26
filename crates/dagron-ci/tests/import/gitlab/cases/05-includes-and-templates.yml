@@ -1,0 +1,35 @@
+# Jobs shared through a file of the project, templates and references.
+include:
+  - local: /ci/templates.yml
+  - project: group/shared-ci
+    file: /templates/security.yml
+  - template: Security/SAST.gitlab-ci.yml
+
+.rust: &rust
+  image: rust:1.86-bookworm
+  variables:
+    CARGO_HOME: $CI_PROJECT_DIR/.cargo
+
+.setup:
+  script:
+    - rustup component add clippy rustfmt
+
+fmt:
+  <<: *rust
+  script:
+    - cargo fmt --check
+
+clippy:
+  extends: .rust
+  script:
+    - !reference [.setup, script]
+    - cargo clippy -- -D warnings
+
+build:
+  extends: [.rust, .release-build]
+  stage: build
+
+broken:
+  extends: .no-such-template
+  script:
+    - echo never

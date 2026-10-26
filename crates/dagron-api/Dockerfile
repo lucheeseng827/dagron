@@ -45,26 +45,38 @@ COPY crates/dagron-state/ ./crates/dagron-state/
 COPY crates/dagron-core/ ./crates/dagron-core/
 COPY crates/dagron-api/Cargo.toml ./crates/dagron-api/Cargo.toml
 WORKDIR /app/crates/dagron-api
-# Cargo features for the api binary. Empty = OSS. Pass `enterprise` for the
-# enterprise build (unlocks the audit trail + flips the reported edition to
-# "enterprise").
+# Cargo features for the api binary, comma-separated. Empty is the lean build:
+# local artifacts and archives only, no span delivery. The published image is
+# built with `otel,archive-s3,archive-gcs,archive-azure` (the release
+# workflow passes them): the three object stores and OTLP delivery. Pass
+# `enterprise` for the enterprise build (unlocks the audit trail + flips the
+# reported edition to "enterprise").
 ARG CARGO_FEATURES=
 # Compile dependencies against a stub main first so this layer is cached and a
 # source-only change doesn't force a full dependency rebuild.
 RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release --bin dagron-api ${CARGO_FEATURES:+--features $CARGO_FEATURES}
 COPY crates/dagron-api/src ./src
+# The release this is built for, which the binary answers `--version` with. A
+# release's build passes it, and any other build says `dev`. Declared here,
+# just before the build, so that the layers above are reused across versions.
+ARG APP_VERSION=dev
+ENV APP_VERSION=$APP_VERSION
 # Bust the stub's mtime so cargo rebuilds the real binary (deps stay cached).
 RUN touch src/main.rs && cargo build --release --bin dagron-api ${CARGO_FEATURES:+--features $CARGO_FEATURES}
 
 # Non-root-owned /artifacts to COPY into the shell-less runtime. The gateway writes an
 # approval's `approved.sha256` here and serves artifacts from it; a volume mounted over a
 # path the image lacks would be created root-owned and unwritable as 65532.
-RUN mkdir -p /seed/artifacts && chown -R 65532:65532 /seed
+# Group 0 with the owner's rights: OpenShift runs the image as an arbitrary uid
+# in group 0.
+RUN mkdir -p /seed/artifacts && chown -R 65532:0 /seed && chmod -R g=u /seed
 
 # ── Runtime: distroless/cc (glibc, no shell) ────────────────────────────────────
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=builder /app/crates/dagron-api/target/release/dagron-api /usr/local/bin/dagron-api
-COPY --from=builder --chown=65532:65532 /seed/artifacts /artifacts
+# --chmod: a directory COPY makes is 0755 whatever its source's mode, and
+# OpenShift's uid writes here as group 0.
+COPY --from=builder --chown=65532:0 --chmod=775 /seed/artifacts /artifacts
 # Served at / by the binary; override the location with DAGRON_CONSOLE_DIR.
 # Absent = API-only, which is what a `cargo run` on a dev box gets.
 COPY --from=console /web/out /usr/share/dagron/console

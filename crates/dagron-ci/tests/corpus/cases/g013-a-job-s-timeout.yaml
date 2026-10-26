@@ -1,0 +1,12 @@
+shows: A job's timeout in minutes is the task's in seconds
+front: github
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+source: |
+  on: push
+  jobs:
+    slow:
+      runs-on: ubuntu-latest
+      timeout-minutes: 45
+      steps:
+        - run: make slow
+          timeout-minutes: 30

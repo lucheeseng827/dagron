@@ -1,0 +1,14 @@
+shows: Where the operator lists the actions that may be used, one not listed is refused, and one listed is pinned to a commit's full id
+front: github
+github:
+  runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" }
+  actions_allow: "acme/*"
+source: |
+  on: push
+  jobs:
+    build:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: octo/hello@v1
+        - uses: acme/lint@main
+        - run: make

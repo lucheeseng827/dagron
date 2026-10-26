@@ -1,0 +1,3 @@
+not a pipeline:
+  tasks[0] (build).steps[0].run: is required: the command to run
+  tasks[1] (empty).steps: must be a list of at least one step

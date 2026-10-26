@@ -1,0 +1,54 @@
+# Imported from a GitHub Actions workflow by dagron-import.
+#
+# To do by hand (4):
+#   jobs.say.steps[2]: `github.head_ref` in the script has nothing to stand for it here: the step stops where it is read
+#   jobs.say.steps[2]: `github.run_id` in the script has nothing to stand for it here: the step stops where it is read
+#   jobs.say.steps[2]: `hashFiles('**/package-lock.json')` in the script has nothing to stand for it here: the step stops where it is read
+#   jobs.say.steps[2]: the script reads $GITHUB_ENV, which a step here is not given
+#
+# Changed on the way (11):
+#   jobs.say.steps[0]: what the script read in `${{ }}` is a variable of the shell's here, which the shell fills in as it runs the script
+#   jobs.say.steps[0], jobs.say.steps[1]: the event's kind is read from $CI_EVENT, which is `tag` for a push of a tag where GitHub says `push`, and `dispatch` where it says `workflow_dispatch`
+#   jobs.say.steps[1]: $GITHUB_SHA is $CI_SHA here
+#   jobs.say.steps[1]: $GITHUB_REF is $CI_REF here
+#   jobs.say.steps[1]: $GITHUB_EVENT_NAME is $CI_EVENT here
+#   jobs.say.steps[1]: $GITHUB_REPOSITORY is $CI_REPO here
+#   jobs.say.steps[1]: $GITHUB_STEP_SUMMARY is $CI_STEP_SUMMARY here
+#   jobs.say.runs-on: ubuntu-latest is the image docker.io/library/ubuntu:24.04: an operating system, with none of the tools a hosted runner holds
+#   jobs: a step that named no shell ran under bash on a runner GitHub hosts, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   jobs: a job that set no timeout had GitHub's six hours, and has dagron-ci's own here (an hour, unless CI_DEFAULT_TIMEOUT_SECS says another): say timeout_secs where a job needs longer
+name: scripts
+on:
+  push: {}
+  pull_request: {}
+tasks:
+- name: say
+  docker_image: docker.io/library/ubuntu:24.04
+  env:
+  - name: REGISTRY
+    value: registry.example.com
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        jobs.say.steps[2]: `github.head_ref` in the script has nothing to stand for it here: the step stops where it is read
+        jobs.say.steps[2]: `github.run_id` in the script has nothing to stand for it here: the step stops where it is read
+        jobs.say.steps[2]: `hashFiles('**/package-lock.json')` in the script has nothing to stand for it here: the step stops where it is read
+        jobs.say.steps[2]: the script reads $GITHUB_ENV, which a step here is not given
+      DAGRON_IMPORT
+      exit 1
+  - run: |
+      echo "commit ${CI_SHA} of ${CI_REPO}"
+      echo "ref ${CI_REF}, event ${CI_EVENT}"
+      echo "pull request ${CI_PR} against ${CI_BASE_SHA}"
+      echo "on Linux, from https://${CI_FORGE_HOST}/${CI_REPO}"
+      echo "registry ${REGISTRY}"
+  - run: |
+      echo "sha $CI_SHA ref $CI_REF repo $CI_REPO event ${CI_EVENT}"
+      echo "## Built" >> "$CI_STEP_SUMMARY"
+      echo "MY_GITHUB_SHA_COPY is not GITHUB_SHA2"
+  - run: |
+      echo "branch ${IMPORT_TODO:?not imported, github.head_ref} run ${IMPORT_TODO:?not imported, github.run_id}"
+      echo "FOO=bar" >> "$GITHUB_ENV"
+      echo "hash ${IMPORT_TODO:?not imported, hashFiles package-lock.json}"

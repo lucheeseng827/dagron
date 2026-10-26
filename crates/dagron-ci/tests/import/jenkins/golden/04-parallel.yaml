@@ -1,0 +1,40 @@
+# Imported from a Jenkinsfile by dagron-import.
+#
+# Changed on the way (4):
+#   on: a multibranch pipeline's builds are each branch and tag pushed, each pull request, and a run asked for (dispatch) here: say on: where it ran for fewer
+#   stage('Checks'): the parallel stages Lint, Unit run one after another here, as steps of one job, so that each has the files of the stages before it; one that fails ends the job. A stage that needs none of them can be a job of its own
+#   stage('Package'): its stages start in a workspace of their own, a checkout of the event's commit, where on Jenkins they had what the stages before them left in the agent's: what they need of it is made again, or the stages are steps of one job
+#   stage('Install').steps[0]: Jenkins's variables a step reads are set at its head from dagron-ci's own (CI_SHA, CI_REF, …): a program it runs that reads one the step does not is not given it
+#
+# Not carried over (1):
+#   stage('Checks').failFast: a parallel stage that fails does not stop the others here: one that is a job of its own runs to its end, and the jobs after them are skipped
+name: 04-parallel
+on:
+  push: {}
+  pull_request: {}
+  dispatch: {}
+tasks:
+- name: install
+  docker_image: python:3.12
+  steps:
+  - name: Install
+    run: pip install -r requirements.txt
+  - name: Lint
+    run: ruff check .
+  - name: Unit
+    run: pytest tests/unit
+- name: docs
+  docker_image: squidfunk/mkdocs-material:9
+  depends_on:
+  - install
+  steps:
+  - name: Docs
+    run: mkdocs build --strict
+- name: package
+  docker_image: python:3.12
+  depends_on:
+  - install
+  - docs
+  steps:
+  - name: Package
+    run: python -m build

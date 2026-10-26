@@ -1,0 +1,10 @@
+shows: A branch that branches_ignore does not name runs the pipeline
+event: { kind: push, ref: refs/heads/main }
+source: |
+  name: ci
+  on:
+    push: { branches_ignore: ["wip/*"] }
+  tasks:
+    - name: build
+      steps:
+        - run: make

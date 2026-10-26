@@ -1,0 +1,2 @@
+not a pipeline:
+  concurrency.cancel-in-progress: is true or false here: one that is an expression is not read

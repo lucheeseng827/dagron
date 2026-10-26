@@ -1,0 +1,21 @@
+shows: A job whose permissions let it ask for an OIDC token is given the engine's identity, for the forge's own audience and the repository's, where the operator gives workflows one
+front: github
+github:
+  runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" }
+  oidc: true
+  oidc_audiences: [sts.amazonaws.com]
+source: |
+  on: push
+  permissions:
+    contents: read
+  jobs:
+    deploy:
+      runs-on: ubuntu-latest
+      permissions:
+        id-token: write
+      steps:
+        - run: ./deploy.sh
+    test:
+      runs-on: ubuntu-latest
+      steps:
+        - run: make test

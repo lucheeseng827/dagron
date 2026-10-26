@@ -1,0 +1,14 @@
+shows: A workflow's cancel-in-progress is a key whose newer run takes the older one's place
+front: github
+github: { runs_on: { ubuntu-latest: "docker.io/library/ubuntu:24.04" } }
+event: { kind: pull_request, pr: 12, ref: refs/pull/12/head }
+source: |
+  on: pull_request
+  concurrency:
+    group: ci-${{ github.ref }}
+    cancel-in-progress: true
+  jobs:
+    test:
+      runs-on: ubuntu-latest
+      steps:
+        - run: make test

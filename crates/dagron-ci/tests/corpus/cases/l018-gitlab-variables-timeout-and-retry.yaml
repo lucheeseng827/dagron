@@ -1,0 +1,15 @@
+shows: GitLab variables expand with the job's own, and timeout and retry become dagron's keys
+front: gitlab
+file: gitlab-ci
+source: |
+  image: alpine:3.20
+  variables:
+    APP: widgets
+    TAG: $APP:$CI_COMMIT_SHORT_SHA
+  release:
+    variables:
+      APP: gadgets
+    timeout: 1h 30m
+    retry: 2
+    allow_failure: true
+    script: [docker build -t "$TAG" .]

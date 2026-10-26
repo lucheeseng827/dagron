@@ -13,11 +13,32 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dagron_source::source::SourceFactory;
 
+/// What a [`ConnectionCheck`] reads, for a build that implements one
+/// without depending on dagron-core itself.
+pub use dagron_core::connections;
+
 /// Notified when a run reaches a terminal state. Default: no-op. An alternate
 /// implementation may emit the event to an external orchestration layer.
+///
+/// **Called for each run end, whichever path ended it:** `succeeded` or
+/// `failed` from the reaper, `cancelled` from a cancel through either API, and
+/// `failed` from the run_timeout_secs sweep. A run rerun and ended again is
+/// reported again.
+///
+/// From the run's `run.completed` event in the outbox, by a worker of its own
+/// and not the reconcile loop: at least once, so an end may be reported
+/// again after a crash, and an implementation must take the same end twice as
+/// once. An end superseded before it was reported (a cancelled run rerun) is
+/// not.
 #[async_trait]
 pub trait RunSink: Send + Sync {
     async fn on_run_completed(&self, _run_id: &str, _status: &str) {}
+
+    /// Whether this sink does anything: `false` only for the no-op, whose
+    /// ends the engine then does not keep a delivery of.
+    fn delivers(&self) -> bool {
+        true
+    }
 }
 
 /// Usage-accounting hook, called as each task finishes. Default: no-op.
@@ -115,12 +136,34 @@ pub trait ExternalPoller: Send + Sync {
 /// No-op [`RunSink`] (the default).
 pub struct NoopRunSink;
 #[async_trait]
-impl RunSink for NoopRunSink {}
+impl RunSink for NoopRunSink {
+    fn delivers(&self) -> bool {
+        false
+    }
+}
 
 /// No-op [`Meter`] (the default).
 pub struct NoopMeter;
 #[async_trait]
 impl Meter for NoopMeter {}
+
+/// A database beyond the engine's own whose connection limits it reads with
+/// its own, as it starts and every five minutes after, gauges and warns of
+/// (`dagron_core::connections`): in a build that adds control-database
+/// checks, the database its meter and run sink write to, on a login of the
+/// workspace's own. Never a stop: a failed read is said, and changes
+/// nothing, its gauges keeping the last read.
+#[async_trait]
+pub trait ConnectionCheck: Send + Sync {
+    /// Before each scope's name on `scheduler_db_connection_limit`
+    /// (`control_`).
+    fn prefix(&self) -> &'static str;
+    /// The sessions the engine may hold there at once, and what the warning
+    /// calls them.
+    fn holds(&self) -> (u32, String);
+    /// The limits, as the server reports them.
+    async fn read(&self) -> anyhow::Result<dagron_core::connections::Limits>;
+}
 
 /// Extension seams handed to [`crate::run`]. [`Default`] is the built-in
 /// configuration: built-in sources only, no run sink, no usage accounting.
@@ -136,6 +179,16 @@ pub struct Seams {
     /// startup, while this is consulted per parked row on every sweep and the
     /// sweep polls rows concurrently.
     pub external_poller: Option<Arc<dyn ExternalPoller>>,
+    /// The environment variables this build reads beyond the engine's own,
+    /// for the typo scan at start, which would otherwise warn of each that it
+    /// looks like a mistyped setting: a variable's name as it is set, or a
+    /// family's prefix, which ends in `_`. Nothing is read through this.
+    /// What reads them is the build's own code, in its seams and around
+    /// them.
+    pub env_names: Vec<&'static str>,
+    /// Databases beyond its own whose limits the engine reads, gauges and
+    /// warns of ([`ConnectionCheck`]).
+    pub connection_checks: Vec<Arc<dyn ConnectionCheck>>,
 }
 
 impl Default for Seams {
@@ -145,6 +198,8 @@ impl Default for Seams {
             run_sink: Arc::new(NoopRunSink),
             meter: Arc::new(NoopMeter),
             external_poller: None,
+            env_names: Vec::new(),
+            connection_checks: Vec::new(),
         }
     }
 }

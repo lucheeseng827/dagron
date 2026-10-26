@@ -14,6 +14,10 @@ use dagron_step_mcp::{parse_timeout_secs, run_step, StepConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `--version` first: for it nothing is read and nothing is started.
+    if dagron_logging::version_requested("dagron-step-mcp") {
+        return Ok(());
+    }
     dagron_logging::init("dagron-step-mcp");
 
     // Establish the deadline *before* the first blocking read. Arguments can

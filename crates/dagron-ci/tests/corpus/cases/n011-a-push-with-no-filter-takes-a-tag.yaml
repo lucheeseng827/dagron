@@ -1,0 +1,10 @@
+shows: A push trigger with no filter runs for a tag as it does for a branch
+event: { kind: tag, ref: refs/tags/v1.2.3 }
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: build
+      steps:
+        - run: make

@@ -8,6 +8,7 @@
 - **Arch:** `linux/amd64`, `linux/arm64`
 - **Binary inside:** `/usr/local/bin/dagron-api` (entrypoint) · **Exposes:** `8080`
 - **Datastore:** Postgres (`DATABASE_URL`, shared with the engine)
+- **Built with, in releases after 0.11.0:** S3, Google Cloud Storage and Azure Blob, for archived runs (`GC_ARCHIVE_URL`) and the artifact store (`DAGRON_ARTIFACT_URL`); and OTLP span export (`OTEL_EXPORTER_OTLP_ENDPOINT`). The tags below through 0.11.0 have none of these. An image built with them says so as it starts, on its `configuration resolved` line (`features=…`); one that prints no `features=` there is an earlier one.
 - **Website:** dagron.dev · **Source / full docs:** github.com/lucheeseng827/dagron · Apache-2.0
 
 ## Tags

@@ -1,0 +1,3 @@
+not a pipeline:
+  name: "my pipeline" must be letters, digits, '.', '_' or '-', at most 100
+  tasks[0].name: is required: letters, digits, '.', '_' or '-', at most 100

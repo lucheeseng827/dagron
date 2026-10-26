@@ -22,11 +22,7 @@ spec:
         app.kubernetes.io/component: dagron-api
     spec:
       securityContext:
-        runAsNonRoot: true
-        runAsUser: 65532
-        fsGroup: 65532
-        seccompProfile:
-          type: RuntimeDefault
+        {{- include "dagron.podSecurityContext" (dict "root" $ "uid" 65532 "fsGroup" true) | nindent 8 }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -84,6 +80,30 @@ spec:
               value: {{ .Values.dagronApi.cookieSecure | quote }}
             - name: RUST_LOG
               value: {{ .Values.dagronApi.rustLog | quote }}
+            {{- if and .Values.workspaceId .Values.orgId }}
+            # The workspace it serves, as the engine is told: a build that
+            # audits names it on each row.
+            - name: DAGRON_WORKSPACE_ID
+              value: {{ .Values.workspaceId | quote }}
+            - name: DAGRON_ORG_ID
+              value: {{ .Values.orgId | quote }}
+            {{- end }}
+            {{- with .Values.dagronApi.auditSinkSecret }}
+            # Where a build that audits forwards each row, and with what, from
+            # a Secret's keys, each optional: a Secret without them sends none.
+            - name: DAGRON_AUDIT_SINK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: DAGRON_AUDIT_SINK_URL
+                  optional: true
+            - name: DAGRON_AUDIT_SINK_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: DAGRON_AUDIT_SINK_TOKEN
+                  optional: true
+            {{- end }}
             {{- if eq (include "dagron.envSecretsEnabled" .) "true" }}
             # Encrypts environment secret values on write (the engine holds the
             # same key to decrypt them at dispatch).

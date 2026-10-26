@@ -1,0 +1,8 @@
+shows: GitLab parallel with a count makes that many instances, each with its index
+front: gitlab
+file: gitlab-ci
+source: |
+  image: alpine:3.20
+  shard:
+    parallel: 3
+    script: [./test.sh "$CI_NODE_INDEX/$CI_NODE_TOTAL"]

@@ -1,0 +1,3 @@
+not a pipeline:
+  tasks[0] (build).steps[0].shell: tasks[0] (build).steps[0] has no key "shell"
+  tasks[0] (build).steps[0].working_directory: tasks[0] (build).steps[0] has no key "working_directory"

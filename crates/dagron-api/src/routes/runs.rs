@@ -22,9 +22,10 @@ pub struct RunSummary {
     /// Workflow/DAG name from the run's definition (LEFT JOIN; None if the
     /// definition row is missing). Surfaced as the "Workflow" column in the UI.
     pub name: Option<String>,
-    /// What started this run — derived, no schema change: a
-    /// `schedule_backfills` row claims it as a backfill, a stamped
-    /// `schedule_id` marks a cron fire, anything else was human-initiated.
+    /// What started this run ([`trigger_kind_sql`]): a `schedule_backfills`
+    /// row claims it as a backfill, a stamped `schedule_id` marks a cron fire,
+    /// a trigger record says what the service that submitted it said (`ci`),
+    /// and anything else was human-initiated.
     pub trigger_kind: String,
     /// What a human decided about this run: acknowledged / resolved / ignored,
     /// or absent for one nobody has looked at. `status` is what the engine did;
@@ -41,19 +42,60 @@ pub struct RunSummary {
     /// clock still keeps its schedule; this says whether its timestamps are
     /// evidence.
     pub clock_confidence: Option<String>,
+    /// Set on a `running` run that was cancelled, or passed its deadline,
+    /// while a worker held one of its tasks: the status it takes once that
+    /// work has stopped (`cancelled` or `failed`). `null` on every other run.
+    #[sqlx(default)]
+    pub stopping_as: Option<String>,
+    /// A run that arrived while its workflow's `max_active_runs` was full,
+    /// and was made to wait (`when_full`): when it began to, and when it was
+    /// let in. A `running` run with the first and not the second waits, and
+    /// has started nothing. Both `null` on a run that never waited.
+    #[sqlx(default)]
+    pub queued_at: Option<String>,
+    #[sqlx(default)]
+    pub admitted_at: Option<String>,
+}
+
+/// A run's trigger kind, over `workflow_runs wr` joined to `schedule_backfills
+/// sb` and `run_triggers rt`. Written once, as the value and as the filter must
+/// agree: a run listed as `ci` is the run `?trigger=ci` returns.
+///
+/// The run's trigger record comes first: it was written with the run, by
+/// whatever started it, and every run has one. A run with none predates it,
+/// and is read as it was then: a backfill by its ledger row, a schedule's
+/// fire by its stamp, and otherwise manual.
+macro_rules! trigger_kind_sql {
+    () => {
+        "CASE WHEN rt.kind IS NOT NULL THEN rt.kind
+              WHEN sb.run_id IS NOT NULL THEN 'backfill'
+              WHEN wr.schedule_id IS NOT NULL THEN 'schedule'
+              ELSE 'manual' END"
+    };
+}
+
+/// The joins [`trigger_kind_sql`] reads.
+macro_rules! trigger_joins_sql {
+    () => {
+        " LEFT JOIN schedule_backfills sb ON sb.run_id = wr.id
+ LEFT JOIN run_triggers rt ON rt.run_id = wr.id"
+    };
 }
 
 /// SELECT list + joins shared by the run list and per-workflow runs: summary
-/// columns, the definition name, and the derived trigger kind.
-pub(crate) const SUMMARY_SELECT: &str = "SELECT wr.id, wr.definition_id, wr.status, wr.created_at, wr.finished_at, d.name,
+/// columns, the definition name, and the trigger kind.
+pub(crate) const SUMMARY_SELECT: &str = concat!(
+    "SELECT wr.id, wr.definition_id, wr.status, wr.created_at, wr.finished_at, d.name,
         wr.triage_state, wr.triage_note, wr.triaged_at, wr.triaged_by,
-        wr.clock_confidence,
-        CASE WHEN sb.run_id IS NOT NULL THEN 'backfill'
-             WHEN wr.schedule_id IS NOT NULL THEN 'schedule'
-             ELSE 'manual' END AS trigger_kind
+        wr.clock_confidence, wr.stopping_as, wr.queued_at, wr.admitted_at,
+        ",
+    trigger_kind_sql!(),
+    " AS trigger_kind
  FROM workflow_runs wr
  LEFT JOIN workflow_definitions d ON d.id = wr.definition_id
- LEFT JOIN schedule_backfills sb ON sb.run_id = wr.id";
+",
+    trigger_joins_sql!()
+);
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct TaskRow {
@@ -84,9 +126,29 @@ pub struct TaskRow {
     /// sweep did. `None` on every non-approval row and on an unresolved gate.
     pub decided_by: Option<String>,
     pub decision_comment: Option<String>,
+    /// Why a `ready` task is not being dispatched: its pod was refused by a
+    /// full Kubernetes namespace ResourceQuota, so it went back to the queue
+    /// with no attempt consumed and `scheduled_at` set to its next probe. When
+    /// the wait began, the last refusal sentence, and the refusals so far. Set
+    /// only while the task is waiting — `None` / `0` on every other row — so
+    /// the console can tell "queued behind a quota" from "nobody is claiming
+    /// this".
+    pub quota_wait_since: Option<String>,
+    pub quota_wait_detail: Option<String>,
+    pub quota_waits: i64,
+    /// When a `running` task was asked to stop: its run was cancelled or
+    /// passed its deadline, or a gang sibling failed, while a worker held it.
+    /// Its work is still to be seen gone, and it is `cancelled` once it has
+    /// been. `null` on every other row, a cancelled one included.
+    pub stop_requested_at: Option<String>,
+    /// What broke the attempt that failed, as the engine read it from what
+    /// the task printed: a [`dagron_core::fault::FaultClass`] in kebab case
+    /// (`user-code`, `storage`, `preemption`, …). `null` where nothing has
+    /// looked; `unknown` where something looked and could not tell.
+    pub fault_class: Option<String>,
 }
 
-/// Why a run failed, in the run detail itself (G-AG6).
+/// Why a run failed, in the run detail itself.
 ///
 /// Without this, an agent whose run failed holds a status and a list of task
 /// rows and must work out which one broke and then fetch its logs — two more
@@ -118,15 +180,34 @@ pub struct RunFailure {
     /// tell a complete error from a clipped one will confidently explain the
     /// wrong half, so say which this is rather than leaving it to be guessed.
     pub truncated: bool,
+    /// What broke the failed task's last attempt, as the engine classified it
+    /// (the task row's `fault_class`); `null` where nothing classified it.
+    pub fault_class: Option<String>,
+    /// What another attempt is worth, given that class: `infrastructure` (the
+    /// same code elsewhere likely succeeds), `application` (another attempt
+    /// reproduces it), `platform` (it was taken away; retrying is a policy
+    /// question) or `unknown`. A caller deciding between running the task
+    /// again and reading its code reads this, and not the class's name.
+    pub disposition: Option<String>,
 }
 
 /// The task rows behind a run, used by both `GET /api/runs/{id}` and the
 /// failure summary on `GET /api/runs/{id}/wait`. Shared so the two cannot drift:
 /// a column added for one and missed by the other would silently change what a
 /// failure summary can see depending on which route asked for it.
+///
+/// The quota-wait columns are never cleared once written, so they are guarded
+/// rather than selected bare: a row is waiting only while it is `ready` and no
+/// claim has moved `version` past the one it was handed back at.
 const RUN_TASK_ROWS_SQL: &str = "SELECT id, name, status, attempt, output, scheduled_at, finished_at,
         wake_at, wait_url, wait_dataset, sub_run_id,
-        pool, priority, cache_hit, decided_by, decision_comment
+        pool, priority, cache_hit, decided_by, decision_comment, stop_requested_at, fault_class,
+        CASE WHEN status = 'ready' AND quota_wait_version = version
+             THEN quota_wait_since END AS quota_wait_since,
+        CASE WHEN status = 'ready' AND quota_wait_version = version
+             THEN quota_wait_detail END AS quota_wait_detail,
+        CASE WHEN status = 'ready' AND quota_wait_version = version
+             THEN quota_waits ELSE 0 END AS quota_waits
  FROM task_runs WHERE run_id = $1 ORDER BY name";
 
 /// How much failure text to inline. Enough for a stack trace's business end,
@@ -202,6 +283,13 @@ fn summarize_failure(status: &str, run_output: Option<&str>, tasks: &[TaskRow]) 
         .map(|t| failure_tail(t, FAILURE_TAIL_LINES, FAILURE_TAIL_BYTES))
         .unwrap_or_default();
 
+    let fault_class = task.and_then(|t| t.fault_class.clone());
+    let disposition = fault_class.as_deref().map(|c| {
+        dagron_core::fault::FaultClass::parse(c)
+            .disposition()
+            .as_str()
+            .to_string()
+    });
     Some(RunFailure {
         task_id: task.map(|t| t.id.clone()),
         task_name: task.map(|t| t.name.clone()),
@@ -209,6 +297,8 @@ fn summarize_failure(status: &str, run_output: Option<&str>, tasks: &[TaskRow]) 
         failed_tasks,
         message: if message.is_empty() { None } else { Some(message) },
         truncated,
+        fault_class,
+        disposition,
     })
 }
 
@@ -223,8 +313,11 @@ pub struct RunDetail {
     pub finished_at: Option<String>,
     /// Workflow/DAG name from the run's definition (for the header + backlink).
     pub name: Option<String>,
-    /// Derived trigger kind: manual | schedule | backfill.
+    /// Trigger kind: manual | schedule | backfill | ci.
     pub trigger_kind: String,
+    /// What the run was started for, when the service that submitted it said
+    /// (`run_triggers`): `null` for a run with no record.
+    pub trigger: Option<RunTriggerView>,
     /// What a human decided about this run. `status` is what the engine did;
     /// this is what was done about it.
     pub triage_state: Option<String>,
@@ -242,10 +335,61 @@ pub struct RunDetail {
     pub clock_offset_ms: Option<i64>,
     /// What produced the verdict: `sync-file`, `step`, `behind-datastore`.
     pub clock_source: Option<String>,
-    /// Why this run failed, when it did (G-AG6) — `null` otherwise, so a
+    /// A run that was cancelled, or passed its deadline, while a worker held
+    /// one of its tasks: the status it takes once that work has stopped
+    /// (`cancelled` or `failed`), and when it was asked. Both set only while
+    /// the run is `running`, which it is until then; `null` otherwise.
+    pub stopping_as: Option<String>,
+    pub stop_requested_at: Option<String>,
+    /// A run that arrived while its workflow's `max_active_runs` was full,
+    /// and was made to wait (`when_full`): when it began to, and when it was
+    /// let in. A `running` run with the first and not the second waits: it
+    /// has started nothing, and its `run_timeout_secs` is counted from when
+    /// it is let in. Both `null` on a run that never waited.
+    pub queued_at: Option<String>,
+    pub admitted_at: Option<String>,
+    /// Why this run failed, when it did — `null` otherwise, so a
     /// caller can branch on presence without inspecting `status`.
     pub failure: Option<RunFailure>,
+    /// What the run, with the runs it started, spent of a model's tokens and
+    /// has reserved for its tasks still running, and its `budget: { tokens }`.
+    /// Absent where nothing of it was metered.
+    #[cfg(feature = "enterprise")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<dagron_core::tokens::RunTokens>,
     pub tasks: Vec<TaskRow>,
+}
+
+/// A run's trigger record, as a reader gets it: what started the run, as
+/// whatever started it wrote it down when the run was made. Where a caller of
+/// this gateway gave it (a CI service), every field but the first two is that
+/// caller's word, taken because the caller may set a trigger at all.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct RunTriggerView {
+    pub kind: String,
+    /// What submitted it: this gateway's caller as it authenticated them
+    /// (`user:…`, `ci:…`), `engine` for a run the engine started itself, or
+    /// `ops-api` for one asked of the engine's own API.
+    pub principal: String,
+    /// Who caused it at the source: the person who asked, the pusher, a pull
+    /// request's author. A parent run's, for a run its task started.
+    pub actor: Option<String>,
+    pub trust: Option<String>,
+    /// What it came from, where that is no repository: a schedule, a cron
+    /// entry, a dataset, a parent run's task, a source, a dead letter.
+    pub source: Option<String>,
+    pub forge_host: Option<String>,
+    /// `owner/name` on that forge.
+    pub repo: Option<String>,
+    #[sqlx(rename = "ref")]
+    #[serde(rename = "ref")]
+    pub git_ref: Option<String>,
+    pub sha: Option<String>,
+    pub base_sha: Option<String>,
+    pub pr: Option<i64>,
+    /// The id of the event at its source: a fire's time, a backfill's date,
+    /// a source's position, a CI service's event.
+    pub event_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,14 +397,31 @@ pub struct ListParams {
     pub status: Option<String>,
     /// Filter to one workflow's runs (definition name, exact match).
     pub name: Option<String>,
-    /// Filter by trigger kind: manual | schedule | backfill.
+    /// Filter by trigger kind: manual | schedule | backfill | ci.
     pub trigger: Option<String>,
+    /// Filter to the runs whose trigger record names this repository
+    /// (`host/owner/name`, as a listed CI pipeline's `description` has it).
+    /// Two repositories may each have a pipeline of one name: `name` alone
+    /// returns both's runs.
+    pub repo: Option<String>,
+    /// Filter to the runs of one event at its source, by the id their
+    /// trigger records carry: a CI service's event, which may have made a
+    /// run for each of several pipelines.
+    pub event: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
 
-/// `GET /api/runs?status=&name=&trigger=&limit=&offset=` — most-recent-first
-/// run list with optional status / workflow-name / trigger filters.
+/// The repository a run's trigger record names, as one text: `host/owner/name`,
+/// or `owner/name` where the record has no host. Reads `run_triggers rt`. A
+/// listed CI pipeline's `description` is the same text, so a row's link can
+/// narrow the run list to exactly its runs.
+pub(crate) const TRIGGER_REPO_SQL: &str =
+    "concat_ws('/', NULLIF(rt.forge_host, ''), NULLIF(rt.repo, ''))";
+
+/// `GET /api/runs?status=&name=&trigger=&repo=&event=&limit=&offset=` —
+/// most-recent-first run list with optional status / workflow-name / trigger /
+/// repository / event filters.
 pub async fn list_runs(
     _auth: AuthUser,
     State(state): State<AppState>,
@@ -268,30 +429,233 @@ pub async fn list_runs(
 ) -> Result<Json<Vec<RunSummary>>, StatusCode> {
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let offset = params.offset.unwrap_or(0).max(0);
+    // An empty `repo=` names no repository, and filters nothing. So with an
+    // empty `event=`.
+    let repo = params.repo.as_deref().filter(|r| !r.is_empty());
+    let event = params.event.as_deref().filter(|e| !e.is_empty());
 
     // Bind each filter as optional: when None, the `$n IS NULL` branch keeps
     // every row, so one parameterized query serves all filter combinations.
     let rows = sqlx::query_as::<_, RunSummary>(&format!(
         "{SUMMARY_SELECT}
-         WHERE ($1::text IS NULL OR wr.status = $1)
-           AND ($2::text IS NULL OR d.name = $2)
-           AND ($3::text IS NULL OR
-                CASE WHEN sb.run_id IS NOT NULL THEN 'backfill'
-                     WHEN wr.schedule_id IS NOT NULL THEN 'schedule'
-                     ELSE 'manual' END = $3)
+         WHERE (CAST($1 AS TEXT) IS NULL OR wr.status = $1)
+           AND (CAST($2 AS TEXT) IS NULL OR d.name = $2)
+           AND (CAST($3 AS TEXT) IS NULL OR {} = $3)
+           AND (CAST($6 AS TEXT) IS NULL OR {TRIGGER_REPO_SQL} = $6)
+           AND (CAST($7 AS TEXT) IS NULL OR rt.event_id = $7)
          ORDER BY wr.created_at DESC
-         LIMIT $4 OFFSET $5"
+         LIMIT $4 OFFSET $5",
+        trigger_kind_sql!()
     ))
     .bind(&params.status)
     .bind(&params.name)
     .bind(&params.trigger)
     .bind(limit)
     .bind(offset)
+    .bind(repo)
+    .bind(event)
     .fetch_all(&state.read_pool)
     .await
     .map_err(internal)?;
 
     Ok(Json(rows))
+}
+
+/// A repository that runs came from, as their trigger records name it.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct RunSource {
+    /// `host/owner/name`: what `?repo=` narrows a list to.
+    pub repo: String,
+    /// How many runs name it.
+    pub runs: i64,
+    /// When the latest of them was made.
+    pub last_run_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SourcesParams {
+    pub limit: Option<i64>,
+}
+
+/// `GET /api/runs/sources?limit=` — the repositories that runs' trigger
+/// records name, the one with the latest run first. A run that names none (a
+/// schedule's, a person's) is of no repository, and is counted under none.
+pub async fn list_sources(
+    _auth: AuthUser,
+    State(state): State<AppState>,
+    Query(params): Query<SourcesParams>,
+) -> Result<Json<Vec<RunSource>>, StatusCode> {
+    let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let rows = sqlx::query_as::<_, RunSource>(&format!(
+        "SELECT {TRIGGER_REPO_SQL} AS repo, count(*) AS runs, max(rt.created_at) AS last_run_at
+           FROM run_triggers rt
+          WHERE rt.repo IS NOT NULL AND rt.repo <> ''
+          GROUP BY 1
+          ORDER BY last_run_at DESC, repo
+          LIMIT $1"
+    ))
+    .bind(limit)
+    .fetch_all(&state.read_pool)
+    .await
+    .map_err(internal)?;
+    Ok(Json(rows))
+}
+
+/// One of a repository's refs, with the runs for its latest commit: the
+/// commit of the latest run on it, and the latest run of each workflow for
+/// that commit. So a branch reads as its head does, whichever event each
+/// run came of: a push's runs, and a later one asked for by hand for one
+/// workflow, are one row.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct RefRuns {
+    #[serde(rename = "ref")]
+    pub git_ref: String,
+    /// The pull request's number, where the ref is one's.
+    pub pr: Option<i64>,
+    pub sha: Option<String>,
+    /// Who caused the latest run's event at its source.
+    pub actor: Option<String>,
+    /// The latest run's event, by its id at its source: what
+    /// `GET /api/runs?event=` narrows to.
+    pub event_id: Option<String>,
+    /// When the latest run was made.
+    pub at: String,
+    /// The commit's runs, the latest of each workflow, by name.
+    pub runs: Vec<RefRun>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct RefRun {
+    pub id: String,
+    /// The workflow's name: a CI pipeline's.
+    pub name: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+    pub stopping_as: Option<String>,
+    /// When a run that waits for its workflow's `max_active_runs` began to,
+    /// and when it was let in ([`RunDetail::queued_at`]).
+    pub queued_at: Option<String>,
+    pub admitted_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RefsParams {
+    /// The repository, as [`RunSource::repo`] has it: `host/owner/name`.
+    pub repo: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct RefRunRow {
+    #[sqlx(rename = "ref")]
+    git_ref: String,
+    pr: Option<i64>,
+    sha: Option<String>,
+    actor: Option<String>,
+    event_id: Option<String>,
+    at: String,
+    id: String,
+    name: Option<String>,
+    status: String,
+    created_at: String,
+    finished_at: Option<String>,
+    stopping_as: Option<String>,
+    queued_at: Option<String>,
+    admitted_at: Option<String>,
+}
+
+/// `GET /api/runs/refs?repo=&limit=` — a repository's refs, each with the
+/// runs for its latest commit, the ref with the latest run first. 400
+/// without a `repo`.
+///
+/// A repository is matched by its record's columns, so that
+/// `idx_run_triggers_repo_ref` serves it: `host/owner/name` as a host and
+/// the rest, or the whole as the name of a record that has no host. Each
+/// arm is one the index answers, so that no arm reads the table.
+pub async fn list_refs(
+    _auth: AuthUser,
+    State(state): State<AppState>,
+    Query(params): Query<RefsParams>,
+) -> Result<Json<Vec<RefRuns>>, StatusCode> {
+    let repo = params
+        .repo
+        .as_deref()
+        .filter(|r| !r.is_empty())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let (host, name) = repo.split_once('/').unwrap_or(("", repo));
+    let rows = sqlx::query_as::<_, RefRunRow>(
+        "WITH mine AS (
+             SELECT rt.run_id, rt.ref, rt.pr, rt.sha, rt.actor, rt.event_id, rt.created_at
+               FROM run_triggers rt
+              WHERE rt.ref IS NOT NULL AND rt.ref <> ''
+                AND ((rt.forge_host = $1 AND rt.repo = $2)
+                     OR (rt.forge_host IS NULL AND rt.repo = $3)
+                     OR (rt.forge_host = '' AND rt.repo = $3))
+         ), latest AS (
+             -- The newest of each ref: the first row of each partition, which
+             -- reads the same on Postgres and SQLite (no DISTINCT ON).
+             SELECT ref, pr, sha, actor, event_id, created_at FROM (
+                 SELECT ref, pr, sha, actor, event_id, created_at,
+                        ROW_NUMBER() OVER (PARTITION BY ref ORDER BY created_at DESC, run_id DESC) AS rn
+                   FROM mine
+             ) newest WHERE rn = 1
+         ), shown AS (
+             SELECT * FROM latest ORDER BY created_at DESC, ref LIMIT $4
+         ), runs AS (
+             SELECT ref, pr, sha, actor, event_id, at, id, name, status, created_at, finished_at,
+                    stopping_as, queued_at, admitted_at FROM (
+                 SELECT s.ref, s.pr, s.sha, s.actor, s.event_id, s.created_at AS at,
+                        wr.id, d.name, wr.status, wr.created_at, wr.finished_at, wr.stopping_as,
+                        wr.queued_at, wr.admitted_at,
+                        ROW_NUMBER() OVER (PARTITION BY s.ref, d.name
+                                           ORDER BY wr.created_at DESC, wr.id DESC) AS rn
+                   FROM shown s
+                   JOIN mine m ON m.ref = s.ref AND m.sha IS NOT DISTINCT FROM s.sha
+                   JOIN workflow_runs wr ON wr.id = m.run_id
+                   LEFT JOIN workflow_definitions d ON d.id = wr.definition_id
+             ) newest WHERE rn = 1
+         )
+         SELECT ref, pr, sha, actor, event_id, at, id, name, status, created_at, finished_at, stopping_as,
+                queued_at, admitted_at
+           FROM runs
+          ORDER BY at DESC, ref, name, id",
+    )
+    .bind(host)
+    .bind(name)
+    .bind(repo)
+    .bind(limit)
+    .fetch_all(&state.read_pool)
+    .await
+    .map_err(internal)?;
+
+    let mut refs: Vec<RefRuns> = Vec::new();
+    for row in rows {
+        let run = RefRun {
+            id: row.id,
+            name: row.name,
+            status: row.status,
+            created_at: row.created_at,
+            finished_at: row.finished_at,
+            stopping_as: row.stopping_as,
+            queued_at: row.queued_at,
+            admitted_at: row.admitted_at,
+        };
+        match refs.last_mut() {
+            Some(last) if last.git_ref == row.git_ref => last.runs.push(run),
+            _ => refs.push(RefRuns {
+                git_ref: row.git_ref,
+                pr: row.pr,
+                sha: row.sha,
+                actor: row.actor,
+                event_id: row.event_id,
+                at: row.at,
+                runs: vec![run],
+            }),
+        }
+    }
+    Ok(Json(refs))
 }
 
 /// `GET /api/runs/:id` — one run plus its task rows. 404 if the run is unknown.
@@ -300,24 +664,36 @@ pub async fn get_run(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<RunDetail>, StatusCode> {
-    let run = sqlx::query_as::<_, RunSummaryFull>(
+    let run = sqlx::query_as::<_, RunSummaryFull>(concat!(
         "SELECT wr.id, wr.definition_id, wr.status, wr.input, wr.output,
                 wr.created_at, wr.finished_at, d.name,
                 wr.triage_state, wr.triage_note, wr.triaged_at, wr.triaged_by,
                 wr.clock_confidence, wr.clock_offset_ms, wr.clock_source,
-                CASE WHEN sb.run_id IS NOT NULL THEN 'backfill'
-                     WHEN wr.schedule_id IS NOT NULL THEN 'schedule'
-                     ELSE 'manual' END AS trigger_kind
+                wr.stopping_as, wr.stop_requested_at, wr.queued_at, wr.admitted_at,
+                ",
+        trigger_kind_sql!(),
+        " AS trigger_kind
          FROM workflow_runs wr
          LEFT JOIN workflow_definitions d ON d.id = wr.definition_id
-         LEFT JOIN schedule_backfills sb ON sb.run_id = wr.id
-         WHERE wr.id = $1",
-    )
+",
+        trigger_joins_sql!(),
+        "
+         WHERE wr.id = $1"
+    ))
     .bind(&id)
     .fetch_optional(&state.read_pool)
     .await
     .map_err(internal)?
     .ok_or(StatusCode::NOT_FOUND)?;
+
+    let trigger = sqlx::query_as::<_, RunTriggerView>(
+        "SELECT kind, principal, actor, trust, source, forge_host, repo, ref, sha, base_sha, pr, event_id
+           FROM run_triggers WHERE run_id = $1",
+    )
+    .bind(&id)
+    .fetch_optional(&state.read_pool)
+    .await
+    .map_err(internal)?;
 
     let tasks = sqlx::query_as::<_, TaskRow>(RUN_TASK_ROWS_SQL)
         .bind(&id)
@@ -328,6 +704,13 @@ pub async fn get_run(
     // Built from `tasks` and the run row, both already fetched — the summary
     // costs no additional round trip to the database.
     let failure = summarize_failure(&run.status, run.output.as_deref(), &tasks);
+    #[cfg(feature = "enterprise")]
+    let tokens = dagron_core::tokens::of_run(&state.read_pool, &id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = ?e, "reading a run's tokens failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     Ok(Json(RunDetail {
         id: run.id,
@@ -339,6 +722,7 @@ pub async fn get_run(
         finished_at: run.finished_at,
         name: run.name,
         trigger_kind: run.trigger_kind,
+        trigger,
         triage_state: run.triage_state,
         triage_note: run.triage_note,
         triaged_at: run.triaged_at,
@@ -346,7 +730,13 @@ pub async fn get_run(
         clock_confidence: run.clock_confidence,
         clock_offset_ms: run.clock_offset_ms,
         clock_source: run.clock_source,
+        stopping_as: run.stopping_as,
+        stop_requested_at: run.stop_requested_at,
+        queued_at: run.queued_at,
+        admitted_at: run.admitted_at,
         failure,
+        #[cfg(feature = "enterprise")]
+        tokens,
         tasks,
     }))
 }
@@ -437,12 +827,14 @@ pub async fn get_run_specs(
         ));
     }
 
-    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+    let sql = format!(
         "SELECT r.id, d.spec, d.name FROM workflow_runs r
          JOIN workflow_definitions d ON d.id = r.definition_id
-         WHERE r.id = ANY($1)",
-    )
-    .bind(&ids)
+         WHERE r.id {}",
+        crate::db::in_list("$1")
+    );
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(&sql)
+    .bind(crate::db::list(&ids))
     .fetch_all(&state.read_pool)
     .await
     .map_err(|e| (internal(e), "db query failed".to_string()))?;
@@ -505,6 +897,14 @@ struct RunSummaryFull {
     clock_confidence: Option<String>,
     clock_offset_ms: Option<i64>,
     clock_source: Option<String>,
+    #[sqlx(default)]
+    stopping_as: Option<String>,
+    #[sqlx(default)]
+    stop_requested_at: Option<String>,
+    #[sqlx(default)]
+    queued_at: Option<String>,
+    #[sqlx(default)]
+    admitted_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -519,8 +919,8 @@ pub struct RunResult {
     pub finished: bool,
     /// The `result_from` task's output on success, else null (fast-win #15).
     pub result: Option<String>,
-    /// Why the run failed, in the same shape `GET /api/runs/{id}` returns
-    /// (G-AG6). `null` unless this wait ended on a failure.
+    /// Why the run failed, in the same shape `GET /api/runs/{id}` returns.
+    /// `null` unless this wait ended on a failure.
     ///
     /// This route is the one a synchronous caller actually uses — an agent
     /// blocking on a run holds *this* response, not the run detail. Putting the
@@ -528,6 +928,10 @@ pub struct RunResult {
     /// that most needed it never looked: it got `status: "failed"` and had to
     /// start a second investigation with the tools it had.
     pub failure: Option<RunFailure>,
+    /// How many times the run was rerun whole (`from: all`): a reader that
+    /// counts runs tells a rerun of every job from a rerun of the failed ones
+    /// by it, as each ends on the same run.
+    pub whole_reruns: i64,
 }
 
 /// `GET /api/runs/:id/wait?timeout_secs=` — synchronous invocation (fast-win
@@ -555,13 +959,13 @@ pub async fn wait_run(
     // poll-as-backstop contract the engine's reconcile loop uses.
     let mut events = state.tx.subscribe();
     loop {
-        let row: Option<(String, Option<String>)> =
-            sqlx::query_as("SELECT status, output FROM workflow_runs WHERE id = $1")
+        let row: Option<(String, Option<String>, i64)> =
+            sqlx::query_as("SELECT status, output, whole_reruns FROM workflow_runs WHERE id = $1")
                 .bind(&id)
                 .fetch_optional(&state.read_pool)
                 .await
                 .map_err(internal)?;
-        let Some((status, output)) = row else {
+        let Some((status, output, whole_reruns)) = row else {
             return Err(StatusCode::NOT_FOUND);
         };
         let finished = matches!(status.as_str(), "succeeded" | "failed" | "cancelled");
@@ -583,7 +987,14 @@ pub async fn wait_run(
             // Per the contract, `result` is the run output only on success; a
             // failed/cancelled run's output is an error message, not a result.
             let result = if status == "succeeded" { output } else { None };
-            return Ok(Json(RunResult { run_id: id, status, finished, result, failure }));
+            return Ok(Json(RunResult {
+                run_id: id,
+                status,
+                finished,
+                result,
+                failure,
+                whole_reruns,
+            }));
         }
         // Block until this run changes, the stream hiccups (lag/close — treat
         // as "recheck now"), the fallback tick fires, or the deadline lands.
@@ -764,7 +1175,52 @@ mod failure_summary_tests {
             cache_hit: false,
             decided_by: None,
             decision_comment: None,
+            quota_wait_since: None,
+            quota_wait_detail: None,
+            quota_waits: 0,
+            stop_requested_at: None,
+            fault_class: None,
         }
+    }
+
+    /// The failure says what broke it, as the engine classified it, and what
+    /// another attempt is worth: what a caller deciding whether to run it
+    /// again, or to read its code, needs.
+    #[test]
+    fn a_failure_says_its_class_and_what_another_attempt_is_worth() {
+        let mut broke = task(
+            "a",
+            "failed",
+            Some("2026-01-01T00:00:00Z"),
+            Some("No space left on device"),
+        );
+        broke.fault_class = Some("storage".into());
+        let failure = summarize_failure("failed", None, &[broke]).unwrap();
+        assert_eq!(
+            (
+                failure.fault_class.as_deref(),
+                failure.disposition.as_deref()
+            ),
+            (Some("storage"), Some("infrastructure"))
+        );
+        let mut bug = task(
+            "b",
+            "failed",
+            Some("2026-01-01T00:00:00Z"),
+            Some("assertion failed"),
+        );
+        bug.fault_class = Some("user-code".into());
+        let failure = summarize_failure("failed", None, &[bug]).unwrap();
+        assert_eq!(failure.disposition.as_deref(), Some("application"));
+        // Nothing classified it: neither is said.
+        let plain = task("c", "failed", Some("2026-01-01T00:00:00Z"), Some("exit 1"));
+        let failure = summarize_failure("failed", None, &[plain]).unwrap();
+        assert_eq!((failure.fault_class, failure.disposition), (None, None));
+        // A class this build does not know reads as unknown, never as another.
+        let mut newer = task("d", "failed", Some("2026-01-01T00:00:00Z"), Some("x"));
+        newer.fault_class = Some("from-a-newer-engine".into());
+        let failure = summarize_failure("failed", None, &[newer]).unwrap();
+        assert_eq!(failure.disposition.as_deref(), Some("unknown"));
     }
 
     #[test]

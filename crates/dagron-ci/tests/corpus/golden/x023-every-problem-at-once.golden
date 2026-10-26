@@ -1,0 +1,6 @@
+not a pipeline:
+  name: "" must be letters, digits, '.', '_' or '-', at most 100
+  on.push.paths: is empty, so nothing matches; leave it out to match everything
+  on.pushes: on has no key "pushes"; did you mean "push"?
+  tasks[0] (a).steps[0].run: is required: the command to run
+  tasks[1].name: is required: letters, digits, '.', '_' or '-', at most 100

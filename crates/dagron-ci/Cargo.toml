@@ -1,0 +1,95 @@
+[package]
+name = "dagron-ci"
+version = "0.1.0"
+edition = "2021"
+# MSRV — see the root Cargo.toml for how 1.88 was measured.
+rust-version = "1.88"
+description = "dagron-ci — CI on dagron. Forge events in, ordinary dagron runs out, statuses back: a façade over dagron-api's submit path, so the engine stays a DAG scheduler."
+
+[lib]
+name = "dagron_ci"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dagron-ci"
+path = "src/main.rs"
+
+[features]
+# OpenTelemetry: OTLP export of dagron-ci's spans, log records
+# and what its /metrics serves, once OTEL_EXPORTER_OTLP_ENDPOINT names a
+# collector; dagron-logging's exporter, as the engine's.
+otel = ["dagron-logging/otel"]
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+dagron-logging = { path = "../dagron-logging" }
+# Where a webhook payload too large for its event's row is kept
+# (CI_OBJECT_STORE_URL): the engine's object stores, S3, GCS and Azure, and a
+# directory. The same object_store line the engine and dagron-api build.
+dagron-artifact = { path = "../dagron-artifact", features = ["s3", "gcs", "azure"] }
+# The webhook signature: HMAC-SHA256 over the raw body, compared in constant
+# time by `Mac::verify_slice`. hmac 0.12 is already in the lock (sqlx-postgres).
+hex = "0.4"
+hmac = "0.12"
+# A GitHub App's own token (RS256), which mints a checkout's installation token.
+jsonwebtoken = "9"
+# Workers run workflows through dagron-api. The same reqwest, features and TLS
+# stack dagron-forge and the engine use, so nothing new enters the lock.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "stream"] }
+sha2 = "0.10"
+# A paths filter's shallow fetch: a pack's objects are zlib streams,
+# and named by SHA-1 (sha2 names a SHA-256 repository's). Both in the lock
+# already: dagron-ci-exec's flate2, and the sha1 the AWS SDK uses.
+flate2 = "1"
+sha1 = "0.10"
+serde = { version = "1", features = ["derive"] }
+# GitLab's `rules:if` matches with RE2's syntax, which regex shares. In the
+# lock already (dagron-core uses it).
+regex = "1"
+# GitHub's expression language, for the GitHub Actions front-end.
+dagron-ci-expr = { path = "../dagron-ci-expr" }
+# `dagron-ci import`: the importers of GitHub Actions workflows, GitLab CI
+# pipelines and Jenkinsfiles, whose every result is held to this crate's own
+# reader and compiler (tests/import.rs holds their corpus to it too). Its
+# own dependencies are this crate's already, and it knows nothing of it.
+dagron-import = { path = "../dagron-import" }
+serde_json = "1"
+# Pipeline files are YAML. The same serde_yaml dagron-core reads workflows
+# with, so a pipeline and the workflow it compiles to parse alike.
+serde_yaml = "0.9"
+# sqlx DIRECTLY, never through dagron-core. dagron-core permits exactly one DB
+# backend per build; dagron-ci serves both from one binary, picked at start by
+# CI_DATABASE_URL. Activating sqlx's own backend features is safe in the
+# workspace's default build (crates/dagron-step-sql explains the trap).
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "macros", "migrate", "sqlite", "postgres", "tls-rustls-ring"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+tracing = "0.1"
+# Time-ordered ids (UUIDv7) for repos and events: the event queue sorts by them.
+uuid = { version = "1", features = ["v7"] }
+# A day's records are written out as zstd segments: the same zstd
+# dagron-ci-cache compresses caches with.
+zstd = "0.13"
+# A patch bundle is a tar, read to check it and for the pipelines
+# it changes. The same tar as dagron-ci-exec's and dagron-ci-cache's.
+tar = { version = "0.4", default-features = false }
+# A bundle's tar is sent decompressed a chunk at a time, as a stream. In the
+# lock already (axum's, reqwest's).
+futures-util = { version = "0.3", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+# `dagron-ci run` stops the engine it started, and every task the engine
+# runs, by signalling its process group.
+libc = "0.2"
+
+[dev-dependencies]
+# Tests only: compiled workflows go through dagron's own parse, expand and
+# validate, the path dagron-api runs at submit. dagron-ci's tests run in the
+# workspace's sqlite leg, where dagron-core's default backend is the one in
+# use; the binary never links it (see sqlx above).
+dagron-core = { path = "../dagron-core" }
+# Tests only: the mounts `dagron-ci run` writes are the ones the Docker
+# executor reads, under the names it reads them by.
+dagron-executor = { path = "../dagron-executor" }
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

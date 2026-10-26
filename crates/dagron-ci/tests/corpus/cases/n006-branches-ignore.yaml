@@ -1,0 +1,10 @@
+shows: A branch that branches_ignore names is passed over
+event: { kind: push, ref: refs/heads/wip/spike }
+source: |
+  name: ci
+  on:
+    push: { branches_ignore: ["wip/*"] }
+  tasks:
+    - name: build
+      steps:
+        - run: make

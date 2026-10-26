@@ -1,0 +1,10 @@
+shows: A push trigger that names only tags is passed over for a branch
+event: { kind: push, ref: refs/heads/main }
+source: |
+  name: release
+  on:
+    push: { tags: ["v*"] }
+  tasks:
+    - name: publish
+      steps:
+        - run: make publish

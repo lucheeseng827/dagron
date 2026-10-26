@@ -1,0 +1,8 @@
+shows: A GitLab need of a job the pipeline does not have is refused
+front: gitlab
+file: gitlab-ci
+source: |
+  image: alpine:3.20
+  test:
+    needs: [build]
+    script: [make test]

@@ -1,0 +1,2 @@
+not a pipeline:
+  when_full: is dagron-ci's to say: a run over its key waits for a turn, and with concurrency: { cancel_superseded: true } it takes the place of the run before it

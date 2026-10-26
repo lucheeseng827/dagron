@@ -1,0 +1,10 @@
+shows: A merge queue's group runs a pipeline that takes merge groups
+event: { kind: merge_group }
+source: |
+  name: ci
+  on:
+    merge_group: {}
+  tasks:
+    - name: test
+      steps:
+        - run: make test

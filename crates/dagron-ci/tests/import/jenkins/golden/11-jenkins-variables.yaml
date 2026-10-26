@@ -1,0 +1,61 @@
+# Imported from a Jenkinsfile by dagron-import.
+#
+# To do by hand (3):
+#   stage('Info').steps[1]: the step reads $BUILD_NUMBER, $JOB_NAME, which a step here is not given
+#   stage('Info').steps[3]: an interpolation stood inside the shell's single quotes, where the shell fills nothing in: the variable in its place is read there as it is written. Close the quotes around it
+#   stage('Info').steps[4]: `currentBuild.number` is Groovy that the step's text held, and is not run here: the step stops where it is read. Write what it stood for in the script
+#
+# Changed on the way (10):
+#   on: a multibranch pipeline's builds are each branch and tag pushed, each pull request, and a run asked for (dispatch) here: say on: where it ran for fewer
+#   stage('Info').steps[0]: it reads $BRANCH_NAME, $GIT_COMMIT, $CHANGE_ID, $CHANGE_TARGET, $WORKSPACE: each is set at the head of its script
+#   stage('Info').steps[1], stage('Info').steps[3]: what the string interpolated is a variable of the shell's here, which the shell fills in as it runs the script
+#   stage('Info').steps[2]: the script named its interpreter: it is run as `bash -c` here
+#   stage('Info').steps[2]: it reads $BRANCH_NAME: each is set at the head of its script
+#   stage('Info').steps[3]: it reads $GIT_COMMIT: each is set at the head of its script
+#   stage('Info').steps[5]: it reads $STAGE_NAME: each is set at the head of its script
+#   stage('Info').steps[0]: Jenkins's variables a step reads are set at its head from dagron-ci's own (CI_SHA, CI_REF, …): a program it runs that reads one the step does not is not given it
+#   stage('Info').steps[0]: $BRANCH_NAME is a branch's or a tag's name, and PR-<number> for a pull request, as a multibranch pipeline has it
+name: 11-jenkins-variables
+on:
+  push: {}
+  pull_request: {}
+  dispatch: {}
+tasks:
+- name: info
+  docker_image: debian:12-slim
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        stage('Info').steps[1]: the step reads $BUILD_NUMBER, $JOB_NAME, which a step here is not given
+        stage('Info').steps[3]: an interpolation stood inside the shell's single quotes, where the shell fills nothing in: the variable in its place is read there as it is written. Close the quotes around it
+        stage('Info').steps[4]: `currentBuild.number` is Groovy that the step's text held, and is not run here: the step stops where it is read. Write what it stood for in the script
+      DAGRON_IMPORT
+      exit 1
+  - name: Info
+    run: |-
+      case "$CI_EVENT" in pull_request) export BRANCH_NAME="PR-$CI_PR" ;; *) export BRANCH_NAME="${CI_REF#refs/*/}" ;; esac
+      export GIT_COMMIT="$CI_SHA"
+      [ -z "$CI_PR" ] || export CHANGE_ID="$CI_PR"
+      [ -z "$CI_BASE_REF" ] || export CHANGE_TARGET="${CI_BASE_REF#refs/heads/}"
+      export WORKSPACE="$PWD"
+      echo "$BRANCH_NAME at $GIT_COMMIT in $WORKSPACE, PR $CHANGE_ID into $CHANGE_TARGET"
+  - name: Info
+    run: echo build ${BUILD_NUMBER} of ${JOB_NAME}
+  - name: Info
+    run: |-
+      case "$CI_EVENT" in pull_request) export BRANCH_NAME="PR-$CI_PR" ;; *) export BRANCH_NAME="${CI_REF#refs/*/}" ;; esac
+      bash -c '                    set -euo pipefail
+                          if [[ "$BRANCH_NAME" == main ]]; then echo main; fi
+                      '
+  - name: Info
+    run: |-
+      export GIT_COMMIT="$CI_SHA"
+      echo '${GIT_COMMIT}' > commit.txt
+  - name: Info
+    run: echo ${IMPORT_TODO:?not imported, currentBuild.number}
+  - name: Info
+    run: |-
+      export STAGE_NAME='Info'
+      echo $STAGE_NAME

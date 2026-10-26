@@ -1,6 +1,18 @@
-//! Importers from other orchestrators to dagron DAG YAML.
+//! Importers from other orchestrators to dagron.
 //!
-//! Today: **Argo Workflows**. [`argo_to_dagron`] converts the common case — an
+//! **GitHub Actions**: [`github_to_pipeline`] reads a workflow file as a
+//! dagron-ci pipeline, with a report of what was not carried over as it
+//! was ([`github`]).
+//!
+//! **GitLab CI**: [`gitlab_to_pipeline`] reads a `.gitlab-ci.yml`, with the
+//! files it includes from the project, the same way ([`gitlab`]);
+//! [`gitlab::read_included`] reads those from a checkout.
+//!
+//! **Jenkins**: [`jenkins_to_pipeline`] reads a Declarative Pipeline
+//! (`pipeline { … }`) the same way ([`jenkins`]); a Scripted one is
+//! refused by name.
+//!
+//! **Argo Workflows**: [`argo_to_dagron`] converts the common case — an
 //! entrypoint `dag` (or single `container`) template whose tasks reference
 //! container templates — into a dagron spec (name + tasks with `command`,
 //! `docker_image`, `depends_on`). Unsupported Argo features (steps templates,
@@ -10,6 +22,16 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Context, Result};
+
+mod common;
+pub mod github;
+pub mod gitlab;
+pub mod jenkins;
+/// What every pipeline importer gives: the pipeline and its report.
+pub use common::{pipeline_name, Imported, Kind, Note};
+pub use github::github_to_pipeline;
+pub use gitlab::gitlab_to_pipeline;
+pub use jenkins::jenkins_to_pipeline;
 use serde::{Deserialize, Serialize};
 
 // ── Argo input (the subset we map) ─────────────────────────────────────────────
@@ -227,6 +249,25 @@ fn reject_unsupported_task(t: &ArgoDagTask) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pipeline_is_named_for_its_file() {
+        let name = |importer, file| pipeline_name(importer, std::path::Path::new(file));
+        assert_eq!(
+            name("github", ".github/workflows/ci.yml").as_deref(),
+            Some("ci")
+        );
+        assert_eq!(
+            name("gitlab", ".gitlab-ci.yml").as_deref(),
+            Some("gitlab-ci")
+        );
+        assert_eq!(name("jenkins", "Jenkinsfile").as_deref(), Some("ci"));
+        assert_eq!(
+            name("jenkins", "deploy.jenkinsfile").as_deref(),
+            Some("deploy")
+        );
+        assert_eq!(name("github", ".."), None);
+    }
 
     const ARGO_DAG: &str = r#"
 apiVersion: argoproj.io/v1alpha1

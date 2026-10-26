@@ -1,0 +1,2 @@
+not a pipeline:
+  on: must map at least one event (dispatch, failed, merge_group, pull_request, push) to its filters

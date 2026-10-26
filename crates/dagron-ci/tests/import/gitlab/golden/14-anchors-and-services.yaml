@@ -1,0 +1,73 @@
+# Imported from a GitLab CI pipeline by dagron-import.
+#
+# To do by hand (1):
+#   integration.services[3]: the service is reached as `search-engine` here, where the job reached it as `Search_Engine`: a service's name is a host's
+#
+# Changed on the way (5):
+#   integration.services[0]: GitLab waited for the service's port to open: here the job waits for `pg_isready -h localhost`
+#   integration.services[2]: GitLab waited for the service's port to open: here the job waits for `redis-cli ping`
+#   integration.services[0]: a service is given the job's plain variables, as GitLab gives them, each written in its env
+#   integration.script: a job's script ran under bash where its image had bash, and a step here is run by `sh -e`: a script that is bash's calls bash
+#   on.dispatch: a pipeline run from GitLab's page or its API is a run asked for here (dispatch), through the run API
+#
+# Not carried over (2):
+#   integration.services[1], integration.services[3]: GitLab waited for the service's port to open: here the job's first step starts once its container has, unless `ready` says what makes it ready
+name: 14-anchors-and-services
+on:
+  push: {}
+  dispatch: {}
+tasks:
+- name: integration
+  docker_image: python:3.12
+  env:
+  - name: POSTGRES_PASSWORD
+    value: ci
+  - name: MYSQL_ROOT_PASSWORD
+    value: ci
+  services:
+  - name: database
+    image: postgres:16
+    env:
+    - name: POSTGRES_PASSWORD
+      value: ci
+    - name: MYSQL_ROOT_PASSWORD
+      value: ci
+    - name: POSTGRES_DB
+      value: app
+    ready: pg_isready -h localhost
+  - name: mysql-mysql-server
+    image: mysql/mysql-server:8.0
+    env:
+    - name: POSTGRES_PASSWORD
+      value: ci
+    - name: MYSQL_ROOT_PASSWORD
+      value: ci
+  - name: redis
+    image: redis:7
+    args:
+    - redis-server
+    - --appendonly
+    - yes
+    env:
+    - name: POSTGRES_PASSWORD
+      value: ci
+    - name: MYSQL_ROOT_PASSWORD
+      value: ci
+    ready: redis-cli ping
+  - name: search-engine
+    image: elasticsearch:8.15.0
+    env:
+    - name: POSTGRES_PASSWORD
+      value: ci
+    - name: MYSQL_ROOT_PASSWORD
+      value: ci
+  steps:
+  - name: 'imported: to do'
+    run: |
+      cat >&2 <<'DAGRON_IMPORT'
+      dagron-import left this to do by hand:
+        integration.services[3]: the service is reached as `search-engine` here, where the job reached it as `Search_Engine`: a service's name is a host's
+      DAGRON_IMPORT
+      exit 1
+  - name: script
+    run: pytest tests/integration

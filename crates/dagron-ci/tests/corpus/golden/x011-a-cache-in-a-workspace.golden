@@ -1,0 +1,2 @@
+not a pipeline:
+  tasks[0] (build).workspace.cache[0]: is a mapping: `{ prefix, key_files, paths }`

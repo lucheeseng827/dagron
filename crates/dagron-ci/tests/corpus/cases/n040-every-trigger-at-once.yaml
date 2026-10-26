@@ -1,0 +1,13 @@
+shows: A pipeline with every trigger runs for a merge group as for the rest
+event: { kind: merge_group }
+source: |
+  name: ci
+  on:
+    push: { branches: [main, "release/*"], paths_ignore: ["docs/**"] }
+    pull_request: { branches: [main] }
+    merge_group: {}
+    dispatch: { inputs: { channel: { default: beta } } }
+  tasks:
+    - name: test
+      steps:
+        - run: make test

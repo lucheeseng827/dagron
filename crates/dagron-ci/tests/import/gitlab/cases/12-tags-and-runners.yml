@@ -1,0 +1,12 @@
+# Jobs with no image, run where a runner's tag sent them.
+
+build:
+  tags: [docker]
+  script: [make]
+
+gpu:
+  tags: [gpu, linux]
+  script: [nvidia-smi]
+
+default-runner:
+  script: [uname -a]

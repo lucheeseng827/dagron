@@ -1,0 +1,7 @@
+shows: A pipeline with no on key is refused, since nothing would ever run it
+source: |
+  name: ci
+  tasks:
+    - name: build
+      steps:
+        - run: make

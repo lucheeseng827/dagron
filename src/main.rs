@@ -6,5 +6,9 @@
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // `--version` first: for it nothing is read and nothing is started.
+    if dagron_engine::version_requested("dagron") {
+        return Ok(());
+    }
     dagron_engine::run(dagron_engine::Seams::default()).await
 }

@@ -51,7 +51,16 @@ Verbosity precedence: `RUST_LOG` (if set and parseable) → `LOG_LEVEL` → `inf
 | `LOG_THREAD_NAMES` | Include the thread name (`1`/`0`, default `0`) |
 | `LOG_LINE` | Include source file + line number (`1`/`0`, default `0`) |
 | `LOG_SPAN_EVENTS` | Span lifecycle events `none`/`new`/`enter`/`exit`/`close`/`active`/`full` (default `none`) |
-| `LOG_ANSI` | Force ANSI colors on/off (`1`/`0`, default auto; always off for `json`) |
+| `LOG_ANSI` | Force ANSI colors on/off (`1`/`0`). Unset, lines are coloured only when stdout is a terminal and `NO_COLOR` is not set. Always off for `json` |
+| `NO_COLOR` | Any value but an empty one: no colour, as <https://no-color.org> has it. `LOG_ANSI` wins over it |
+
+## What release a binary is
+
+`VERSION` is the release a binary was built for: `APP_VERSION` as it was set
+when the binary was compiled, which a release's build sets, and `dev` for any
+other build. `version_requested("dagron-api")` answers `--version` (or `-V`,
+alone) with `dagron-api 0.11.0` and returns `true`; every dagron binary calls
+it first in `main`, before `init`, and returns.
 
 ## Reading logs back (`logfilter`, feature-gated)
 

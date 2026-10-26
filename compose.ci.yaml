@@ -1,0 +1,250 @@
+# dagron with CI, on one machine: pulls published images, builds nothing.
+#
+#   export CI_GITHUB_APP_ID=123456
+#   export CI_GITHUB_APP_KEY=/path/to/your-app.private-key.pem
+#   docker compose -f compose.ci.yaml up -d
+#   docker compose -f compose.ci.yaml exec dagron-ci dagron-ci repo add github.com/OWNER/NAME
+#
+# docs/CI_QUICKSTART.md walks through it, the GitHub App first. Then open
+# http://localhost:8080 and sign in with admin@local / dagron-admin.
+#
+# What it is: Postgres, the engine with the Docker executor, dagron-api and
+# dagron-ci. A push to the repository runs its `.dagron/ci` pipelines, each
+# job in a container of its own, and each job's outcome is a status on the
+# commit. dagron-ci finds the push by polling GitHub, so nothing has to reach
+# this machine from outside.
+#
+# With Podman: point DOCKER_SOCK at its socket, which a rootless one has at
+# /run/user/1000/podman/podman.sock inside its machine.
+#
+# NOT a production deployment. The credentials are in this file, the engine
+# holds the container runtime's socket, and nothing is TLS: the services talk
+# over one machine's loopback, which is why none is needed here. See
+# docs/OPERATIONS.md and the Helm chart for a real one.
+
+services:
+  postgres:
+    image: docker.io/library/postgres:16-alpine
+    environment:
+      POSTGRES_USER: dagron
+      POSTGRES_PASSWORD: dagron
+      POSTGRES_DB: workflow
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dagron -d workflow"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - dagron-ci-pg:/var/lib/postgresql/data
+
+  # One network namespace for the engine, dagron-api and dagron-ci, as a pod
+  # has: they reach each other on 127.0.0.1.
+  #
+  # That is not a convenience. dagron-ci sends its token for dagron-api to its
+  # cell, and the engine sends its checkout secret to dagron-ci, and each
+  # starts on no such address over plain http unless it is its own machine.
+  # Over a compose network they would be two hosts, and need TLS between them.
+  #
+  # The ports are published here, since the namespace is this container's:
+  # 8080 is dagron-api and the console, 8090 is dagron-ci's run API.
+  pod:
+    image: docker.io/library/alpine:3.20
+    command: ["sleep", "infinity"]
+    init: true
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8090:8090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # The one secret that has to be there before the engine starts: what the
+  # engine presents to dagron-ci to ask for a checkout's credential. Made
+  # once, and kept in a volume.
+  secrets:
+    image: docker.io/library/alpine:3.20
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        if [ ! -s /secrets/checkout-secret ]; then
+          head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /secrets/checkout-secret
+        fi
+        # Read by services that do not run as root, in a volume only this
+        # stack mounts.
+        chmod 0644 /secrets/checkout-secret
+    volumes:
+      - dagron-ci-secrets:/secrets
+
+  engine:
+    image: docker.io/mancube/dagron-engine:${DAGRON_VERSION:-0.11.0}
+    network_mode: "service:pod"
+    # The container runtime's socket is root's, so the engine runs as root
+    # here. A deployment gives the engine a runtime of its own, or runs jobs
+    # on Kubernetes (docs/HARDENING.md).
+    user: "0:0"
+    environment:
+      DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
+      # The engine's own API, on loopback: only this pod reaches it.
+      API_ADDR: 127.0.0.1:8787
+      EXECUTOR: docker
+      # The image of a task that names none. A CI job names its own.
+      DOCKER_IMAGE: docker.io/library/alpine:3.20
+      # A container's log is kept in a file, where the runtime's own choice
+      # may drop lines (Podman's journal does, past its rate limit): for what
+      # is read back of a container once it is over, such as a Docker
+      # action's step output. A job's own log is read as it writes it.
+      DAGRON_DOCKER_LOG_DRIVER: json-file
+      # What gives a job its workspace: the step runner, installed beside it,
+      # and the image that fetches the commit into it.
+      DAGRON_CI_EXEC_IMAGE: docker.io/mancube/dagron-ci-exec:${DAGRON_VERSION:-0.11.0}
+      DAGRON_CHECKOUT_IMAGE: docker.io/alpine/git:2.54.0
+      # Each checkout's credential is asked of dagron-ci, which mints it as
+      # your GitHub App for that one repository, and revokes it after.
+      DAGRON_CHECKOUT_TOKEN_URL: http://127.0.0.1:8090/ci/v1/checkout-tokens
+      DAGRON_CHECKOUT_TOKEN_SECRET_FILE: /secrets/checkout-secret
+      # What an environment's secrets are encrypted with: the same on the
+      # engine, which decrypts one for the job that names it, and on
+      # dagron-api, which encrypts one when it is written.
+      DAGRON_ENV_SECRET_KEY: ${DAGRON_ENV_SECRET_KEY:-quickstart-only-not-a-real-key-change-me}
+      RUST_LOG: info
+    volumes:
+      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
+      - dagron-ci-secrets:/secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pod:
+        condition: service_started
+      secrets:
+        condition: service_completed_successfully
+
+  # Holds dagron-api until the engine has finished migrating: both create
+  # some of the same tables, and two sessions doing that at once can fail
+  # (compose.quickstart.yaml has the whole story). The engine opens its API
+  # only after its migrations commit.
+  schema-gate:
+    image: docker.io/library/alpine:3.20
+    network_mode: "service:pod"
+    command:
+      - sh
+      - -c
+      - |
+        i=0
+        until nc -z 127.0.0.1 8787 2>/dev/null; do
+          i=$$((i+1))
+          if [ $$i -ge 120 ]; then
+            echo "schema-gate: the engine did not open :8787 within 60s; starting dagron-api anyway" >&2
+            exit 0
+          fi
+          sleep 0.5
+        done
+        echo "schema-gate: the engine's migrations are in; releasing dagron-api"
+    depends_on:
+      engine:
+        condition: service_started
+
+  dagron-api:
+    image: docker.io/mancube/dagron-api:${DAGRON_VERSION:-0.11.0}
+    network_mode: "service:pod"
+    environment:
+      DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
+      # Dev credentials, seeded on first start. Change them for anything that
+      # outlives the afternoon.
+      DAGRON_ADMIN_EMAIL: admin@local
+      DAGRON_ADMIN_PASSWORD: ${DAGRON_ADMIN_PASSWORD:-dagron-admin}
+      DAGRON_ADMIN_NAME: Administrator
+      DAGRON_JWT_SECRET: ${DAGRON_JWT_SECRET:-quickstart-only-not-a-real-secret-change-me}
+      DAGRON_ENV_SECRET_KEY: ${DAGRON_ENV_SECRET_KEY:-quickstart-only-not-a-real-key-change-me}
+      # The console is served over plain http on localhost here.
+      DAGRON_COOKIE_SECURE: "false"
+      RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      schema-gate:
+        condition: service_completed_successfully
+
+  # dagron-ci's own identity in dagron-api, made once: a user in the one
+  # group whose members may say what started a run, so that the runs it
+  # submits read as CI's, and an API token for it, kept in the volume.
+  identity:
+    image: docker.io/curlimages/curl:8.11.1
+    network_mode: "service:pod"
+    user: "0:0"
+    environment:
+      ADMIN_PASSWORD: ${DAGRON_ADMIN_PASSWORD:-dagron-admin}
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        [ -s /secrets/ci-api-token ] && { echo "identity: dagron-ci has its token already"; exit 0; }
+        api=http://127.0.0.1:8080
+        i=0
+        until curl -sf -o /dev/null "$$api/healthz"; do
+          i=$$((i+1)); [ $$i -lt 120 ] || { echo "identity: dagron-api never answered" >&2; exit 1; }
+          sleep 1
+        done
+        # token JSON: the value of its "token"
+        token() { sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'; }
+        json='content-type: application/json'
+        # The password as JSON takes it. curl reads it from the environment
+        # and encodes it itself, so one with a quote, a backslash, a tab or
+        # a newline in it, at its end too, is still the password.
+        admin=$$(curl -sS -H "$$json" "$$api/api/login" --variable %ADMIN_PASSWORD \
+          --expand-data '{"email":"admin@local","password":"{{ADMIN_PASSWORD:json}}"}' | token)
+        [ -n "$$admin" ] || { echo "identity: could not sign in to dagron-api as admin@local" >&2; exit 1; }
+        password=$$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+        # Refused when the user is there from an earlier start whose token
+        # went with its volume. The sign-in below then fails, and says what
+        # to do.
+        curl -sS -o /dev/null -H "authorization: Bearer $$admin" -H "$$json" "$$api/api/users" \
+          -d "{\"email\":\"dagron-ci@local\",\"password\":\"$$password\",\"name\":\"dagron-ci\",\"groups\":[\"ci:trigger\"]}"
+        session=$$(curl -sS -H "$$json" "$$api/api/login" -d "{\"email\":\"dagron-ci@local\",\"password\":\"$$password\"}" | token)
+        [ -n "$$session" ] || { echo "identity: could not sign in as dagron-ci@local; remove that user in the console and start again" >&2; exit 1; }
+        curl -sS -H "authorization: Bearer $$session" -H "$$json" "$$api/api/tokens" -d '{"name":"dagron-ci"}' | token | tr -d '\n' > /secrets/ci-api-token
+        [ -s /secrets/ci-api-token ] || { echo "identity: dagron-api gave no token" >&2; exit 1; }
+        chmod 0644 /secrets/ci-api-token
+        echo "identity: dagron-ci@local has its token"
+    volumes:
+      - dagron-ci-secrets:/secrets
+    depends_on:
+      dagron-api:
+        condition: service_started
+
+  dagron-ci:
+    image: docker.io/mancube/dagron-ci:${DAGRON_VERSION:-0.11.0}
+    network_mode: "service:pod"
+    # As root here, so that it can read your App's key as you keep it. The
+    # chart mounts a Secret instead, and the image's own user is not root.
+    user: "0:0"
+    environment:
+      # The same database, in a schema of its own (dagron_ci).
+      CI_DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
+      CI_LISTEN: 0.0.0.0:8090
+      # Where runs go: this pod's dagron-api.
+      CI_CELLS: default=http://127.0.0.1:8080
+      CI_API_TOKEN_FILE: /secrets/ci-api-token
+      CI_CHECKOUT_TOKEN_SECRET_FILE: /secrets/checkout-secret
+      # Your GitHub App: what dagron-ci reads the repository as, posts
+      # statuses as, and mints each checkout's credential as.
+      CI_GITHUB_APP_ID: ${CI_GITHUB_APP_ID:?set CI_GITHUB_APP_ID to your GitHub App's id (docs/CI_QUICKSTART.md)}
+      CI_GITHUB_APP_KEY_FILE: /app/private-key.pem
+      # How often each repository is looked at. A webhook is quicker and is
+      # not needed: see docs/CI_QUICKSTART.md.
+      CI_POLL_SECS: ${CI_POLL_SECS:-60}
+      # What a commit status links to: the run, in the console.
+      CI_RUN_URL: http://localhost:8080/runs/detail/?id={run_id}
+      RUST_LOG: info
+    volumes:
+      - ${CI_GITHUB_APP_KEY:?set CI_GITHUB_APP_KEY to the path of your GitHub App's private key (docs/CI_QUICKSTART.md)}:/app/private-key.pem:ro
+      - dagron-ci-secrets:/secrets:ro
+    depends_on:
+      identity:
+        condition: service_completed_successfully
+
+volumes:
+  dagron-ci-pg:
+  dagron-ci-secrets:

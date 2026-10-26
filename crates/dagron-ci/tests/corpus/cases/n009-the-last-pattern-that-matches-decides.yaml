@@ -1,0 +1,10 @@
+shows: The last pattern that matches a branch decides, so a later one puts it back
+event: { kind: push, ref: refs/heads/main }
+source: |
+  name: ci
+  on:
+    push: { branches: ["!main", "**"] }
+  tasks:
+    - name: build
+      steps:
+        - run: make

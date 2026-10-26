@@ -1,0 +1,10 @@
+shows: A push trigger with no filter runs for a push to any branch
+event: { kind: push, ref: refs/heads/anything/at-all }
+source: |
+  name: ci
+  on:
+    push: {}
+  tasks:
+    - name: build
+      steps:
+        - run: make

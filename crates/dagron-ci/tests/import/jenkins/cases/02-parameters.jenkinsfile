@@ -1,0 +1,28 @@
+// A build with parameters, run by hand with other values.
+pipeline {
+    agent { docker { image 'node:22-bookworm-slim' } }
+    parameters {
+        string(name: 'TARGET', defaultValue: 'staging', description: 'Where to deploy')
+        booleanParam(name: 'RUN_E2E', defaultValue: false, description: 'Run the end-to-end tests')
+        choice(name: 'REGION', choices: ['eu-west-1', 'us-east-1'], description: 'Region')
+    }
+    stages {
+        stage('Install') {
+            steps {
+                sh 'npm ci'
+            }
+        }
+        stage('E2E') {
+            when { expression { return params.RUN_E2E } }
+            steps {
+                sh 'npm run e2e'
+            }
+        }
+        stage('Deploy') {
+            when { expression { params.TARGET == 'production' && env.BRANCH_NAME == 'main' } }
+            steps {
+                sh "./deploy.sh ${params.TARGET} ${params.REGION}"
+            }
+        }
+    }
+}

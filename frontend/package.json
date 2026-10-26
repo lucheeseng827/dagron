@@ -13,7 +13,8 @@
     "check:errors": "node --experimental-strip-types --no-warnings scripts/check-error-envelope.mjs",
     "check:loops": "node --experimental-strip-types --no-warnings scripts/check-loops.mjs",
     "check:diff": "node --experimental-strip-types --no-warnings scripts/check-diff.mjs",
-    "check:params": "node --experimental-strip-types --no-warnings scripts/check-params.mjs"
+    "check:params": "node --experimental-strip-types --no-warnings scripts/check-params.mjs",
+    "check:ci": "node --experimental-strip-types --no-warnings scripts/check-ci.mjs"
   },
   "dependencies": {
     "@dagrejs/dagre": "^1.1.8",

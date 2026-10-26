@@ -1,0 +1,11 @@
+-- How many times the run was rerun whole (`from: all`), as its cell's
+-- dagron-api says at the end of a look (`GET /api/runs/{id}/wait`). A rerun
+-- of every job runs on the same engine run as the run it reruns, and a meter
+-- is told its end with this, by which it tells a run of every job again from
+-- a rerun of the failed ones. 0 for a run never rerun whole, and for one
+-- whose cell does not say.
+--
+-- `started` is then of this round: a look that sees the count rise takes
+-- whether a job started from that look alone, where it otherwise stays true
+-- once it is.
+ALTER TABLE ci_runs ADD COLUMN whole_reruns BIGINT NOT NULL DEFAULT 0;
