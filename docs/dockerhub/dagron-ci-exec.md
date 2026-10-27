@@ -13,7 +13,7 @@ You do not run this image yourself. Point the dagron engine at it, and every
 dagron-ci job starts with an init container from it:
 
 ```bash
-DAGRON_CI_EXEC_IMAGE=docker.io/mancube/dagron-ci-exec:0.11.0
+DAGRON_CI_EXEC_IMAGE=docker.io/mancube/dagron-ci-exec:0.11.1
 ```
 
 The init container runs `dagron-ci-exec install /dagron/bin` into a volume of
@@ -52,7 +52,7 @@ Beside it:
 | Tag | Meaning |
 |---|---|
 | `latest` | newest stable release |
-| `0.11.0` | pinned version (= current `latest`) |
+| `0.11.1` | pinned version (= current `latest`) |
 | `0.11` | floating minor: newest `0.11.x` |
 
 First published with 0.11.0. Use the same version as your engine and

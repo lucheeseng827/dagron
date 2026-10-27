@@ -78,7 +78,7 @@ services:
       - dagron-ci-secrets:/secrets
 
   engine:
-    image: docker.io/mancube/dagron-engine:${DAGRON_VERSION:-0.11.0}
+    image: docker.io/mancube/dagron-engine:${DAGRON_VERSION:-0.11.1}
     network_mode: "service:pod"
     # The container runtime's socket is root's, so the engine runs as root
     # here. A deployment gives the engine a runtime of its own, or runs jobs
@@ -98,7 +98,7 @@ services:
       DAGRON_DOCKER_LOG_DRIVER: json-file
       # What gives a job its workspace: the step runner, installed beside it,
       # and the image that fetches the commit into it.
-      DAGRON_CI_EXEC_IMAGE: docker.io/mancube/dagron-ci-exec:${DAGRON_VERSION:-0.11.0}
+      DAGRON_CI_EXEC_IMAGE: docker.io/mancube/dagron-ci-exec:${DAGRON_VERSION:-0.11.1}
       DAGRON_CHECKOUT_IMAGE: docker.io/alpine/git:2.54.0
       # Each checkout's credential is asked of dagron-ci, which mints it as
       # your GitHub App for that one repository, and revokes it after.
@@ -146,7 +146,7 @@ services:
         condition: service_started
 
   dagron-api:
-    image: docker.io/mancube/dagron-api:${DAGRON_VERSION:-0.11.0}
+    image: docker.io/mancube/dagron-api:${DAGRON_VERSION:-0.11.1}
     network_mode: "service:pod"
     environment:
       DATABASE_URL: postgres://dagron:dagron@postgres:5432/workflow
@@ -215,7 +215,7 @@ services:
         condition: service_started
 
   dagron-ci:
-    image: docker.io/mancube/dagron-ci:${DAGRON_VERSION:-0.11.0}
+    image: docker.io/mancube/dagron-ci:${DAGRON_VERSION:-0.11.1}
     network_mode: "service:pod"
     # As root here, so that it can read your App's key as you keep it. The
     # chart mounts a Secret instead, and the image's own user is not root.

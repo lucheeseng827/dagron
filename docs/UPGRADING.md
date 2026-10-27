@@ -5,6 +5,7 @@ before you do. The general procedure is short; the per-release sections are the
 part to read every time.
 
 - [The procedure](#the-procedure) — back up, one engine first, then the rest
+- [Upgrading to 0.11.1](#upgrading-to-0111) — from 0.11.0
 - [Upgrading to 0.11.0](#upgrading-to-0110) — from 0.10.0
 - [Upgrading to 0.10.0](#upgrading-to-0100) — from 0.9.x
 - [Upgrading from 0.8.x](#upgrading-from-08x) — the frontend image is gone
@@ -85,6 +86,33 @@ already right. Drop the `gitops.image` lines if the worker is not enabled.
 
 Stop the engine, replace the binary, start it. Same order as above when you run
 more than one.
+
+## Upgrading to 0.11.1
+
+From 0.11.0. **No migrations**: the schema of 0.11.1 is 0.11.0's, on SQLite and
+Postgres alike, and dagron-ci's schema is unchanged too. Engines, dagron-api and
+dagron-ci of the two releases run side by side while you roll them, and rolling
+back is pulling the 0.11.0 images again. The procedure is the usual one:
+
+```sh
+DAGRON_VERSION=0.11.1 docker compose -f compose.quickstart.yaml pull
+DAGRON_VERSION=0.11.1 docker compose -f compose.quickstart.yaml up -d
+# or, with dagron-ci: the same two lines against compose.ci.yaml
+helm upgrade dagron oci://registry-1.docker.io/mancube/dagron --version 0.11.1 --reuse-values
+```
+
+New in 0.11.1 and off until you use it, so nothing to do unless you adopt it:
+`dagron-step-sql` on Snowflake, BigQuery and Databricks (`SQL_ENGINE=snowflake`,
+`bigquery`, `databricks`), on DuckDB (`SQL_ENGINE=duckdb`), `SQL_MODE=script`,
+and `dagron-step-sql parity`; dagron-state's compiled warehouse moves; and
+two release binaries, `dagron-ci` and armv7 `dagron`.
+
+### Before you start
+
+| If you… | What changed | Do this first |
+|---|---|---|
+| run dagron-ci with `CI_FLAKE_ISSUES` set | A job that failed and then passed when a **person reran** the run (`dagron-ci rerun`, a check's Re-run, the console) now counts as a flake, as one the engine's own retry passed always did. A job that passed and was rerun whole, or was cancelled and rerun, does not. So a team that reruns red jobs by hand will see flaky-job issues it did not before | Nothing, if that is what you want: it is the change. If the count now files too many, raise `CI_FLAKE_ISSUES` |
+| run dagron-ci against github.com | A GitHub App token request that GitHub answers with a 5xx, or a connection it does not take, is now sent again up to three times inside the mint's 8 s, instead of failing the job at its checkout. A refusal, a rate limit and a timeout are not sent again | Nothing |
 
 ## Upgrading to 0.11.0
 

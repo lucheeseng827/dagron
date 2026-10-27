@@ -47,7 +47,7 @@ set serves every class, and would race your runners for theirs.
    ```yaml
    containers:
      - name: runner
-       image: mancube/dagron-runner:0.11.0
+       image: mancube/dagron-runner:0.11.1
        args: ["run"]
        env:
          - { name: DAGRON_RUNNER_URL, value: "https://dagron.example.com" }
@@ -92,7 +92,7 @@ in `crates/dagron-runner/README.md` in the source.
 | Tag | Meaning |
 |---|---|
 | `latest` | newest stable release |
-| `0.11.0` | pinned version (= current `latest`) |
+| `0.11.1` | pinned version (= current `latest`) |
 | `0.11` | floating minor: newest `0.11.x` |
 
 First published with 0.11.0. Upgrade dagron-api before its runners: an older

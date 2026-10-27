@@ -76,7 +76,7 @@ With Podman, name its socket first: `export DOCKER_SOCK=/run/user/1000/podman/po
 for a rootless one.
 
 **From a checkout, before a release has the images.** `compose.ci.yaml`
-names the images of 0.11.0. Until they are published, or to try a change,
+names the images of 0.11.1. Until they are published, or to try a change,
 build them from the tree, and name both files in every `docker compose`
 command below:
 
@@ -122,7 +122,7 @@ Check it before it is pushed. This needs no server:
 
 ```sh
 docker run --rm -v "$PWD:/repo" -w /repo \
-  docker.io/mancube/dagron-ci:0.11.0 validate
+  docker.io/mancube/dagron-ci:0.11.1 validate
 # .dagron/ci/ci.yaml: ok (ci: 1 task; on push, pull_request)
 ```
 
@@ -156,7 +156,7 @@ ci run --remote --repo github.com/OWNER/NAME --ref refs/heads/main --wait --time
 ```
 
 With `dagron-ci` on this machine too (a release's `dagron-ci-<version>-<target>`
-archive, from the release after 0.11.0), log in to it once instead. Paste an
+archive, from 0.11.1), log in to it once instead. Paste an
 API token of yours (`POST /api/tokens`, [HOWTO §5](HOWTO.md#5-api-tokens-for-ci-and-scripts):
 a session's ends with the session); it is not shown as it is typed, and is
 kept for that server once the server has said whose it is. The commands
@@ -217,7 +217,7 @@ above, and each is a thing to have before starting:
 kubectl create secret generic dagron-ci-api --from-literal=token='<a dagron-api token>'
 kubectl create secret generic dagron-ci-app --from-file=private-key.pem=dagron-ci.private-key.pem
 kubectl create secret generic dagron-ci-checkout --from-literal=secret="$(openssl rand -hex 32)"
-helm upgrade --install dagron oci://registry-1.docker.io/mancube/dagron --version 0.11.0 \
+helm upgrade --install dagron oci://registry-1.docker.io/mancube/dagron --version 0.11.1 \
   --set ingress.enabled=true --set ingress.host=dagron.example.com \
   --set ingress.tls.enabled=true \
   --set ci.enabled=true \
@@ -227,7 +227,7 @@ helm upgrade --install dagron oci://registry-1.docker.io/mancube/dagron --versio
   --set ci.githubApp.keySecret.name=dagron-ci-app \
   --set ci.checkoutTokenSecret.name=dagron-ci-checkout \
   --set 'engine.extraEnv[0].name=DAGRON_CI_EXEC_IMAGE' \
-  --set 'engine.extraEnv[0].value=docker.io/mancube/dagron-ci-exec:0.11.0' \
+  --set 'engine.extraEnv[0].value=docker.io/mancube/dagron-ci-exec:0.11.1' \
   --set 'engine.extraEnv[1].name=DAGRON_CHECKOUT_IMAGE' \
   --set 'engine.extraEnv[1].value=docker.io/alpine/git:2.54.0'
 kubectl exec deploy/dagron-engine -c dagron-ci -- dagron-ci repo add github.com/OWNER/NAME

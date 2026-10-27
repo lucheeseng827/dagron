@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-10-27
+
 ### Added
 - **`dagron-step-sql parity`: is a partition the same on two stores?**
   The check a warehouse move is cut over on. Each side is read under its own prefix (`PARITY_SOURCE_*`, `PARITY_TARGET_*`) with

@@ -17,7 +17,7 @@ Reach for the distroless [`mancube/dagron-engine`](https://hub.docker.com/r/manc
 | Tag | Notes |
 |---|---|
 | `latest` | newest release |
-| `0.11.0` | pinned version (= current `latest`) |
+| `0.11.1` | pinned version (= current `latest`) |
 | `0.11` | floating minor — newest `0.11.x` |
 
 ## Run
@@ -37,7 +37,7 @@ docker run \
   -e API_ADDR=0.0.0.0:8787 \
   -e EXECUTOR=local \
   -v dagron-workflows:/workflows \
-  mancube/dagron-engine-localdev:0.11.0 /workflows/simple_dag.yaml
+  mancube/dagron-engine-localdev:0.11.1 /workflows/simple_dag.yaml
 ```
 
 Setting `DAG_PATH` in the environment does nothing: the binary never reads it, falls back to a built-in default that does not exist in the image, and logs `cannot read DAG file` on every boot.

@@ -123,10 +123,10 @@ pending while it waits or runs, then its outcome (below).
   own reader and compiler ([below](#from-another-ci-dagron-ci-import)).
 - **`/healthz`, `/readyz`, `/metrics`** for an orchestrator and Prometheus.
 
-**Getting the command.** From the release after 0.11.0, each release carries
+**Getting the command.** From 0.11.1, each release carries
 `dagron-ci-<version>-<target>` for Linux x86_64 and arm64 (static, musl),
 macOS arm64 and Windows x86_64, beside `dagron`, which `dagron-ci run` needs.
-0.11.0 shipped it in the `mancube/dagron-ci` image alone; there, a command
+0.11.0 shipped it in the `mancube/dagron-ci` image alone; with that release, a command
 that needs no server is
 `docker run --rm -v "$PWD:/repo" -w /repo docker.io/mancube/dagron-ci:0.11.0 validate`.
 
@@ -157,7 +157,7 @@ dagron-ci serve
 ```
 
 **As an image.** `mancube/dagron-ci` is this binary on distroless, as
-nonroot, published with each release from the one after 0.11.0
+nonroot, published with each release from 0.11.0
 (`crates/dagron-ci/Dockerfile`). Its entrypoint serves, and the other
 commands run from the same image:
 

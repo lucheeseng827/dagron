@@ -110,7 +110,7 @@ waiting will see it. A refusal on a commit is a status that never passes.
 | **A log followed for an event of several runs** (`follow=true`) | A stream is one run's, as its cell streams it: each run is followed by its own id | 400, which names them |
 | **A redirect from a server a token is sent to** | The token is for the server that was named | The command, or the engine, says the answer it got |
 
-## What 0.11.0 does not do
+## What 0.11.1 does not do
 
 Said here so that nobody finds out by trying.
 

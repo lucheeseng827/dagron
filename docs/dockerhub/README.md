@@ -64,8 +64,8 @@ along that path.
 | `oci://registry-1.docker.io/mancube/dagron` | [`dagron-chart.md`](./dagron-chart.md) | Helm chart (the full stack) |
 
 All eleven current images and the chart are published **`linux/amd64` + `linux/arm64`** at
-the release version, the floating minor and `latest` — `0.11.0`, `0.11` and
-`latest` as of 0.11.0. (`dagron-frontend` stopped at 0.8.1.)
+the release version, the floating minor and `latest` — `0.11.1`, `0.11` and
+`latest` as of 0.11.1. (`dagron-frontend` stopped at 0.8.1.)
 
 A new repository is created by its first push, and Docker Hub makes it
 **private** by default. That is why the three step images, first pushed with

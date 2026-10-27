@@ -455,7 +455,7 @@ ci:
   #     port from anywhere, as it is open where dagron-ci has a pod of its
   #     own. The engine's port stays as closed as it was.
   placement: engine
-  # First published with the release after 0.11.0. Release packaging rewrites
+  # First published with 0.11.0. Release packaging rewrites
   # this tag to the release version (docker.yml), so the pin here only matters
   # to a repo checkout, where no image of this tag was ever pushed: build one
   # (crates/dagron-ci/Dockerfile) or name a published tag.

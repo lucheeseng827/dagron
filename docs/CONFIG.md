@@ -66,7 +66,7 @@ build's. The `dagron-engine` and `dagron-engine-localdev` images are built with
 `dagron-api` image with its own `otel,archive-s3,archive-gcs,archive-azure`: the same
 three object stores, for archived runs and for the artifact store, and span
 export under the same variable. `mqtt` and `archive-parquet` are in no published
-image. This holds for the images of releases after 0.11.0. Those of 0.11.0 and
+image. This holds for the images of 0.11.0 and later. Those of 0.10.x and
 earlier were built with `postgres,ops,kubernetes` (the engine) and with no
 features (`dagron-api`), and name no `features=` as they start.
 

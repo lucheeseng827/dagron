@@ -47,7 +47,7 @@ start. The full list is in `crates/dagron-ci/README.md` in the source.
 | Tag | Meaning |
 |---|---|
 | `latest` | newest stable release |
-| `0.11.0` | pinned version (= current `latest`) |
+| `0.11.1` | pinned version (= current `latest`) |
 | `0.11` | floating minor: newest `0.11.x` |
 
 First published with 0.11.0. Run it with the engine and `dagron-api` of the
