@@ -15,22 +15,29 @@ binary, zero infrastructure to get started.
 [![Engine image size](https://img.shields.io/docker/image-size/mancube/dagron-engine?sort=semver&label=engine%20image)](https://hub.docker.com/r/mancube/dagron-engine)
 [![Platforms](https://img.shields.io/badge/platform-linux%2Famd64%20%7C%20arm64-informational)](https://hub.docker.com/r/mancube/dagron-engine)
 
-**Status: released.** The current release is **0.10.0** — multi-arch images
-(`mancube/dagron-engine`, `-engine-localdev`, `-api`, `-gitops`, `-mcp`) and an
-OCI Helm chart (`oci://registry-1.docker.io/mancube/dagron`, listed on
-[Artifact Hub](https://artifacthub.io/packages/search?repo=dagron-workflow))
-are published per tagged release. dagron's bet is a lean trade: one static Rust
-binary, plain YAML, and a database as the only state — durable workflow
-orchestration with no control plane and no cluster to operate.
+**Status: released.** The current release is **0.11.1**. Each tagged release
+publishes:
+- multi-arch images (`linux/amd64`, `linux/arm64`): `mancube/dagron-engine`,
+  `-engine-localdev`, `-api`, `-gitops` and `-mcp`; the CI service `-ci`, with
+  `-ci-exec`; the remote `-runner`; and the task steps `-step-mcp`, `-step-spark`
+  and `-step-sql`;
+- an OCI Helm chart, `oci://registry-1.docker.io/mancube/dagron`, listed on
+  [Artifact Hub](https://artifacthub.io/packages/search?repo=dagron-workflow);
+- signed [release binaries](https://github.com/lucheeseng827/dagron/releases)
+  of `dagron`, `dagron-ci` and `dagron-runner`.
 
-> **Upgrading?** Read [`docs/UPGRADING.md`](docs/UPGRADING.md) first. From 0.9.x,
-> 0.10.0 asks for a few things before the new engine starts: a ServiceAccount
-> allow-list if tasks set `service_account:`, `secrets` permissions for a
-> hand-written engine Role, `allowFrom` for anything calling the engine past the
-> chart's new NetworkPolicy, and the `admin` group for anyone who deletes
-> workflows or manages Git repositories. From 0.8.x, `mancube/dagron-frontend` is
-> discontinued: `dagron-api` serves the console. Migrations are forward-only and
-> apply at startup, so back up first.
+dagron's bet is a lean trade: one static Rust binary, plain YAML, and a
+database as the only state. That gives durable workflow orchestration with no
+control plane and no cluster to operate. Since 0.11 the same engine runs your
+repository's CI ([below](#ci-on-the-same-engine)).
+
+> **Upgrading?** Read [`docs/UPGRADING.md`](docs/UPGRADING.md) first.
+> - **From 0.11.0 to 0.11.1:** there are no migrations; pull the new images.
+> - **From 0.10.0 to 0.11.x:** upgrade the engines before dagron-api, or with
+>   it. The migrations (SQLite 051–081, Postgres 066–107) run at start-up, and
+>   the page says what each costs.
+>
+> Migrations are forward-only, so back up first.
 
 ## See it in action
 
@@ -80,6 +87,28 @@ series and shows each dashboard.
   SQLite (state lives in a single `workflow.db` file); switch the Cargo
   feature to `postgres` for multi-node.
 
+## CI on the same engine
+
+A repository keeps its pipelines in `.dagron/ci/`. dagron-ci, one service beside
+the engine, turns each push or pull request into an ordinary dagron run, and
+reports each job back on the commit. The run happens in a container, with the
+commit checked out using a credential minted for that one attempt.
+
+dagron-ci polls the forge, so nothing has to reach it: it runs on a laptop or
+behind a firewall. It works with GitHub and GitLab. It can import a GitHub
+Actions workflow, a `.gitlab-ci.yml` or a Jenkinsfile, and it names in the file
+anything it could not carry over.
+
+```bash
+dagron-ci validate                  # check .dagron/ci/*.yaml before you push; no server needed
+docker compose -f compose.ci.yaml up -d
+```
+
+- **Getting started:** [the CI quickstart](docs/CI_QUICKSTART.md) goes from a
+  GitHub App to a green check.
+- **What it does and refuses:** [`docs/CI.md`](docs/CI.md).
+- **Pipeline reference:** [`docs/CI_PIPELINES.md`](docs/CI_PIPELINES.md).
+
 ## Quick start
 
 > **New here?** The [**how-to guide**](docs/HOWTO.md) has copy-paste recipes:
@@ -109,7 +138,7 @@ podman compose   -f compose.quickstart.yaml up -d   # podman ≥ 4.7, provider i
 podman-compose   -f compose.quickstart.yaml up -d   # standalone provider, older podman too
 ```
 
-The images are pinned (`DAGRON_VERSION`, default **0.10.0** — the current
+The images are pinned (`DAGRON_VERSION`, default **0.11.1** — the current
 release). Floating `:latest` is deliberately not the default: a quickstart that
 silently changes under you is worse than one you have to bump.
 
@@ -151,8 +180,12 @@ Open <http://localhost:8080> and sign in with the seeded dev admin
 only, so changing them later needs `down -v`. Change everything for a real
 deploy, see [`docs/OPERATIONS.md`](docs/OPERATIONS.md)).
 
-**Option B — one binary, zero infra** (default build = embedded SQLite + the
-management API):
+**Option B — one binary, zero infra** (embedded SQLite + the management API).
+Download `dagron` for your platform from the
+[releases](https://github.com/lucheeseng827/dagron/releases). Builds are
+provided for Linux x86_64, arm64 and armv7 (static), macOS arm64 and
+Windows x86_64, with signed checksums ([`docs/VERIFY.md`](docs/VERIFY.md)).
+Or build it:
 
 ```bash
 cargo build --release -p dagron
@@ -653,6 +686,8 @@ to run a workflow except the first five rows.
 | `dagron-plan` | spec diff for a pull request: what a workflow change does before it merges |
 | `dagron-forge` | commit statuses / PR checks on GitHub or GitLab when a run finishes |
 | `dagron-ci` | CI on dagron: forge events in, ordinary runs out, statuses back. It verifies and queues GitHub deliveries, polls each repository for what a delivery missed, and takes runs dagron-api users ask for (`POST /ci/v1/runs`). Its workers compile each trusted event's `.dagron/ci` pipelines at its commit and run them through dagron-api, once per commit (the bound workflow, for a commit without pipelines); it posts a commit status per job, and mints each attempt's checkout credential ([`crates/dagron-ci`](crates/dagron-ci/README.md)) |
+| `dagron-ci-exec` | the step runner inside each CI job: per-step timeouts, cancellation, cleanup and a result, in an image that has only `sh`; put into each job by an init container |
+| `dagron-runner` | the remote runner: runs a class of tasks where no engine runs (a Mac, a Windows host, a GPU box, a host behind NAT), dialling dagron-api over HTTPS with no database credentials |
 | `dagron-step-mcp` | a task that calls a tool on an MCP server, with dagron's retries and artifacts around it |
 
 The full design reference — component diagrams, the task state machine, and
