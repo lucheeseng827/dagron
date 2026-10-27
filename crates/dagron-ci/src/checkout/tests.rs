@@ -88,6 +88,8 @@ struct GithubState {
     installed: bool,
     /// A status the token mint answers instead of a token.
     mint_answer: Option<u16>,
+    /// How many of the token mint's POSTs are answered an empty 500 first.
+    mint_fails: u32,
     /// How long it takes to answer anything.
     delay: Option<Duration>,
     /// Each request: its method, path, Authorization and body.
@@ -138,6 +140,10 @@ async fn stub_github() -> (String, StubGithub) {
         {
             if let Some(code) = gh.mint_answer {
                 return StatusCode::from_u16(code).unwrap().into_response();
+            }
+            if gh.mint_fails > 0 {
+                gh.mint_fails -= 1;
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
             return (
                 StatusCode::CREATED,
@@ -1538,6 +1544,82 @@ async fn a_mint_github_fails_is_a_bad_gateway() {
     );
     assert_eq!(counted(&app, "failed").await, 1);
     assert_eq!(counted(&app, "minted").await, 0);
+}
+
+/// The POSTs of a mint, as the stub saw them.
+fn mint_posts(gh: &StubGithub) -> usize {
+    let path = format!("/app/installations/{INSTALLATION}/access_tokens");
+    gh.lock()
+        .unwrap()
+        .seen
+        .iter()
+        .filter(|(method, seen, _, _)| method == "POST" && *seen == path)
+        .count()
+}
+
+/// github.com answers a mint an empty 500 now and then, and the next one is
+/// minted: the job is not failed at its checkout for it.
+#[tokio::test]
+async fn a_mint_github_failed_on_its_side_is_sent_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some((key, _)) = rsa_key(dir.path()) else {
+        return;
+    };
+    let (origin, gh) = stub_github().await;
+    {
+        let mut gh = gh.lock().unwrap();
+        gh.installed = true;
+        gh.mint_fails = 2;
+    }
+    let (db, _db_dir) = sqlite().await;
+    let sha = submitted(&db, "run-1").await;
+    let app = router(AppState::new(
+        db,
+        &configured(dir.path(), true, Some(&key), &origin),
+        Seams::default(),
+    ));
+    let (status, answer) = mint(&app, ask("run-1", REPOSITORY, &sha)).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["password"], MINTED);
+    assert_eq!(mint_posts(&gh), 3);
+    assert_eq!(counted(&app, "minted").await, 1);
+    assert_eq!(counted(&app, "failed").await, 0);
+}
+
+/// One that GitHub fails each time is a bad gateway, after a third send and
+/// no more; and one it refuses is not sent again.
+#[tokio::test]
+async fn a_mint_github_keeps_failing_is_sent_three_times_and_one_refused_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some((key, _)) = rsa_key(dir.path()) else {
+        return;
+    };
+    for (answer, posts) in [(500, 3), (503, 3), (422, 1)] {
+        let (origin, gh) = stub_github().await;
+        {
+            let mut gh = gh.lock().unwrap();
+            gh.installed = true;
+            gh.mint_answer = Some(answer);
+        }
+        let (db, _db_dir) = sqlite().await;
+        let sha = submitted(&db, "run-1").await;
+        let app = router(AppState::new(
+            db,
+            &configured(dir.path(), true, Some(&key), &origin),
+            Seams::default(),
+        ));
+        let (status, problem) = mint(&app, ask("run-1", REPOSITORY, &sha)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{answer}: {problem}");
+        assert!(
+            problem["detail"]
+                .as_str()
+                .unwrap()
+                .contains(&answer.to_string()),
+            "{problem}"
+        );
+        assert_eq!(mint_posts(&gh), posts, "{answer}");
+        assert_eq!(counted(&app, "failed").await, 1, "{answer}");
+    }
 }
 
 #[tokio::test]

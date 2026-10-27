@@ -8,7 +8,7 @@
 - **Arch:** `linux/amd64`, `linux/arm64`
 - **Binary inside:** `/usr/local/bin/dagron-api` (entrypoint) · **Exposes:** `8080`
 - **Datastore:** Postgres (`DATABASE_URL`, shared with the engine)
-- **Built with, in releases after 0.11.0:** S3, Google Cloud Storage and Azure Blob, for archived runs (`GC_ARCHIVE_URL`) and the artifact store (`DAGRON_ARTIFACT_URL`); and OTLP span export (`OTEL_EXPORTER_OTLP_ENDPOINT`). The tags below through 0.11.0 have none of these. An image built with them says so as it starts, on its `configuration resolved` line (`features=…`); one that prints no `features=` there is an earlier one.
+- **Built with, from 0.11.0:** S3, Google Cloud Storage and Azure Blob, for archived runs (`GC_ARCHIVE_URL`) and the artifact store (`DAGRON_ARTIFACT_URL`); and OTLP span export (`OTEL_EXPORTER_OTLP_ENDPOINT`). Tags through 0.10.x have none of these. An image built with them says so as it starts, on its `configuration resolved` line (`features=…`); one that prints no `features=` there is an earlier one.
 - **Website:** dagron.dev · **Source / full docs:** github.com/lucheeseng827/dagron · Apache-2.0
 
 ## Tags
@@ -16,10 +16,10 @@
 | Tag | Notes |
 |---|---|
 | `latest` | newest release |
-| `0.10.0` | pinned version (= current `latest`) |
-| `0.10` | floating minor — newest `0.10.x` |
+| `0.11.0` | pinned version (= current `latest`) |
+| `0.11` | floating minor — newest `0.11.x` |
 
-Pin in production: `mancube/dagron-api:0.10.0`.
+Pin in production: `mancube/dagron-api:0.11.0`.
 
 ## Run
 
@@ -29,7 +29,7 @@ docker run -p 8080:8080 \
   -e DAGRON_JWT_SECRET=replace-with-a-32+char-signing-key \
   -e DAGRON_ADMIN_EMAIL=admin@local \
   -e DAGRON_ADMIN_PASSWORD=replace-with-a-strong-password \
-  mancube/dagron-api:0.10.0
+  mancube/dagron-api:0.11.0
 ```
 
 ## Configuration (env)

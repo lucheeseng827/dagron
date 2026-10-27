@@ -6,6 +6,96 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- **`dagron-step-sql parity`: is a partition the same on two stores?**
+  The check a warehouse move is cut over on. Each side is read under its own prefix (`PARITY_SOURCE_*`, `PARITY_TARGET_*`) with
+  the step's own variables and transports, so every credential, deadline and
+  budget rule holds. Two numbers per side, computed where the data is: the
+  row count, and the sum over rows of 60 bits of the MD5 of each row's
+  canonical text, which ignores row order and counts a duplicate twice.
+  Columns come from each side's `information_schema` and are compared by
+  family: integers and decimals as value × 10^scale, floats rounded to
+  `PARITY_FLOAT_DIGITS`, booleans as `1`/`0`, dates and timestamps as days
+  and microseconds since 1970, text as itself. Cells are length-prefixed, so
+  NULL is not `''`. A column only one side has is a difference, and a type
+  outside the families is refused. Exit `0` equal, `2` shown different, `1`
+  not compared, with `parity.json` in `$DAGRON_ARTIFACTS`. Shown on a live
+  Postgres to catch a dropped, a duplicated and a changed row and to pass a
+  faithful copy (`tests/parity.rs`, now run by `scripts/ci-test.sh` against
+  the Postgres it starts). The Redshift, Snowflake, BigQuery and Databricks
+  forms are unit-pinned and not yet run against those stores.
+- **`SQL_ENGINE=duckdb`: the engine a copy uses where a store cannot read or
+  write Parquet.** The DuckDB CLI as a child process, with
+  the script on stdin, `-bail`, stdout dropped, stderr kept, the deadline
+  killing it, and `SQL_PASSWORD` handed over as `PGPASSWORD` for a Postgres
+  it attaches through libpq's environment. `exec` and `script` only. The
+  transports now take a `Settings` (one store's connection, read under a
+  prefix) and hand rows to a sink the caller owns, which is how one process
+  reaches two stores; behaviour under `SQL_*` is unchanged.
+- **dagron-state compiles a warehouse move.** A
+  `freshet move --json` document (contract `freshet-move/1`) becomes
+  `<unit>__unload → <unit>__load → <unit>__parity` per partition, the units
+  independent of one another, at `POST /api/state/moves` and
+  `/moves/submit`, or offline with `dagron-state move [--json]`. The move
+  names no host and holds no credential: connections come per kind of task
+  (`options.unload`, `.load`, `.parity`, each `env` and `secret_env`), and
+  options may not set what the move sets. `check_only` compiles just the
+  parity tasks for a side-by-side period. Tested on the producer's own
+  captured output, and parsed through dagron's real `DagGraph::from_yaml`.
+- **`dagron-step-sql` runs Snowflake, BigQuery and Databricks.** `SQL_ENGINE=snowflake`, `bigquery` and `databricks` drive each
+  vendor's statement API over HTTPS (Snowflake's SQL API v2, BigQuery's
+  `jobs.query`, Databricks' Statement Execution API 2.0). Each submits, polls
+  the handle it gets back, and reads the result a page at a time. Every
+  dialect `freshet plan --sql` renders now has a step that runs it, and a
+  dialect's name is its `SQL_ENGINE`, so `SQL_ENGINE: "{{ dialect }}"` serves
+  all five. The DSN is the API's host with the session as query parameters
+  (`?warehouse=…`, `?project=…&dataset=…`, `?warehouse_id=…`); an unknown
+  parameter is refused, and so is plain `http://` to anywhere but loopback.
+  The token rides in `SQL_PASSWORD` (`SQL_TOKEN_TYPE` names Snowflake's
+  kind). BigQuery with none takes its service account's token from the GCE
+  metadata server. All four modes work. A script goes to Snowflake with
+  `MULTI_STATEMENT_COUNT=0`, to BigQuery as it is, and to Databricks as one
+  `BEGIN … END` compound statement. These transports hold a handle, so a
+  statement still running at `SQL_TIMEOUT_SECS` is **cancelled** rather than
+  left running, and Snowflake is given the deadline as its own `timeout`. A
+  poll or a page lost in transit is retried; a submit never is. The budget
+  reaches the store where the API lets it (one row past `SQL_MAX_ROWS` as
+  BigQuery's `maxResults` and Databricks' `row_limit`), and a page is read
+  whole but refused while still arriving once it passes twice `SQL_MAX_BYTES`
+  plus 1 MiB. Values are the APIs' text, not re-typed. They are in the default
+  build, with no driver beyond the HTTP client; reqwest gains `gzip`, for
+  Snowflake's compressed partitions. Tested against stand-ins in each API's
+  documented shapes (`tests/statement_api.rs`), not yet against the services.
+
+### Changed
+- **dagron-ci: a job that failed and passed when a person reran it is a
+  flake.** Until now only the engine's own retries counted
+  (`CI_FLAKE_ISSUES`). A rerun starts a job's attempts again, so a job that
+  failed, was rerun (`dagron-ci rerun`, a check's Re-run, the console) and
+  then passed on the same commit filed nothing. Now a run that was rerun has
+  each passed job's attempts read, and a failed life before the pass counts.
+  A job that passed and was rerun whole, or was cancelled and rerun, is not
+  a flake. Each run's job is still kept once.
+
+### Fixed
+- **Release: an armv7 binary.** The 32-bit ARM leg fetched its cross
+  toolchain from musl.cc, which never answers GitHub's runners, so no
+  release had one. It now builds with cargo-zigbuild (Zig from PyPI, pinned
+  by sha256) and is run under `qemu-arm` before it ships: `--version` and
+  `validate`, as the native legs are.
+- **Release: a signature is verified until Docker Hub lists it.** v0.11.0's
+  image merges and its chart failed "no signatures found" seconds after
+  signing, and verified later. Verification is now tried for a minute
+  before it fails.
+- **dagron-ci: a GitHub App token GitHub failed on its side is asked for
+  again.** github.com answers an installation token's request with an empty
+  500 now and then, and the next request is answered: in the first run
+  against github.com, two mints in eleven, each failing a job at its
+  checkout. A mint's two calls are now sent up to three times where GitHub
+  answers a 5xx or does not take the connection, 250 ms and then 500 ms
+  apart, inside the 8 s a mint already had. A refusal, a rate limit and a
+  timeout are not sent again.
+
 ## [0.11.0] - 2026-10-26
 
 ### Added

@@ -3,6 +3,7 @@
 //!   dagron-state explain <plan.json>     # markdown + Mermaid, for a PR comment
 //!   dagron-state plan    <plan.json>     # the dagron workflow YAML
 //!   dagron-state contract                # the wire contract revision this build reads
+//!   dagron-state move    <move.json>     # a `freshet move` document → workflow YAML
 //!
 //! `-` reads the plan from stdin, so it composes with the planner directly:
 //!
@@ -24,6 +25,7 @@ use std::process::ExitCode;
 
 use dagron_state::compile::{compile, CompileError, CompileOptions, Ordering, PlanEnvelope};
 use dagron_state::explain::explain;
+use dagron_state::moves::{compile_move, MoveEnvelope, MoveOptions};
 use dagron_state::wire::{PlanResponse, WIRE_CONTRACT_VERSION};
 
 /// Stand-in command for `explain`, which never renders the command. Only ever
@@ -33,14 +35,15 @@ const PLACEHOLDER_COMMAND: &str = "echo {{ model }}";
 const USAGE: &str = "usage:\n  \
     dagron-state explain <plan.json|->\n  \
     dagron-state plan    <plan.json|-> [--command '<shell>']\n  \
-    dagron-state contract\n\
+    dagron-state contract\n  \
+    dagron-state move    <move.json|->   (a bare `freshet move --json`, or {\"move\": …, \"options\": …})\n\
     \noptions:\n  \
     --command <shell>  per-model argv as `sh -c <shell>`; `{{ model }}`,\n                     \
     `{{ unit }}` and `{{ partitions }}` substitute. `plan` needs this\n                     \
     unless the envelope carries `options.command_template`.\n  \
     --sequential       chain the plan instead of deriving parallel edges\n  \
     --mermaid          print only the Mermaid graph (explain)\n  \
-    --json             print the explanation as JSON (explain)\n  \
+    --json             print the explanation as JSON (explain), or the spec (move)\n  \
     --exit-code        return 2 (not 0) when the plan is non-empty\n  \
     -h, --help         this help";
 
@@ -106,6 +109,35 @@ fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     match subcommand {
         "contract" => {
             println!("{WIRE_CONTRACT_VERSION}");
+            Ok(ExitCode::SUCCESS)
+        }
+        "move" => {
+            let [path] = rest else {
+                anyhow::bail!("`move` takes exactly one move file (or `-`)\n{USAGE}");
+            };
+            let raw = if *path == "-" {
+                std::io::read_to_string(std::io::stdin())?
+            } else {
+                std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?
+            };
+            let value: serde_json::Value =
+                serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("{path} is not valid JSON: {e}"))?;
+            // An envelope has a `move`; `freshet move --json` itself does not.
+            let envelope: MoveEnvelope = if value.get("move").is_some() {
+                serde_json::from_value(value).map_err(|e| anyhow::anyhow!("{path} is not a move envelope: {e}"))?
+            } else {
+                let moved = serde_json::from_value(value)
+                    .map_err(|e| anyhow::anyhow!("{path} is not a `freshet move` document: {e}"))?;
+                MoveEnvelope { moved, options: MoveOptions::default() }
+            };
+            let spec = compile_move(&envelope)?;
+            // `--json`: the same spec as JSON, for a script that would rather not
+            // parse YAML to read the tasks.
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&spec)?);
+            } else {
+                print!("{}", spec.to_yaml()?);
+            }
             Ok(ExitCode::SUCCESS)
         }
         "explain" | "plan" => {

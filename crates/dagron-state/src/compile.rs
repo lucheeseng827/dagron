@@ -338,7 +338,7 @@ fn placeholder_values(model: &PlanModel) -> BTreeMap<&'static str, String> {
 /// Only the two spellings this crate has always accepted — `{{ name }}` and
 /// `{{name}}` — and only known names are substituted; anything else in braces is
 /// the command's own templating and passes through untouched.
-fn expand(template: &str, values: &BTreeMap<&'static str, String>) -> String {
+pub(crate) fn expand(template: &str, values: &BTreeMap<&'static str, String>) -> String {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
     while let Some(at) = rest.find("{{") {
@@ -420,7 +420,7 @@ fn task_input(model: &PlanModel) -> serde_json::Value {
 /// Model names are dotted and schema-qualified (`analytics.stg_orders`); dagron
 /// gives `.` its own meaning in fan-out instance names (`<task>.<label>`), so
 /// passing one through would produce a task that reads like an expansion instance.
-fn unique_task_name(model: &str, taken: &mut BTreeSet<String>) -> String {
+pub(crate) fn unique_task_name(model: &str, taken: &mut BTreeSet<String>) -> String {
     let mut base: String = model
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })

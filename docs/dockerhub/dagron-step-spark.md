@@ -15,7 +15,7 @@ You usually do **not** deploy this image. You copy the binary into whatever imag
 
 ```dockerfile
 FROM your-task-image:1.2.3
-COPY --from=mancube/dagron-step-spark:0.10 \
+COPY --from=mancube/dagron-step-spark:0.11 \
      /usr/local/bin/dagron-step-spark /usr/local/bin/dagron-step-spark
 ```
 
@@ -86,7 +86,7 @@ tasks:
 | Tag | Notes |
 |---|---|
 | `latest` | newest release |
-| `0.10` | floating minor — newest `0.10.x` |
+| `0.11` | floating minor — newest `0.11.x` |
 
 Pin in production — pick the newest published tag rather than copying a version from this page, which ages.
 

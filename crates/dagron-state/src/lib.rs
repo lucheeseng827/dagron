@@ -118,6 +118,7 @@
 
 pub mod compile;
 pub mod explain;
+pub mod moves;
 #[cfg(feature = "http")]
 pub mod router;
 pub mod spec;

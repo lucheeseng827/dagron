@@ -129,6 +129,15 @@ const RECORD_POLL: Duration = Duration::from_millis(25);
 /// How long one call to GitHub may take.
 const GITHUB_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// How many times a mint's call is sent where GitHub failed it on its side,
+/// and the pause before the second send; each later one is twice the last.
+/// github.com answers an installation token's POST with an empty 500 now and
+/// then, and the next one is minted: two in eleven on a quiet afternoon,
+/// each a job failed at its checkout. Out of [`MINT_BUDGET`], which still
+/// cuts the whole short.
+pub(crate) const MINT_SENDS: u32 = 3;
+const MINT_RESEND: Duration = Duration::from_millis(250);
+
 const GITHUB_API_VERSION: &str = "2022-11-28";
 
 /// The user a GitHub installation token is presented as, over HTTP basic.
@@ -651,14 +660,15 @@ pub(crate) async fn installation_token_of(
     struct Installation {
         id: u64,
     }
-    let res = github(
-        http,
-        api,
-        reqwest::Method::GET,
-        &format!("/repos/{owner}/{name}/installation"),
-        &jwt,
-    )
-    .send()
+    let res = resent(|| {
+        github(
+            http,
+            api,
+            reqwest::Method::GET,
+            &format!("/repos/{owner}/{name}/installation"),
+            &jwt,
+        )
+    })
     .await
     .map_err(|e| MintError::Failed(format!("GitHub could not be reached: {e}")))?;
     if res.status() == reqwest::StatusCode::NOT_FOUND {
@@ -666,24 +676,53 @@ pub(crate) async fn installation_token_of(
     }
     let installation: Installation = read(res, "the App's installation").await?;
 
-    let res = github(
-        http,
-        api,
-        reqwest::Method::POST,
-        &format!("/app/installations/{}/access_tokens", installation.id),
-        &jwt,
-    )
-    .json(&match one_repository {
+    let body = match one_repository {
         true => serde_json::json!({
             "repositories": [name],
             "permissions": permissions,
         }),
         false => serde_json::json!({ "permissions": permissions }),
+    };
+    // A 500 may still have minted a token, which no one is handed: it is the
+    // installation's, for this repository and these permissions alone, and
+    // expires within the hour.
+    let res = resent(|| {
+        github(
+            http,
+            api,
+            reqwest::Method::POST,
+            &format!("/app/installations/{}/access_tokens", installation.id),
+            &jwt,
+        )
+        .json(&body)
     })
-    .send()
     .await
     .map_err(|e| MintError::Failed(format!("GitHub could not be reached: {e}")))?;
     read(res, "an installation token").await
+}
+
+/// `request`'s answer, sent again where GitHub failed it on its side: a 5xx,
+/// or a connection it did not take ([`MINT_SENDS`]). Not one that timed out,
+/// which has had its time; and not a refusal or a rate limit, which the next
+/// send is answered the same.
+async fn resent(
+    request: impl Fn() -> reqwest::RequestBuilder,
+) -> reqwest::Result<reqwest::Response> {
+    let mut pause = MINT_RESEND;
+    for _ in 1..MINT_SENDS {
+        match request().send().await {
+            Ok(res) if res.status().is_server_error() => {
+                tracing::debug!(status = %res.status(), "GitHub failed a mint's call: sent again");
+            }
+            Err(e) if e.is_connect() => {
+                tracing::debug!(error = %e, "GitHub did not take a mint's call: sent again");
+            }
+            answered => return answered,
+        }
+        tokio::time::sleep(pause).await;
+        pause *= 2;
+    }
+    request().send().await
 }
 
 /// Whether a repository shares its actions with workflows of its owner's

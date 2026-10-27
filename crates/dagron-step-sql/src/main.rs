@@ -4,11 +4,18 @@
 //! `SQL_STATEMENT_FILE`), runs it against `SQL_ENGINE`, and honours the output
 //! contract in [`dagron_step_sql`]: nothing to stdout in `exec`, one bounded
 //! value in `scalar`, NDJSON into `$DAGRON_ARTIFACTS` in `rows`.
+//!
+//! `dagron-step-sql parity` is the other command: it compares one relation's rows
+//! on two stores (see `parity_driver`).
+
+mod api_driver;
+mod duckdb_driver;
+mod parity_driver;
 
 use anyhow::{bail, Context, Result};
 use dagron_step_sql::{
-    artifacts_dir, reject_inline_credential, scalar_for_stdout, Budget, Engine, Mode, Transport,
-    DEFAULT_MAX_BYTES, DEFAULT_MAX_ROWS, PASSWORD_VAR,
+    artifacts_dir, scalar_for_stdout, Budget, Mode, Settings, Transport, DEFAULT_MAX_BYTES,
+    DEFAULT_MAX_ROWS,
 };
 // Only the wire transports re-encode rows; the HTTP path copies the store's own
 // JSONEachRow lines through, so this is unused in a default build.
@@ -23,13 +30,13 @@ async fn main() -> Result<()> {
     }
     dagron_logging::init("dagron-step-sql");
 
-    let engine = Engine::parse(&std::env::var("SQL_ENGINE").unwrap_or_default())?;
+    // `dagron-step-sql parity`: the same transports, two stores, one verdict.
+    if std::env::args().nth(1).as_deref() == Some("parity") {
+        return parity_driver::main().await;
+    }
+
+    let settings = Settings::from_env("SQL_", |k| std::env::var(k).ok())?;
     let mode = Mode::parse(std::env::var("SQL_MODE").ok().as_deref())?;
-    let dsn = std::env::var("SQL_DSN")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .context("SQL_DSN is required (e.g. http://clickhouse:8123/?database=analytics)")?;
-    reject_inline_credential(&dsn)?;
 
     let statement = match std::env::var("SQL_STATEMENT_FILE").ok().filter(|s| !s.trim().is_empty())
     {
@@ -56,15 +63,42 @@ async fn main() -> Result<()> {
         env_u64("SQL_MAX_BYTES", DEFAULT_MAX_BYTES)?,
     );
 
+    // Created before anything runs, like the path above: a statement that fails
+    // drops the sink, and a dropped sink removes its temp file.
+    let mut sink = out_path.map(RowSink::create).transpose()?;
+    run(&settings, &statement, mode, sink.as_mut(), budget).await?;
+    if let Some(mut sink) = sink {
+        sink.commit()?;
+        tracing::info!(rows = sink.rows, path = %sink.describe(), "wrote NDJSON");
+    }
+    Ok(())
+}
+
+/// Run one statement against the store `settings` names.
+///
+/// Every transport honours the same contract: nothing kept in `exec` and
+/// `script`, one bounded value printed in `scalar`, and in `rows` each admitted
+/// row handed to `sink`, which the caller commits once the whole result is in.
+/// `sink` is `Some` exactly when `mode` is `rows`.
+pub(crate) async fn run(
+    settings: &Settings,
+    statement: &str,
+    mode: Mode,
+    sink: Option<&mut RowSink>,
+    budget: Budget,
+) -> Result<()> {
+    debug_assert_eq!(sink.is_some(), mode == Mode::Rows, "a sink exactly when rows are kept");
+    let engine = settings.engine;
     match engine.transport() {
         Transport::Http if mode == Mode::Script => bail!(
             "SQL_MODE=script needs a wire transport: {engine:?} is reached over HTTP, which runs \
              one statement per request. Run each statement as its own task instead — sending \
              the script anyway would run its first statement and drop the rest."
         ),
-        Transport::Http => run_http(&dsn, &statement, mode, out_path, budget).await,
-        Transport::MySql => run_wire(engine, &dsn, &statement, mode, out_path, budget).await,
-        Transport::Postgres => run_wire(engine, &dsn, &statement, mode, out_path, budget).await,
+        Transport::Http => run_http(settings, statement, mode, sink, budget).await,
+        Transport::MySql | Transport::Postgres => run_wire(settings, statement, mode, sink, budget).await,
+        Transport::Api(api) => api_driver::run(api, settings, statement, mode, sink, budget).await,
+        Transport::DuckDb => duckdb_driver::run(settings, statement, mode).await,
     }
 }
 
@@ -89,14 +123,14 @@ fn env_u64(key: &str, default: u64) -> Result<u64> {
 /// decides how much of it is read at all: `exec` reads none of it, `scalar`
 /// stops after the first line, and `rows` holds one line at a time.
 async fn run_http(
-    dsn: &str,
+    settings: &Settings,
     statement: &str,
     mode: Mode,
-    out_path: Option<std::path::PathBuf>,
+    sink: Option<&mut RowSink>,
     mut budget: Budget,
 ) -> Result<()> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(env_u64("SQL_TIMEOUT_SECS", 300)? ))
+        .timeout(std::time::Duration::from_secs(settings.timeout_secs))
         .build()
         .context("building the HTTP client")?;
 
@@ -111,11 +145,11 @@ async fn run_http(
         statement.to_string()
     };
 
-    let mut req = client.post(dsn).body(body);
-    if let Ok(user) = std::env::var("SQL_USER") {
+    let mut req = client.post(&settings.dsn).body(body);
+    if let Some(user) = &settings.user {
         req = req.header("X-ClickHouse-User", user);
     }
-    if let Ok(pw) = std::env::var(PASSWORD_VAR) {
+    if let Some(pw) = &settings.password {
         req = req.header("X-ClickHouse-Key", pw);
     }
     let resp = req.send().await.context("sending the statement")?;
@@ -156,20 +190,16 @@ async fn run_http(
             Ok(())
         }
         Mode::Rows => {
-            let path = out_path.expect("rows mode resolved an artifact path");
+            let sink = sink.expect("rows mode passes a sink");
             // Each line is admitted and written as it arrives, so memory holds
             // one row rather than the result set — and the write still lands in
             // a temp file that is renamed into place only if every row was
-            // admitted, so an over-budget result leaves nothing at `path`.
-            let mut sink = RowSink::create(path)?;
+            // admitted, so an over-budget result leaves nothing at the path.
             for_each_line(resp.bytes_stream(), &mut budget, |line| {
                 sink.write_row(line)?;
                 Ok(Flow::Continue)
             })
-            .await?;
-            sink.commit()?;
-            tracing::info!(rows = budget.rows_written(), path = %sink.path.display(), "wrote NDJSON");
-            Ok(())
+            .await
         }
     }
 }
@@ -342,15 +372,26 @@ fn emit(
 /// result set, *and* an over-budget statement still leaves **nothing** at the
 /// artifact path — a refusal drops the temp file rather than leaving a partial
 /// artifact to be cleaned up, which is exactly what the budget exists to avoid.
-struct RowSink {
-    path: std::path::PathBuf,
-    tmp: std::path::PathBuf,
-    file: std::io::BufWriter<std::fs::File>,
-    committed: bool,
+pub(crate) struct RowSink {
+    target: SinkTarget,
+    /// Rows written so far.
+    pub(crate) rows: u64,
+}
+
+enum SinkTarget {
+    File {
+        path: std::path::PathBuf,
+        tmp: std::path::PathBuf,
+        file: std::io::BufWriter<std::fs::File>,
+        committed: bool,
+    },
+    /// The parity check's: a few rows it reads back itself, never written
+    /// anywhere. The budget still admits every row before it lands here.
+    Memory(Vec<String>),
 }
 
 impl RowSink {
-    fn create(path: std::path::PathBuf) -> Result<Self> {
+    pub(crate) fn create(path: std::path::PathBuf) -> Result<Self> {
         // A dotfile sibling: the same directory, so the rename is within one
         // filesystem and therefore atomic, and hidden so a collector walking the
         // artifact directory does not pick up a result still being written.
@@ -361,41 +402,76 @@ impl RowSink {
         let tmp = path.with_file_name(format!(".{name}.partial"));
         let file =
             std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-        Ok(RowSink { path, tmp, file: std::io::BufWriter::new(file), committed: false })
+        Ok(RowSink {
+            target: SinkTarget::File { path, tmp, file: std::io::BufWriter::new(file), committed: false },
+            rows: 0,
+        })
+    }
+
+    pub(crate) fn memory() -> Self {
+        RowSink { target: SinkTarget::Memory(Vec::new()), rows: 0 }
     }
 
     /// Write one NDJSON line, adding the newline if the caller's line does not
     /// carry one — the HTTP path copies lines without their terminator, the wire
     /// path re-encodes them with it.
-    fn write_row(&mut self, line: &str) -> Result<()> {
+    pub(crate) fn write_row(&mut self, line: &str) -> Result<()> {
         use std::io::Write;
-        let write = |f: &mut std::io::BufWriter<std::fs::File>| -> std::io::Result<()> {
-            f.write_all(line.as_bytes())?;
-            if !line.ends_with('\n') {
-                f.write_all(b"\n")?;
+        self.rows += 1;
+        match &mut self.target {
+            SinkTarget::File { tmp, file, .. } => {
+                let write = |f: &mut std::io::BufWriter<std::fs::File>| -> std::io::Result<()> {
+                    f.write_all(line.as_bytes())?;
+                    if !line.ends_with('\n') {
+                        f.write_all(b"\n")?;
+                    }
+                    Ok(())
+                };
+                write(file).with_context(|| format!("writing {}", tmp.display()))
             }
-            Ok(())
-        };
-        write(&mut self.file).with_context(|| format!("writing {}", self.tmp.display()))
+            SinkTarget::Memory(lines) => {
+                lines.push(line.trim_end_matches('\n').to_string());
+                Ok(())
+            }
+        }
     }
 
-    fn commit(&mut self) -> Result<()> {
+    pub(crate) fn commit(&mut self) -> Result<()> {
         use std::io::Write;
-        self.file.flush().with_context(|| format!("flushing {}", self.tmp.display()))?;
-        std::fs::rename(&self.tmp, &self.path)
-            .with_context(|| format!("renaming {} into place", self.tmp.display()))?;
-        self.committed = true;
+        let SinkTarget::File { path, tmp, file, committed } = &mut self.target else {
+            return Ok(());
+        };
+        file.flush().with_context(|| format!("flushing {}", tmp.display()))?;
+        std::fs::rename(&*tmp, &*path)
+            .with_context(|| format!("renaming {} into place", tmp.display()))?;
+        *committed = true;
         Ok(())
+    }
+
+    /// Where the rows went, for a log line.
+    pub(crate) fn describe(&self) -> String {
+        match &self.target {
+            SinkTarget::File { path, .. } => path.display().to_string(),
+            SinkTarget::Memory(_) => "memory".into(),
+        }
+    }
+
+    /// The rows a memory sink holds, each one NDJSON line.
+    pub(crate) fn into_lines(self) -> Vec<String> {
+        match &self.target {
+            SinkTarget::Memory(lines) => lines.clone(),
+            SinkTarget::File { .. } => Vec::new(),
+        }
     }
 }
 
 impl Drop for RowSink {
     fn drop(&mut self) {
-        if !self.committed {
+        if let SinkTarget::File { tmp, committed: false, .. } = &self.target {
             // Every error path lands here, a budget refusal included. Leaving the
             // partial file behind would put an over-budget result in the artifact
             // directory under another name.
-            let _ = std::fs::remove_file(&self.tmp);
+            let _ = std::fs::remove_file(tmp);
         }
     }
 }
@@ -416,22 +492,22 @@ fn render(v: &serde_json::Value) -> String {
 /// write only.
 #[cfg(any(feature = "mysql", feature = "postgres"))]
 async fn run_wire(
-    engine: Engine,
-    dsn: &str,
+    settings: &Settings,
     statement: &str,
     mode: Mode,
-    out_path: Option<std::path::PathBuf>,
+    sink: Option<&mut RowSink>,
     mut budget: Budget,
 ) -> Result<()> {
     use futures_util::stream::TryStreamExt;
     use sqlx::Row;
 
+    let engine = settings.engine;
     // The password is applied to the DSN here rather than being carried in it,
-    // which is the whole point of PASSWORD_VAR: the value is masked by name
-    // everywhere it might be printed, and the DSN never holds it.
-    let dsn = match std::env::var(PASSWORD_VAR).ok().filter(|s| !s.is_empty()) {
-        Some(pw) => splice_password(dsn, &pw)?,
-        None => dsn.to_string(),
+    // which is the whole point of the PASSWORD variable: the value is masked by
+    // name everywhere it might be printed, and the DSN never holds it.
+    let dsn = match &settings.password {
+        Some(pw) => splice_password(&settings.dsn, pw, &settings.var("PASSWORD"))?,
+        None => settings.dsn.clone(),
     };
 
     // One connection, one statement, no pool: a step process runs exactly one
@@ -491,17 +567,14 @@ async fn run_wire(
             Ok(())
         }
         Mode::Rows => {
-            let path = out_path.expect("rows mode resolved an artifact path");
-            // Same shape as the HTTP path: admit, write, and only rename into
-            // place once the whole result has been admitted.
-            let mut sink = RowSink::create(path)?;
+            let sink = sink.expect("rows mode passes a sink");
+            // Same shape as the HTTP path: admit, then write. The caller renames
+            // into place only once the whole result has been admitted.
             while let Some(row) = rows.try_next().await.context("running the statement")? {
                 let line = ndjson_line(&to_obj(&row));
                 budget.admit(line.len())?;
                 sink.write_row(&line)?;
             }
-            sink.commit()?;
-            tracing::info!(rows = budget.rows_written(), path = %sink.path.display(), "wrote NDJSON");
             Ok(())
         }
     }
@@ -536,15 +609,15 @@ fn to_obj(row: &sqlx::any::AnyRow) -> serde_json::Map<String, serde_json::Value>
 
 /// Put the password into the DSN's userinfo just before connecting.
 #[cfg(any(feature = "mysql", feature = "postgres"))]
-fn splice_password(dsn: &str, pw: &str) -> Result<String> {
+fn splice_password(dsn: &str, pw: &str, password_var: &str) -> Result<String> {
     let (scheme, rest) = dsn
         .split_once("://")
         .context("SQL_DSN must look like scheme://[user@]host[:port]/db")?;
     let (userinfo, host) = match rest.split_once('@') {
         Some((u, h)) => (u.to_string(), h.to_string()),
         None => bail!(
-            "SQL_DSN names no user, so there is nowhere to apply {PASSWORD_VAR}. Write \
-             scheme://user@host/db and keep the password in {PASSWORD_VAR}."
+            "the DSN names no user, so there is nowhere to apply {password_var}. Write \
+             scheme://user@host/db and keep the password in {password_var}."
         ),
     };
     // Percent-encode the delimiters that would otherwise re-parse the DSN.
@@ -572,13 +645,13 @@ fn splice_password(dsn: &str, pw: &str) -> Result<String> {
 
 #[cfg(not(any(feature = "mysql", feature = "postgres")))]
 async fn run_wire(
-    engine: Engine,
-    _dsn: &str,
+    settings: &Settings,
     _statement: &str,
     _mode: Mode,
-    _out_path: Option<std::path::PathBuf>,
+    _sink: Option<&mut RowSink>,
     _budget: Budget,
 ) -> Result<()> {
+    let engine = settings.engine;
     bail!(
         "SQL_ENGINE={engine:?} speaks a wire protocol this binary was not built with. Rebuild \
          with `--features mysql` (StarRocks, Doris, MySQL) or `--features postgres` (Postgres, \

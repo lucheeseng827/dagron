@@ -3,11 +3,13 @@
 //! retries, and so learns nothing of.
 //!
 //! **What a flake is.** The look that sees a run end asks the engine, for
-//! each job that passed on a later attempt, how each attempt before it in
-//! the same life ended (`GET /api/runs/{id}/tasks/{tid}/attempts`): one that
-//! ended `failed` makes the job a flake. A `repeat:` task's earlier passes
-//! end otherwise, and are not one; and a cell that keeps no attempts
-//! (`DAGRON_ATTEMPT_LOG_BYTES=0`) says of none.
+//! each job that passed on a later attempt, or passed in a run that was
+//! rerun, how each attempt before it ended
+//! (`GET /api/runs/{id}/tasks/{tid}/attempts`): one the engine retried after
+//! it failed, or one that failed and a person reran, makes the job a flake.
+//! The same commit failed and then passed, so neither proved anything. A
+//! `repeat:` task's earlier passes end otherwise, and are not one; and a
+//! cell that keeps no attempts (`DAGRON_ATTEMPT_LOG_BYTES=0`) says of none.
 //!
 //! **Whose.** A trusted run's alone, and no patch bundle's: what a stranger
 //! wrote files nothing on the repository. Each is kept once a run, with the
@@ -33,7 +35,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::comment::{cell, code};
-use super::{pipeline_name, Job, Reporter, Seen, BACKOFF, EVERY};
+use super::{pipeline_name, Reporter, Seen, BACKOFF, EVERY};
 use crate::db::{CommentWrite, DueFlakeIssue, DueReport, FlakeRow, Flakes};
 use crate::forge::{Issued, StatusError};
 
@@ -74,22 +76,33 @@ struct Attempts {
     attempts: Vec<Attempt>,
 }
 
+/// One attempt before the last: why it was not the last (`failed`, an engine
+/// retry; `rerun`, the last of a life a person reran; `iteration`, a
+/// `repeat:` pass), and how it ended.
 #[derive(Deserialize)]
 struct Attempt {
     attempt: i64,
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
 }
 
-/// How many attempts of `job` failed before the one it passed on, in its
-/// life since it was last rerun: `attempts` numbers them across its lives.
-fn failed_before(job: &Job, attempts: &Attempts) -> i64 {
-    let life = attempts.current_attempt - job.attempt;
+/// How many attempts of a job failed before the one it passed on, in this
+/// life or one before it: the engine retried it, or a person reran it.
+/// `attempts` numbers them across its lives. A life that ended in a pass,
+/// and was rerun whole, did not fail; and its retries, where it had some,
+/// made that run's flake when it ended, which is kept once a run.
+fn failed_before(attempts: &Attempts) -> i64 {
     attempts
         .attempts
         .iter()
-        .filter(|a| a.attempt > life && a.attempt < attempts.current_attempt)
-        .filter(|a| a.reason.as_deref() == Some("failed"))
+        .filter(|a| a.attempt < attempts.current_attempt)
+        .filter(|a| match a.reason.as_deref() {
+            Some("failed") => true,
+            Some("rerun") => a.status.as_deref() == Some("failed"),
+            _ => false,
+        })
         .count() as i64
 }
 
@@ -203,15 +216,18 @@ impl Reporter {
             return None;
         }
         let mut jobs = Vec::new();
-        let later = seen
-            .jobs
-            .iter()
-            .filter(|job| job.status == "succeeded" && job.attempt > 1 && !job.id.is_empty());
+        // A rerun starts a job's attempts again from 1: in a run that was
+        // rerun, a job that passed on its first attempt of this life may
+        // have failed in the one before it.
+        let rerun = due.reopens > 0;
+        let later = seen.jobs.iter().filter(|job| {
+            job.status == "succeeded" && (job.attempt > 1 || rerun) && !job.id.is_empty()
+        });
         for job in later.take(READS_MAX) {
             let url = format!("{base}/api/runs/{}/tasks/{}/attempts", due.run_id, job.id);
             match self.get::<Attempts>(&url).await {
                 Ok(Some(attempts)) => {
-                    let failed = failed_before(job, &attempts);
+                    let failed = failed_before(&attempts);
                     if failed > 0 {
                         jobs.push((job.name.clone(), failed));
                     }
@@ -335,50 +351,61 @@ mod tests {
     use super::*;
     use crate::db::Repo;
 
-    fn job(attempt: i64) -> Job {
-        Job {
-            id: "t-1".into(),
-            name: "test".into(),
-            status: "succeeded".into(),
-            attempt,
-        }
-    }
-
-    fn attempts(current: i64, ended: &[(i64, &str)]) -> Attempts {
+    /// Attempts before the current one: each its number, why it was not the
+    /// last, and how it ended.
+    fn attempts(current: i64, ended: &[(i64, &str, &str)]) -> Attempts {
         Attempts {
             current_attempt: current,
             attempts: ended
                 .iter()
-                .map(|(attempt, reason)| Attempt {
+                .map(|(attempt, reason, status)| Attempt {
                     attempt: *attempt,
                     reason: Some(reason.to_string()),
+                    status: Some(status.to_string()),
                 })
                 .collect(),
         }
     }
 
-    /// A retry that failed makes a flake; a `repeat:` pass, or an attempt
-    /// of a life before the job was rerun, does not.
+    /// A retry that failed makes a flake, and so does a life that failed and
+    /// a person reran; a `repeat:` pass, a life that passed and was rerun
+    /// whole, or one that was cancelled, does not.
     #[test]
-    fn a_flake_is_a_failed_attempt_before_the_pass_in_the_same_life() {
+    fn a_flake_is_a_failed_attempt_before_the_pass_retried_or_rerun() {
         assert_eq!(
-            failed_before(&job(3), &attempts(3, &[(1, "failed"), (2, "failed")])),
+            failed_before(&attempts(
+                3,
+                &[(1, "failed", "failed"), (2, "failed", "failed")]
+            )),
             2
         );
         assert_eq!(
-            failed_before(&job(3), &attempts(3, &[(1, "iteration"), (2, "iteration")])),
+            failed_before(&attempts(
+                3,
+                &[(1, "iteration", "succeeded"), (2, "iteration", "succeeded")]
+            )),
             0
         );
-        // Rerun after two attempts: this life began at 3, and is on its 2nd.
+        // Failed, and a person reran it: it passed on the rerun.
+        assert_eq!(failed_before(&attempts(2, &[(1, "rerun", "failed")])), 1);
+        // Retried once, failed again, rerun, retried once more, then passed.
         assert_eq!(
-            failed_before(
-                &job(2),
-                &attempts(4, &[(1, "failed"), (2, "rerun"), (3, "failed")])
-            ),
-            1
+            failed_before(&attempts(
+                4,
+                &[
+                    (1, "failed", "failed"),
+                    (2, "rerun", "failed"),
+                    (3, "failed", "failed")
+                ]
+            )),
+            3
         );
+        // Passed, and the run was rerun whole: no failure.
+        assert_eq!(failed_before(&attempts(2, &[(1, "rerun", "succeeded")])), 0);
+        // Cancelled, and rerun: no failure.
+        assert_eq!(failed_before(&attempts(2, &[(1, "rerun", "cancelled")])), 0);
         // Kept no attempts: none is known to have failed.
-        assert_eq!(failed_before(&job(2), &attempts(2, &[])), 0);
+        assert_eq!(failed_before(&attempts(2, &[])), 0);
     }
 
     fn due() -> DueFlakeIssue {

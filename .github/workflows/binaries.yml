@@ -45,8 +45,8 @@ jobs:
     # Job-level and an expression, on purpose: a `continue-on-error:` key
     # written inside a matrix entry is just another matrix variable and gates
     # nothing. The cross-compiled leg is the one allowed to fail — no hosted
-    # runner can execute an armv7 binary, so it is the least-verified leg by
-    # construction — and a red armv7 must not strand the four native archives
+    # runner is armv7, so its binary is run under emulation and not on the
+    # hardware it is for — and a red armv7 must not strand the four native archives
     # behind `publish`'s `needs: build` (v0.5.1 shipped zero assets when one
     # leg hung). The four native legs stay required.
     continue-on-error: ${{ matrix.cross == true }}
@@ -68,10 +68,11 @@ jobs:
           # gateways (i.MX6/7, AM335x, a Raspberry Pi running a 32-bit OS) that
           # an arm64 binary cannot run on. There is no GitHub-hosted armv7
           # runner, so unlike every other leg this one is CROSS-COMPILED on
-          # x86_64 with the musl.cc toolchain and cannot execute its own
-          # output. `cross: true` is what the toolchain step keys on, what the
-          # smoke test is skipped by, and what the job's `continue-on-error`
-          # reads — it is a matrix variable, not an Actions keyword.
+          # x86_64 with Zig as its C compiler and linker, and smoke-tested under
+          # qemu. `cross: true` is what the toolchain step keys on, what the
+          # build and the smoke test run differently by, and what the job's
+          # `continue-on-error` reads — it is a matrix variable, not an
+          # Actions keyword.
           - target: armv7-unknown-linux-musleabihf
             runner: ubuntu-latest
             archive: tar.gz
@@ -113,30 +114,27 @@ jobs:
 
       # armv7 cross toolchain. A Rust target alone is not enough: two crates in
       # `dagron`'s graph compile C — libsqlite3-sys (the bundled SQLite) and
-      # ring (the crypto under rustls) — so the leg needs an ARM C compiler and
-      # archiver, which musl.cc's prebuilt `arm-linux-musleabihf-cross` provides.
-      # The three exported variables are the whole wiring: cargo reads the
-      # `CARGO_TARGET_<TRIPLE>_LINKER`, the `cc` crate reads `CC_<triple>` /
-      # `AR_<triple>` (underscored) when it compiles those C files.
+      # ring (the crypto under rustls) — so the leg needs an ARM C compiler,
+      # archiver and musl libc. cargo-zigbuild gives it all three, from Zig,
+      # which carries musl for every target it compiles for: `cargo zigbuild`
+      # in place of `cargo build` is the whole wiring.
       #
-      # The tarball is pinned by sha256 the way the actions above are pinned by
-      # commit: a toolchain fetched over HTTPS from a third party is build input.
-      # Whether this whole leg links and produces a working binary is UNVERIFIED
-      # until the first tag runs it — it cannot be exercised where this file was
-      # written — which is one more reason it is the leg allowed to fail.
-      - name: armv7 cross toolchain (musl.cc)
+      # Not musl.cc's prebuilt toolchain, which this leg used before: that host
+      # never answers GitHub's runners (v0.11.0's leg timed out twice), so no
+      # release had an armv7 archive. Zig comes from PyPI and cargo-zigbuild
+      # from crates.io, both of which the other legs already depend on. The
+      # wheel is pinned by sha256 and the crate by version and lockfile: a
+      # toolchain is build input. qemu-user, from Ubuntu's archive, is for the
+      # smoke test.
+      - name: armv7 cross toolchain (Zig)
         if: matrix.cross
         run: |
           set -euo pipefail
-          curl -fsSL --retry 3 https://musl.cc/arm-linux-musleabihf-cross.tgz -o /tmp/armv7-cross.tgz
-          echo "11e155a090789c854afb5d91e57c81f441ccdb92f7f277789c3a6d5884a68e58  /tmp/armv7-cross.tgz" | sha256sum -c -
-          sudo tar -C /opt -xzf /tmp/armv7-cross.tgz
-          echo "/opt/arm-linux-musleabihf-cross/bin" >> "$GITHUB_PATH"
-          {
-            echo "CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER=arm-linux-musleabihf-gcc"
-            echo "CC_armv7_unknown_linux_musleabihf=arm-linux-musleabihf-gcc"
-            echo "AR_armv7_unknown_linux_musleabihf=arm-linux-musleabihf-ar"
-          } >> "$GITHUB_ENV"
+          echo "ziglang==0.13.0.post1 --hash=sha256:5ff0f2cb0d583b4f94820909612043f62e4d1d9a8bed77ceec088a01fc2ef015" > /tmp/zig.txt
+          python3 -m pip install --user --break-system-packages --only-binary :all: --require-hashes -r /tmp/zig.txt
+          python3 -m ziglang version
+          cargo install cargo-zigbuild --locked --version 0.20.1
+          sudo apt-get update && sudo apt-get install -y qemu-user
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -158,7 +156,7 @@ jobs:
       - name: Build
         env:
           APP_VERSION: ${{ steps.appver.outputs.version }}
-        run: cargo build --release --locked --bin dagron --target ${{ matrix.target }}
+        run: cargo ${{ matrix.cross && 'zigbuild' || 'build' }} --release --locked --bin dagron --target ${{ matrix.target }}
       # The step runner goes into whatever image a CI task uses, so it is
       # static: musl, x86_64 and arm64, each built natively like `dagron`.
       - name: Build dagron-ci-exec
@@ -213,14 +211,14 @@ jobs:
       # The four native legs can do this — ubuntu-latest and windows-latest are
       # x86_64, macos-latest and ubuntu-24.04-arm are arm64 — so each of those
       # runners executes what it just built. The armv7 leg cannot: it is
-      # cross-compiled on x86_64, so this step is skipped there and that archive
-      # ships having only linked, not run. Executing it under user-mode qemu
-      # (`qemu-arm-static` + binfmt) is the next step, and is not done here.
+      # cross-compiled on x86_64, so it runs its binary under user-mode qemu.
+      # The binary is static, so `qemu-arm` runs it with no ARM libraries and
+      # no binfmt registration.
       - name: Smoke test
-        if: ${{ !matrix.cross }}
         shell: bash
         env:
           APP_VERSION: ${{ steps.appver.outputs.version }}
+          RUN: ${{ matrix.cross && 'qemu-arm' || '' }}
         run: |
           set -euo pipefail
           bin="target/${{ matrix.target }}/release/dagron"
@@ -228,14 +226,14 @@ jobs:
           # test would end the step, which is every non-Windows target.
           if [ -f "$bin.exe" ]; then bin="$bin.exe"; fi
           # It says which release it is, on one line, and starts nothing.
-          said=$("$bin" --version | tr -d '\r')
+          said=$($RUN "$bin" --version | tr -d '\r')
           if [ "$said" != "dagron $APP_VERSION" ]; then
             echo "::error::--version says '$said', not 'dagron $APP_VERSION'"
             exit 1
           fi
           # `validate` parses, expands and graph-checks a spec with no server
           # and no network — the cheapest end-to-end proof the binary runs.
-          "$bin" validate examples/simple_dag.yaml
+          $RUN "$bin" validate examples/simple_dag.yaml
           echo "smoke test passed for ${{ matrix.target }}"
       # It says which release it is, and on musl it is static: it is copied
       # onto hosts and into images that have nothing else.

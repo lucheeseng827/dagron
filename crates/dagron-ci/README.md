@@ -372,7 +372,7 @@ stops the process with a message naming it.
 | `CI_EVENT_MAX_ATTEMPTS` | `8` | Attempts at an event before it is left failed |
 | `CI_EVENT_WORKERS` | `8` | Event workers in this replica; `0` runs the receivers alone |
 | `CI_FLAKE_DAYS` | `14` | How many days back a job's flakes are counted for `CI_FLAKE_ISSUES`, and kept (1 to 90) |
-| `CI_FLAKE_ISSUES` | `off` | A number N files an issue of a job of a trusted run that passed only after an attempt of it failed, N times within `CI_FLAKE_DAYS`, and writes it again in place as it flakes again: with the App's token for `issues: write` alone, or the GitLab host's (`CI_GITLAB_TOKENS_DIR`). Needs one of them. `off` keeps no flake ([A flaky job's issue](#a-flaky-jobs-issue)) |
+| `CI_FLAKE_ISSUES` | `off` | A number N files an issue of a job of a trusted run that passed only after an attempt of it failed (retried by the engine, or rerun by a person), N times within `CI_FLAKE_DAYS`, and writes it again in place as it flakes again: with the App's token for `issues: write` alone, or the GitLab host's (`CI_GITLAB_TOKENS_DIR`). Needs one of them. `off` keeps no flake ([A flaky job's issue](#a-flaky-jobs-issue)) |
 | `CI_FLEET_ENVIRONMENT` | `dagron-ci-fleet` | The environment, in each cell's dagron-api, that a fleet runner's configuration is kept in as a secret while the runner is out. Made where a cell has none of the name ([Fleet mode](#fleet-mode)) |
 | `CI_FLEET_UNTRUSTED_ENVIRONMENT` | `dagron-ci-fleet-untrusted` | The same, of a runner started for a fork's job (a label's `untrusted: floor`), whose run is not trusted. Made where a cell has none, and given a policy that admits such runs of the fleet's, where it has none and dagron-ci's token may write one. Not `CI_FLEET_ENVIRONMENT`'s ([Fleet mode](#fleet-mode)) |
 | `CI_FORK_APPROVAL` | `first-time` | With `CI_FORK_PRS=untrusted`, which such pull requests wait for an approval before anything of them is run: `first-time` (their author has no commit in the repository), `always`, or `never` |
@@ -945,12 +945,15 @@ issue of its repository, which lists each time:
 ```
 
 **What a flake is.** The look that sees a run end asks its cell, for each
-job that passed on a later attempt, how the attempts before it ended
-(`GET /api/runs/{id}/tasks/{tid}/attempts`): one that ended `failed` (a
-retry, by `max_attempts` or `retry_budgets`) makes the job a flake of that
-run. A `repeat:` task's earlier passes are not failures, and a job rerun
-by a person starts a life of its own. A cell that keeps no attempts
-(`DAGRON_ATTEMPT_LOG_BYTES=0`) says of none, and none is counted.
+job that passed on a later attempt, or passed in a run that was rerun, how
+the attempts before it ended (`GET /api/runs/{id}/tasks/{tid}/attempts`).
+Either of two makes the job a flake of that run: one the engine retried
+after it failed (`max_attempts`, `retry_budgets`), or one that failed and a
+person reran (`dagron-ci rerun`, a check's Re-run, the console). The same
+commit failed and then passed, so neither result proved anything. A
+`repeat:` task's earlier passes are not failures, nor is a job that passed
+and was rerun whole, or one that was cancelled and rerun. A cell that keeps
+no attempts (`DAGRON_ATTEMPT_LOG_BYTES=0`) says of none, and none is counted.
 
 **Whose.** A trusted run's alone, and no patch bundle's: what a stranger
 wrote never files an issue of the repository. Each job's flake is kept

@@ -33,6 +33,9 @@ stay queued. The settings that make it of use:
 | `CI_GITHUB_WEBHOOK_SECRET_FILE` | unset (the receiver answers 404) | File holding the GitHub webhook's secret. |
 | `CI_GITHUB_APP_ID`, `CI_GITHUB_APP_KEY_FILE` | unset | A GitHub App: each repository's calls, and each checkout, get a token for that repository alone. |
 | `CI_GITHUB_TOKEN_FILE` | unset | A GitHub token, for the repositories no App is installed on. |
+| `CI_POLL_SECS` | `60` | How often each connected repository is looked at, for a forge that sends no webhook. |
+| `CI_GITHUB_CHECKS` | `off` | `on`: each job is a check run (with the App's `checks: write`). GitHub's Re-run button on one reruns it only where GitHub's webhook reaches dagron-ci: polling does not see it. |
+| `CI_GITHUB_PR_COMMENT` | `off` | `on`: one comment on each pull request, edited in place as its runs go (with the App's `pull_requests: write`). |
 | `CI_LISTEN` | `0.0.0.0:8090` | HTTP listen address. |
 | `RUST_LOG` | `info` | Log level. |
 
@@ -41,8 +44,20 @@ start. The full list is in `crates/dagron-ci/README.md` in the source.
 
 ## Tags
 
-`latest`, each release's version and its floating minor, from the first release
-that carries this image (the one after 0.11.0).
+| Tag | Meaning |
+|---|---|
+| `latest` | newest stable release |
+| `0.11.0` | pinned version (= current `latest`) |
+| `0.11` | floating minor: newest `0.11.x` |
+
+First published with 0.11.0. Run it with the engine and `dagron-api` of the
+same release, and point the engine's `DAGRON_CI_EXEC_IMAGE` at
+[`mancube/dagron-ci-exec`](https://hub.docker.com/r/mancube/dagron-ci-exec)
+of that release too.
+
+The quickest way to see it work is the source's `compose.ci.yaml`: the whole
+stack on one machine, with a GitHub App and no public address (dagron-ci polls
+your repositories). `docs/CI_QUICKSTART.md` walks through it.
 
 ## Quick start
 

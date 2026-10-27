@@ -3707,3 +3707,41 @@ async fn a_job_that_keeps_flaking_is_filed_one_issue_on_postgres() {
     db.close().await;
     drop_schema(&admin, &schema).await;
 }
+
+/// A job that failed, and passed when a person reran the run, is a flake:
+/// the rerun starts its attempts again from 1, so its pass is on its first
+/// attempt of that life, and the failure is in the life before it.
+#[tokio::test]
+async fn a_job_that_failed_and_passed_on_a_person_s_rerun_is_a_flake() {
+    let (db, _dir) = sqlite().await;
+    let (origin, st) = stub().await;
+    let Some(reporter) = reporter_with_flakes(&db, &origin) else {
+        return;
+    };
+    recorded(&db, "run-1").await;
+    set_run_at(
+        &st,
+        "run-1",
+        &[("build", "succeeded", 1), ("test", "failed", 1)],
+        Some("failed"),
+    );
+    assert!(reporter.report_one("a").await.unwrap());
+    assert_eq!(flake_count(&db).await, 0, "a failure alone is no flake");
+
+    assert!(db.reopen_run("run-1", Duration::ZERO, None).await.unwrap());
+    set_run_at(
+        &st,
+        "run-1",
+        &[("build", "succeeded", 1), ("test", "succeeded", 1)],
+        Some("succeeded"),
+    );
+    st.lock().unwrap().attempts.insert(
+        "t-test".into(),
+        json!({
+            "current_attempt": 2,
+            "attempts": [{ "attempt": 1, "reason": "rerun", "status": "failed" }]
+        }),
+    );
+    assert!(reporter.report_one("a").await.unwrap());
+    assert_eq!(flake_count(&db).await, 1, "test flaked on the rerun");
+}

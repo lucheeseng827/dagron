@@ -131,10 +131,12 @@ mounts it at `/api/state`.
 
 | Route | In dagron | What it does |
 |---|---|---|
-| `GET /contract` | `/api/state/contract` | The wire contract revision this build reads |
+| `GET /contract` | `/api/state/contract` | The wire contract revision this build reads, and the move contract (`move_contract`) |
 | `POST /plans` | `/api/state/plans` | Compile a plan → workflow YAML. Submits nothing. |
 | `POST /plans/explain` | `/api/state/plans/explain` | Why each model rebuilds: summary, rows, markdown, Mermaid |
 | `POST /plans/submit` | `/api/state/plans/submit` | Compile, then submit as a run |
+| `POST /moves` | `/api/state/moves` | Compile a warehouse move → workflow YAML. Submits nothing. See [Warehouse moves](#warehouse-moves) |
+| `POST /moves/submit` | `/api/state/moves/submit` | Compile a move, then submit it as a run |
 
 `POST /plans` and `POST /plans/explain` are the explainability surface: *what would
 this SQL change rebuild, and as what run graph* — with no side effects. It is the
@@ -336,8 +338,11 @@ This crate still writes no SQL. It carries the planner's statements onto the tas
   explanation says which dialect the plan was rendered for.
 
 The executor that pairs with it is [`dagron-step-sql`](../dagron-step-sql/)'s
-`script` mode, which runs the statements in order on one session. Pass the script
-through the env, where no shell quotes it:
+`script` mode, which runs the statements in order on one session. It runs every
+dialect the planner renders: `postgres` and `redshift` on the Postgres wire, and
+`snowflake`, `bigquery` and `databricks` through their statement APIs. A dialect's
+name is its `SQL_ENGINE`, so `"SQL_ENGINE": "{{ dialect }}"` follows the plan. Pass
+the script through the env, where no shell quotes it:
 
 ```sh
 freshet plan --project ./models --state .planner/state.json --sql postgres --json \
@@ -353,6 +358,59 @@ freshet plan --project ./models --state .planner/state.json --sql postgres --jso
 A partition restatement is the same shape: `freshet restate … --sql postgres --json`
 renders a replace that names exactly the partitions being restated on both sides —
 the rows it deletes and the rows it inserts — so nothing outside them is touched.
+
+## Warehouse moves
+
+`freshet move --json` is Freshet's other document beside the plan (contract
+`freshet-move/1`, separate from the plan contract on purpose): a move of a warehouse
+to another, partition by partition, through Parquet on a stage. Each **unit** is one
+partition of one model (or one whole relation), and compiles to three tasks:
+
+```text
+<unit>__unload  ──►  <unit>__load  ──►  <unit>__parity
+dagron-step-sql      dagron-step-sql    dagron-step-sql parity
+(SQL_ENGINE: the     (the target, or    (both stores; exit 2 when the
+ source, or duckdb)   duckdb)            partition is not shown equal)
+```
+
+**Units do not wait on one another**: a copy reads a relation's stored rows, not a
+model's SQL, so the run is as wide as dagron's concurrency allows. A failure retries
+one partition, and the cut-over is decided on the parity tasks: every one green is
+every partition shown equal.
+
+**The move names no host and holds no credential**, and this crate adds none. It
+sets what only the move knows (`SQL_ENGINE`, `SQL_MODE=script`, `SQL_STATEMENT`, and
+each parity side's `ENGINE`, `SCHEMA`, `TABLE`, `RELATION`, `WHERE`) and refuses
+options that set them too. The connections are yours, per kind of task:
+
+```sh
+freshet move --project ./models --from postgres --to snowflake \
+    --stage s3://acme-moves/2026-10/ --from-schema public --to-schema ANALYTICS.MARTS \
+    --storage-integration FRESHET_STAGE --partitions 2026-06-01..2026-06-30 --json \
+  | jq '{move: ., options: {
+      unload: {env: {SQL_DSN: ":memory:", PGHOST: "old-warehouse", PGDATABASE: "analytics", PGUSER: "etl"},
+               secret_env: {SQL_PASSWORD: "OLD_WAREHOUSE_PASSWORD"}},
+      load:   {env: {SQL_DSN: "https://acme.snowflakecomputing.com/?warehouse=LOAD"},
+               secret_env: {SQL_PASSWORD: "SNOWFLAKE_PAT"}},
+      parity: {env: {PARITY_SOURCE_DSN: "postgresql://reader@old-warehouse/analytics",
+                     PARITY_TARGET_DSN: "https://acme.snowflakecomputing.com/?warehouse=CHECK"},
+               secret_env: {PARITY_SOURCE_PASSWORD: "OLD_WAREHOUSE_PASSWORD",
+                            PARITY_TARGET_PASSWORD: "SNOWFLAKE_PAT"}}}}' \
+  | curl -sS -X POST http://localhost:8080/api/state/moves/submit \
+      -H 'content-type: application/json' -H "authorization: Bearer $DAGRON_TOKEN" -d @-
+```
+
+`env` values expand `{{ model }}`, `{{ partition }}` and `{{ location }}` per unit;
+`secret_env` maps a variable to a dagron secret, resolved at dispatch. A Postgres side
+runs through DuckDB (`SQL_ENGINE=duckdb`), which reaches the database through libpq's
+`PG*` environment, so the unload and load tasks carry those, and the image they run
+in carries the DuckDB CLI. The stage's own credentials (an AWS role, `AWS_*`) go in
+the same `env`/`secret_env`.
+
+`check_only: true` compiles just the parity tasks, for the side-by-side period: both
+warehouses already rebuild the partition from their own plans, and the question is
+whether they still agree. `sql_command` and `parity_command` override the argv.
+Offline, `dagron-state move <move.json|->` prints the YAML (`--json` prints the same spec as JSON).
 
 ## Dependency edges
 

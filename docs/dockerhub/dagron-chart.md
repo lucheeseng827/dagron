@@ -12,12 +12,12 @@ A Helm chart published as an **OCI artifact**. It wires the dagron images togeth
 
 | Version | Notes |
 |---|---|
-| `0.10.0` | pulls the `0.10.0` images |
+| `0.11.0` | pulls the `0.11.0` images |
 
 ## Install
 
 ```bash
-helm install dagron oci://registry-1.docker.io/mancube/dagron --version 0.10.0 \
+helm install dagron oci://registry-1.docker.io/mancube/dagron --version 0.11.0 \
   -n dagron --create-namespace \
   --set ingress.enabled=true --set-string ingress.host='dagron.your-host.example.com' \
   --set ingress.tls.enabled=true --set-string ingress.tls.secretName='dagron-tls' \
@@ -28,19 +28,19 @@ helm install dagron oci://registry-1.docker.io/mancube/dagron --version 0.10.0 \
 Inspect first:
 
 ```bash
-helm show values oci://registry-1.docker.io/mancube/dagron --version 0.10.0
-helm template dagron oci://registry-1.docker.io/mancube/dagron --version 0.10.0   # render without installing
+helm show values oci://registry-1.docker.io/mancube/dagron --version 0.11.0
+helm template dagron oci://registry-1.docker.io/mancube/dagron --version 0.11.0   # render without installing
 ```
 
 ## Common values
 
 | Value | Meaning |
 |---|---|
-| `engine.image` / `dagronApi.image` | image refs (default the matching `0.10.0` tags). `frontend.image` is pinned to `0.8.1` and off by default — the console ships in `dagron-api`. |
+| `engine.image` / `dagronApi.image` | image refs (default the matching `0.11.0` tags). `frontend.image` is pinned to `0.8.1` and off by default — the console ships in `dagron-api`. |
 | `dagronApi.jwtSecret` | **required** — session-cookie signing key (≥32 chars). |
 | `dagronApi.admin.{email,password,name}` | bootstrap admin user. |
 | `ingress.*` | host + TLS for the console. |
-| `ci.enabled` | `true` deploys `dagron-ci`, the CI service (from the release after 0.11.0), as a container in the engine's pod. Its secrets come from Secrets you name under `ci`. |
+| `ci.enabled` | `true` deploys `dagron-ci`, the CI service (from 0.11.0), as a container in the engine's pod. Its secrets come from Secrets you name under `ci`. |
 | `ci.placement` | `engine` (the default): in the engine's pod, where a private repository's checkout is given its credential. `deployment`: a Deployment of its own, for public repositories. |
 | `postgres.enabled` | `true` deploys a **throwaway** in-cluster Postgres (testing only). |
 | `externalDatabaseUrl` | set `postgres.enabled=false` and point at a managed DB for anything real. |

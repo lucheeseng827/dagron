@@ -1794,6 +1794,7 @@ name = "dagron-step-sql"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "dagron-logging",
  "futures-util",
  "reqwest 0.12.28",

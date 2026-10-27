@@ -65,8 +65,8 @@ image ships `openssh-client` for the SSH transport.
 | Tag | Notes |
 |---|---|
 | `latest` | newest release |
-| `0.10.0` | pinned version (= current `latest`) |
-| `0.10` | floating minor — newest `0.10.x` |
+| `0.11.0` | pinned version (= current `latest`) |
+| `0.11` | floating minor — newest `0.11.x` |
 
 ## Quick start
 

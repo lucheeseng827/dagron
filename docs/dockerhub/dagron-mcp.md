@@ -33,8 +33,8 @@ rises — so a client with a 60 s request timeout can still use it.
 | Tag | Notes |
 |---|---|
 | `latest` | newest release |
-| `0.10.0` | pinned version (= current `latest`) |
-| `0.10` | floating minor — newest `0.10.x` |
+| `0.11.0` | pinned version (= current `latest`) |
+| `0.11` | floating minor — newest `0.11.x` |
 
 Pin in production — pick the newest published tag rather than copying a version
 from this page, which ages.

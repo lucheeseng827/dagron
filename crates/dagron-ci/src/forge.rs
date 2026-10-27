@@ -4472,7 +4472,11 @@ pub(crate) mod tests {
             "nothing was asked as nobody"
         );
         assert!(forge.has_token(&widgets), "nor is it said to have none");
-        assert_eq!(mints(&gh), 1, "and GitHub is not asked again at once");
+        assert_eq!(
+            mints(&gh),
+            crate::checkout::MINT_SENDS as usize,
+            "one mint's sends, and GitHub is not asked again at once"
+        );
 
         // With a token to fall back on, the token makes the call.
         let (origin, gh) = stub_github().await;

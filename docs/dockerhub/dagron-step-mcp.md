@@ -17,7 +17,7 @@ So you usually do **not** deploy this image. You copy the binary into whatever i
 
 ```dockerfile
 FROM your-task-image:1.2.3
-COPY --from=mancube/dagron-step-mcp:0.10 \
+COPY --from=mancube/dagron-step-mcp:0.11 \
      /usr/local/bin/dagron-step-mcp /usr/local/bin/dagron-step-mcp
 ```
 
@@ -61,7 +61,7 @@ Secrets resolve at dispatch and are masked in task output.
 | Tag | Notes |
 |---|---|
 | `latest` | newest release |
-| `0.10` | floating minor — newest `0.10.x` |
+| `0.11` | floating minor — newest `0.11.x` |
 
 Pin in production — pick the newest published tag rather than copying a version from this page, which ages.
 

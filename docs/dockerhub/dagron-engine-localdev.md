@@ -17,8 +17,8 @@ Reach for the distroless [`mancube/dagron-engine`](https://hub.docker.com/r/manc
 | Tag | Notes |
 |---|---|
 | `latest` | newest release |
-| `0.10.0` | pinned version (= current `latest`) |
-| `0.10` | floating minor — newest `0.10.x` |
+| `0.11.0` | pinned version (= current `latest`) |
+| `0.11` | floating minor — newest `0.11.x` |
 
 ## Run
 
@@ -37,7 +37,7 @@ docker run \
   -e API_ADDR=0.0.0.0:8787 \
   -e EXECUTOR=local \
   -v dagron-workflows:/workflows \
-  mancube/dagron-engine-localdev:0.10.0 /workflows/simple_dag.yaml
+  mancube/dagron-engine-localdev:0.11.0 /workflows/simple_dag.yaml
 ```
 
 Setting `DAG_PATH` in the environment does nothing: the binary never reads it, falls back to a built-in default that does not exist in the image, and logs `cannot read DAG file` on every boot.
@@ -48,7 +48,7 @@ Set `SOURCE=dir` to make it a live inbox instead — every `*.yaml`/`*.yml` in t
 
 ## Configuration (env)
 
-Identical to [`mancube/dagron-engine`](https://hub.docker.com/r/mancube/dagron-engine); the two images differ only in base layer. Built with `FEATURES=postgres,ops,kubernetes`, and in releases after 0.11.0 with `otel,archive-s3,archive-gcs,archive-azure` as well, as that image is.
+Identical to [`mancube/dagron-engine`](https://hub.docker.com/r/mancube/dagron-engine); the two images differ only in base layer. Built with `FEATURES=postgres,ops,kubernetes`, and from 0.11.0 with `otel,archive-s3,archive-gcs,archive-azure` as well, as that image is.
 
 | Var | Meaning |
 |---|---|

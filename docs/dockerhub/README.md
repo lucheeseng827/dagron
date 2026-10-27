@@ -57,18 +57,21 @@ along that path.
 | [`mancube/dagron-step-mcp`](https://hub.docker.com/r/mancube/dagron-step-mcp) | [`dagron-step-mcp.md`](./dagron-step-mcp.md) | MCP-tool *step* (drive an agent's tools from a DAG) — a task binary, usually `COPY --from`'d into your task's image |
 | [`mancube/dagron-step-spark`](https://hub.docker.com/r/mancube/dagron-step-spark) | [`dagron-step-spark.md`](./dagron-step-spark.md) | Spark *step* (submit a job, hand back its id, park on it) — a task binary |
 | [`mancube/dagron-step-sql`](https://hub.docker.com/r/mancube/dagron-step-sql) | [`dagron-step-sql.md`](./dagron-step-sql.md) | SQL *step* (one statement against an analytical store, bounded result) — a task binary |
-| [`mancube/dagron-ci`](https://hub.docker.com/r/mancube/dagron-ci) | [`dagron-ci.md`](./dagron-ci.md) | the CI service (a forge's events in, runs in dagron-api, commit statuses back); first published with the release after 0.11.0 |
+| [`mancube/dagron-ci`](https://hub.docker.com/r/mancube/dagron-ci) | [`dagron-ci.md`](./dagron-ci.md) | the CI service (a forge's events in, runs in dagron-api, commit statuses back); from 0.11.0 |
+| [`mancube/dagron-ci-exec`](https://hub.docker.com/r/mancube/dagron-ci-exec) | [`dagron-ci-exec.md`](./dagron-ci-exec.md) | a CI job's step runner, put into each job by an init container (`DAGRON_CI_EXEC_IMAGE`); from 0.11.0 |
+| [`mancube/dagron-runner`](https://hub.docker.com/r/mancube/dagron-runner) | [`dagron-runner.md`](./dagron-runner.md) | the remote runner: runs a class of tasks away from the engine, dialling dagron-api; from 0.11.0 |
 | [`mancube/dagron-engine-localdev`](https://hub.docker.com/r/mancube/dagron-engine-localdev) | [`dagron-engine-localdev.md`](./dagron-engine-localdev.md) | the engine on debian-slim — has a shell, so `EXECUTOR=local` tasks resolve |
 | `oci://registry-1.docker.io/mancube/dagron` | [`dagron-chart.md`](./dagron-chart.md) | Helm chart (the full stack) |
 
-All eight images and the chart are published **`linux/amd64` + `linux/arm64`** at
-the release version, the floating minor and `latest` — `0.10.0`, `0.10` and
-`latest` as of 0.10.0.
+All eleven current images and the chart are published **`linux/amd64` + `linux/arm64`** at
+the release version, the floating minor and `latest` — `0.11.0`, `0.11` and
+`latest` as of 0.11.0. (`dagron-frontend` stopped at 0.8.1.)
 
 A new repository is created by its first push, and Docker Hub makes it
 **private** by default. That is why the three step images, first pushed with
 0.9.3, could not be pulled until their repositories were made public on
-2026-10-03. When a release adds an image, make its repository public before
+2026-10-03, and why `dagron-ci`, `dagron-ci-exec` and `dagron-runner`, first
+pushed with 0.11.0, were made public on 2026-10-27. When a release adds an image, make its repository public before
 announcing it, then publish its description with the script below.
 
 Publish them with [`../../scripts/publish-dockerhub-descriptions.py`](../../scripts/publish-dockerhub-descriptions.py)

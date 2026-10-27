@@ -1,13 +1,20 @@
 //! dagron SQL step — run one statement against an analytical store.
 //!
 //! One binary, one statement, per-protocol transports. Named after what people
-//! search for (ClickHouse, StarRocks, Postgres) and implemented against what
-//! actually varies (HTTP, MySQL wire, Postgres wire), because Airflow ran the
-//! per-store-operator experiment and reversed it: `SnowflakeOperator`,
-//! `BigQueryExecuteQueryOperator`, `PostgresOperator` and `TrinoOperator` were
-//! all deprecated in favour of one `SQLExecuteQueryOperator` plus a connection.
-//! Per-store operators rot; generic SQL plus a per-store connection ages.
-//! Maintenance here is bounded by protocol count, not vendor count.
+//! search for (ClickHouse, StarRocks, Postgres, Snowflake) and implemented against
+//! what actually varies (HTTP, MySQL wire, Postgres wire, a vendor's statement
+//! API), because Airflow ran the per-store-operator experiment and reversed it:
+//! `SnowflakeOperator`, `BigQueryExecuteQueryOperator`, `PostgresOperator` and
+//! `TrinoOperator` were all deprecated in favour of one `SQLExecuteQueryOperator`
+//! plus a connection. Per-store operators rot; generic SQL plus a per-store
+//! connection ages. Maintenance here is bounded by protocol count, not vendor
+//! count.
+//!
+//! Snowflake, BigQuery and Databricks test that bound, and are counted against it
+//! honestly. None of them answers on a wire another store shares, so each one's
+//! statement API is a protocol of its own. They share one *shape* (submit, poll a
+//! handle, page the result), so they share one transport and one driver. See
+//! [`statement_api`].
 //!
 //! ## What this actually buys over `command: ["sh","-c","clickhouse-client …"]`
 //!
@@ -81,9 +88,16 @@
 
 use anyhow::{bail, Context, Result};
 
-/// Which wire protocol a store speaks. Vendors are named in the docs and in
-/// [`Engine`]; only these three are implemented, and that is the whole
-/// maintenance bound.
+pub mod parity;
+pub mod settings;
+pub mod statement_api;
+
+pub use settings::Settings;
+pub use statement_api::Api;
+
+/// Which protocol a store speaks. Vendors are named in the docs and in
+/// [`Engine`]; only these are implemented, and that is the whole maintenance
+/// bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
     /// ClickHouse `:8123`, and anything else that speaks the same shape: one
@@ -101,6 +115,12 @@ pub enum Transport {
     MySql,
     /// Postgres, Redshift, Materialize, CockroachDB, Greenplum.
     Postgres,
+    /// A vendor's own statement API over HTTPS: submit, poll the handle, page
+    /// the result. One vendor per [`Api`], because no other store answers on it.
+    Api(Api),
+    /// The DuckDB CLI, as a child process with the script on its stdin. Not a
+    /// store: the engine that reads and writes Parquet for one that cannot.
+    DuckDb,
 }
 
 /// A store, as a person names it.
@@ -112,7 +132,15 @@ pub enum Engine {
     Postgres,
     Redshift,
     MySql,
+    Snowflake,
+    BigQuery,
+    Databricks,
+    DuckDb,
 }
+
+/// Every `SQL_ENGINE` name, for the messages that list them.
+pub(crate) const KNOWN_ENGINES: &str =
+    "clickhouse, starrocks, doris, postgres, redshift, mysql, snowflake, bigquery, databricks, duckdb";
 
 impl Engine {
     pub fn parse(raw: &str) -> Result<Self> {
@@ -123,14 +151,18 @@ impl Engine {
             "postgres" | "postgresql" => Engine::Postgres,
             "redshift" => Engine::Redshift,
             "mysql" => Engine::MySql,
-            "" => bail!("SQL_ENGINE is required (clickhouse, starrocks, doris, postgres, redshift, mysql)"),
+            "snowflake" => Engine::Snowflake,
+            "bigquery" => Engine::BigQuery,
+            "databricks" => Engine::Databricks,
+            "duckdb" => Engine::DuckDb,
+            "" => bail!("SQL_ENGINE is required ({KNOWN_ENGINES})"),
             other => bail!(
-                "unknown SQL_ENGINE '{other}'. Known: clickhouse, starrocks, doris, \
-                 postgres, redshift, mysql. A store not listed here very likely speaks one of \
-                 these three wires already — Redshift is Postgres, Doris is MySQL — so try the \
-                 one it is compatible with rather than waiting for a name. Trino is NOT one of \
-                 them: its /v1/statement protocol needs a nextUri loop this step does not \
-                 implement, so it is refused rather than routed through the ClickHouse path."
+                "unknown SQL_ENGINE '{other}'. Known: {KNOWN_ENGINES}. A store not listed here \
+                 very likely speaks one of the three shared wires already (Redshift is \
+                 Postgres, Doris is MySQL), so try the one it is compatible with rather than \
+                 waiting for a name. Trino is NOT one of them: its /v1/statement protocol is \
+                 its own (a nextUri chain, with state echoed back in headers), so it is \
+                 refused rather than routed through the ClickHouse path."
             ),
         })
     }
@@ -144,6 +176,10 @@ impl Engine {
             Engine::ClickHouse => Transport::Http,
             Engine::StarRocks | Engine::Doris | Engine::MySql => Transport::MySql,
             Engine::Postgres | Engine::Redshift => Transport::Postgres,
+            Engine::Snowflake => Transport::Api(Api::Snowflake),
+            Engine::BigQuery => Transport::Api(Api::BigQuery),
+            Engine::Databricks => Transport::Api(Api::Databricks),
+            Engine::DuckDb => Transport::DuckDb,
         }
     }
 }
@@ -166,7 +202,7 @@ pub enum Mode {
     /// more than one is refused rather than having its first row taken. Without
     /// an `ORDER BY` there is no first row, only whichever the store sent
     /// first, so silently picking it makes a gate depend on an order nothing
-    /// fixed. Both transports read one row past the answer to check.
+    /// fixed. Every transport reads one row past the answer to check.
     Scalar,
     /// Many rows, as NDJSON, into `$DAGRON_ARTIFACTS`. Never stdout.
     Rows,
@@ -175,12 +211,14 @@ pub enum Mode {
     /// which is how a planner recreates a Postgres table (Postgres has no
     /// `CREATE OR REPLACE TABLE`). Nothing to stdout, like `exec`.
     ///
-    /// **Wire transports only.** They send the script as one simple-query message,
-    /// which the store runs statement by statement on the same session — and which
-    /// Postgres runs as a single implicit transaction unless the script manages its
-    /// own. `exec` cannot: it prepares its statement, and a prepared statement holds
-    /// exactly one. ClickHouse's HTTP interface takes one statement per request, so
-    /// a script there is refused rather than cut down to its first statement.
+    /// **Not on ClickHouse.** The wire transports send the script as one
+    /// simple-query message, which the store runs statement by statement on the
+    /// same session — and which Postgres runs as a single implicit transaction
+    /// unless the script manages its own. `exec` cannot: it prepares its statement,
+    /// and a prepared statement holds exactly one. The statement APIs each take a
+    /// script their own way (see [`statement_api`]). ClickHouse's HTTP interface
+    /// takes one statement per request, so a script there is refused rather than
+    /// cut down to its first statement.
     Script,
 }
 
@@ -194,8 +232,8 @@ impl Mode {
             Some(other) => bail!(
                 "unknown SQL_MODE '{other}'. Expected 'exec' (no rows kept), 'scalar' (one \
                  value to stdout, for a `when:` gate), 'rows' (NDJSON into \
-                 $DAGRON_ARTIFACTS), or 'script' (several statements in order, wire \
-                 transports only)."
+                 $DAGRON_ARTIFACTS), or 'script' (several statements in order; not on \
+                 ClickHouse)."
             ),
         }
     }
@@ -385,19 +423,35 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn engines_map_to_the_three_wires_that_actually_exist() {
+    fn engines_map_to_the_transports_that_actually_exist() {
         assert_eq!(Engine::parse("clickhouse").unwrap().transport(), Transport::Http);
         // Trino is deliberately absent: its client protocol is not this one.
         // Accepting the name would route it through the ClickHouse transport.
         assert!(Engine::parse("trino").is_err(), "trino is not implemented, so it is not accepted");
+        assert_eq!(Engine::parse("Snowflake").unwrap().transport(), Transport::Api(Api::Snowflake));
+        assert_eq!(Engine::parse("bigquery").unwrap().transport(), Transport::Api(Api::BigQuery));
+        assert_eq!(Engine::parse("databricks").unwrap().transport(), Transport::Api(Api::Databricks));
         assert_eq!(Engine::parse(" StarRocks ").unwrap().transport(), Transport::MySql);
         assert_eq!(Engine::parse("doris").unwrap().transport(), Transport::MySql);
         assert_eq!(Engine::parse("redshift").unwrap().transport(), Transport::Postgres,
             "Redshift speaks the Postgres wire — which is also why gating it by vendor name \
              would be unenforceable");
-        let e = Engine::parse("snowflake").unwrap_err().to_string();
-        assert!(e.contains("Known:"), "{e}");
+        let e = Engine::parse("oracle").unwrap_err().to_string();
+        assert!(e.contains("Known:") && e.contains("databricks"), "{e}");
         assert!(e.contains("Redshift is Postgres"), "teaches the mapping: {e}");
+    }
+
+    /// Freshet's `--sql` dialects, as `freshet_render::Dialect::as_str` spells them
+    /// (not a dependency here, so the list is copied, and this test is what
+    /// notices when this side drifts from it). Each is an `SQL_ENGINE` with no translation,
+    /// which is what lets dagron-state's `{{ dialect }}` fill `SQL_ENGINE` for any
+    /// plan, and every one of them can run a script.
+    #[test]
+    fn every_dialect_freshet_renders_is_an_engine_that_runs_scripts() {
+        for dialect in ["postgres", "snowflake", "bigquery", "databricks", "redshift"] {
+            let engine = Engine::parse(dialect).unwrap_or_else(|e| panic!("{dialect}: {e}"));
+            assert_ne!(engine.transport(), Transport::Http, "{dialect}: ClickHouse's HTTP refuses scripts");
+        }
     }
 
     #[test]

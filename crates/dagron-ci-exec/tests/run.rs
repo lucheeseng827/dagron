@@ -556,12 +556,21 @@ fn install_with_node_copies_the_node_beside_it_or_fails() {
     .unwrap();
     std::fs::write(image.join("node/lib/ld-x.so.1"), "loader").unwrap();
     std::os::unix::fs::symlink("ld-x.so.1", image.join("node/lib/libc.x.so.1")).unwrap();
-    let out = Command::new(image.join("dagron-ci-exec"))
-        .args(["install"])
-        .arg(&bin)
-        .args(["--with", "node"])
-        .output()
-        .unwrap();
+    // The binary was just copied: exec(2) can find it "busy" while a fork made by
+    // another test in this process still holds the copy's write end open.
+    let mut install = Command::new(image.join("dagron-ci-exec"));
+    install.args(["install"]).arg(&bin).args(["--with", "node"]);
+    let mut out = install.output();
+    for _ in 0..100 {
+        match out {
+            Err(ref e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(20));
+                out = install.output();
+            }
+            _ => break,
+        }
+    }
+    let out = out.unwrap();
     assert!(
         out.status.success(),
         "{}",

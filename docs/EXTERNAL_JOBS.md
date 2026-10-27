@@ -478,11 +478,14 @@ write.
 ```
 
 Named after what people search for (`clickhouse`, `starrocks`, `doris`,
-`postgres`, `redshift`, `mysql`), implemented against what actually varies —
-three wire protocols. **Trino is deliberately not in that list**: its
-`/v1/statement` protocol needs a `nextUri` loop this step does not implement,
-so it is refused rather than routed through the ClickHouse transport. Maintenance is bounded by protocol count, not vendor count.
-Airflow ran the per-store-operator experiment and reversed it.
+`postgres`, `redshift`, `mysql`, `snowflake`, `bigquery`, `databricks`),
+implemented against what actually varies — three shared wires, and the three
+vendors' own statement APIs (submit, poll, page), which share no wire with
+anything else and are counted as three. **Trino is deliberately not in that
+list**: its `/v1/statement` protocol is its own (a `nextUri` chain), so it is
+refused rather than routed through the ClickHouse transport. Maintenance is
+bounded by protocol count, not vendor count. Airflow ran the per-store-operator
+experiment and reversed it.
 
 **The output contract is the reason to use this over `sh -c "clickhouse-client …"`:**
 
@@ -497,7 +500,8 @@ task's `output` column with no cap anywhere on that path — so `SELECT *` to
 stdout is an unbounded write into the datastore. `SQL_MAX_ROWS` and
 `SQL_MAX_BYTES` are checked **before each row is read into the step**, and
 therefore before it is written: a check applied afterwards is a report, not a
-budget. Both transports stream, so a `SELECT *` over a huge table is refused
+budget. Every transport reads as the answer arrives (a row at a time, or a page
+at a time on the statement APIs), so a `SELECT *` over a huge table is refused
 with the limit named rather than OOM-killing the step before the refusal can
 print. And `rows` mode
 **refuses** when `$DAGRON_ARTIFACTS` is unset rather than falling back — stdout

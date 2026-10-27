@@ -27,7 +27,9 @@ mysql = ["dep:sqlx", "sqlx/any", "sqlx/mysql"]
 postgres = ["dep:sqlx", "sqlx/any", "sqlx/postgres"]
 
 [dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+# `process` and `io-util` are the DuckDB transport's: it runs the DuckDB CLI as a
+# child and feeds it the script on stdin.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "process", "io-util"] }
 serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
@@ -41,7 +43,12 @@ dagron-logging = { path = "../dagron-logging" }
 # already carries — another workspace crate's reqwest features brought it in —
 # so the manifest change costs the lock nothing beyond the `futures-util` edge
 # below.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "stream"] }
+#
+# `gzip` is the other: Snowflake's SQL API sends every result partition after the
+# first gzip-compressed, and reqwest then decodes it on the way into the stream,
+# so the page bound applies to the decoded bytes. Its decoder is tower-http's,
+# which the lock already carries with async-compression and flate2.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "stream", "gzip"] }
 # For `StreamExt`/`TryStreamExt` over the two streams: reqwest's byte stream and
 # sqlx's row stream. Default features, matching dagron-executor, so the lock's
 # existing futures-util entry is reused rather than re-resolved.
@@ -56,4 +63,8 @@ futures-util = "0.3"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls"], optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+# The stand-in vendor APIs the statement-API tests drive the binary against. The
+# version and default features dagron-ci and dagron-runner already use, so the
+# lock gains an edge and no package.
+axum = "0.8"

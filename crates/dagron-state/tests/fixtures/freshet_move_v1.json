@@ -1,0 +1,160 @@
+{
+  "contract": "freshet-move/1",
+  "from": "postgres",
+  "to": "snowflake",
+  "stage": "s3://acme-moves/2026-10/",
+  "units": [
+    {
+      "model": "events",
+      "partition": {
+        "column": "dt",
+        "key": "2026-06-20",
+        "partition_type": "date"
+      },
+      "location": "s3://acme-moves/2026-10/events.dt=2026-06-20/",
+      "unload": {
+        "engine": "duckdb",
+        "statements": [
+          "INSTALL postgres",
+          "LOAD postgres",
+          "INSTALL httpfs",
+          "LOAD httpfs",
+          "INSTALL aws",
+          "LOAD aws",
+          "CREATE OR REPLACE SECRET freshet_stage (TYPE s3, PROVIDER credential_chain)",
+          "ATTACH '' AS freshet_pg (TYPE postgres, READ_ONLY)",
+          "COPY (SELECT dt, user_id, n FROM freshet_pg.public.events WHERE dt IN (DATE '2026-06-20')) TO 's3://acme-moves/2026-10/events.dt=2026-06-20/data_0.parquet' (FORMAT parquet)"
+        ],
+        "atomic": true
+      },
+      "load": {
+        "engine": "snowflake",
+        "statements": [
+          "BEGIN TRANSACTION",
+          "DELETE FROM ANALYTICS.MARTS.events WHERE dt IN (DATE '2026-06-20')",
+          "COPY INTO ANALYTICS.MARTS.events\nFROM 's3://acme-moves/2026-10/events.dt=2026-06-20/'\nSTORAGE_INTEGRATION = FRESHET_STAGE\nFILE_FORMAT = (TYPE = PARQUET)\nMATCH_BY_COLUMN_NAME = CASE_INSENSITIVE\nPATTERN = '.*[.]parquet'\nFORCE = TRUE",
+          "COMMIT"
+        ],
+        "atomic": true
+      },
+      "parity": {
+        "source": {
+          "engine": "postgres",
+          "schema": "public",
+          "table": "events",
+          "relation": "public.events",
+          "predicate": "dt IN (DATE '2026-06-20')"
+        },
+        "target": {
+          "engine": "snowflake",
+          "schema": "ANALYTICS.MARTS",
+          "table": "events",
+          "relation": "ANALYTICS.MARTS.events",
+          "predicate": "dt IN (DATE '2026-06-20')"
+        }
+      }
+    },
+    {
+      "model": "events",
+      "partition": {
+        "column": "dt",
+        "key": "2026-06-21",
+        "partition_type": "date"
+      },
+      "location": "s3://acme-moves/2026-10/events.dt=2026-06-21/",
+      "unload": {
+        "engine": "duckdb",
+        "statements": [
+          "INSTALL postgres",
+          "LOAD postgres",
+          "INSTALL httpfs",
+          "LOAD httpfs",
+          "INSTALL aws",
+          "LOAD aws",
+          "CREATE OR REPLACE SECRET freshet_stage (TYPE s3, PROVIDER credential_chain)",
+          "ATTACH '' AS freshet_pg (TYPE postgres, READ_ONLY)",
+          "COPY (SELECT dt, user_id, n FROM freshet_pg.public.events WHERE dt IN (DATE '2026-06-21')) TO 's3://acme-moves/2026-10/events.dt=2026-06-21/data_0.parquet' (FORMAT parquet)"
+        ],
+        "atomic": true
+      },
+      "load": {
+        "engine": "snowflake",
+        "statements": [
+          "BEGIN TRANSACTION",
+          "DELETE FROM ANALYTICS.MARTS.events WHERE dt IN (DATE '2026-06-21')",
+          "COPY INTO ANALYTICS.MARTS.events\nFROM 's3://acme-moves/2026-10/events.dt=2026-06-21/'\nSTORAGE_INTEGRATION = FRESHET_STAGE\nFILE_FORMAT = (TYPE = PARQUET)\nMATCH_BY_COLUMN_NAME = CASE_INSENSITIVE\nPATTERN = '.*[.]parquet'\nFORCE = TRUE",
+          "COMMIT"
+        ],
+        "atomic": true
+      },
+      "parity": {
+        "source": {
+          "engine": "postgres",
+          "schema": "public",
+          "table": "events",
+          "relation": "public.events",
+          "predicate": "dt IN (DATE '2026-06-21')"
+        },
+        "target": {
+          "engine": "snowflake",
+          "schema": "ANALYTICS.MARTS",
+          "table": "events",
+          "relation": "ANALYTICS.MARTS.events",
+          "predicate": "dt IN (DATE '2026-06-21')"
+        }
+      }
+    },
+    {
+      "model": "daily",
+      "partition": null,
+      "location": "s3://acme-moves/2026-10/daily/",
+      "unload": {
+        "engine": "duckdb",
+        "statements": [
+          "INSTALL postgres",
+          "LOAD postgres",
+          "INSTALL httpfs",
+          "LOAD httpfs",
+          "INSTALL aws",
+          "LOAD aws",
+          "CREATE OR REPLACE SECRET freshet_stage (TYPE s3, PROVIDER credential_chain)",
+          "ATTACH '' AS freshet_pg (TYPE postgres, READ_ONLY)",
+          "COPY (SELECT dt, total FROM freshet_pg.public.daily) TO 's3://acme-moves/2026-10/daily/data_0.parquet' (FORMAT parquet)"
+        ],
+        "atomic": true
+      },
+      "load": {
+        "engine": "snowflake",
+        "statements": [
+          "BEGIN TRANSACTION",
+          "DELETE FROM ANALYTICS.MARTS.daily",
+          "COPY INTO ANALYTICS.MARTS.daily\nFROM 's3://acme-moves/2026-10/daily/'\nSTORAGE_INTEGRATION = FRESHET_STAGE\nFILE_FORMAT = (TYPE = PARQUET)\nMATCH_BY_COLUMN_NAME = CASE_INSENSITIVE\nPATTERN = '.*[.]parquet'\nFORCE = TRUE",
+          "COMMIT"
+        ],
+        "atomic": true
+      },
+      "parity": {
+        "source": {
+          "engine": "postgres",
+          "schema": "public",
+          "table": "daily",
+          "relation": "public.daily",
+          "predicate": null
+        },
+        "target": {
+          "engine": "snowflake",
+          "schema": "ANALYTICS.MARTS",
+          "table": "daily",
+          "relation": "ANALYTICS.MARTS.daily",
+          "predicate": null
+        }
+      }
+    }
+  ],
+  "not_moved": [
+    {
+      "model": "recent",
+      "reason": "a view holds no rows: the target gets it by being planned for"
+    }
+  ]
+}

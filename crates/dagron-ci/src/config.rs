@@ -105,7 +105,7 @@ pub const KNOBS: &[Knob] = &[
     Knob {
         name: "CI_FLAKE_ISSUES",
         default: "off",
-        meaning: "Whether a job that flakes is filed an issue, and after how many flakes: a number N files one of a job of a trusted run that passed only after an attempt of it failed, N times within CI_FLAKE_DAYS, and writes it again in place as it flakes again; a person closes it, and its flakes are counted again from then. Written with the App's token for issues: write alone, on a repository it is installed on, or with the token CI_GITLAB_TOKENS_DIR keeps for a GitLab host; off keeps no flake and files none",
+        meaning: "Whether a job that flakes is filed an issue, and after how many flakes: a number N files one of a job of a trusted run that passed only after an attempt of it failed (retried by the engine, or rerun by a person), N times within CI_FLAKE_DAYS, and writes it again in place as it flakes again; a person closes it, and its flakes are counted again from then. Written with the App's token for issues: write alone, on a repository it is installed on, or with the token CI_GITLAB_TOKENS_DIR keeps for a GitLab host; off keeps no flake and files none",
     },
     Knob {
         name: "CI_FLEET_ENVIRONMENT",

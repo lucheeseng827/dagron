@@ -341,9 +341,19 @@ jobs:
           DIGEST: ${{ steps.sign.outputs.digest }}
         run: |
           set -euo pipefail
-          cosign verify "$IMAGE@$DIGEST" \
-            --certificate-identity "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/.github/workflows/docker.yml@$GITHUB_REF" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+          # Docker Hub can take a while to list a signature it has just
+          # taken: v0.11.0's merges failed "no signatures found" seconds after
+          # the push, and verified when checked later. A signature that is
+          # not there still fails, a minute on.
+          for try in 1 2 3 4 5 6 7; do
+            if cosign verify "$IMAGE@$DIGEST" \
+              --certificate-identity "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/.github/workflows/docker.yml@$GITHUB_REF" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null; then
+              break
+            fi
+            if [ "$try" = 7 ]; then exit 1; fi
+            sleep 10
+          done
           docker buildx imagetools inspect "$IMAGE@$DIGEST" --format '{{json .SBOM}}' \
             | jq -e '[.. | objects | select(has("SPDX"))] | length > 0' > /dev/null \
             || { echo "::error::$IMAGE@$DIGEST carries no SBOM"; exit 1; }
@@ -447,7 +457,14 @@ jobs:
         run: |
           set -euo pipefail
           cosign sign --yes "docker.io/mancube/dagron@$DIGEST"
-          cosign verify "docker.io/mancube/dagron@$DIGEST" \
-            --certificate-identity "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/.github/workflows/docker.yml@$GITHUB_REF" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+          # As for the images: Docker Hub lists a new signature late.
+          for try in 1 2 3 4 5 6 7; do
+            if cosign verify "docker.io/mancube/dagron@$DIGEST" \
+              --certificate-identity "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/.github/workflows/docker.yml@$GITHUB_REF" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null; then
+              break
+            fi
+            if [ "$try" = 7 ]; then exit 1; fi
+            sleep 10
+          done
           echo "docker.io/mancube/dagron@$DIGEST: signed"

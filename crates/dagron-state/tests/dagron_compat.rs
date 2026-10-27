@@ -190,3 +190,30 @@ fn a_secret_env_reaches_dagron_as_value_from_and_never_as_a_value() {
     let engine = task.env.iter().find(|e| e.name == "SQL_ENGINE").unwrap();
     assert_eq!((engine.value.as_str(), engine.value_from.is_none()), ("postgres", true));
 }
+
+/// A compiled warehouse move: multi-line scripts in env, secrets by name, the
+/// unload → load → parity chain per unit. dagron's own parser has to take it, or a
+/// move compiles here and is refused at submit.
+#[test]
+fn a_compiled_move_parses_and_validates_in_dagron() {
+    use dagron_state::moves::{compile_move, MoveEnvelope, MoveOptions, TaskEnv};
+
+    let moved = serde_json::from_str(include_str!("fixtures/freshet_move_v1.json")).unwrap();
+    let options = MoveOptions {
+        unload: TaskEnv {
+            env: BTreeMap::from([("SQL_DSN".into(), ":memory:".into())]),
+            secret_env: BTreeMap::from([("SQL_PASSWORD".into(), "OLD_WAREHOUSE_PASSWORD".into())]),
+        },
+        parity: TaskEnv {
+            env: BTreeMap::new(),
+            secret_env: BTreeMap::from([("PARITY_TARGET_PASSWORD".into(), "SNOWFLAKE_PAT".into())]),
+        },
+        ..MoveOptions::default()
+    };
+    let yaml = compile_move(&MoveEnvelope { moved, options }).unwrap().to_yaml().unwrap();
+    let graph = DagGraph::from_yaml(&yaml).unwrap_or_else(|e| panic!("dagron refused the move: {e}\n{yaml}"));
+    assert_eq!(graph.spec.tasks.len(), 9, "{yaml}");
+    let unload = graph.spec.tasks.iter().find(|t| t.name == "events__dt_2026-06-20__unload").unwrap();
+    let script = unload.env.iter().find(|e| e.name == "SQL_STATEMENT").map(|e| e.value.clone()).unwrap_or_default();
+    assert!(script.contains("\nATTACH '' AS freshet_pg (TYPE postgres, READ_ONLY);\n"), "the script survives YAML: {script}");
+}

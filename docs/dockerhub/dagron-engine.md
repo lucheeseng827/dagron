@@ -15,10 +15,10 @@ dagron is a lightweight workflow scheduler in Rust. The engine parses a YAML DAG
 | Tag | Notes |
 |---|---|
 | `latest` | newest release |
-| `0.10.0` | pinned version (= current `latest`) |
-| `0.10` | floating minor — newest `0.10.x` |
+| `0.11.0` | pinned version (= current `latest`) |
+| `0.11` | floating minor — newest `0.11.x` |
 
-Pin in production: `mancube/dagron-engine:0.10.0`.
+Pin in production: `mancube/dagron-engine:0.11.0`.
 
 ## Run
 
@@ -27,7 +27,7 @@ docker run \
   -e DATABASE_URL=postgres://dagron:dagron@postgres:5432/workflow \
   -e API_ADDR=0.0.0.0:8787 \
   -e EXECUTOR=local \
-  mancube/dagron-engine:0.10.0
+  mancube/dagron-engine:0.11.0
 ```
 
 ## Configuration (env)
@@ -42,4 +42,4 @@ docker run \
 | `K8S_IMAGE` / `K8S_NAMESPACE` | task image + namespace for the kubernetes executor. |
 | `RUST_LOG` | log level (`info`). |
 
-The engine is built with `FEATURES=postgres,ops,kubernetes`: Postgres, the ops API and the Kubernetes executor. **Releases after 0.11.0** add `otel,archive-s3,archive-gcs,archive-azure`: OpenTelemetry (a trace context for each task, and OTLP span export once `OTEL_EXPORTER_OTLP_ENDPOINT` names a collector), and S3, Google Cloud Storage and Azure Blob for archived runs (`GC_ARCHIVE_URL`). The tags above through 0.11.0 do not have them: there `GC_ARCHIVE_URL` with a bucket is a startup error. An image built with them says so as it starts, on its `configuration resolved` line (`features=…`); one that prints no `features=` there is an earlier one. It needs a Postgres datastore — run it with the `dagron-api` (auth/UI gateway) and `dagron-frontend` (console) for the full stack, or deploy everything with the Helm chart (`oci://registry-1.docker.io/mancube/dagron`).
+The engine is built with `FEATURES=postgres,ops,kubernetes`: Postgres, the ops API and the Kubernetes executor. **From 0.11.0** it adds `otel,archive-s3,archive-gcs,archive-azure`: OpenTelemetry (a trace context for each task, and OTLP span export once `OTEL_EXPORTER_OTLP_ENDPOINT` names a collector), and S3, Google Cloud Storage and Azure Blob for archived runs (`GC_ARCHIVE_URL`). Tags through 0.10.x do not have them: there `GC_ARCHIVE_URL` with a bucket is a startup error. An image built with them says so as it starts, on its `configuration resolved` line (`features=…`); one that prints no `features=` there is an earlier one. It needs a Postgres datastore — run it with `dagron-api` (auth, REST API and the console) for the full stack, or deploy everything with the Helm chart (`oci://registry-1.docker.io/mancube/dagron`).

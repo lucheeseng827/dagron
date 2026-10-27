@@ -19,6 +19,8 @@
 //! | `POST /plans` | `/api/state/plans` | Compile a plan → workflow YAML. Submits nothing. |
 //! | `POST /plans/explain` | `/api/state/plans/explain` | Why each model rebuilds: summary, rows, markdown, Mermaid |
 //! | `POST /plans/submit` | `/api/state/plans/submit` | Compile, then submit through the host |
+//! | `POST /moves` | `/api/state/moves` | Compile a warehouse move → workflow YAML. Submits nothing. |
+//! | `POST /moves/submit` | `/api/state/moves/submit` | Compile a move, then submit it through the host |
 //!
 //! The compile-only route is the explainability surface: it answers "what would
 //! this SQL change rebuild, and as what run graph" without side effects, which is
@@ -40,6 +42,7 @@ use serde::Serialize;
 
 use crate::compile::{compile, CompileError, PlanEnvelope};
 use crate::explain::{explain, Explanation};
+use crate::moves::{compile_move, MoveCompileError, MoveEnvelope, MOVE_CONTRACT_VERSION};
 use crate::wire::WIRE_CONTRACT_VERSION;
 
 /// The one thing this component needs from whoever hosts it: a way to turn
@@ -79,6 +82,19 @@ impl SubmitError {
 pub struct ContractView {
     pub component: &'static str,
     pub wire_contract: &'static str,
+    /// The `freshet move` document this build compiles.
+    pub move_contract: &'static str,
+}
+
+/// A compiled move, not submitted, or one that became a run (`run_id`).
+#[derive(Debug, Serialize)]
+pub struct MoveView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub yaml: Option<String>,
+    pub unit_count: usize,
+    pub task_count: usize,
 }
 
 /// A compiled plan, not submitted.
@@ -122,11 +138,54 @@ pub fn router<S: PlanSubmitter>(submitter: Arc<S>) -> Router {
         .route("/plans", post(plans::<S>))
         .route("/plans/explain", post(explain_plan::<S>))
         .route("/plans/submit", post(submit::<S>))
+        .route("/moves", post(moves::<S>))
+        .route("/moves/submit", post(submit_move::<S>))
         .with_state(submitter)
 }
 
 async fn contract() -> Json<ContractView> {
-    Json(ContractView { component: "dagron-state", wire_contract: WIRE_CONTRACT_VERSION })
+    Json(ContractView {
+        component: "dagron-state",
+        wire_contract: WIRE_CONTRACT_VERSION,
+        move_contract: MOVE_CONTRACT_VERSION,
+    })
+}
+
+/// `POST /api/state/moves` — compile a move only.
+async fn moves<S: PlanSubmitter>(
+    State(_submitter): State<Arc<S>>,
+    Json(envelope): Json<MoveEnvelope>,
+) -> Result<Json<MoveView>, (StatusCode, String)> {
+    let (yaml, task_count) = compile_move_to_yaml(&envelope)?;
+    Ok(Json(MoveView { run_id: None, yaml: Some(yaml), unit_count: envelope.moved.units.len(), task_count }))
+}
+
+/// `POST /api/state/moves/submit` — compile a move, then hand the YAML to the host.
+async fn submit_move<S: PlanSubmitter>(
+    State(submitter): State<Arc<S>>,
+    Json(envelope): Json<MoveEnvelope>,
+) -> Result<(StatusCode, Json<MoveView>), (StatusCode, String)> {
+    let (yaml, task_count) = compile_move_to_yaml(&envelope)?;
+    let run_id = submitter.submit(yaml).await.map_err(SubmitError::into_response)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(MoveView { run_id: Some(run_id), yaml: None, unit_count: envelope.moved.units.len(), task_count }),
+    ))
+}
+
+/// A move with no units is a 422 like an empty plan: well-formed, with no run in it.
+fn compile_move_to_yaml(envelope: &MoveEnvelope) -> Result<(String, usize), (StatusCode, String)> {
+    let spec = compile_move(envelope).map_err(|e| {
+        let status = match e {
+            MoveCompileError::EmptyMove => StatusCode::UNPROCESSABLE_ENTITY,
+            _ => StatusCode::BAD_REQUEST,
+        };
+        (status, e.to_string())
+    })?;
+    let yaml = spec
+        .to_yaml()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to render YAML: {e}")))?;
+    Ok((yaml, spec.tasks.len()))
 }
 
 /// `POST /api/state/plans` — compile only.
