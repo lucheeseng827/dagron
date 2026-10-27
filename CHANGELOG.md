@@ -66,6 +66,14 @@ All notable changes to this project are documented here. The format is based on
   build, with no driver beyond the HTTP client; reqwest gains `gzip`, for
   Snowflake's compressed partitions. Tested against stand-ins in each API's
   documented shapes (`tests/statement_api.rs`), not yet against the services.
+- **`dagron-ci` as a release binary.** Each release now carries
+  `dagron-ci-<version>-<target>` for Linux x86_64 and arm64 (static, musl),
+  macOS arm64 and Windows x86_64, signed and attested with the rest. It is the
+  developer's half of dagron CI: `validate`, `import` and `run` a pipeline
+  before a push, and `logs`, `rerun` and `cancel` against a server. 0.11.0
+  shipped it only inside the `mancube/dagron-ci` image. Each leg checks the
+  binary before it ships: its `--version`, that it is static on musl, and that
+  it validates the Rust and Node starters.
 
 ### Changed
 - **dagron-ci: a job that failed and passed when a person reran it is a

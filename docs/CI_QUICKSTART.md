@@ -155,7 +155,8 @@ ci cancel RUN_ID          # stop it
 ci run --remote --repo github.com/OWNER/NAME --ref refs/heads/main --wait --timeout 900
 ```
 
-With `dagron-ci` on this machine too, log in to it once instead. Paste an
+With `dagron-ci` on this machine too (a release's `dagron-ci-<version>-<target>`
+archive, from the release after 0.11.0), log in to it once instead. Paste an
 API token of yours (`POST /api/tokens`, [HOWTO §5](HOWTO.md#5-api-tokens-for-ci-and-scripts):
 a session's ends with the session); it is not shown as it is typed, and is
 kept for that server once the server has said whose it is. The commands

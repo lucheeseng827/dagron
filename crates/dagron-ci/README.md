@@ -123,6 +123,13 @@ pending while it waits or runs, then its outcome (below).
   own reader and compiler ([below](#from-another-ci-dagron-ci-import)).
 - **`/healthz`, `/readyz`, `/metrics`** for an orchestrator and Prometheus.
 
+**Getting the command.** From the release after 0.11.0, each release carries
+`dagron-ci-<version>-<target>` for Linux x86_64 and arm64 (static, musl),
+macOS arm64 and Windows x86_64, beside `dagron`, which `dagron-ci run` needs.
+0.11.0 shipped it in the `mancube/dagron-ci` image alone; there, a command
+that needs no server is
+`docker run --rm -v "$PWD:/repo" -w /repo docker.io/mancube/dagron-ci:0.11.0 validate`.
+
 ### Trust classes
 
 Opening a pull request must not be the same as authoring a workflow. dagron-ci
@@ -2180,8 +2187,10 @@ The run a push would start, on this machine. The event is read from the
 checkout, each pipeline compiles as the event workers compile it, and each one
 that runs goes to a `dagron` engine started for it alone: a one-shot run on a
 SQLite file of its own. The engine is `--engine PATH`, else the `dagron` beside
-`dagron-ci`, else the one on `PATH`; `cargo build --release -p dagron
--p dagron-ci -p dagron-ci-exec` builds all three side by side. The tasks work
+`dagron-ci`, else the one on `PATH`. A release's `dagron` and `dagron-ci`
+archives, unpacked into one directory, are that pair (and on Linux
+`dagron-ci-exec`'s beside them); from a checkout, `cargo build --release -p
+dagron -p dagron-ci -p dagron-ci-exec` builds all three side by side. The tasks work
 in the working tree, so they have no checkout of their own.
 
 - **The pipelines** are the files named, else every file of `.dagron/ci`

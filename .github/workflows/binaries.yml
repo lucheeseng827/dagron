@@ -9,11 +9,13 @@
 # poor first impression and, for the single-binary/edge story the project makes,
 # an odd gap.
 #
-# Two binaries are published. The root `dagron` binary is the one a person
-# runs (`dagron dev`, `dagron validate`, a one-shot run); dagron-api, the GitOps
-# worker and the MCP server are services and ship as images. `dagron-ci-exec`,
-# the step runner a CI task's image carries, ships beside it on the two Linux
-# musl legs, the only platforms it is for.
+# The root `dagron` binary is the one a person runs (`dagron dev`,
+# `dagron validate`, a one-shot run); dagron-api, the GitOps worker and the MCP
+# server are services and ship as images. Beside it: `dagron-ci`, a
+# developer's CI command (validate, import and run a pipeline before a push;
+# logs, rerun and cancel against a server), and `dagron-runner`, on every
+# native leg; and `dagron-ci-exec`, the step runner a CI task's image carries,
+# on the two Linux musl legs, the only platforms it is for.
 #
 # Five legs. Four build natively on a runner of the target's own architecture
 # and smoke-test what they built; the fifth (armv7, the 32-bit ARM gateways
@@ -177,6 +179,17 @@ jobs:
           APP_VERSION: ${{ steps.appver.outputs.version }}
         run: cargo build --release --locked -p dagron-runner --target ${{ matrix.target }}
 
+      # dagron-ci, for a developer's machine: `validate`, `import` and `run`
+      # before a push, and `logs`, `rerun` and `cancel` against a server. The
+      # service ships as an image; until 0.11.0 this was all a person had too,
+      # so checking a pipeline meant `docker run`. On every native leg, as the
+      # runner; not armv7, which it is not promised for.
+      - name: Build dagron-ci
+        if: ${{ !matrix.cross }}
+        env:
+          APP_VERSION: ${{ steps.appver.outputs.version }}
+        run: cargo build --release --locked -p dagron-ci --bin dagron-ci --target ${{ matrix.target }}
+
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'
         shell: bash
@@ -285,6 +298,52 @@ jobs:
             echo "RUNNER_ASSET=dist/${name}.tar.gz" >> "$GITHUB_ENV"
           fi
 
+      # It says which release it is, is static on musl, and checks a pipeline
+      # with no server and no network: the starters in examples/ci are what a
+      # first-time user validates first.
+      - name: Smoke test dagron-ci
+        if: ${{ !matrix.cross }}
+        shell: bash
+        env:
+          APP_VERSION: ${{ steps.appver.outputs.version }}
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/dagron-ci"
+          if [ -f "$bin.exe" ]; then bin="$bin.exe"; fi
+          said=$("$bin" --version | tr -d '\r')
+          if [ "$said" != "dagron-ci $APP_VERSION" ]; then
+            echo "::error::--version says '$said', not 'dagron-ci $APP_VERSION'"
+            exit 1
+          fi
+          case "${{ matrix.target }}" in
+            *-musl)
+              if readelf -l "$bin" | grep -q INTERP; then
+                echo "dagron-ci is dynamically linked"
+                exit 1
+              fi ;;
+          esac
+          "$bin" validate examples/ci/rust.yaml examples/ci/node.yaml
+          echo "dagron-ci smoke test passed for ${{ matrix.target }}"
+      - name: Package dagron-ci
+        if: ${{ !matrix.cross }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ github.event.inputs.tag || github.ref_name }}"
+          name="dagron-ci-${version}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          bin="target/${{ matrix.target }}/release/dagron-ci"
+          if [ -f "$bin.exe" ]; then bin="$bin.exe"; fi
+          cp "$bin" "dist/$name/"
+          cp LICENSE "dist/$name/" 2>/dev/null || true
+          if [ "${{ matrix.archive }}" = zip ]; then
+            (cd dist && 7z a "${name}.zip" "$name" >/dev/null)
+            echo "CI_ASSET=dist/${name}.zip" >> "$GITHUB_ENV"
+          else
+            tar -C dist -czf "dist/${name}.tar.gz" "$name"
+            echo "CI_ASSET=dist/${name}.tar.gz" >> "$GITHUB_ENV"
+          fi
+
       # Static, and it runs a step: an ELF naming an interpreter (a dynamic
       # loader) would fail in the minimal images it is copied into.
       - name: Smoke test dagron-ci-exec
@@ -340,6 +399,12 @@ jobs:
           name: dagron-runner-${{ matrix.target }}
           path: ${{ env.RUNNER_ASSET }}
           if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !matrix.cross }}
+        with:
+          name: dagron-ci-${{ matrix.target }}
+          path: ${{ env.CI_ASSET }}
+          if-no-files-found: error
 
   # A CycloneDX SBOM of each binary: what its build links, from the lockfile
   # the release was built with. One job and not one a leg: the dependencies
@@ -359,13 +424,14 @@ jobs:
           VERSION: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          # A file beside each crate that builds a binary; the three that are
+          # A file beside each crate that builds a binary; the four that are
           # published are kept, under the names their archives have.
           cargo cyclonedx --format json --spec-version 1.5 --describe binaries --no-build-deps
           mkdir -p dist
           cp dagron_bin.cdx.json "dist/dagron-${VERSION}.cdx.json"
           cp crates/dagron-ci-exec/dagron-ci-exec_bin.cdx.json "dist/dagron-ci-exec-${VERSION}.cdx.json"
           cp crates/dagron-runner/dagron-runner_bin.cdx.json "dist/dagron-runner-${VERSION}.cdx.json"
+          cp crates/dagron-ci/dagron-ci_bin.cdx.json "dist/dagron-ci-${VERSION}.cdx.json"
           for sbom in dist/*.cdx.json; do
             jq -e '.bomFormat == "CycloneDX" and (.components | length) > 0' "$sbom" > /dev/null \
               || { echo "::error::$sbom is not an SBOM with components"; exit 1; }
