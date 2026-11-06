@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-11-06
+
+### Fixed
+- **A workflow that listed the same dependency twice never ran.** `depends_on: [b, b]` passed `dagron validate`, then run creation died on the dependency table's uniqueness (`UNIQUE constraint failed: task_dependencies`) and the ingest source nacked it for redelivery — the run silently never existed. A repeated entry is now deduplicated where the graph is built, so the graph, the stored spec and the run's dependency rows all see it once.
+- **A workflow saved with a UTF-8 byte-order mark was refused, blaming a field that was there.** The BOM became part of the first key, so the parse failed with `missing field tasks`. Both submit parsers now strip it.
+- **`scripts/examples_check.py` reported the shipped CI starter examples invalid.** They are dagron-ci pipelines, valid under `dagron-ci validate`; the checker now classifies them as such instead of failing them as dagron DAGs.
+
 ## [0.11.1] - 2026-10-27
 
 ### Added

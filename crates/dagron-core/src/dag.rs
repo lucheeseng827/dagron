@@ -1800,7 +1800,7 @@ impl DagGraph {
     /// and validate the graph. This is the single entry point every submit path
     /// uses, so sub-workflow support is uniform across the API, cron, and ingest.
     pub fn from_yaml(yaml: &str) -> Result<Self> {
-        let spec: DagSpec = serde_yaml::from_str(yaml)?;
+        let spec: DagSpec = serde_yaml::from_str(yaml.strip_prefix('\u{FEFF}').unwrap_or(yaml))?;
         // Authoring path: no run is being triggered, so `required` is not
         // enforced, but a rule that is malformed or contradicts its own default
         // is still an error.
@@ -1824,7 +1824,7 @@ impl DagGraph {
         yaml: &str,
         overrides: &BTreeMap<String, String>,
     ) -> Result<Self> {
-        let mut spec: DagSpec = serde_yaml::from_str(yaml)?;
+        let mut spec: DagSpec = serde_yaml::from_str(yaml.strip_prefix('\u{FEFF}').unwrap_or(yaml))?;
         for (k, v) in overrides {
             spec.parameters.insert(k.clone(), v.clone());
         }
@@ -1873,7 +1873,15 @@ impl DagGraph {
     }
 
     /// Build the graph from an already-expanded (leaf-only) [`DagSpec`].
-    pub fn from_spec(spec: DagSpec) -> Result<Self> {
+    pub fn from_spec(mut spec: DagSpec) -> Result<Self> {
+        // A dependency listed twice is one dependency: the graph, the
+        // stored spec and the run's dependency rows (unique per pair) must
+        // all see it once, or a workflow `dagron validate` passed dies at
+        // run creation on that uniqueness and never runs.
+        for task in &mut spec.tasks {
+            let mut seen = std::collections::HashSet::new();
+            task.depends_on.retain(|dep| seen.insert(dep.clone()));
+        }
         let mut graph = DiGraph::new();
         let mut node_index = HashMap::new();
 
@@ -3171,10 +3179,34 @@ mod tests {
         }
     }
 
+    /// A repeated `depends_on` entry is one dependency, not two: the graph,
+    /// the stored spec and the run's dependency rows must all see it once,
+    /// or run creation dies on the dependency table's uniqueness and the
+    /// submitted workflow never runs.
+    #[test]
+    fn a_repeated_depends_on_entry_is_one_dependency() {
+        let g = DagGraph::from_yaml(
+            "name: w\ntasks:\n  - { name: b, command: [\"x\"] }\n  - { name: a, command: [\"y\"], depends_on: [b, b] }\n",
+        )
+        .expect("a repeated depends_on entry parses");
+        assert_eq!(g.task_spec("a").unwrap().depends_on, vec!["b".to_string()]);
+    }
+
+    /// A UTF-8 byte-order mark (what a Windows editor saves) is not part
+    /// of the first key.
+    #[test]
+    fn a_bom_prefixed_workflow_parses() {
+        let g = DagGraph::from_yaml(
+            "\u{FEFF}name: w\ntasks:\n  - { name: a, command: [\"x\"] }\n",
+        )
+        .expect("a BOM-prefixed workflow parses");
+        assert_eq!(g.spec.name, "w");
+    }
+
+    #[test]
     /// `env_from:` is kept on a command task as it is written, names a task
     /// the task depends on, follows that task where a template renames it,
     /// and is refused where it could not be given.
-    #[test]
     fn a_task_s_env_from_names_what_it_reads_of_a_task_it_depends_on() {
         let g = DagGraph::from_yaml(
             "name: w\ntasks:\n  - { name: build, command: [\"x\"] }\n  - name: use\n    command: [\"y\"]\n    \

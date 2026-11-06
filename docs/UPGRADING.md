@@ -5,6 +5,7 @@ before you do. The general procedure is short; the per-release sections are the
 part to read every time.
 
 - [The procedure](#the-procedure) — back up, one engine first, then the rest
+- [Upgrading to 0.11.2](#upgrading-to-0112) — from 0.11.1
 - [Upgrading to 0.11.1](#upgrading-to-0111) — from 0.11.0
 - [Upgrading to 0.11.0](#upgrading-to-0110) — from 0.10.0
 - [Upgrading to 0.10.0](#upgrading-to-0100) — from 0.9.x
@@ -86,6 +87,27 @@ already right. Drop the `gitops.image` lines if the worker is not enabled.
 
 Stop the engine, replace the binary, start it. Same order as above when you run
 more than one.
+
+## Upgrading to 0.11.2
+
+From 0.11.1. **No migrations**: the schema of 0.11.2 is 0.11.1's, on SQLite and
+Postgres alike, and dagron-ci's schema is unchanged too. Engines, dagron-api and
+dagron-ci of the two releases run side by side while you roll them, and rolling
+back is pulling the 0.11.1 images again. The procedure is the usual one:
+
+```sh
+DAGRON_VERSION=0.11.2 docker compose -f compose.quickstart.yaml pull
+DAGRON_VERSION=0.11.2 docker compose -f compose.quickstart.yaml up -d
+# or, with dagron-ci: the same two lines against compose.ci.yaml
+helm upgrade dagron oci://registry-1.docker.io/mancube/dagron --version 0.11.2 --reuse-values
+```
+
+0.11.2 fixes two submission bugs and nothing else, so there is nothing to do
+but upgrade: a workflow that listed the same dependency twice
+(`depends_on: [b, b]`) passed validation and then never ran — run creation
+died on the dependency table's uniqueness — and a workflow saved with a UTF-8
+byte-order mark was refused with a misleading `missing field tasks`. If a
+workflow of yours vanished on submit under 0.11.1, resubmit it under 0.11.2.
 
 ## Upgrading to 0.11.1
 
